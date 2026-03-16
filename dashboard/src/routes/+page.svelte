@@ -3,6 +3,7 @@
 	import type { Transaction } from '$lib/types';
 	import { fetchReviewQueue } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
+	import { DATE_PRESETS } from '$lib/datePresets';
 
 	let items: Transaction[] = $state([]);
 	let loading = $state(true);
@@ -14,6 +15,9 @@
 	let entityFilter = $state('');
 	let categoryFilter = $state('');
 	let amountFilter = $state(''); // '' | 'has' | 'missing'
+	let datePreset = $state('');
+	let dateFrom = $state('');
+	let dateTo = $state('');
 
 	const BUSINESS_CATEGORIES = [
 		{ value: 'ADVERTISING',           label: 'Advertising' },
@@ -44,14 +48,12 @@
 	];
 
 	let filteredItems = $derived(items.filter((tx) => {
-		// Entity
 		if (entityFilter && tx.entity !== entityFilter) return false;
-		// Category
 		if (categoryFilter && tx.tax_category !== categoryFilter) return false;
-		// Amount
 		if (amountFilter === 'has' && !tx.amount) return false;
 		if (amountFilter === 'missing' && tx.amount) return false;
-		// Search (vendor + description)
+		if (dateFrom && tx.date < dateFrom) return false;
+		if (dateTo && tx.date > dateTo) return false;
 		if (search) {
 			const q = search.toLowerCase();
 			const haystack = `${tx.vendor ?? ''} ${tx.description}`.toLowerCase();
@@ -61,8 +63,24 @@
 	}));
 
 	let hasActiveFilters = $derived(
-		!!search || !!entityFilter || !!categoryFilter || !!amountFilter
+		!!search || !!entityFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo
 	);
+
+	const datePresetGroups = [...new Set(DATE_PRESETS.map(p => p.group))];
+
+	function handleDatePreset() {
+		if (!datePreset) {
+			dateFrom = '';
+			dateTo = '';
+		} else {
+			const preset = DATE_PRESETS.find(p => p.label === datePreset);
+			if (preset) {
+				const range = preset.range();
+				dateFrom = range.from;
+				dateTo = range.to;
+			}
+		}
+	}
 
 	onMount(async () => {
 		await load();
@@ -92,6 +110,9 @@
 		entityFilter = '';
 		categoryFilter = '';
 		amountFilter = '';
+		datePreset = '';
+		dateFrom = '';
+		dateTo = '';
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
@@ -168,9 +189,9 @@
 		<div class="filter-bar card">
 			<input
 				type="search"
-				placeholder="Search vendor, description…"
+				placeholder="Search…"
 				bind:value={search}
-				class="filter-search"
+				class="filter-search filter-search-compact"
 				aria-label="Search transactions"
 			/>
 
@@ -199,6 +220,17 @@
 				<option value="">All amounts</option>
 				<option value="has">Has amount</option>
 				<option value="missing">Missing amount</option>
+			</select>
+
+			<select bind:value={datePreset} onchange={handleDatePreset} aria-label="Date range" class="filter-date-preset">
+				<option value="">Date range…</option>
+				{#each datePresetGroups as group}
+					<optgroup label={group}>
+						{#each DATE_PRESETS.filter(p => p.group === group) as preset}
+							<option value={preset.label}>{preset.label}</option>
+						{/each}
+					</optgroup>
+				{/each}
 			</select>
 
 			{#if hasActiveFilters}
@@ -282,7 +314,15 @@
 
 	.filter-search {
 		flex: 1;
-		min-width: 180px;
+		min-width: 120px;
+	}
+
+	.filter-search-compact {
+		max-width: 160px;
+	}
+
+	.filter-date-preset {
+		min-width: 140px;
 	}
 
 	.filter-clear {

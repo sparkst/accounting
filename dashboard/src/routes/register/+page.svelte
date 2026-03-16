@@ -4,6 +4,7 @@
 	import { fetchTransactions, updateTransaction, confirmTransaction } from '$lib/api';
 	import type { TransactionFilters } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
+	import { DATE_PRESETS } from '$lib/datePresets';
 
 	const PAGE_SIZES = [25, 50, 100, 200];
 	let pageSize = $state(50);
@@ -113,6 +114,24 @@
 		return c.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (ch) => ch.toUpperCase());
 	}
 
+	let datePreset = $state('');
+	const datePresetGroups = [...new Set(DATE_PRESETS.map(p => p.group))];
+
+	function handleDatePreset() {
+		if (!datePreset) {
+			dateFrom = '';
+			dateTo = '';
+		} else {
+			const preset = DATE_PRESETS.find(p => p.label === datePreset);
+			if (preset) {
+				const range = preset.range();
+				dateFrom = range.from;
+				dateTo = range.to;
+			}
+		}
+		applyFilters();
+	}
+
 	let searchTimeout: ReturnType<typeof setTimeout>;
 	function onSearchInput() {
 		clearTimeout(searchTimeout);
@@ -140,6 +159,7 @@
 		statusFilter = '';
 		dateFrom = '';
 		dateTo = '';
+		datePreset = '';
 		applyFilters();
 	}
 
@@ -192,10 +212,10 @@
 	<div class="filter-bar card">
 		<input
 			type="search"
-			placeholder="Search vendor, description…"
+			placeholder="Search…"
 			bind:value={search}
 			oninput={onSearchInput}
-			class="filter-search"
+			class="filter-search filter-search-compact"
 			aria-label="Search transactions"
 		/>
 
@@ -212,25 +232,33 @@
 			<option value="confirmed">Confirmed</option>
 			<option value="auto_classified">Auto Classified</option>
 			<option value="rejected">Rejected</option>
-			<option value="split_parent">Split Parent</option>
 		</select>
 
-		<label class="filter-date-label" for="date-from">From</label>
+		<select bind:value={datePreset} onchange={handleDatePreset} aria-label="Date range preset" class="filter-date-preset">
+			<option value="">Date range…</option>
+			{#each datePresetGroups as group}
+				<optgroup label={group}>
+					{#each DATE_PRESETS.filter(p => p.group === group) as preset}
+						<option value={preset.label}>{preset.label}</option>
+					{/each}
+				</optgroup>
+			{/each}
+		</select>
+
 		<input
-			id="date-from"
 			type="date"
 			bind:value={dateFrom}
-			onchange={applyFilters}
+			onchange={() => { datePreset = ''; applyFilters(); }}
 			aria-label="Start date"
+			class="filter-date-input"
 		/>
-
-		<label class="filter-date-label" for="date-to">To</label>
+		<span class="filter-date-sep">–</span>
 		<input
-			id="date-to"
 			type="date"
 			bind:value={dateTo}
-			onchange={applyFilters}
+			onchange={() => { datePreset = ''; applyFilters(); }}
 			aria-label="End date"
+			class="filter-date-input"
 		/>
 
 		{#if search || entityFilter || statusFilter || dateFrom || dateTo}
@@ -460,13 +488,25 @@
 
 	.filter-search {
 		flex: 1;
-		min-width: 200px;
+		min-width: 120px;
 	}
 
-	.filter-date-label {
-		font-size: .75rem;
+	.filter-search-compact {
+		max-width: 180px;
+	}
+
+	.filter-date-preset {
+		min-width: 140px;
+	}
+
+	.filter-date-input {
+		width: 130px;
+		font-size: .8rem;
+	}
+
+	.filter-date-sep {
 		color: var(--text-muted);
-		font-weight: 500;
+		font-size: .8rem;
 	}
 
 	.table-wrapper {

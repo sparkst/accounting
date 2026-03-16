@@ -1,0 +1,9 @@
+data/
+.env
+__pycache__/
+.venv/
+node_modules/
+.DS_Store
+*.pyc
+dashboard/.svelte-kit/
+dashboard/build/

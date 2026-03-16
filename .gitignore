@@ -7,3 +7,5 @@ node_modules/
 *.pyc
 dashboard/.svelte-kit/
 dashboard/build/
+.qralph/
+accounting_test*

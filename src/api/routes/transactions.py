@@ -69,7 +69,7 @@ class TransactionOut(BaseModel):
     source_id: str | None
     date: str
     description: str
-    amount: Any  # Decimal serialised as string to avoid float precision loss
+    amount: Any | None = None  # Decimal serialised as string; None = unknown
     currency: str
     entity: str | None
     direction: str | None
@@ -90,11 +90,13 @@ class TransactionOut(BaseModel):
 
     @field_validator("amount", mode="before")
     @classmethod
-    def coerce_amount(cls, v: Any) -> str:
+    def coerce_amount(cls, v: Any) -> str | None:
         """Serialise Decimal / float to a plain string to preserve precision."""
+        if v is None:
+            return None
         if isinstance(v, Decimal):
             return str(v)
-        return str(v) if v is not None else "0"
+        return str(v)
 
 
 class TransactionListResponse(BaseModel):
@@ -102,6 +104,8 @@ class TransactionListResponse(BaseModel):
 
     items: list[TransactionOut]
     total: int
+    income_total: float = 0.0
+    expense_total: float = 0.0
     limit: int
     offset: int
 
@@ -297,7 +301,8 @@ def list_transactions(
         default="date",
         description="Sort column: date | amount | description",
     ),
-    sort_dir: str = Query(default="desc", description="asc | desc"),
+    sort_order: str = Query(default="desc", description="asc | desc"),
+    sort_dir: str = Query(default="", description="(deprecated alias for sort_order)"),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_db),  # noqa: B008
@@ -339,14 +344,33 @@ def list_transactions(
 
         total: int = query.count()
 
+        # Aggregate totals across all filtered results (before pagination)
+        income_total: float = (
+            session.query(func.sum(Transaction.amount))
+            .filter(Transaction.id.in_(query.with_entities(Transaction.id)))
+            .filter(Transaction.amount > 0)
+            .scalar()
+        ) or 0.0
+        expense_total: float = (
+            session.query(func.sum(Transaction.amount))
+            .filter(Transaction.id.in_(query.with_entities(Transaction.id)))
+            .filter(Transaction.amount < 0)
+            .scalar()
+        ) or 0.0
+
         # Sorting
         sort_col_map = {
             "date": Transaction.date,
             "amount": Transaction.amount,
             "description": Transaction.description,
+            "vendor": Transaction.description,
+            "entity": Transaction.entity,
+            "tax_category": Transaction.tax_category,
+            "status": Transaction.status,
         }
         sort_col = sort_col_map.get(sort_by, Transaction.date)
-        if sort_dir.lower() == "asc":
+        effective_dir = sort_dir if sort_dir else sort_order
+        if effective_dir.lower() == "asc":
             query = query.order_by(sort_col.asc())
         else:
             query = query.order_by(sort_col.desc())
@@ -356,6 +380,8 @@ def list_transactions(
         return TransactionListResponse(
             items=[TransactionOut.model_validate(tx) for tx in items],
             total=total,
+            income_total=float(income_total),
+            expense_total=float(expense_total),
             limit=limit,
             offset=offset,
         )

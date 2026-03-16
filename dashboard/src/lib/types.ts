@@ -56,6 +56,7 @@ export interface Transaction {
 	amount: number;
 	entity: Entity | null;
 	tax_category: TaxCategory | null;
+	tax_subcategory: string | null;
 	direction: Direction | null;
 	status: TransactionStatus;
 	confidence: number | null;
@@ -76,6 +77,8 @@ export interface Transaction {
 export interface TransactionList {
 	items: Transaction[];
 	total: number;
+	income_total: number;
+	expense_total: number;
 	limit: number;
 	offset: number;
 }
@@ -105,6 +108,7 @@ export interface IngestResult {
 export interface TransactionUpdate {
 	entity?: Entity;
 	tax_category?: TaxCategory;
+	tax_subcategory?: string;
 	direction?: Direction;
 	status?: TransactionStatus;
 	notes?: string;

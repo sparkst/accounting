@@ -18,6 +18,8 @@
 	let entity: string = $state(transaction.entity ?? '');
 	// eslint-disable-next-line svelte/reactivity
 	let taxCategory: string = $state(transaction.tax_category ?? '');
+	// eslint-disable-next-line svelte/reactivity
+	let taxSubcategory: string = $state(transaction.tax_subcategory ?? '');
 	let reasoningOpen = $state(false);
 	let detailOpen = $state(false);
 	let saving = $state(false);
@@ -70,6 +72,74 @@
 		{ value: 'INVESTMENT_INCOME',       label: 'Investment Income' },
 		{ value: 'PERSONAL_NON_DEDUCTIBLE', label: 'Personal (Non-deductible)' }
 	];
+
+	// Subcategories grouped by parent category
+	const SUBCATEGORIES: Record<string, { value: string; label: string }[]> = {
+		ADVERTISING: [
+			{ value: 'social_ads', label: 'Social Media Ads (Pinterest, FB)' },
+			{ value: 'race_promotion', label: 'Race / Event Promotion' },
+			{ value: 'print_marketing', label: 'Print Marketing' },
+		],
+		CONTRACT_LABOR: [
+			{ value: 'photography', label: 'Photography' },
+			{ value: 'brand_design', label: 'Brand / Design Work' },
+		],
+		SUPPLIES: [
+			{ value: 'ai_services', label: 'AI Services (APIs)' },
+			{ value: 'software_tools', label: 'Software / SaaS' },
+			{ value: 'ecommerce_platform', label: 'Ecommerce Platform Fees' },
+			{ value: 'payment_processing', label: 'Payment Processing Fees' },
+			{ value: 'packaging', label: 'Packaging & Labels' },
+			{ value: 'shipping', label: 'Shipping (Outbound)' },
+			{ value: 'shipping_inbound', label: 'Shipping (Inbound / Freight)' },
+			{ value: 'hardware', label: 'Hardware' },
+			{ value: 'office_supplies', label: 'Office Supplies' },
+			{ value: 'software', label: 'Software (General)' },
+		],
+		TRAVEL: [
+			{ value: 'flights', label: 'Flights' },
+			{ value: 'lodging', label: 'Lodging' },
+			{ value: 'ground_transport', label: 'Ground Transport' },
+			{ value: 'wifi', label: 'Wi-Fi' },
+		],
+		MEALS: [
+			{ value: 'meals_team', label: 'Team / Rider Dinner' },
+			{ value: 'meals_event', label: 'Race / Event Meal' },
+			{ value: 'meals_client', label: 'Client Meal' },
+			{ value: 'meals_solo', label: 'Solo Business Meal' },
+		],
+		COGS: [
+			{ value: 'raw_materials', label: 'Raw Materials (Sourcing)' },
+			{ value: 'manufacturing', label: 'Manufacturing / Production' },
+			{ value: 'inventory', label: 'Finished Goods / Inventory' },
+			{ value: 'shipping_cogs', label: 'Shipping (COGS)' },
+		],
+		CONSULTING_INCOME: [
+			{ value: 'consulting', label: 'Consulting' },
+		],
+		SUBSCRIPTION_INCOME: [
+			{ value: 'subscription', label: 'Subscription' },
+		],
+		SALES_INCOME: [
+			{ value: 'product_sales', label: 'Product Sales' },
+			{ value: 'event_income', label: 'Event Income' },
+		],
+		CHARITABLE_CASH: [
+			{ value: 'cash_donation', label: 'Cash Donation' },
+		],
+		CHARITABLE_STOCK: [
+			{ value: 'stock_donation', label: 'Stock Donation' },
+		],
+		INVESTMENT_INCOME: [
+			{ value: 'capital_gain_short', label: 'Short-Term Capital Gain' },
+			{ value: 'capital_gain_long', label: 'Long-Term Capital Gain' },
+			{ value: 'dividend', label: 'Dividend' },
+		],
+	};
+
+	let availableSubcategories = $derived(
+		taxCategory ? (SUBCATEGORIES[taxCategory] ?? []) : []
+	);
 
 	function formatCurrency(amount: number | string): string {
 		return new Intl.NumberFormat('en-US', {
@@ -269,6 +339,8 @@
 				updates.entity = entity as Entity;
 			if (taxCategory && taxCategory !== transaction.tax_category)
 				updates.tax_category = taxCategory as TaxCategory;
+			if (taxSubcategory !== (transaction.tax_subcategory ?? ''))
+				updates.tax_subcategory = taxSubcategory || undefined;
 			if (notes.trim() && notes.trim() !== (transaction.notes ?? ''))
 				updates.notes = notes.trim();
 
@@ -427,6 +499,18 @@
 				</optgroup>
 			</select>
 		</div>
+
+		{#if availableSubcategories.length > 0}
+			<div class="field-group">
+				<label class="field-label" for="subcat-{transaction.id}">Subcategory</label>
+				<select id="subcat-{transaction.id}" bind:value={taxSubcategory} class="field-select">
+					<option value="">— none —</option>
+					{#each availableSubcategories as sub}
+						<option value={sub.value}>{sub.label}</option>
+					{/each}
+				</select>
+			</div>
+		{/if}
 	</div>
 
 	<div class="tx-notes">

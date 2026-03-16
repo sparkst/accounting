@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { TransactionList } from '$lib/types';
-	import { fetchTransactions } from '$lib/api';
+	import type { Transaction, TransactionList } from '$lib/types';
+	import { fetchTransactions, updateTransaction, confirmTransaction } from '$lib/api';
 	import type { TransactionFilters } from '$lib/api';
+	import TransactionCard from '$lib/components/TransactionCard.svelte';
 
-	const PAGE_SIZE = 50;
+	const PAGE_SIZES = [25, 50, 100, 200];
+	let pageSize = $state(50);
 
 	let data: TransactionList | null = $state(null);
 	let loading = $state(true);
@@ -24,13 +26,16 @@
 	// Pagination
 	let offset = $state(0);
 
+	// Expanded row
+	let expandedId = $state<string | null>(null);
+
 	// Derived
 	let items = $derived(data?.items ?? []);
-	let income   = $derived(items.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0));
-	let expenses = $derived(items.filter(t => t.amount < 0).reduce((s, t) => s + t.amount, 0));
-	let net      = $derived(income + expenses);
-	let totalPages  = $derived(data ? Math.ceil(data.total / PAGE_SIZE) : 0);
-	let currentPage = $derived(Math.floor(offset / PAGE_SIZE) + 1);
+	let incomeTotalAll  = $derived(data?.income_total ?? 0);
+	let expenseTotalAll = $derived(data?.expense_total ?? 0);
+	let netAll          = $derived(incomeTotalAll + expenseTotalAll);
+	let totalPages  = $derived(data ? Math.ceil(data.total / pageSize) : 0);
+	let currentPage = $derived(Math.floor(offset / pageSize) + 1);
 
 	onMount(() => load());
 
@@ -39,7 +44,7 @@
 		fetchError = '';
 		try {
 			const filters: TransactionFilters = {
-				limit: PAGE_SIZE,
+				limit: pageSize,
 				offset,
 				sort_by: sortBy,
 				sort_order: sortOrder
@@ -115,12 +120,17 @@
 	}
 
 	function prevPage() {
-		offset = Math.max(0, offset - PAGE_SIZE);
+		offset = Math.max(0, offset - pageSize);
 		load();
 	}
 
 	function nextPage() {
-		offset += PAGE_SIZE;
+		offset += pageSize;
+		load();
+	}
+
+	function handlePageSizeChange() {
+		offset = 0;
 		load();
 	}
 
@@ -131,6 +141,16 @@
 		dateFrom = '';
 		dateTo = '';
 		applyFilters();
+	}
+
+	function toggleRow(id: string) {
+		expandedId = expandedId === id ? null : id;
+	}
+
+	function handleRowConfirmed(tx: Transaction) {
+		// Refresh the list after a confirm/reject from the expanded card
+		load();
+		expandedId = null;
 	}
 </script>
 
@@ -143,6 +163,30 @@
 			{/if}
 		</div>
 	</header>
+
+	<!-- Summary cards -->
+	{#if data && data.total > 0}
+		<div class="summary-row">
+			<div class="summary-card">
+				<span class="summary-label">Income</span>
+				<span class="summary-value amount-positive">{formatCurrency(incomeTotalAll)}</span>
+			</div>
+			<div class="summary-card">
+				<span class="summary-label">Expenses</span>
+				<span class="summary-value amount-negative">{formatCurrency(expenseTotalAll)}</span>
+			</div>
+			<div class="summary-card">
+				<span class="summary-label">Net</span>
+				<span class="summary-value" class:amount-positive={netAll >= 0} class:amount-negative={netAll < 0}>
+					{formatCurrency(netAll)}
+				</span>
+			</div>
+			<div class="summary-card">
+				<span class="summary-label">Transactions</span>
+				<span class="summary-value">{data.total.toLocaleString()}</span>
+			</div>
+		</div>
+	{/if}
 
 	<!-- Filter bar -->
 	<div class="filter-bar card">
@@ -258,12 +302,26 @@
 								>
 									Entity{sortIndicator('entity')}
 								</th>
-								<th>Status</th>
+								<th
+									class="sortable"
+									onclick={() => handleSort('status')}
+									onkeydown={(e) => e.key === 'Enter' && handleSort('status')}
+									role="columnheader"
+									tabindex="0"
+								>
+									Status{sortIndicator('status')}
+								</th>
 							</tr>
 						</thead>
 						<tbody>
 							{#each items as tx (tx.id)}
-								<tr class="row-{tx.status}">
+								<!-- svelte-ignore a11y_click_events_have_key_events -->
+								<tr
+									class="row-{tx.status}"
+									class:row-expandable={true}
+									class:row-expanded={expandedId === tx.id}
+									onclick={() => toggleRow(tx.id)}
+								>
 									<td class="col-date">{formatDate(tx.date)}</td>
 									<td class="col-vendor">
 										<span class="truncate" style="max-width: 280px; display: block;">
@@ -281,7 +339,7 @@
 										class:amount-positive={tx.amount > 0}
 										class:amount-negative={tx.amount < 0}
 									>
-										{formatCurrency(tx.amount)}
+										{tx.amount ? formatCurrency(tx.amount) : '—'}
 									</td>
 									<td class="col-entity">{entityLabel(tx.entity)}</td>
 									<td class="no-strike">
@@ -290,54 +348,52 @@
 										</span>
 									</td>
 								</tr>
+								{#if expandedId === tx.id}
+									<tr class="expanded-row">
+										<td colspan="6">
+											<div class="expanded-card-wrap">
+												<TransactionCard
+													transaction={tx}
+													onconfirmed={handleRowConfirmed}
+												/>
+											</div>
+										</td>
+									</tr>
+								{/if}
 							{/each}
 						</tbody>
-						<tfoot>
-							<tr>
-								<td colspan="3" class="footer-label">Page totals</td>
-								<td class="col-amount">
-									<div class="totals">
-										<span class="total-row">
-											<span class="total-label">Income</span>
-											<span class="amount-positive">{formatCurrency(income)}</span>
-										</span>
-										<span class="total-row">
-											<span class="total-label">Expenses</span>
-											<span class="amount-negative">{formatCurrency(expenses)}</span>
-										</span>
-										<span class="total-row total-net">
-											<span class="total-label">Net</span>
-											<span class:amount-positive={net >= 0} class:amount-negative={net < 0}>
-												{formatCurrency(net)}
-											</span>
-										</span>
-									</div>
-								</td>
-								<td colspan="2"></td>
-							</tr>
-						</tfoot>
 					</table>
 				</div>
 
-				{#if totalPages > 1}
-					<div class="pagination">
-						<button
-							class="btn btn-ghost"
-							disabled={offset === 0}
-							onclick={prevPage}
-						>
-							← Previous
-						</button>
-						<span class="page-info">Page {currentPage} of {totalPages}</span>
-						<button
-							class="btn btn-ghost"
-							disabled={offset + PAGE_SIZE >= (data?.total ?? 0)}
-							onclick={nextPage}
-						>
-							Next →
-						</button>
+				<div class="pagination">
+					<div class="pagination-left">
+						<label class="page-size-label" for="page-size">Show</label>
+						<select id="page-size" bind:value={pageSize} onchange={handlePageSizeChange} class="page-size-select">
+							{#each PAGE_SIZES as size}
+								<option value={size}>{size}</option>
+							{/each}
+						</select>
 					</div>
-				{/if}
+					{#if totalPages > 1}
+						<div class="pagination-center">
+							<button
+								class="btn btn-ghost"
+								disabled={offset === 0}
+								onclick={prevPage}
+							>
+								← Previous
+							</button>
+							<span class="page-info">Page {currentPage} of {totalPages}</span>
+							<button
+								class="btn btn-ghost"
+								disabled={offset + pageSize >= (data?.total ?? 0)}
+								onclick={nextPage}
+							>
+								Next →
+							</button>
+						</div>
+					{/if}
+				</div>
 			{/if}
 		</div>
 	{/if}
@@ -357,6 +413,40 @@
 		margin-top: 4px;
 		color: var(--text-muted);
 		font-size: .9rem;
+	}
+
+	/* Summary cards */
+	.summary-row {
+		display: flex;
+		gap: 12px;
+		margin-bottom: 16px;
+		flex-wrap: wrap;
+	}
+
+	.summary-card {
+		flex: 1;
+		min-width: 140px;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		padding: 16px 20px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.summary-label {
+		font-size: .7rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: .06em;
+		color: var(--text-muted);
+	}
+
+	.summary-value {
+		font-size: 1.3rem;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
 	}
 
 	.filter-bar {
@@ -405,44 +495,56 @@
 		color: var(--text-muted);
 	}
 
-	.totals {
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		align-items: flex-end;
+	.row-expandable {
+		cursor: pointer;
+		transition: background .1s;
+	}
+	.row-expandable:hover {
+		background: var(--gray-50);
+	}
+	.row-expanded {
+		background: var(--gray-50);
 	}
 
-	.total-row {
-		display: flex;
-		gap: 10px;
-		font-size: .8rem;
+	.expanded-row td {
+		padding: 0;
+		border-top: none;
 	}
 
-	.total-net {
-		border-top: 1px solid var(--border);
-		padding-top: 3px;
-		margin-top: 2px;
-		font-weight: 700;
-	}
-
-	.total-label {
-		color: var(--text-muted);
-	}
-
-	.footer-label {
-		color: var(--text-muted);
-		font-size: .75rem;
-		text-transform: uppercase;
-		letter-spacing: .05em;
+	.expanded-card-wrap {
+		padding: 8px 12px 16px;
+		border-bottom: 2px solid var(--border);
 	}
 
 	.pagination {
 		display: flex;
 		align-items: center;
-		justify-content: center;
-		gap: 16px;
-		padding: 16px;
+		justify-content: space-between;
+		padding: 12px 16px;
 		border-top: 1px solid var(--border);
+	}
+
+	.pagination-left {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.pagination-center {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+	}
+
+	.page-size-label {
+		font-size: .75rem;
+		color: var(--text-muted);
+	}
+
+	.page-size-select {
+		width: 70px;
+		padding: 4px 6px;
+		font-size: .8rem;
 	}
 
 	.page-info {

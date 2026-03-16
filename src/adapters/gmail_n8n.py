@@ -550,7 +550,11 @@ class GmailN8nAdapter(BaseAdapter):
         vendor = extract_vendor(from_field, body_text)
 
         amount = extract_amount(body_text, subject)
-        payment_method = extract_payment_method(body_text)
+        # Fallback: try HTML body for amounts if body_text had nothing
+        body_html: str = record.get("body_html", "")
+        if amount is None and body_html:
+            amount = extract_amount(body_html, subject)
+        payment_method = extract_payment_method(body_text) or extract_payment_method(body_html)
 
         # Determine status: needs_review when amount could not be extracted.
         # Store None (NULL) for unknown amounts so the dashboard shows

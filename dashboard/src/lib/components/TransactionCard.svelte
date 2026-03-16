@@ -462,7 +462,10 @@
 			{/if}
 			<div class="tx-badges">
 				{#if transaction.confidence !== null}
-					<span class="confidence-badge {confidenceClass(transaction.confidence)}">
+					<span
+						class="confidence-badge {confidenceClass(transaction.confidence)}"
+						title="Classification confidence: how sure the system is about the entity and category assignment. 90%+ = high (auto-classified via known vendor rule), 70-89% = medium (pattern match), below 70% = low (needs human review)."
+					>
 						{confidenceLabel(transaction.confidence)}
 					</span>
 				{/if}

@@ -195,6 +195,26 @@ def extract_amount(body_text: str, subject: str = "") -> Decimal | None:
 
 
 # ---------------------------------------------------------------------------
+# Shopify order email filter
+# ---------------------------------------------------------------------------
+
+_SHOPIFY_ORDER_PATTERNS = [
+    re.compile(r"\[.*\]\s*Order\s*#\d+", re.IGNORECASE),
+    re.compile(r"\[.*\].*You've got a new order", re.IGNORECASE),
+    re.compile(r"\[.*\]\s*New order.*#\d+", re.IGNORECASE),
+]
+
+
+def _is_shopify_order_email(subject: str, from_field: str) -> bool:
+    """Detect Shopify order notification emails that should be skipped.
+
+    Sales data comes from the Shopify API integration, not email notifications.
+    Only skips order notifications — expense/billing emails from Shopify pass through.
+    """
+    return any(p.search(subject) for p in _SHOPIFY_ORDER_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
 # Vendor extraction
 # ---------------------------------------------------------------------------
 
@@ -547,6 +567,15 @@ class GmailN8nAdapter(BaseAdapter):
         from_field: str = record.get("from", "")
         body_text: str = record.get("body_text", "")
         subject: str = record.get("subject", "")
+
+        # Skip Shopify order notification emails — sales data comes from
+        # the Shopify API integration, not email notifications.
+        if _is_shopify_order_email(subject, from_field):
+            logger.debug("Skipping Shopify order email: %s", subject[:60])
+            result.records_skipped += 1
+            result.records_processed += 1
+            return
+
         vendor = extract_vendor(from_field, body_text)
 
         amount = extract_amount(body_text, subject)

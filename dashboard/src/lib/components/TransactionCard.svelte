@@ -27,6 +27,7 @@
 	// eslint-disable-next-line svelte/reactivity
 	let notes = $state(transaction.notes ?? '');
 	let extracting = $state(false);
+	let pdfViewPath = $state<string | null>(null);
 
 	// ── Amount editing ────────────────────────────────────────────────────────
 	let amountEditing = $state(false);
@@ -616,14 +617,19 @@
 								<span class="attachment-preview-name">{filenameFromPath(path)}</span>
 							</div>
 						{:else if isPdf(path)}
-							<div class="attachment-preview">
-								<iframe
-									src={attachmentUrl(path)}
-									title={filenameFromPath(path)}
-									class="attachment-pdf"
-								></iframe>
-								<span class="attachment-preview-name">{filenameFromPath(path)}</span>
-							</div>
+							{#if pdfViewPath === path}
+								<div class="attachment-preview">
+									<iframe
+										src={attachmentUrl(path)}
+										title={filenameFromPath(path)}
+										class="attachment-pdf"
+									></iframe>
+									<span class="attachment-preview-name">
+										{filenameFromPath(path)}
+										<button class="btn btn-ghost" type="button" onclick={(e) => { e.stopPropagation(); pdfViewPath = null; }} style="margin-left: 8px; font-size: .7rem;">Close</button>
+									</span>
+								</div>
+							{/if}
 						{/if}
 					{/each}
 					<!-- File list for all attachments -->
@@ -632,7 +638,13 @@
 							<li class="attachment-item">
 								<span class="file-icon">{fileTypeIcon(path)}</span>
 								<span class="file-name" title={path}>{filenameFromPath(path)}</span>
-								{#if isImage(path) || isPdf(path)}
+								{#if isPdf(path)}
+									<button
+										class="btn btn-ghost copy-btn"
+										type="button"
+										onclick={(e) => { e.stopPropagation(); pdfViewPath = pdfViewPath === path ? null : path; }}
+									>{pdfViewPath === path ? 'Hide' : 'View PDF'}</button>
+								{:else if isImage(path)}
 									<a
 										href={attachmentUrl(path)}
 										target="_blank"

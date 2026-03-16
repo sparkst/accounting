@@ -130,3 +130,11 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
     if result.tax_subcategory:
         transaction.tax_subcategory = result.tax_subcategory
     transaction.deductible_pct = result.deductible_pct
+
+    # Missing amounts always need review regardless of classification confidence
+    if transaction.amount is None and transaction.status != TransactionStatus.NEEDS_REVIEW.value:
+        transaction.status = TransactionStatus.NEEDS_REVIEW.value
+        reason = (transaction.review_reason or "")
+        transaction.review_reason = (
+            reason + " Amount is missing — manual entry required."
+        ).strip()

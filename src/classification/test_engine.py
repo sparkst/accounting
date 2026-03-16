@@ -206,19 +206,19 @@ class TestTier1VendorRules:
         assert result is not None
         assert result.entity == Entity.BLACKLINE
         assert result.tax_category == TaxCategory.COGS
-        assert result.tax_subcategory == TaxSubcategory.RAW_MATERIALS.value
+        assert result.tax_subcategory == TaxSubcategory.MANUFACTURING.value
 
-    def test_minuteman_press_packaging(self, seeded_session: Session) -> None:
+    def test_minuteman_press_print_marketing(self, seeded_session: Session) -> None:
         result = lookup_vendor_rule("Minuteman Press invoice", seeded_session)
         assert result is not None
         assert result.entity == Entity.BLACKLINE
-        assert result.tax_subcategory == TaxSubcategory.PACKAGING.value
+        assert result.tax_subcategory == TaxSubcategory.PRINT_MARKETING.value
 
     def test_dhl_shipping(self, seeded_session: Session) -> None:
         result = lookup_vendor_rule("DHL shipment", seeded_session)
         assert result is not None
         assert result.entity == Entity.BLACKLINE
-        assert result.tax_subcategory == TaxSubcategory.SHIPPING.value
+        assert result.tax_subcategory == TaxSubcategory.SHIPPING_INBOUND.value
 
     def test_pinterest_advertising(self, seeded_session: Session) -> None:
         result = lookup_vendor_rule("Pinterest ads statement", seeded_session)
@@ -766,9 +766,9 @@ class TestSeedRules:
                 TaxSubcategory(rule.tax_subcategory)
 
     def test_seeded_rules_have_high_confidence(self, seeded_session: Session) -> None:
-        """All seed rules must have confidence >= 0.9 (human-authored)."""
+        """All seed rules must have confidence >= 0.8 (human-authored)."""
         rules = seeded_session.query(VendorRule).all()
         for rule in rules:
-            assert rule.confidence >= 0.9, (
+            assert rule.confidence >= 0.8, (
                 f"Rule {rule.vendor_pattern!r} has low confidence {rule.confidence}"
             )

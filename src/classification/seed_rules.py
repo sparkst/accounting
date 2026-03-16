@@ -209,6 +209,7 @@ _SEED_RULES: list[_RuleDef] = [
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.ADVERTISING,
         direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.SOCIAL_ADS,
         confidence=0.97,
         examples=5,
     ),
@@ -262,42 +263,87 @@ _SEED_RULES: list[_RuleDef] = [
         confidence=0.95,
         examples=40,
     ),
+    # Ecommerce platforms
     _RuleDef(
         vendor_pattern=r"woocommerce",
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
-        tax_subcategory=TaxSubcategory.SOFTWARE_TOOLS,
+        tax_subcategory=TaxSubcategory.ECOMMERCE_PLATFORM,
         confidence=0.95,
         examples=4,
     ),
+
+    # Print & packaging
     _RuleDef(
         vendor_pattern=r"minuteman.*press",
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
-        tax_subcategory=TaxSubcategory.PACKAGING,
+        tax_subcategory=TaxSubcategory.PRINT_MARKETING,
         confidence=0.95,
         examples=3,
     ),
+
+    # Manufacturing & sourcing
     _RuleDef(
         vendor_pattern=r"brist.*mfg",
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.COGS,
         direction=Direction.EXPENSE,
-        tax_subcategory=TaxSubcategory.RAW_MATERIALS,
+        tax_subcategory=TaxSubcategory.MANUFACTURING,
         confidence=0.97,
         examples=4,
     ),
+    _RuleDef(
+        vendor_pattern=r"leeline",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.COGS,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.RAW_MATERIALS,
+        confidence=0.97,
+        examples=3,
+    ),
+    _RuleDef(
+        vendor_pattern=r"boelter",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.COGS,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.INVENTORY,
+        confidence=0.95,
+        examples=2,
+    ),
+
+    # Shipping & logistics
     _RuleDef(
         vendor_pattern=r"\bdhl\b",
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
-        tax_subcategory=TaxSubcategory.SHIPPING,
+        tax_subcategory=TaxSubcategory.SHIPPING_INBOUND,
         confidence=0.95,
         examples=4,
     ),
+    _RuleDef(
+        vendor_pattern=r"\bfedex\b",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.SUPPLIES,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.SHIPPING,
+        confidence=0.93,
+        examples=15,
+    ),
+    _RuleDef(
+        vendor_pattern=r"\busps\b|stamps\.com",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.SUPPLIES,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.SHIPPING,
+        confidence=0.93,
+        examples=5,
+    ),
+
+    # Packaging & labels
     _RuleDef(
         vendor_pattern=r"ecoenclose",
         entity=Entity.BLACKLINE,
@@ -316,22 +362,100 @@ _SEED_RULES: list[_RuleDef] = [
         confidence=0.95,
         examples=4,
     ),
+
+    # Events & races
     _RuleDef(
-        vendor_pattern=r"\bfedex\b",
+        vendor_pattern=r"tune.?up.*event|nwtuneup",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.MEALS,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.MEALS_EVENT,
+        deductible_pct=0.5,
+        confidence=0.90,
+        examples=2,
+    ),
+    _RuleDef(
+        vendor_pattern=r"usa\s*cycling|usac",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.ADVERTISING,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.EVENT_FEES,
+        confidence=0.95,
+        examples=2,
+    ),
+    _RuleDef(
+        vendor_pattern=r"bikereg|bike\s*reg",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.ADVERTISING,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.EVENT_FEES,
+        confidence=0.95,
+        examples=3,
+    ),
+
+    # Photography
+    _RuleDef(
+        vendor_pattern=r"gaby.*photo",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.CONTRACT_LABOR,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.PHOTOGRAPHY,
+        confidence=0.95,
+        examples=2,
+    ),
+
+    # Stripe fees (BlackLine payment processing)
+    _RuleDef(
+        vendor_pattern=r"stripe.*fee|stripe.*inc",
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
-        tax_subcategory=TaxSubcategory.SHIPPING,
-        confidence=0.93,
-        examples=15,
+        tax_subcategory=TaxSubcategory.PAYMENT_PROCESSING,
+        confidence=0.90,
+        examples=10,
     ),
+
+    # BlackLine income
     _RuleDef(
         vendor_pattern=r"black.*line.*mtb|blacklinemtb",
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SALES_INCOME,
         direction=Direction.INCOME,
+        tax_subcategory=TaxSubcategory.PRODUCT_SALES,
         confidence=0.95,
         examples=20,
+    ),
+
+    # Fiverr for BlackLine (design work)
+    _RuleDef(
+        vendor_pattern=r"fiverr",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.CONTRACT_LABOR,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.BRAND_DESIGN,
+        confidence=0.85,
+        examples=3,
+    ),
+
+    # Hartford insurance (BlackLine)
+    _RuleDef(
+        vendor_pattern=r"hartford",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.INSURANCE,
+        direction=Direction.EXPENSE,
+        confidence=0.95,
+        examples=2,
+    ),
+
+    # Alaska Airlines (travel for races/events)
+    _RuleDef(
+        vendor_pattern=r"alaska.*air",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.TRAVEL,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.FLIGHTS,
+        confidence=0.85,
+        examples=2,
     ),
 ]
 

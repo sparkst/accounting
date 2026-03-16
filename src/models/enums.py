@@ -77,29 +77,48 @@ class TaxSubcategory(enum.StrEnum):
     # Meals context
     MEALS_CLIENT = "meals_client"
     MEALS_SOLO = "meals_solo"
+    MEALS_TEAM = "meals_team"          # Staff/rider dinners, team events
+    MEALS_EVENT = "meals_event"        # Race weekend meals, sponsor dinners
 
     # Income sub-items
     SUBSCRIPTION = "subscription"
     CONSULTING = "consulting"
     PRODUCT_SALES = "product_sales"
+    EVENT_INCOME = "event_income"      # Race entry fees, event revenue
 
     # COGS
-    INVENTORY = "inventory"
+    INVENTORY = "inventory"            # Finished goods (apparel, accessories)
     SHIPPING_COGS = "shipping_cogs"
+    RAW_MATERIALS = "raw_materials"    # Leeline, Brist Mfg — product sourcing
+    MANUFACTURING = "manufacturing"    # Production runs, samples, prototyping
+
+    # Shipping & fulfillment
+    PACKAGING = "packaging"            # EcoEnclose, Sticker Mule
+    SHIPPING = "shipping"              # FedEx, USPS, DHL — outbound to customers
+    SHIPPING_INBOUND = "shipping_inbound"  # Freight, inbound from manufacturers
+
+    # Events & sponsorship (BlackLine)
+    EVENT_FEES = "event_fees"          # Race registrations, booth fees, permits
+    SPONSORSHIP = "sponsorship"        # Rider sponsorships, team support
+    EVENT_SUPPLIES = "event_supplies"  # Tent, banners, swag, race day supplies
+    RACE_PROMOTION = "race_promotion"  # Race-specific advertising, flyers, social
 
     # Office / Supplies
     SOFTWARE = "software"
     HARDWARE = "hardware"
     OFFICE_SUPPLIES = "office_supplies"
 
-    # SaaS / cloud (more specific than SOFTWARE)
-    AI_SERVICES = "ai_services"      # Anthropic, OpenRouter, RunPod, ElevenLabs
+    # SaaS / cloud
+    AI_SERVICES = "ai_services"        # Anthropic, OpenRouter, RunPod, ElevenLabs
     SOFTWARE_TOOLS = "software_tools"  # Vercel, Render, Google Workspace, Lovable
+    ECOMMERCE_PLATFORM = "ecommerce_platform"  # Shopify fees, WooCommerce
+    PAYMENT_PROCESSING = "payment_processing"  # Stripe fees, PayPal fees
 
-    # BlackLine shipping / packaging
-    PACKAGING = "packaging"
-    SHIPPING = "shipping"
-    RAW_MATERIALS = "raw_materials"
+    # Marketing & advertising
+    SOCIAL_ADS = "social_ads"          # Pinterest, Facebook, Instagram ads
+    PHOTOGRAPHY = "photography"        # Product photos, event photos
+    PRINT_MARKETING = "print_marketing"  # Minuteman Press, business cards, flyers
+    BRAND_DESIGN = "brand_design"      # Logo work, Fiverr design, creative
 
     # Charitable
     CASH_DONATION = "cash_donation"

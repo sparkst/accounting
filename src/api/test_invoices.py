@@ -519,7 +519,12 @@ class TestGenerateCalendar:
         assert data["status"] == "draft"
         assert float(data["total"]) == 250.0  # 1*100 + 1.5*100
         assert data["invoice_number"].startswith("202603-")
-        assert len(data["line_items"]) == 2
+        # 1 section header (sort_order=0) + 2 session line items = 3 total
+        assert len(data["line_items"]) == 3
+        # Header is first item
+        header = data["line_items"][0]
+        assert header["sort_order"] == 0
+        assert header["date"] is None
 
     def test_generate_calendar_double_billing_guard(self, client: TestClient, db_session: Session) -> None:
         """INV-TEST-010: Double-billing guard on generate-calendar."""

@@ -163,3 +163,92 @@ export interface TransactionUpdate {
 	notes?: string;
 	amount?: number;
 }
+
+// ── Invoice types ───────────────────────────────────────────────────────────
+
+export type InvoiceStatus = 'draft' | 'sent' | 'paid' | 'overdue' | 'void';
+
+export type BillingModel = 'hourly' | 'flat_rate' | 'project';
+
+export interface InvoiceLineItem {
+	id: string;
+	invoice_id: string;
+	description: string;
+	quantity: string | null;
+	unit_price: string | null;
+	total_price: string | null;
+	date: string | null;
+	sort_order: number;
+}
+
+export interface Invoice {
+	id: string;
+	invoice_number: string;
+	customer_id: string;
+	entity: string;
+	project: string | null;
+	submitted_date: string | null;
+	due_date: string | null;
+	service_period_start: string | null;
+	service_period_end: string | null;
+	paid_date: string | null;
+	subtotal: string | null;
+	adjustments: string | null;
+	tax: string | null;
+	total: string | null;
+	status: InvoiceStatus;
+	payment_terms: string | null;
+	payment_method: string | null;
+	late_fee_pct: number;
+	po_number: string | null;
+	payment_transaction_id: string | null;
+	sap_instructions: Record<string, unknown> | null;
+	sap_checklist_state: Record<string, unknown> | null;
+	pdf_path: string | null;
+	notes: string | null;
+	created_at: string;
+	updated_at: string;
+	days_outstanding: number | null;
+	expected_payment_date: string | null;
+	line_items: InvoiceLineItem[] | null;
+}
+
+export interface InvoiceListResponse {
+	items: Invoice[];
+	total: number;
+}
+
+export interface Customer {
+	id: string;
+	name: string;
+	contact_name: string | null;
+	contact_email: string | null;
+	billing_model: BillingModel;
+	default_rate: string | null;
+	payment_terms: string | null;
+	invoice_prefix: string;
+	late_fee_pct: number;
+	po_number: string | null;
+	sap_config: Record<string, unknown> | null;
+	calendar_patterns: string[] | null;
+	calendar_exclusions: string[] | null;
+	address: Record<string, unknown> | null;
+	contract_start_date: string | null;
+	last_invoiced_date: string | null;
+	notes: string | null;
+	active: boolean;
+	created_at: string;
+}
+
+export interface CalendarSession {
+	date: string;
+	description: string;
+	hours: number;
+	rate: number;
+}
+
+export interface ICalUploadResult {
+	matched_sessions: CalendarSession[];
+	unmatched_events: Array<Record<string, unknown>>;
+	warnings: string[];
+}

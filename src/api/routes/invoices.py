@@ -30,6 +30,8 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
+from src.invoicing.generator import generate_calendar_invoice as _gen_calendar
+from src.invoicing.generator import generate_flat_invoice as _gen_flat
 from src.models.audit_event import AuditEvent
 from src.models.enums import (
     INVOICE_STATUS_TRANSITIONS,
@@ -575,84 +577,29 @@ def generate_flat_invoice(
     # Parse month
     try:
         parts = body.month.split("-")
-        year, month = int(parts[0]), int(parts[1])
+        year, month_num = int(parts[0]), int(parts[1])
     except (ValueError, IndexError) as exc:
         raise HTTPException(
             status_code=422, detail=f"Invalid month format: {body.month!r}. Expected YYYY-MM."
         ) from exc
 
-    # Calculate service period
-    first_biz, last_biz = _business_days_in_month(year, month)
-
-    # Duplicate guard
-    existing = (
-        session.query(Invoice)
-        .filter(
-            Invoice.customer_id == body.customer_id,
-            Invoice.service_period_start == first_biz.isoformat(),
-        )
-        .first()
-    )
-    if existing is not None:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Invoice already exists for customer {body.customer_id} "
-                   f"with service_period_start={first_biz.isoformat()} "
-                   f"(invoice #{existing.invoice_number}).",
-        )
-
-    # Invoice number
-    invoice_number = f"{customer.invoice_prefix}{year}{month:02d}{last_biz.day:02d}"
-
-    # Amount
-    rate = customer.default_rate or decimal.Decimal("0.00")
-    subtotal = decimal.Decimal(str(rate))
-
-    # Month ordinal
-    ordinal = 1
-    if customer.contract_start_date:
-        ordinal = _month_ordinal(customer.contract_start_date, body.month)
-
-    # Line item description
-    project_name = "AI Product Engineering Coaching"
-    line_desc = f"{project_name} Month {ordinal}"
-
-    invoice_id = _new_uuid()
-    invoice = Invoice(
-        id=invoice_id,
-        invoice_number=invoice_number,
-        customer_id=body.customer_id,
-        entity="sparkry",
-        project=project_name,
-        service_period_start=first_biz.isoformat(),
-        service_period_end=last_biz.isoformat(),
-        subtotal=subtotal,
-        adjustments=decimal.Decimal("0.00"),
-        tax=decimal.Decimal("0.00"),
-        total=subtotal,
-        status=InvoiceStatus.DRAFT.value,
-        payment_terms=customer.payment_terms,
-        late_fee_pct=customer.late_fee_pct,
-        po_number=customer.po_number,
-    )
-    session.add(invoice)
-
-    line_item = InvoiceLineItem(
-        id=_new_uuid(),
-        invoice_id=invoice_id,
-        description=line_desc,
-        quantity=decimal.Decimal("1.0000"),
-        unit_price=subtotal,
-        total_price=subtotal,
-        sort_order=0,
-    )
-    session.add(line_item)
+    try:
+        invoice = _gen_flat(session, customer, year, month_num)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     session.commit()
     session.refresh(invoice)
 
+    line_items = (
+        session.query(InvoiceLineItem)
+        .filter(InvoiceLineItem.invoice_id == invoice.id)
+        .order_by(InvoiceLineItem.sort_order)
+        .all()
+    )
+
     data = _enrich_with_aging(invoice)
-    data["line_items"] = [LineItemOut.model_validate(line_item)]
+    data["line_items"] = [LineItemOut.model_validate(li) for li in line_items]
     return InvoiceOut.model_validate(data)
 
 
@@ -669,95 +616,39 @@ def generate_calendar_invoice(
     if not body.sessions:
         raise HTTPException(status_code=422, detail="At least one session is required.")
 
-    # Double-billing guard: check each session date+description against existing line items
-    for sess in body.sessions:
-        existing_li = (
-            session.query(InvoiceLineItem)
-            .join(Invoice, InvoiceLineItem.invoice_id == Invoice.id)
-            .filter(
-                Invoice.customer_id == body.customer_id,
-                InvoiceLineItem.date == sess.date,
-                InvoiceLineItem.description == sess.description,
-                Invoice.status != InvoiceStatus.VOID.value,
-            )
-            .first()
-        )
-        if existing_li is not None:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Session '{sess.description}' on {sess.date} already billed "
-                       f"on invoice {existing_li.invoice_id[:8]}...",
-            )
+    # Adapt CalendarSession objects to duck-typed interface expected by generator
+    class _SessionAdapter:
+        def __init__(self, cs: CalendarSession) -> None:
+            self.date = cs.date
+            self.description = cs.description
+            self.duration_hours = cs.hours
+            self.rate = cs.rate
 
-    # Auto-increment invoice number: YYYYMM-NNN
-    # Get all sessions' dates to determine the month
-    session_dates = sorted(s.date for s in body.sessions)
-    first_date = session_dates[0]
-    year_month = first_date[:7].replace("-", "")
+    adapted = [_SessionAdapter(s) for s in body.sessions]
 
-    # Find existing invoices with same prefix
-    prefix = f"{year_month}-"
-    existing_numbers = (
-        session.query(Invoice.invoice_number)
-        .filter(Invoice.invoice_number.like(f"{prefix}%"))
-        .all()
-    )
-    max_seq = 0
-    for (num,) in existing_numbers:
-        try:
-            seq = int(num.split("-")[-1])
-            max_seq = max(max_seq, seq)
-        except ValueError:
-            pass
-    invoice_number = f"{prefix}{max_seq + 1:03d}"
+    # Use the rate from the first session (all sessions in one request share a rate)
+    rate = body.sessions[0].rate if body.sessions else None
 
-    # Build line items and calculate subtotal
-    invoice_id = _new_uuid()
-    subtotal = decimal.Decimal("0.00")
-    line_items_out = []
+    try:
+        invoice = _gen_calendar(session, customer, adapted, rate=rate)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    for i, sess in enumerate(body.sessions):
-        qty = decimal.Decimal(str(sess.hours))
-        price = decimal.Decimal(str(sess.rate))
-        total_price = qty * price
-        subtotal += total_price
-
-        li = InvoiceLineItem(
-            id=_new_uuid(),
-            invoice_id=invoice_id,
-            description=sess.description,
-            quantity=qty,
-            unit_price=price,
-            total_price=total_price,
-            date=sess.date,
-            sort_order=i,
-        )
-        session.add(li)
-        line_items_out.append(li)
-
-    invoice = Invoice(
-        id=invoice_id,
-        invoice_number=invoice_number,
-        customer_id=body.customer_id,
-        entity="sparkry",
-        project=customer.name,
-        service_period_start=session_dates[0],
-        service_period_end=session_dates[-1],
-        subtotal=subtotal,
-        adjustments=decimal.Decimal("0.00"),
-        tax=decimal.Decimal("0.00"),
-        total=subtotal,
-        status=InvoiceStatus.DRAFT.value,
-        payment_terms=customer.payment_terms,
-        late_fee_pct=customer.late_fee_pct,
-    )
-    session.add(invoice)
+    if invoice is None:
+        raise HTTPException(status_code=422, detail="At least one session is required.")
 
     session.commit()
     session.refresh(invoice)
 
+    line_items = (
+        session.query(InvoiceLineItem)
+        .filter(InvoiceLineItem.invoice_id == invoice.id)
+        .order_by(InvoiceLineItem.sort_order)
+        .all()
+    )
+
     data = _enrich_with_aging(invoice)
-    data["line_items"] = [LineItemOut.model_validate(li) for li in line_items_out]
+    data["line_items"] = [LineItemOut.model_validate(li) for li in line_items]
     return InvoiceOut.model_validate(data)
 
 

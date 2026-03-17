@@ -4,7 +4,12 @@ import type {
 	TransactionUpdate,
 	HealthResponse,
 	IngestResult,
-	IngestSummary
+	IngestSummary,
+	Invoice,
+	InvoiceListResponse,
+	Customer,
+	CalendarSession,
+	ICalUploadResult
 } from './types';
 
 const BASE = '/api';
@@ -124,5 +129,121 @@ export async function splitTransaction(id: string, lineItems: SplitLineItem[]): 
 	return request<SplitResponse>(`/transactions/${id}/split`, {
 		method: 'POST',
 		body: JSON.stringify({ line_items: lineItems })
+	});
+}
+
+// ── Invoice API ─────────────────────────────────────────────────────────────
+
+export interface InvoiceFilters {
+	customer_id?: string;
+	status?: string;
+	date_from?: string;
+	date_to?: string;
+}
+
+export async function fetchInvoices(filters: InvoiceFilters = {}): Promise<InvoiceListResponse> {
+	const params = new URLSearchParams();
+	for (const [key, val] of Object.entries(filters)) {
+		if (val !== undefined && val !== '') {
+			params.set(key, String(val));
+		}
+	}
+	const qs = params.toString();
+	return request<InvoiceListResponse>(`/invoices${qs ? `?${qs}` : ''}`);
+}
+
+export async function fetchInvoice(id: string): Promise<Invoice> {
+	return request<Invoice>(`/invoices/${id}`);
+}
+
+export async function patchInvoice(
+	id: string,
+	updates: Record<string, unknown>
+): Promise<Invoice> {
+	return request<Invoice>(`/invoices/${id}`, {
+		method: 'PATCH',
+		body: JSON.stringify(updates)
+	});
+}
+
+export async function transitionInvoiceStatus(
+	id: string,
+	status: string,
+	extra?: { paid_date?: string; payment_transaction_id?: string }
+): Promise<Invoice> {
+	return request<Invoice>(`/invoices/${id}/status`, {
+		method: 'PATCH',
+		body: JSON.stringify({ status, ...extra })
+	});
+}
+
+export async function generateFlatInvoice(
+	customer_id: string,
+	month: string
+): Promise<Invoice> {
+	return request<Invoice>('/invoices/generate-flat', {
+		method: 'POST',
+		body: JSON.stringify({ customer_id, month })
+	});
+}
+
+export async function generateCalendarInvoice(
+	customer_id: string,
+	sessions: CalendarSession[]
+): Promise<Invoice> {
+	return request<Invoice>('/invoices/generate-calendar', {
+		method: 'POST',
+		body: JSON.stringify({ customer_id, sessions })
+	});
+}
+
+export async function uploadIcal(
+	file: File,
+	customer_id?: string,
+	start_date?: string,
+	end_date?: string
+): Promise<ICalUploadResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+	const params = new URLSearchParams();
+	if (customer_id) params.set('customer_id', customer_id);
+	if (start_date) params.set('start_date', start_date);
+	if (end_date) params.set('end_date', end_date);
+	const qs = params.toString();
+
+	const res = await fetch(`${BASE}/invoices/ical-upload${qs ? `?${qs}` : ''}`, {
+		method: 'POST',
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`API ${res.status}: ${text}`);
+	}
+	return res.json() as Promise<ICalUploadResult>;
+}
+
+export function getInvoicePdfUrl(id: string): string {
+	return `${BASE}/invoices/${id}/pdf`;
+}
+
+export function getInvoiceHtmlUrl(id: string): string {
+	return `${BASE}/invoices/${id}/html`;
+}
+
+export async function fetchCustomers(): Promise<Customer[]> {
+	return request<Customer[]>('/customers');
+}
+
+export async function createCustomer(data: Record<string, unknown>): Promise<Customer> {
+	return request<Customer>('/customers', {
+		method: 'POST',
+		body: JSON.stringify(data)
+	});
+}
+
+export async function patchCustomer(id: string, data: Record<string, unknown>): Promise<Customer> {
+	return request<Customer>(`/customers/${id}`, {
+		method: 'PATCH',
+		body: JSON.stringify(data)
 	});
 }

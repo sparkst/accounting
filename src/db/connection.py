@@ -23,6 +23,7 @@ from src.models.audit_event import AuditEvent  # noqa: F401
 from src.models.base import Base
 from src.models.ingested_file import IngestedFile  # noqa: F401
 from src.models.ingestion_log import IngestionLog  # noqa: F401
+from src.models.invoice import Customer, Invoice, InvoiceLineItem  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
 
@@ -47,6 +48,8 @@ def _configure_sqlite(
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    # Give concurrent writers up to 5 seconds before raising "database is locked".
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 

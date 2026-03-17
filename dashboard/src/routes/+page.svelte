@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import type { Transaction } from '$lib/types';
-	import { fetchReviewQueue } from '$lib/api';
+	import { fetchReviewQueue, updateTransaction, confirmTransaction } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
+	import Toast from '$lib/components/Toast.svelte';
+	import ShortcutOverlay from '$lib/components/ShortcutOverlay.svelte';
 	import { DATE_PRESETS } from '$lib/datePresets';
 
 	let items: Transaction[] = $state([]);
@@ -18,6 +20,23 @@
 	let datePreset = $state('');
 	let dateFrom = $state('');
 	let dateTo = $state('');
+
+	// Batch selection
+	let selectedIds = $state<Set<string>>(new Set());
+	let lastSelectedIndex = $state<number | null>(null);
+	let batchEntity = $state('');
+	let batchCategory = $state('');
+	let batchSaving = $state(false);
+
+	// Toast state
+	let toasts = $state<Array<{ id: number; message: string; type: 'info' | 'success' | 'error'; undoAction?: () => void }>>([]);
+	let toastCounter = $state(0);
+
+	// Shortcut overlay
+	let showShortcuts = $state(false);
+
+	// Card component refs
+	let cardRefs = $state<Record<string, TransactionCard>>({});
 
 	const BUSINESS_CATEGORIES = [
 		{ value: 'ADVERTISING',           label: 'Advertising' },
@@ -47,24 +66,48 @@
 		{ value: 'PERSONAL_NON_DEDUCTIBLE', label: 'Personal (Non-deductible)' }
 	];
 
-	let filteredItems = $derived(items.filter((tx) => {
-		if (entityFilter && tx.entity !== entityFilter) return false;
-		if (categoryFilter && tx.tax_category !== categoryFilter) return false;
-		if (amountFilter === 'has' && !tx.amount) return false;
-		if (amountFilter === 'missing' && tx.amount) return false;
-		if (dateFrom && tx.date < dateFrom) return false;
-		if (dateTo && tx.date > dateTo) return false;
-		if (search) {
-			const q = search.toLowerCase();
-			const haystack = `${tx.vendor ?? ''} ${tx.description}`.toLowerCase();
-			if (!haystack.includes(q)) return false;
+	// Priority sorting for review queue
+	function priorityScore(tx: Transaction): number {
+		// Lower score = higher priority
+		if (tx.status === 'needs_review') {
+			// errors first (no amount or missing entity)
+			if (!tx.amount) return 0;
+			// duplicates (check for duplicate-related notes/reasoning)
+			const text = `${tx.reasoning ?? ''} ${tx.notes ?? ''}`.toLowerCase();
+			if (text.includes('duplicate')) return 1;
+			// low confidence
+			if (tx.confidence !== null && tx.confidence < 0.7) return 2;
+			// first-time vendors (no confidence = never seen)
+			if (tx.confidence === null) return 3;
+			// pending reimbursables
+			if (tx.direction === 'reimbursable') return 4;
+			return 5;
 		}
-		return true;
-	}));
+		return 10;
+	}
+
+	let filteredItems = $derived(
+		items.filter((tx) => {
+			if (entityFilter && tx.entity !== entityFilter) return false;
+			if (categoryFilter && tx.tax_category !== categoryFilter) return false;
+			if (amountFilter === 'has' && !tx.amount) return false;
+			if (amountFilter === 'missing' && tx.amount) return false;
+			if (dateFrom && tx.date < dateFrom) return false;
+			if (dateTo && tx.date > dateTo) return false;
+			if (search) {
+				const q = search.toLowerCase();
+				const haystack = `${tx.vendor ?? ''} ${tx.description}`.toLowerCase();
+				if (!haystack.includes(q)) return false;
+			}
+			return true;
+		}).sort((a, b) => priorityScore(a) - priorityScore(b))
+	);
 
 	let hasActiveFilters = $derived(
 		!!search || !!entityFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo
 	);
+
+	let hasSelection = $derived(selectedIds.size > 0);
 
 	const datePresetGroups = [...new Set(DATE_PRESETS.map(p => p.group))];
 
@@ -100,6 +143,8 @@
 
 	function handleConfirmed(tx: Transaction) {
 		items = items.filter((t) => t.id !== tx.id);
+		selectedIds.delete(tx.id);
+		selectedIds = new Set(selectedIds);
 		if (focusedIndex >= filteredItems.length) {
 			focusedIndex = Math.max(0, filteredItems.length - 1);
 		}
@@ -115,9 +160,127 @@
 		dateTo = '';
 	}
 
+	// ── Toast helpers ────────────────────────────────────────────────────────
+
+	function addToast(message: string, type: 'info' | 'success' | 'error' = 'info', undoAction?: () => void) {
+		const id = ++toastCounter;
+		toasts = [...toasts, { id, message, type, undoAction }];
+		return id;
+	}
+
+	function removeToast(id: number) {
+		toasts = toasts.filter(t => t.id !== id);
+	}
+
+	// ── Reject with undo ─────────────────────────────────────────────────────
+
+	async function rejectWithUndo() {
+		const tx = filteredItems[focusedIndex];
+		if (!tx) return;
+
+		// Optimistically remove
+		const originalItems = [...items];
+		items = items.filter(t => t.id !== tx.id);
+		if (focusedIndex >= filteredItems.length) {
+			focusedIndex = Math.max(0, filteredItems.length - 1);
+		}
+
+		let undone = false;
+		const toastId = addToast(`Rejected "${tx.vendor ?? tx.description}"`, 'info', () => {
+			undone = true;
+			items = originalItems;
+			removeToast(toastId);
+		});
+
+		// After 5 seconds, actually persist if not undone
+		setTimeout(async () => {
+			removeToast(toastId);
+			if (!undone) {
+				try {
+					await updateTransaction(tx.id, { status: 'rejected' });
+				} catch {
+					// If the API call fails, restore the item
+					items = originalItems;
+					addToast('Failed to reject transaction', 'error');
+				}
+			}
+		}, 5000);
+	}
+
+	// ── Selection ────────────────────────────────────────────────────────────
+
+	function toggleSelect(tx: Transaction) {
+		if (selectedIds.has(tx.id)) {
+			selectedIds.delete(tx.id);
+		} else {
+			selectedIds.add(tx.id);
+		}
+		selectedIds = new Set(selectedIds);
+		lastSelectedIndex = filteredItems.findIndex(t => t.id === tx.id);
+	}
+
+	function handleShiftClick(tx: Transaction, index: number) {
+		if (lastSelectedIndex === null) {
+			toggleSelect(tx);
+			return;
+		}
+		const start = Math.min(lastSelectedIndex, index);
+		const end = Math.max(lastSelectedIndex, index);
+		for (let i = start; i <= end; i++) {
+			selectedIds.add(filteredItems[i].id);
+		}
+		selectedIds = new Set(selectedIds);
+		lastSelectedIndex = index;
+	}
+
+	function clearSelection() {
+		selectedIds = new Set();
+		lastSelectedIndex = null;
+	}
+
+	async function bulkConfirm() {
+		if (batchSaving || selectedIds.size === 0) return;
+		batchSaving = true;
+		try {
+			const updates: Record<string, string> = {};
+			if (batchEntity) updates.entity = batchEntity;
+			if (batchCategory) updates.tax_category = batchCategory;
+
+			for (const id of selectedIds) {
+				if (Object.keys(updates).length > 0) {
+					await updateTransaction(id, updates);
+				}
+				await confirmTransaction(id);
+			}
+			items = items.filter(t => !selectedIds.has(t.id));
+			const count = selectedIds.size;
+			clearSelection();
+			batchEntity = '';
+			batchCategory = '';
+			addToast(`Confirmed ${count} transaction${count !== 1 ? 's' : ''}`, 'success');
+			if (focusedIndex >= filteredItems.length) {
+				focusedIndex = Math.max(0, filteredItems.length - 1);
+			}
+		} catch (e) {
+			addToast(e instanceof Error ? e.message : 'Bulk confirm failed', 'error');
+		} finally {
+			batchSaving = false;
+		}
+	}
+
+	// ── Keyboard ─────────────────────────────────────────────────────────────
+
 	function handleKeydown(e: KeyboardEvent) {
 		const tag = (e.target as HTMLElement)?.tagName;
 		if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+
+		if (e.key === '?') {
+			e.preventDefault();
+			showShortcuts = !showShortcuts;
+			return;
+		}
+
+		if (showShortcuts) return;
 
 		if (e.key === 'j' || e.key === 'ArrowDown') {
 			e.preventDefault();
@@ -127,6 +290,69 @@
 			e.preventDefault();
 			focusedIndex = Math.max(focusedIndex - 1, 0);
 			scrollToFocused();
+		} else if (e.key === 'e') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.focusEntityField();
+			}
+		} else if (e.key === 's') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.doToggleSplit();
+			}
+		} else if (e.key === 'd') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				// Mark as duplicate = reject
+				rejectWithUndo();
+			}
+		} else if (e.key === 'r') {
+			e.preventDefault();
+			rejectWithUndo();
+		} else if (e.key === 'n') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.focusNotesField();
+			}
+		} else if (e.key === 'c') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.focusCategoryField();
+			}
+		} else if (e.key === '1') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.setEntity('sparkry');
+			}
+		} else if (e.key === '2') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.setEntity('blackline');
+			}
+		} else if (e.key === '3') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) {
+				const ref = cardRefs[tx.id];
+				ref?.setEntity('personal');
+			}
+		} else if (e.key === 'x') {
+			e.preventDefault();
+			const tx = filteredItems[focusedIndex];
+			if (tx) toggleSelect(tx);
 		}
 	}
 
@@ -139,6 +365,21 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+{#if showShortcuts}
+	<ShortcutOverlay onclose={() => (showShortcuts = false)} />
+{/if}
+
+<!-- Toasts -->
+{#each toasts as toast (toast.id)}
+	<Toast
+		message={toast.message}
+		type={toast.type}
+		undoLabel={toast.undoAction ? 'Undo' : undefined}
+		onundo={toast.undoAction}
+		ondismiss={() => removeToast(toast.id)}
+	/>
+{/each}
 
 <div class="container page-shell">
 	<header class="page-header">
@@ -238,6 +479,39 @@
 			{/if}
 		</div>
 
+		<!-- Batch bar (appears when items selected) -->
+		{#if hasSelection}
+			<div class="batch-bar card">
+				<span class="batch-count">{selectedIds.size} selected</span>
+
+				<select bind:value={batchEntity} aria-label="Set entity for selection" class="batch-select">
+					<option value="">Entity…</option>
+					<option value="sparkry">Sparkry AI LLC</option>
+					<option value="blackline">BlackLine MTB LLC</option>
+					<option value="personal">Personal</option>
+				</select>
+
+				<select bind:value={batchCategory} aria-label="Set category for selection" class="batch-select">
+					<option value="">Category…</option>
+					<optgroup label="Business">
+						{#each BUSINESS_CATEGORIES as cat}
+							<option value={cat.value}>{cat.label}</option>
+						{/each}
+					</optgroup>
+					<optgroup label="Personal">
+						{#each PERSONAL_CATEGORIES as cat}
+							<option value={cat.value}>{cat.label}</option>
+						{/each}
+					</optgroup>
+				</select>
+
+				<button class="btn btn-primary" onclick={bulkConfirm} disabled={batchSaving}>
+					{batchSaving ? 'Confirming…' : `Bulk Confirm (${selectedIds.size})`}
+				</button>
+				<button class="btn btn-ghost" onclick={clearSelection}>Cancel</button>
+			</div>
+		{/if}
+
 		<!-- Result count -->
 		<p class="results-count" aria-live="polite">
 			{#if hasActiveFilters}
@@ -248,7 +522,13 @@
 		</p>
 
 		<div class="keyboard-hint" aria-live="polite">
-			<kbd>j</kbd><kbd>k</kbd> navigate &nbsp;·&nbsp; <kbd>y</kbd> confirm focused card
+			<kbd>j</kbd><kbd>k</kbd> navigate &nbsp;·&nbsp;
+			<kbd>y</kbd> confirm &nbsp;·&nbsp;
+			<kbd>e</kbd> edit &nbsp;·&nbsp;
+			<kbd>s</kbd> split &nbsp;·&nbsp;
+			<kbd>r</kbd> reject &nbsp;·&nbsp;
+			<kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> entity &nbsp;·&nbsp;
+			<kbd>?</kbd> all shortcuts
 		</div>
 
 		{#if filteredItems.length === 0}
@@ -263,10 +543,16 @@
 				{#each filteredItems as tx, i (tx.id)}
 					<li>
 						<TransactionCard
+							bind:this={cardRefs[tx.id]}
 							transaction={tx}
 							focused={focusedIndex === i}
+							selected={selectedIds.has(tx.id)}
 							onconfirmed={handleConfirmed}
 							onfocusrequest={() => (focusedIndex = i)}
+							onselect={(t) => toggleSelect(t)}
+							onreject={(t) => {
+								// handled by onconfirmed removing from list
+							}}
 						/>
 					</li>
 				{/each}
@@ -329,6 +615,30 @@
 		flex-shrink: 0;
 	}
 
+	/* ── Batch bar ───────────────────────────────────────────────────────── */
+	.batch-bar {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 10px 16px;
+		margin-bottom: 10px;
+		background: rgba(59,130,246,.06);
+		border-color: var(--blue-500);
+		flex-wrap: wrap;
+	}
+
+	.batch-count {
+		font-size: .85rem;
+		font-weight: 600;
+		color: var(--blue-600);
+	}
+
+	.batch-select {
+		font-size: .82rem;
+		padding: 5px 8px;
+		min-width: 120px;
+	}
+
 	.results-count {
 		font-size: .8rem;
 		color: var(--text-muted);
@@ -343,6 +653,7 @@
 		display: flex;
 		align-items: center;
 		gap: 4px;
+		flex-wrap: wrap;
 	}
 
 	/* ── Queue list ──────────────────────────────────────────────────────── */

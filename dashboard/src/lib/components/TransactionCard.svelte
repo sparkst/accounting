@@ -1,15 +1,21 @@
 <script lang="ts">
-	import type { Transaction, Entity, TaxCategory, TransactionUpdate } from '$lib/types';
-	import { updateTransaction, confirmTransaction, extractReceipt } from '$lib/api';
+	import type { Transaction, Entity, TaxCategory, Direction, TransactionUpdate } from '$lib/types';
+	import { updateTransaction, confirmTransaction, extractReceipt, splitTransaction } from '$lib/api';
+	import type { SplitLineItem } from '$lib/api';
 
 	interface Props {
 		transaction: Transaction;
 		focused?: boolean;
+		selected?: boolean;
 		onconfirmed?: (tx: Transaction) => void;
 		onfocusrequest?: () => void;
+		onselect?: (tx: Transaction) => void;
+		onreject?: (tx: Transaction) => void;
+		/** Callback signals that the card wants a specific keyboard action */
+		onkeyaction?: (action: string) => void;
 	}
 
-	let { transaction, focused = false, onconfirmed, onfocusrequest }: Props = $props();
+	let { transaction, focused = false, selected = false, onconfirmed, onfocusrequest, onselect, onreject, onkeyaction }: Props = $props();
 
 	// Initialise from the prop's current value. These are intentionally
 	// local editing copies — the user can change entity/category before
@@ -20,6 +26,8 @@
 	let taxCategory: string = $state(transaction.tax_category ?? '');
 	// eslint-disable-next-line svelte/reactivity
 	let taxSubcategory: string = $state(transaction.tax_subcategory ?? '');
+	// eslint-disable-next-line svelte/reactivity
+	let direction: string = $state(transaction.direction ?? '');
 	let reasoningOpen = $state(false);
 	let detailOpen = $state(false);
 	let saving = $state(false);
@@ -28,6 +36,92 @@
 	let notes = $state(transaction.notes ?? '');
 	let extracting = $state(false);
 	let pdfViewPath = $state<string | null>(null);
+
+	// ── Split panel ──────────────────────────────────────────────────────────
+	let splitOpen = $state(false);
+	let splitRows = $state<{ amount: string; entity: string; tax_category: string; description: string }[]>([]);
+	let splitSaving = $state(false);
+	let splitError = $state('');
+
+	const HOTEL_KEYWORDS = ['hotel', 'marriott', 'hilton', 'hyatt', 'holiday inn', 'hampton', 'courtyard', 'fairfield', 'residence inn', 'springhill', 'doubletree', 'embassy', 'westin', 'sheraton', 'radisson', 'best western', 'motel', 'lodge', 'inn', 'resort'];
+
+	function isHotelTransaction(): boolean {
+		const text = `${transaction.vendor ?? ''} ${transaction.description}`.toLowerCase();
+		return HOTEL_KEYWORDS.some(k => text.includes(k));
+	}
+
+	function initSplitRows() {
+		if (splitRows.length > 0) return;
+		const amt = Math.abs(Number(transaction.amount) || 0);
+		if (isHotelTransaction() && amt > 0) {
+			const roomAmt = Math.round(amt * 0.80 * 100) / 100;
+			const mealsAmt = Math.round((amt - roomAmt) * 100) / 100;
+			splitRows = [
+				{ amount: String(roomAmt), entity: entity, tax_category: 'TRAVEL', description: 'Room' },
+				{ amount: String(mealsAmt), entity: entity, tax_category: 'MEALS', description: 'Meals' },
+			];
+		} else {
+			splitRows = [
+				{ amount: '', entity: entity, tax_category: taxCategory, description: '' },
+				{ amount: '', entity: entity, tax_category: taxCategory, description: '' },
+			];
+		}
+	}
+
+	function toggleSplit() {
+		splitOpen = !splitOpen;
+		if (splitOpen) initSplitRows();
+		splitError = '';
+	}
+
+	function addSplitRow() {
+		splitRows = [...splitRows, { amount: '', entity: entity, tax_category: taxCategory, description: '' }];
+	}
+
+	function removeSplitRow(index: number) {
+		splitRows = splitRows.filter((_, i) => i !== index);
+	}
+
+	let splitSum = $derived(
+		splitRows.reduce((sum, r) => {
+			const v = parseFloat(r.amount);
+			return sum + (isNaN(v) ? 0 : v);
+		}, 0)
+	);
+
+	let parentAbsAmount = $derived(Math.abs(Number(transaction.amount) || 0));
+
+	let splitSumMatches = $derived(
+		parentAbsAmount > 0 && Math.abs(splitSum - parentAbsAmount) < 0.005
+	);
+
+	let splitDelta = $derived(
+		Math.round((parentAbsAmount - splitSum) * 100) / 100
+	);
+
+	async function applySplit() {
+		if (!splitSumMatches || splitSaving) return;
+		splitSaving = true;
+		splitError = '';
+		try {
+			const sign = Number(transaction.amount) < 0 ? -1 : 1;
+			const lineItems: SplitLineItem[] = splitRows.map(r => ({
+				amount: parseFloat(r.amount) * sign,
+				entity: r.entity || null,
+				tax_category: r.tax_category || null,
+				description: r.description || null,
+			}));
+			const result = await splitTransaction(transaction.id, lineItems);
+			transaction = result.parent;
+			splitOpen = false;
+			splitRows = [];
+			onconfirmed?.(result.parent);
+		} catch (e) {
+			splitError = e instanceof Error ? e.message : 'Split failed';
+		} finally {
+			splitSaving = false;
+		}
+	}
 
 	// ── Amount editing ────────────────────────────────────────────────────────
 	let amountEditing = $state(false);
@@ -328,6 +422,18 @@
 		}
 	}
 
+	// ── Direction change ─────────────────────────────────────────────────────
+
+	async function handleDirectionChange() {
+		if (!direction) return;
+		try {
+			const result = await updateTransaction(transaction.id, { direction: direction as Direction });
+			transaction = result;
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'Failed to update direction';
+		}
+	}
+
 	// ── Confirm / reject ──────────────────────────────────────────────────────
 
 	async function handleConfirm() {
@@ -342,6 +448,8 @@
 				updates.tax_category = taxCategory as TaxCategory;
 			if (taxSubcategory !== (transaction.tax_subcategory ?? ''))
 				updates.tax_subcategory = taxSubcategory || undefined;
+			if (direction && direction !== (transaction.direction ?? ''))
+				updates.direction = direction as Direction;
 			if (notes.trim() && notes.trim() !== (transaction.notes ?? ''))
 				updates.notes = notes.trim();
 
@@ -364,12 +472,46 @@
 		error = '';
 		try {
 			const result = await updateTransaction(transaction.id, { status: 'rejected' });
+			onreject?.(result);
 			onconfirmed?.(result);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to reject';
 		} finally {
 			saving = false;
 		}
+	}
+
+	// ── Public methods for parent to call ────────────────────────────────────
+
+	export function setEntity(val: string) {
+		entity = val;
+	}
+
+	export function focusEntityField() {
+		const el = document.getElementById(`entity-${transaction.id}`);
+		el?.focus();
+	}
+
+	export function focusCategoryField() {
+		const el = document.getElementById(`cat-${transaction.id}`);
+		el?.focus();
+	}
+
+	export function focusNotesField() {
+		const el = document.getElementById(`notes-${transaction.id}`);
+		el?.focus();
+	}
+
+	export function doConfirm() {
+		handleConfirm();
+	}
+
+	export function doReject() {
+		handleReject();
+	}
+
+	export function doToggleSplit() {
+		toggleSplit();
 	}
 
 	function handleCardKeydown(e: KeyboardEvent) {
@@ -390,11 +532,25 @@
 <div
 	class="card tx-card"
 	class:card-focused={focused}
+	class:card-selected={selected}
 	data-id={transaction.id}
 	role="region"
 	aria-label="Transaction: {transaction.vendor ?? transaction.description}"
 	onclick={() => onfocusrequest?.()}
 >
+	{#if onselect}
+		<div class="tx-select-wrap">
+			<input
+				type="checkbox"
+				checked={selected}
+				onchange={() => onselect?.(transaction)}
+				onclick={(e) => e.stopPropagation()}
+				aria-label="Select transaction"
+				class="tx-checkbox"
+			/>
+		</div>
+	{/if}
+
 	<div class="tx-header">
 		<div class="tx-main">
 			<span class="tx-date">{formatDate(transaction.date)}</span>
@@ -515,6 +671,16 @@
 				</select>
 			</div>
 		{/if}
+
+		<div class="field-group">
+			<label class="field-label" for="dir-{transaction.id}">Direction</label>
+			<select id="dir-{transaction.id}" bind:value={direction} onchange={handleDirectionChange} class="field-select">
+				<option value="">— unset —</option>
+				<option value="income">Income</option>
+				<option value="expense">Expense</option>
+				<option value="reimbursable">Reimbursable</option>
+			</select>
+		</div>
 	</div>
 
 	<div class="tx-notes">
@@ -581,6 +747,14 @@
 		>
 			Reject
 		</button>
+		<button
+			class="btn btn-ghost"
+			type="button"
+			onclick={toggleSplit}
+			title="Split transaction (s)"
+		>
+			{splitOpen ? '▾ Close split' : '▸ Split'}
+		</button>
 		<span class="tx-source">{transaction.source.replace(/_/g, ' ')}</span>
 
 		<!-- Detail toggle — only shown when there's email content or attachments -->
@@ -596,6 +770,93 @@
 			</button>
 		{/if}
 	</div>
+
+	<!-- ── Split panel ─────────────────────────────────────────────────── -->
+	{#if splitOpen}
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<div class="split-panel" onclick={(e) => e.stopPropagation()}>
+			<div class="detail-divider"></div>
+			<div class="split-header">
+				<span class="split-label">Split Transaction</span>
+				<span class="split-parent-amount">
+					Parent: {formatCurrency(transaction.amount)}
+				</span>
+			</div>
+
+			<div class="split-rows">
+				{#each splitRows as row, i}
+					<div class="split-row">
+						<input
+							type="number"
+							class="split-amount-input"
+							bind:value={row.amount}
+							placeholder="0.00"
+							step="0.01"
+							min="0"
+							aria-label="Split row {i + 1} amount"
+						/>
+						<select bind:value={row.entity} class="split-field-select" aria-label="Split row {i + 1} entity">
+							<option value="">Entity…</option>
+							<option value="sparkry">Sparkry</option>
+							<option value="blackline">BlackLine</option>
+							<option value="personal">Personal</option>
+						</select>
+						<select bind:value={row.tax_category} class="split-field-select" aria-label="Split row {i + 1} category">
+							<option value="">Category…</option>
+							<optgroup label="Business">
+								{#each BUSINESS_CATEGORIES as cat}
+									<option value={cat.value}>{cat.label}</option>
+								{/each}
+							</optgroup>
+							<optgroup label="Personal">
+								{#each PERSONAL_CATEGORIES as cat}
+									<option value={cat.value}>{cat.label}</option>
+								{/each}
+							</optgroup>
+						</select>
+						<input
+							type="text"
+							class="split-desc-input"
+							bind:value={row.description}
+							placeholder="Description…"
+							aria-label="Split row {i + 1} description"
+						/>
+						{#if splitRows.length > 2}
+							<button class="btn btn-ghost split-remove-btn" type="button" onclick={() => removeSplitRow(i)} aria-label="Remove row" title="Remove row">&times;</button>
+						{/if}
+					</div>
+				{/each}
+			</div>
+
+			<div class="split-footer">
+				<button class="btn btn-ghost" type="button" onclick={addSplitRow}>+ Add Row</button>
+
+				<div class="split-sum" class:split-sum-match={splitSumMatches} class:split-sum-mismatch={!splitSumMatches && splitSum > 0}>
+					Sum: {formatCurrency(splitSum)}
+					{#if splitSumMatches}
+						<span class="split-check" title="Amounts match">&#10003;</span>
+					{:else if splitSum > 0}
+						<span class="split-delta" title="Delta from parent">
+							({splitDelta > 0 ? '+' : ''}{formatCurrency(splitDelta)} remaining)
+						</span>
+					{/if}
+				</div>
+
+				<button
+					class="btn btn-primary"
+					type="button"
+					onclick={applySplit}
+					disabled={!splitSumMatches || splitSaving}
+				>
+					{splitSaving ? 'Splitting…' : 'Apply Split'}
+				</button>
+			</div>
+
+			{#if splitError}
+				<p class="tx-error" style="margin-top: 8px;">{splitError}</p>
+			{/if}
+		</div>
+	{/if}
 
 	<!-- ── Detail panel ─────────────────────────────────────────────────── -->
 	{#if detailOpen}
@@ -729,6 +990,25 @@
 	.tx-card {
 		padding: 20px 22px;
 		transition: box-shadow .15s;
+		position: relative;
+	}
+
+	.card-selected {
+		border-color: var(--blue-500);
+		background: rgba(59,130,246,.04);
+	}
+
+	.tx-select-wrap {
+		position: absolute;
+		top: 14px;
+		left: 8px;
+	}
+
+	.tx-checkbox {
+		width: 16px;
+		height: 16px;
+		cursor: pointer;
+		accent-color: var(--blue-500);
 	}
 
 	.tx-header {
@@ -858,7 +1138,7 @@
 		flex-direction: column;
 		gap: 4px;
 		flex: 1;
-		min-width: 160px;
+		min-width: 140px;
 	}
 
 	.field-label {
@@ -991,6 +1271,129 @@
 		font-size: .78rem;
 		padding: 4px 10px;
 		color: var(--gray-600);
+	}
+
+	/* ── Split panel ──────────────────────────────────────────────────────── */
+	.split-panel {
+		margin-top: 4px;
+	}
+
+	.split-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 12px;
+	}
+
+	.split-label {
+		font-size: .8rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: .04em;
+		color: var(--text-muted);
+	}
+
+	.split-parent-amount {
+		font-size: .85rem;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		color: var(--text);
+		background: var(--gray-100);
+		padding: 3px 10px;
+		border-radius: var(--radius-sm);
+	}
+
+	.split-rows {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		margin-bottom: 12px;
+	}
+
+	.split-row {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+		flex-wrap: wrap;
+	}
+
+	.split-amount-input {
+		width: 100px;
+		font-size: .85rem;
+		font-variant-numeric: tabular-nums;
+		text-align: right;
+		padding: 5px 8px;
+		font-family: var(--font);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--surface);
+		color: var(--text);
+	}
+	.split-amount-input::-webkit-outer-spin-button,
+	.split-amount-input::-webkit-inner-spin-button {
+		-webkit-appearance: none;
+	}
+	.split-amount-input[type=number] { -moz-appearance: textfield; }
+
+	.split-field-select {
+		min-width: 120px;
+		font-size: .82rem;
+		padding: 5px 8px;
+	}
+
+	.split-desc-input {
+		flex: 1;
+		min-width: 100px;
+		font-size: .82rem;
+		padding: 5px 8px;
+		font-family: var(--font);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--surface);
+		color: var(--text);
+	}
+
+	.split-remove-btn {
+		padding: 2px 8px;
+		font-size: 1rem;
+		color: var(--red-600);
+		line-height: 1;
+	}
+
+	.split-footer {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		flex-wrap: wrap;
+	}
+
+	.split-sum {
+		font-size: .85rem;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-left: auto;
+	}
+
+	.split-sum-match {
+		color: var(--green-600);
+	}
+
+	.split-sum-mismatch {
+		color: var(--amber-600);
+	}
+
+	.split-check {
+		color: var(--green-600);
+		font-weight: 700;
+	}
+
+	.split-delta {
+		font-size: .75rem;
+		font-weight: 500;
+		color: var(--red-600);
 	}
 
 	/* ── Detail panel ─────────────────────────────────────────────────────── */

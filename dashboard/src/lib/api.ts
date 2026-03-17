@@ -96,3 +96,33 @@ export async function extractReceipt(id: string, attachmentIndex = 0): Promise<E
 		body: JSON.stringify({ attachment_index: attachmentIndex })
 	});
 }
+
+export interface SplitLineItem {
+	amount: number;
+	entity?: string | null;
+	tax_category?: string | null;
+	description?: string | null;
+}
+
+export interface SplitResponse {
+	parent: Transaction;
+	children: Transaction[];
+	hotel_suggestion?: {
+		room_amount: string;
+		meals_amount: string;
+		entity: string | null;
+		line_items: Array<{
+			amount: string;
+			entity: string | null;
+			tax_category: string | null;
+			description: string | null;
+		}>;
+	} | null;
+}
+
+export async function splitTransaction(id: string, lineItems: SplitLineItem[]): Promise<SplitResponse> {
+	return request<SplitResponse>(`/transactions/${id}/split`, {
+		method: 'POST',
+		body: JSON.stringify({ line_items: lineItems })
+	});
+}

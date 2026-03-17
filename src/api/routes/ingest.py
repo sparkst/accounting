@@ -5,6 +5,9 @@ engine on all unclassified (needs_review) transactions, and returns a summary.
 
 POST /api/ingest/reclassify — Re-extracts vendors for forwarded emails and
 re-runs classification on all needs_review transactions using current vendor rules.
+
+POST /api/import/brokerage-csv — Upload a brokerage 1099-B CSV (E*Trade, Schwab,
+or Vanguard) for immediate ingestion. Max 50 MB.
 """
 
 from __future__ import annotations
@@ -13,9 +16,14 @@ import logging
 import os
 import traceback
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
+from src.adapters.brokerage_csv import (
+    SUPPORTED_BROKERAGES,
+    BrokerageCsvAdapter,
+    detect_brokerage,
+)
 from src.adapters.gmail_n8n import GmailN8nAdapter
 from src.classification.engine import apply_result, classify
 from src.db.connection import SessionLocal
@@ -189,4 +197,120 @@ def run_reclassify() -> ReclassifySummary:
         classified=result.classified,
         still_needs_review=result.still_needs_review,
         errors=result.errors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Brokerage CSV import
+# ---------------------------------------------------------------------------
+
+_MAX_BROKERAGE_CSV_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+class BrokerageCsvImportSummary(BaseModel):
+    """Result of POST /api/import/brokerage-csv."""
+
+    brokerage: str
+    filename: str
+    records_created: int
+    records_skipped: int
+    records_failed: int
+    errors: list[str]
+
+
+_BROKERAGE_FILE_FIELD = File(..., description="1099-B CSV export from E*Trade, Schwab, or Vanguard")
+_BROKERAGE_FORM_FIELD = Form(
+    default=None,
+    description=(
+        "Brokerage format: 'etrade', 'schwab', or 'vanguard'. "
+        "Omit to auto-detect from file contents."
+    ),
+)
+
+
+@router.post("/import/brokerage-csv", response_model=BrokerageCsvImportSummary)
+async def import_brokerage_csv(
+    file: UploadFile = _BROKERAGE_FILE_FIELD,
+    brokerage: str | None = _BROKERAGE_FORM_FIELD,
+) -> BrokerageCsvImportSummary:
+    """Import a brokerage 1099-B CSV file.
+
+    Accepts CSV exports from E*Trade, Schwab, and Vanguard.  The brokerage
+    format can be specified explicitly or auto-detected from the file header.
+
+    Each row is imported as a Transaction with:
+      - entity = personal
+      - tax_category = INVESTMENT_INCOME
+      - tax_subcategory = CAPITAL_GAIN_SHORT or CAPITAL_GAIN_LONG
+      - raw_data preserving cost basis, wash sale adjustment, and all original columns
+
+    Duplicate rows (same security + date + index) are silently skipped via
+    source_hash dedup.  A bad row never halts the batch (per-record isolation).
+
+    Args:
+        file:      Multipart CSV upload. Maximum 50 MB.
+        brokerage: Optional brokerage identifier. Auto-detected when omitted.
+
+    Returns:
+        Import summary with counts and any per-row errors.
+    """
+    # Validate brokerage if provided
+    if brokerage is not None and brokerage not in SUPPORTED_BROKERAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unsupported brokerage {brokerage!r}. "
+                f"Supported values: {list(SUPPORTED_BROKERAGES)}"
+            ),
+        )
+
+    # Read upload (enforce size limit)
+    raw_bytes = await file.read(_MAX_BROKERAGE_CSV_BYTES + 1)
+    if len(raw_bytes) > _MAX_BROKERAGE_CSV_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds maximum allowed size of 50 MB.",
+        )
+
+    try:
+        csv_content = raw_bytes.decode("utf-8-sig")  # utf-8-sig strips BOM if present
+    except UnicodeDecodeError:
+        try:
+            csv_content = raw_bytes.decode("latin-1")
+        except UnicodeDecodeError as err:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not decode CSV file. Expected UTF-8 or Latin-1 encoding.",
+            ) from err
+
+    filename = file.filename or "upload.csv"
+
+    adapter = BrokerageCsvAdapter(
+        csv_content=csv_content,
+        brokerage=brokerage,
+        filename=filename,
+    )
+
+    session = SessionLocal()
+    try:
+        result = adapter.run(session)
+    except Exception as err:
+        session.close()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Adapter error: {traceback.format_exc()}",
+        ) from err
+    finally:
+        session.close()
+
+    # Determine the actual brokerage used (may have been auto-detected)
+    resolved_brokerage = brokerage or detect_brokerage(csv_content) or "unknown"
+
+    return BrokerageCsvImportSummary(
+        brokerage=resolved_brokerage,
+        filename=filename,
+        records_created=result.records_created,
+        records_skipped=result.records_skipped,
+        records_failed=result.records_failed,
+        errors=[f"{rec_id}: {err}" for rec_id, err in result.errors],
     )

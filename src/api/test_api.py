@@ -214,9 +214,45 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         freshness = data["source_freshness"]
-        assert len(freshness) == 1
-        assert freshness[0]["source"] == "gmail_n8n"
-        assert freshness[0]["records_processed"] == 5
+        # All known sources are returned (including those with no log entries).
+        gmail_entry = next(
+            (f for f in freshness if f["source"] == "gmail_n8n"), None
+        )
+        assert gmail_entry is not None
+        assert gmail_entry["records_processed"] == 5
+        assert gmail_entry["freshness_status"] in ("green", "amber", "red")
+
+    def test_health_includes_tax_deadlines_and_failure_log(
+        self, client: TestClient
+    ) -> None:
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "tax_deadlines" in data
+        assert "failure_log" in data
+        assert isinstance(data["tax_deadlines"], list)
+        assert isinstance(data["failure_log"], list)
+        assert "needs_review_count" in data
+
+    def test_health_failure_log_contains_failures(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            fail_log = IngestionLog(
+                source=Source.SHOPIFY.value,
+                status=IngestionStatus.FAILURE.value,
+                records_processed=0,
+                records_failed=3,
+                error_detail="Connection timeout",
+            )
+            s.add(fail_log)
+            s.commit()
+
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        failure_log = data["failure_log"]
+        assert len(failure_log) == 1
+        assert failure_log[0]["source"] == "shopify"
+        assert failure_log[0]["error_detail"] == "Connection timeout"
 
 
 # ---------------------------------------------------------------------------

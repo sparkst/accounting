@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes.attachments import router as attachments_router
+from src.api.routes.csv_import import router as csv_import_router
 from src.api.routes.health import router as health_router
 from src.api.routes.ingest import router as ingest_router
 from src.api.routes.transactions import router as transactions_router
@@ -73,6 +74,7 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 app.include_router(attachments_router, prefix="/api")
+app.include_router(csv_import_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
 app.include_router(transactions_router, prefix="/api")
 app.include_router(ingest_router, prefix="/api")

@@ -3,7 +3,8 @@ import type {
 	TransactionList,
 	TransactionUpdate,
 	HealthResponse,
-	IngestResult
+	IngestResult,
+	IngestSummary
 } from './types';
 
 const BASE = '/api';
@@ -70,6 +71,13 @@ export async function updateTransaction(
 
 export async function triggerIngest(): Promise<IngestResult> {
 	return request<IngestResult>('/ingest/run', { method: 'POST' });
+}
+
+/** Trigger an ingestion run for a specific source. */
+export async function triggerSourceIngest(source: string): Promise<IngestSummary> {
+	return request<IngestSummary>(`/ingest/run?source=${encodeURIComponent(source)}`, {
+		method: 'POST'
+	});
 }
 
 export async function fetchHealth(): Promise<HealthResponse> {

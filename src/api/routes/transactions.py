@@ -4,6 +4,7 @@ GET  /api/transactions          — Paginated, filtered list.
 GET  /api/transactions/review   — needs_review items ordered by priority.
 GET  /api/transactions/{id}     — Single transaction.
 PATCH /api/transactions/{id}    — Update fields + learning loop on confirm.
+POST /api/transactions/{id}/split           — Split into child line items.
 POST /api/transactions/{id}/extract-receipt — OCR an attachment via Claude Vision.
 """
 
@@ -20,6 +21,14 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.classification.splitter import (
+    SplitLineItem,
+    SplitValidationError,
+    cascade_reject_children,
+    split_transaction,
+    suggest_hotel_splits,
+    validate_split_amounts,
+)
 from src.db.connection import SessionLocal
 from src.models.audit_event import AuditEvent
 from src.models.enums import (
@@ -480,6 +489,21 @@ def patch_transaction(
 
         # ── Confirm-specific logic ────────────────────────────────────────────
         is_confirming = patch_data.get("status") == TransactionStatus.CONFIRMED.value
+        is_rejecting = patch_data.get("status") == TransactionStatus.REJECTED.value
+
+        # Guard: cannot confirm a child whose parent is rejected.
+        if is_confirming and tx.parent_id is not None:
+            parent_tx: Transaction | None = (
+                session.query(Transaction)
+                .filter(Transaction.id == tx.parent_id)
+                .first()
+            )
+            if parent_tx is not None and parent_tx.status == TransactionStatus.REJECTED.value:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Cannot confirm a child transaction whose parent is rejected.",
+                )
+
         if is_confirming and tx.confirmed_by != ConfirmedBy.HUMAN.value:
             old_cb = tx.confirmed_by
             tx.confirmed_by = ConfirmedBy.HUMAN.value
@@ -495,9 +519,174 @@ def patch_transaction(
         if is_confirming:
             _upsert_vendor_rule(session, tx)
 
+        # ── Cascade reject to children when parent is rejected ────────────────
+        if is_rejecting and tx.status == TransactionStatus.REJECTED.value:
+            cascade_reject_children(session, tx)
+
         session.commit()
         session.refresh(tx)
         return TransactionOut.model_validate(tx)
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Split endpoint
+# ---------------------------------------------------------------------------
+
+
+class SplitLineItemRequest(BaseModel):
+    """One line item in a split request."""
+
+    amount: Decimal
+    entity: str | None = None
+    tax_category: str | None = None
+    description: str | None = None
+
+    @field_validator("entity")
+    @classmethod
+    def validate_entity(cls, v: str | None) -> str | None:
+        if v is not None:
+            Entity(v)
+        return v
+
+    @field_validator("tax_category")
+    @classmethod
+    def validate_tax_category(cls, v: str | None) -> str | None:
+        if v is not None:
+            TaxCategory(v)
+        return v
+
+
+class SplitRequest(BaseModel):
+    """Body for POST /api/transactions/{id}/split."""
+
+    line_items: list[SplitLineItemRequest]
+
+
+class HotelSuggestionOut(BaseModel):
+    """Hotel split suggestion returned alongside a split_parent transaction."""
+
+    room_amount: str
+    meals_amount: str
+    entity: str | None
+    line_items: list[dict[str, Any]]
+
+
+class SplitResponse(BaseModel):
+    """Response body for POST /api/transactions/{id}/split."""
+
+    parent: TransactionOut
+    children: list[TransactionOut]
+    hotel_suggestion: HotelSuggestionOut | None = None
+
+
+@router.post(
+    "/transactions/{transaction_id}/split",
+    response_model=SplitResponse,
+    status_code=201,
+)
+def split_transaction_endpoint(
+    transaction_id: str,
+    body: SplitRequest,
+    session: Session = Depends(get_db),  # noqa: B008
+) -> SplitResponse:
+    """Split a transaction into child line items.
+
+    Rules:
+    - Parent must not already be split_parent (422 if so).
+    - Parent must not be rejected.
+    - Line item amounts must sum to parent total (422 if not).
+    - On success: parent status → split_parent; children created.
+    - AuditEvent rows are created for all changes.
+    - If the parent description looks like a hotel, a split suggestion is
+      returned in ``hotel_suggestion`` for the UI to pre-populate.
+    """
+    try:
+        tx: Transaction | None = (
+            session.query(Transaction)
+            .filter(Transaction.id == transaction_id)
+            .first()
+        )
+        if tx is None:
+            raise HTTPException(status_code=404, detail="Transaction not found")
+
+        # Cannot re-split an already-split parent.
+        if tx.status == TransactionStatus.SPLIT_PARENT.value:
+            raise HTTPException(
+                status_code=422,
+                detail="Transaction is already split. Cannot re-split a split_parent.",
+            )
+
+        # Cannot split a rejected transaction.
+        if tx.status == TransactionStatus.REJECTED.value:
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot split a rejected transaction.",
+            )
+
+        # Children cannot themselves be split.
+        if tx.parent_id is not None:
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot split a child transaction. Only top-level transactions can be split.",
+            )
+
+        # Build SplitLineItem list.
+        line_items = [
+            SplitLineItem(
+                amount=item.amount,
+                entity=item.entity,
+                tax_category=item.tax_category,
+                description=item.description,
+            )
+            for item in body.line_items
+        ]
+
+        # Validate amounts.
+        parent_amount = Decimal(str(tx.amount)) if tx.amount is not None else None
+        if parent_amount is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Cannot split a transaction with an unknown amount.",
+            )
+
+        try:
+            validate_split_amounts(parent_amount, line_items)
+        except SplitValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # Perform the split.
+        result = split_transaction(session, tx, line_items)
+        session.commit()
+        session.refresh(tx)
+        for child in result.children:
+            session.refresh(child)
+
+        # Hotel suggestion (for UI pre-population on future reference).
+        hotel_suggestion: HotelSuggestionOut | None = None
+        suggestion = suggest_hotel_splits(tx)
+        if suggestion is not None:
+            hotel_suggestion = HotelSuggestionOut(
+                room_amount=str(suggestion.room_amount),
+                meals_amount=str(suggestion.meals_amount),
+                entity=suggestion.entity,
+                line_items=[
+                    {
+                        "amount": str(item.amount),
+                        "entity": item.entity,
+                        "tax_category": item.tax_category,
+                        "description": item.description,
+                    }
+                    for item in suggestion.as_line_items
+                ],
+            )
+
+        return SplitResponse(
+            parent=TransactionOut.model_validate(tx),
+            children=[TransactionOut.model_validate(c) for c in result.children],
+            hotel_suggestion=hotel_suggestion,
+        )
     finally:
         session.close()
 

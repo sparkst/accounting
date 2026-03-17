@@ -91,18 +91,67 @@ export interface SourceHealth {
 	message: string | null;
 }
 
+export interface SourceFreshness {
+	source: string;
+	last_run_at: string | null;          // ISO datetime
+	freshness_status: 'green' | 'amber' | 'red' | 'never';
+	ingestion_status: string | null;     // 'success' | 'partial_failure' | 'failure'
+	records_processed: number;
+	records_failed: number;
+	last_error: string | null;
+}
+
+export interface ClassificationStats {
+	needs_review: number;
+	auto_classified: number;
+	confirmed: number;
+	split_parent: number;
+	rejected: number;
+	total: number;
+	auto_confirmed_pct: number;
+	edited_pct: number;
+	pending_pct: number;
+	rejected_pct: number;
+	pending_count: number;
+}
+
+export interface TaxDeadline {
+	label: string;
+	entity: string;
+	due_date: string;         // YYYY-MM-DD
+	days_until_due: number;
+}
+
+export interface FailureLogEntry {
+	source: string;
+	run_at: string;           // ISO datetime
+	ingestion_status: string;
+	error_detail: string | null;
+	records_processed: number;
+	records_failed: number;
+}
+
 export interface HealthResponse {
-	sources: SourceHealth[];
+	ok: boolean;
+	source_freshness: SourceFreshness[];
+	classification_stats: ClassificationStats;
+	tax_deadlines: TaxDeadline[];
+	failure_log: FailureLogEntry[];
 	total_transactions: number;
 	needs_review_count: number;
-	confirmed_count: number;
-	auto_classified_count: number;
-	rejected_count: number;
+	checked_at: string;       // ISO datetime
 }
 
 export interface IngestResult {
 	triggered: boolean;
 	message: string;
+}
+
+export interface IngestSummary {
+	ingested_count: number;
+	classified_count: number;
+	needs_review_count: number;
+	errors: string[];
 }
 
 export interface TransactionUpdate {

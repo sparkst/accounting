@@ -1,7 +1,12 @@
 """Ingestion trigger endpoints.
 
-POST /api/ingest/run — Runs the Gmail/n8n adapter, then runs the classification
-engine on all unclassified (needs_review) transactions, and returns a summary.
+POST /api/ingest/run — Runs one or all registered adapters, then runs the
+classification engine on all unclassified (needs_review) transactions, and
+returns a summary.
+
+Optional query parameter:
+    source=<source_value>  Run only the specified adapter (e.g. ?source=stripe).
+    When omitted, all registered adapters are run sequentially.
 
 POST /api/ingest/reclassify — Re-extracts vendors for forwarded emails and
 re-runs classification on all needs_review transactions using current vendor rules.
@@ -14,20 +19,21 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import traceback
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
+from src.adapters import INGEST_SOURCES, get_adapter
 from src.adapters.brokerage_csv import (
     SUPPORTED_BROKERAGES,
     BrokerageCsvAdapter,
     detect_brokerage,
 )
-from src.adapters.gmail_n8n import GmailN8nAdapter
 from src.classification.engine import apply_result, classify
 from src.db.connection import SessionLocal
-from src.models.enums import TransactionStatus
+from src.models.enums import Source, TransactionStatus
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
 from src.utils.reclassify import reclassify_all
@@ -36,10 +42,26 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ingest"])
 
+# ---------------------------------------------------------------------------
+# Concurrency guard — only one ingest run at a time
+# ---------------------------------------------------------------------------
+
+_ingest_lock = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Response schema
 # ---------------------------------------------------------------------------
+
+
+class AdapterRunSummary(BaseModel):
+    """Per-adapter result within an IngestSummary."""
+
+    source: str
+    records_processed: int
+    records_created: int
+    records_skipped: int
+    records_failed: int
 
 
 class IngestSummary(BaseModel):
@@ -48,7 +70,22 @@ class IngestSummary(BaseModel):
     ingested_count: int
     classified_count: int
     needs_review_count: int
+    adapter_results: list[AdapterRunSummary]
+    warnings: list[str]
     errors: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Query parameter singletons (avoids B008 — no function call in default arg)
+# ---------------------------------------------------------------------------
+
+_SOURCE_QUERY = Query(
+    default=None,
+    description=(
+        "Run only this adapter (e.g. 'stripe'). "
+        "Omit to run all registered adapters."
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,48 +94,97 @@ class IngestSummary(BaseModel):
 
 
 @router.post("/ingest/run", response_model=IngestSummary)
-def run_ingest() -> IngestSummary:
+def run_ingest(
+    source: Source | None = _SOURCE_QUERY,
+) -> IngestSummary:
     """Trigger a full ingestion + classification pass.
 
     Steps:
-      1. Run GmailN8nAdapter to pull new email receipts.
-      2. Run the classification engine on every transaction whose status is
-         ``needs_review`` (this includes newly ingested items *and* any
-         previously stuck items).
-      3. Return counts and errors.
+      1. Acquire concurrency lock — return HTTP 409 if already running.
+      2. Run one or all registered adapters, collecting results.
+         Sources with missing API keys are skipped (warning included in response).
+      3. Run the classification engine on every transaction whose status is
+         ``needs_review`` (includes newly ingested items *and* any previously
+         stuck items).
+      4. Return counts, per-adapter breakdown, warnings, and errors.
 
     Errors are collected per-step and included in the response rather than
     raising an HTTP 500, so the dashboard can show partial results.
     """
-    errors: list[str] = []
-    ingested_count = 0
-
-    # ── Step 1: Run Gmail adapter ─────────────────────────────────────────────
-    session = SessionLocal()
-    try:
-        adapter = GmailN8nAdapter()
-        result = adapter.run(session)
-        ingested_count = result.records_created
-
-        # Persist an IngestionLog entry for this run.
-        log = IngestionLog(
-            source=adapter.source,
-            status=result.status.value,
-            records_processed=result.records_processed,
-            records_failed=result.records_failed,
-            error_detail=(
-                "\n".join(err for _, err in result.errors) if result.errors else None
+    if not _ingest_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "An ingestion run is already in progress. "
+                "Please wait for it to complete before starting another."
             ),
         )
-        session.add(log)
-        session.commit()
 
-        for _rec_id, err_text in result.errors:
-            errors.append(f"[gmail_n8n] {err_text}")
-    except Exception:
-        errors.append(f"[gmail_n8n] Adapter halted: {traceback.format_exc()}")
+    try:
+        return _run_ingest_locked(source)
     finally:
-        session.close()
+        _ingest_lock.release()
+
+
+def _run_ingest_locked(source: Source | None) -> IngestSummary:
+    """Execute the ingest pass (called only while _ingest_lock is held)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    ingested_count = 0
+    adapter_results: list[AdapterRunSummary] = []
+
+    # Determine which sources to run
+    sources_to_run: list[Source] = [source] if source is not None else INGEST_SOURCES
+
+    # ── Step 1: Run adapters ──────────────────────────────────────────────────
+    for src in sources_to_run:
+        adapter = get_adapter(src)
+        if adapter is None:
+            msg = (
+                f"Adapter for source '{src.value}' is unavailable — "
+                "check that required API keys are set."
+            )
+            warnings.append(msg)
+            logger.warning(msg)
+            continue
+
+        session = SessionLocal()
+        try:
+            result = adapter.run(session)
+            ingested_count += result.records_created
+
+            # Persist IngestionLog entry for this adapter run.
+            log = IngestionLog(
+                source=adapter.source,
+                status=result.status.value,
+                records_processed=result.records_processed,
+                records_failed=result.records_failed,
+                error_detail=(
+                    "\n".join(err for _, err in result.errors) if result.errors else None
+                ),
+            )
+            session.add(log)
+            session.commit()
+
+            adapter_results.append(
+                AdapterRunSummary(
+                    source=adapter.source,
+                    records_processed=result.records_processed,
+                    records_created=result.records_created,
+                    records_skipped=result.records_skipped,
+                    records_failed=result.records_failed,
+                )
+            )
+
+            for _rec_id, err_text in result.errors:
+                errors.append(f"[{adapter.source}] {err_text}")
+
+        except Exception:
+            tb = traceback.format_exc()
+            errors.append(f"[{src.value}] Adapter halted: {tb}")
+            logger.error("Adapter %r halted with exception:\n%s", src.value, tb)
+        finally:
+            session.close()
 
     # ── Step 2: Classify unclassified transactions ────────────────────────────
     classified_count = 0
@@ -106,7 +192,6 @@ def run_ingest() -> IngestSummary:
     try:
         anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 
-        # Fetch all needs_review transactions for the classification pass.
         pending: list[Transaction] = (
             classify_session.query(Transaction)
             .filter(Transaction.status == TransactionStatus.NEEDS_REVIEW.value)
@@ -131,7 +216,7 @@ def run_ingest() -> IngestSummary:
     finally:
         classify_session.close()
 
-    # ── Step 3: Count remaining needs_review ────────────────────────────────
+    # ── Step 3: Count remaining needs_review ─────────────────────────────────
     count_session = SessionLocal()
     try:
         needs_review_count: int = (
@@ -146,6 +231,8 @@ def run_ingest() -> IngestSummary:
         ingested_count=ingested_count,
         classified_count=classified_count,
         needs_review_count=needs_review_count,
+        adapter_results=adapter_results,
+        warnings=warnings,
         errors=errors,
     )
 

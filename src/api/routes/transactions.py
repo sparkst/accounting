@@ -4,14 +4,15 @@ GET  /api/transactions          — Paginated, filtered list.
 GET  /api/transactions/review   — needs_review items ordered by priority.
 GET  /api/transactions/{id}     — Single transaction.
 PATCH /api/transactions/{id}    — Update fields + learning loop on confirm.
-POST /api/transactions/{id}/split           — Split into child line items.
-POST /api/transactions/{id}/extract-receipt — OCR an attachment via Claude Vision.
+POST /api/transactions/{id}/split               — Split into child line items.
+POST /api/transactions/{id}/extract-receipt     — OCR an attachment via Claude Vision.
+POST /api/transactions/{id}/link-reimbursement  — Link an expense to its reimbursement.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ class TransactionOut(BaseModel):
     confidence: float
     review_reason: str | None
     parent_id: str | None
+    reimbursement_link: str | None = None
     payment_method: str | None = None
     notes: str | None
     confirmed_by: str
@@ -288,6 +290,63 @@ def _upsert_vendor_rule(
         )
 
 
+def _flag_reimbursement_partner_if_needed(
+    session: Session,
+    tx: Transaction,
+    changes: dict[str, tuple[Any, Any]],
+) -> None:
+    """If a linked transaction's amount or status changed, flag the partner.
+
+    When a reimbursable expense or its paired reimbursement income has its
+    amount edited or is rejected, the linked partner transaction is set to
+    needs_review so a human can reconcile the pair.
+    """
+    sensitive_fields = {"amount", "status"}
+    if not (sensitive_fields & changes.keys()):
+        return  # No sensitive field changed — nothing to do.
+
+    if not tx.reimbursement_link:
+        return  # Not part of a reimbursement pair.
+
+    partner: Transaction | None = (
+        session.query(Transaction)
+        .filter(Transaction.id == tx.reimbursement_link)
+        .first()
+    )
+    if partner is None:
+        return
+
+    # Only flag if partner is not already in needs_review or rejected.
+    if partner.status in (
+        TransactionStatus.NEEDS_REVIEW.value,
+        TransactionStatus.REJECTED.value,
+    ):
+        return
+
+    old_partner_status = partner.status
+    partner.status = TransactionStatus.NEEDS_REVIEW.value
+    partner.review_reason = (
+        f"Linked reimbursement transaction {tx.id[:8]} was modified "
+        f"(fields changed: {', '.join(sensitive_fields & changes.keys())}). "
+        "Please review and reconcile this pair."
+    )
+    partner.updated_at = datetime.now(UTC).replace(tzinfo=None)
+
+    _create_audit_events(
+        session,
+        partner,
+        {
+            "status": (old_partner_status, TransactionStatus.NEEDS_REVIEW.value),
+            "review_reason": (None, partner.review_reason),
+        },
+    )
+    logger.info(
+        "Flagged reimbursement partner %s as needs_review because linked tx %s changed",
+        partner.id,
+        tx.id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -297,6 +356,14 @@ def _upsert_vendor_rule(
 def list_transactions(
     entity: str | None = Query(default=None, description="Filter by entity"),
     status: str | None = Query(default=None, description="Filter by status"),
+    direction: str | None = Query(default=None, description="Filter by direction"),
+    overdue: bool = Query(
+        default=False,
+        description=(
+            "When true (and direction=reimbursable), return only reimbursable "
+            "expenses older than 30 days with no reimbursement_link"
+        ),
+    ),
     date_from: str | None = Query(
         default=None, description="Inclusive start date YYYY-MM-DD"
     ),
@@ -316,7 +383,12 @@ def list_transactions(
     offset: int = Query(default=0, ge=0),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> TransactionListResponse:
-    """List transactions with optional filters and pagination."""
+    """List transactions with optional filters and pagination.
+
+    To find overdue reimbursable expenses use:
+        GET /api/transactions?direction=reimbursable&overdue=true
+    Returns reimbursable expenses older than 30 days with no reimbursement_link.
+    """
     try:
         # Validate enum filters early for a clear 422 response.
         if entity is not None:
@@ -335,6 +407,14 @@ def list_transactions(
                     status_code=422,
                     detail=f"Invalid status value: {status!r}",
                 ) from exc
+        if direction is not None:
+            try:
+                Direction(direction)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid direction value: {direction!r}",
+                ) from exc
 
         query = session.query(Transaction)
 
@@ -342,6 +422,8 @@ def list_transactions(
             query = query.filter(Transaction.entity == entity)
         if status is not None:
             query = query.filter(Transaction.status == status)
+        if direction is not None:
+            query = query.filter(Transaction.direction == direction)
         if date_from is not None:
             query = query.filter(Transaction.date >= date_from)
         if date_to is not None:
@@ -349,6 +431,15 @@ def list_transactions(
         if search is not None:
             query = query.filter(
                 func.lower(Transaction.description).contains(search.lower())
+            )
+
+        # Overdue reimbursable filter: reimbursable expenses > 30 days, unlinked.
+        if overdue:
+            cutoff = (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%d")
+            query = query.filter(
+                Transaction.direction == Direction.REIMBURSABLE.value,
+                Transaction.date <= cutoff,
+                Transaction.reimbursement_link.is_(None),
             )
 
         total: int = query.count()
@@ -522,6 +613,9 @@ def patch_transaction(
         # ── Cascade reject to children when parent is rejected ────────────────
         if is_rejecting and tx.status == TransactionStatus.REJECTED.value:
             cascade_reject_children(session, tx)
+
+        # ── Flag linked reimbursement partner when amount or status changes ──
+        _flag_reimbursement_partner_if_needed(session, tx, changes)
 
         session.commit()
         session.refresh(tx)
@@ -792,3 +886,138 @@ def extract_transaction_receipt(
         extraction=extracted,
         fields_updated=fields_updated,
     )
+
+
+# ---------------------------------------------------------------------------
+# Reimbursement link endpoint
+# ---------------------------------------------------------------------------
+
+
+class LinkReimbursementRequest(BaseModel):
+    """Body for POST /api/transactions/{id}/link-reimbursement."""
+
+    reimbursement_id: str
+
+
+class LinkReimbursementResponse(BaseModel):
+    """Response body for POST /api/transactions/{id}/link-reimbursement."""
+
+    expense: TransactionOut
+    reimbursement: TransactionOut
+
+
+@router.post(
+    "/transactions/{transaction_id}/link-reimbursement",
+    response_model=LinkReimbursementResponse,
+    status_code=200,
+)
+def link_reimbursement(
+    transaction_id: str,
+    body: LinkReimbursementRequest,
+    session: Session = Depends(get_db),  # noqa: B008
+) -> LinkReimbursementResponse:
+    """Link a reimbursable expense to its matching reimbursement income transaction.
+
+    Validation rules:
+    - The expense transaction must have direction=reimbursable or direction=expense.
+    - The reimbursement transaction must have direction=income.
+    - Both transactions must exist and cannot be the same transaction.
+    - The link is set bidirectionally: expense.reimbursement_link = reimbursement.id
+      and reimbursement.reimbursement_link = expense.id.
+    - AuditEvent rows are created for both transactions.
+
+    When linked, both transactions net to zero on P&L because tax summary
+    queries exclude linked pairs (expense is negative, income is positive,
+    and they are matched 1-to-1).
+    """
+    try:
+        if transaction_id == body.reimbursement_id:
+            raise HTTPException(
+                status_code=422,
+                detail="A transaction cannot be linked to itself.",
+            )
+
+        expense_tx: Transaction | None = (
+            session.query(Transaction)
+            .filter(Transaction.id == transaction_id)
+            .first()
+        )
+        if expense_tx is None:
+            raise HTTPException(status_code=404, detail="Expense transaction not found")
+
+        reimb_tx: Transaction | None = (
+            session.query(Transaction)
+            .filter(Transaction.id == body.reimbursement_id)
+            .first()
+        )
+        if reimb_tx is None:
+            raise HTTPException(
+                status_code=404, detail="Reimbursement transaction not found"
+            )
+
+        # ── Direction validation ───────────────────────────────────────────────
+        valid_expense_directions = {
+            Direction.REIMBURSABLE.value,
+            Direction.EXPENSE.value,
+        }
+        if expense_tx.direction not in valid_expense_directions:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Expense transaction direction must be 'reimbursable' or 'expense', "
+                    f"got {expense_tx.direction!r}."
+                ),
+            )
+        if reimb_tx.direction != Direction.INCOME.value:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Reimbursement transaction direction must be 'income', "
+                    f"got {reimb_tx.direction!r}."
+                ),
+            )
+
+        # ── Bidirectional link ────────────────────────────────────────────────
+        now = datetime.now(UTC).replace(tzinfo=None)
+
+        old_expense_link = expense_tx.reimbursement_link
+        old_reimb_link = reimb_tx.reimbursement_link
+
+        expense_tx.reimbursement_link = reimb_tx.id
+        expense_tx.updated_at = now
+
+        reimb_tx.reimbursement_link = expense_tx.id
+        reimb_tx.updated_at = now
+
+        # ── Audit events ──────────────────────────────────────────────────────
+        _create_audit_events(
+            session,
+            expense_tx,
+            {
+                "reimbursement_link": (old_expense_link, reimb_tx.id),
+            },
+        )
+        _create_audit_events(
+            session,
+            reimb_tx,
+            {
+                "reimbursement_link": (old_reimb_link, expense_tx.id),
+            },
+        )
+
+        session.commit()
+        session.refresh(expense_tx)
+        session.refresh(reimb_tx)
+
+        logger.info(
+            "Linked reimbursement: expense=%s <-> reimbursement=%s",
+            expense_tx.id,
+            reimb_tx.id,
+        )
+
+        return LinkReimbursementResponse(
+            expense=TransactionOut.model_validate(expense_tx),
+            reimbursement=TransactionOut.model_validate(reimb_tx),
+        )
+    finally:
+        session.close()

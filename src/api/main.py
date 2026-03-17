@@ -21,9 +21,11 @@ from src.api.routes.attachments import router as attachments_router
 from src.api.routes.csv_import import router as csv_import_router
 from src.api.routes.health import router as health_router
 from src.api.routes.ingest import router as ingest_router
+from src.api.routes.reconciliation import router as reconciliation_router
 from src.api.routes.transactions import router as transactions_router
 from src.classification.seed_rules import seed_vendor_rules
 from src.db.connection import SessionLocal, init_db
+from src.invoicing.seed_customers import seed_customers
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             logger.info("Seeded %d vendor rules.", inserted)
         else:
             logger.debug("Vendor rules already seeded; skipping.")
+    with SessionLocal() as session:
+        counts = seed_customers(session)
+        logger.info(
+            "seed_customers: %d inserted, %d updated, %d invoices.",
+            counts["customers_inserted"],
+            counts["customers_updated"],
+            counts["invoices_inserted"],
+        )
     logger.info("Startup complete.")
     yield
     logger.info("Shutdown complete.")
@@ -78,3 +88,4 @@ app.include_router(csv_import_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
 app.include_router(transactions_router, prefix="/api")
 app.include_router(ingest_router, prefix="/api")
+app.include_router(reconciliation_router, prefix="/api")

@@ -80,6 +80,15 @@
 						Accounts
 					</a>
 				</li>
+				<li>
+					<a
+						href="/reconciliation"
+						class="nav-link"
+						aria-current={isActive('/reconciliation') ? 'page' : undefined}
+					>
+						Reconciliation
+					</a>
+				</li>
 			</ul>
 		</nav>
 	</div>

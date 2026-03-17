@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Invoice {{ invoice.invoice_number }} — Sparkry LLC</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+      font-size: 13px;
+      color: #111;
+      background: #fff;
+    }
+
+    /* ── Orange header bar ─────────────────────────────────────────────── */
+    .header-bar {
+      background: #F97316;
+      height: 10px;
+      width: 100%;
+    }
+
+    /* ── Page wrapper ──────────────────────────────────────────────────── */
+    .page {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 32px 40px 40px;
+    }
+
+    /* ── Address block ─────────────────────────────────────────────────── */
+    .address-block {
+      margin-top: 24px;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #333;
+    }
+
+    .address-block .company-name {
+      font-weight: 700;
+      font-size: 15px;
+      color: #111;
+    }
+
+    /* ── "Invoice" title ───────────────────────────────────────────────── */
+    .invoice-title {
+      font-size: 28px;
+      font-weight: 700;
+      color: #111;
+      margin-top: 20px;
+      letter-spacing: -0.5px;
+    }
+
+    /* ── Submitted on ──────────────────────────────────────────────────── */
+    .submitted-on {
+      margin-top: 12px;
+      font-size: 13px;
+      color: #555;
+    }
+
+    /* ── Meta grid ─────────────────────────────────────────────────────── */
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 16px 8px;
+      margin-top: 18px;
+    }
+
+    .meta-cell .label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #888;
+      margin-bottom: 3px;
+    }
+
+    .meta-cell .value {
+      font-size: 13px;
+      color: #111;
+    }
+
+    /* ── Divider ───────────────────────────────────────────────────────── */
+    .divider {
+      border: none;
+      border-top: 1px solid #E5E7EB;
+      margin: 24px 0 0;
+    }
+
+    /* ── Line items table ──────────────────────────────────────────────── */
+    table.line-items {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0;
+    }
+
+    table.line-items thead th {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #888;
+      padding: 10px 8px 8px;
+      border-bottom: 1px solid #E5E7EB;
+      text-align: left;
+    }
+
+    table.line-items thead th.right {
+      text-align: right;
+    }
+
+    /* Section header row */
+    table.line-items tr.section-header td {
+      font-weight: 700;
+      font-size: 13px;
+      color: #111;
+      padding: 14px 8px 6px;
+      background: #F9FAFB;
+      border-top: 1px solid #E5E7EB;
+    }
+
+    /* Regular line item rows */
+    table.line-items tr.line-item td {
+      padding: 7px 8px;
+      font-size: 13px;
+      color: #333;
+      border-bottom: 1px solid #F3F4F6;
+      vertical-align: top;
+    }
+
+    table.line-items tr.line-item td.right {
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    table.line-items tr.line-item td.desc {
+      padding-left: 20px;
+    }
+
+    /* ── Totals section ────────────────────────────────────────────────── */
+    .totals-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-top: 20px;
+      gap: 24px;
+    }
+
+    .notes-block {
+      flex: 1;
+      font-size: 12px;
+      color: #555;
+      line-height: 1.6;
+      max-width: 360px;
+    }
+
+    .notes-block .notes-label {
+      font-weight: 700;
+      color: #333;
+      margin-bottom: 2px;
+    }
+
+    .totals-block {
+      min-width: 240px;
+    }
+
+    .totals-block table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .totals-block td {
+      padding: 4px 0;
+      font-size: 13px;
+    }
+
+    .totals-block td.label {
+      color: #555;
+      padding-right: 24px;
+    }
+
+    .totals-block td.amount {
+      text-align: right;
+      color: #111;
+    }
+
+    .totals-block .total-divider {
+      border-top: 1px solid #111;
+      margin: 6px 0;
+    }
+
+    .totals-block .grand-total td {
+      font-size: 22px;
+      font-weight: 700;
+      color: #EC4899;
+      padding-top: 6px;
+    }
+
+    /* ── Late fee notice ───────────────────────────────────────────────── */
+    .late-fee-notice {
+      margin-top: 28px;
+      font-size: 11px;
+      color: #888;
+    }
+
+    /* ── Print styles ──────────────────────────────────────────────────── */
+    @media print {
+      body { background: #fff; }
+      .page { padding: 24px 32px; max-width: 100%; }
+      @page { margin: 0.5in; }
+    }
+  </style>
+</head>
+<body>
+  <div class="header-bar"></div>
+  <div class="page">
+
+    <!-- Address block -->
+    <div class="address-block">
+      <div class="company-name">Sparkry LLC</div>
+      <div>24517 SE 43rd Pl</div>
+      <div>Sammamish, WA 98029</div>
+      <div>(919) 491-3894</div>
+    </div>
+
+    <!-- Invoice title -->
+    <div class="invoice-title">Invoice</div>
+
+    <!-- Submitted on -->
+    <div class="submitted-on">
+      Submitted on: <strong>{{ submitted_date_fmt }}</strong>
+    </div>
+
+    <!-- Meta grid: Invoice for / Payable to / Invoice # / Project / Due date -->
+    <div class="meta-grid">
+      <div class="meta-cell">
+        <div class="label">Invoice for</div>
+        <div class="value">{{ customer.name }}</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">Payable to</div>
+        <div class="value">Sparkry LLC</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">Invoice #</div>
+        <div class="value">{{ invoice.invoice_number }}</div>
+      </div>
+
+      <div class="meta-cell">
+        <!-- empty first column -->
+      </div>
+      <div class="meta-cell">
+        <div class="label">Project</div>
+        <div class="value">{{ invoice.project or "—" }}</div>
+      </div>
+      <div class="meta-cell">
+        <div class="label">Due date</div>
+        <div class="value">{{ due_date_fmt }}</div>
+      </div>
+    </div>
+
+    <hr class="divider" />
+
+    <!-- Line items table -->
+    <table class="line-items">
+      <thead>
+        <tr>
+          <th>Description</th>
+          <th class="right">Qty</th>
+          <th class="right">Unit price</th>
+          <th class="right">Total price</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for group in groups %}
+          {% if group.header %}
+            <tr class="section-header">
+              <td colspan="4">{{ group.header }}</td>
+            </tr>
+          {% endif %}
+          {% for item in group.items %}
+            <tr class="line-item">
+              <td class="desc">{{ item.description }}</td>
+              <td class="right">{{ item.quantity }}</td>
+              <td class="right">${{ item.unit_price }}</td>
+              <td class="right">${{ item.total_price }}</td>
+            </tr>
+          {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <!-- Totals + Notes -->
+    <div class="totals-row">
+      <div class="notes-block">
+        {% if invoice.notes %}
+          <div class="notes-label">Notes</div>
+          <div>{{ invoice.notes }}</div>
+        {% endif %}
+      </div>
+
+      <div class="totals-block">
+        <table>
+          <tr>
+            <td class="label">Subtotal</td>
+            <td class="amount">${{ subtotal_fmt }}</td>
+          </tr>
+          {% if adjustments_nonzero %}
+          <tr>
+            <td class="label">Adjustments</td>
+            <td class="amount">${{ adjustments_fmt }}</td>
+          </tr>
+          {% endif %}
+          <tr>
+            <td colspan="2"><div class="total-divider"></div></td>
+          </tr>
+          <tr class="grand-total">
+            <td class="label"></td>
+            <td class="amount">${{ total_fmt }}</td>
+          </tr>
+        </table>
+      </div>
+    </div>
+
+    <!-- Late fee notice -->
+    {% if late_fee_notice %}
+    <div class="late-fee-notice">{{ late_fee_notice }}</div>
+    {% endif %}
+
+  </div><!-- /page -->
+</body>
+</html>

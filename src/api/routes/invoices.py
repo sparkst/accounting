@@ -215,6 +215,7 @@ class InvoicePatch(BaseModel):
     po_number: str | None = None
     late_fee_pct: float | None = None
     line_items: list[LineItemPatch] | None = None
+    sap_checklist_state: dict[str, bool] | None = None
 
 
 class StatusTransition(BaseModel):
@@ -430,13 +431,33 @@ def patch_invoice(
     if inv is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
+    patch_data = body.model_dump(exclude_none=True)
+
+    # sap_checklist_state can be updated regardless of invoice status
+    if body.sap_checklist_state is not None:
+        inv.sap_checklist_state = body.sap_checklist_state
+        inv.updated_at = _now()
+        session.commit()
+        session.refresh(inv)
+
+        # If only sap_checklist_state was sent, return early
+        other_fields = {k: v for k, v in patch_data.items() if k != "sap_checklist_state"}
+        if not other_fields:
+            line_items = (
+                session.query(InvoiceLineItem)
+                .filter(InvoiceLineItem.invoice_id == invoice_id)
+                .order_by(InvoiceLineItem.sort_order)
+                .all()
+            )
+            data = _enrich_with_aging(inv)
+            data["line_items"] = [LineItemOut.model_validate(li) for li in line_items]
+            return InvoiceOut.model_validate(data)
+
     if inv.status != InvoiceStatus.DRAFT.value:
         raise HTTPException(
             status_code=422,
             detail=f"Cannot edit invoice in '{inv.status}' status. Only draft invoices can be edited.",
         )
-
-    patch_data = body.model_dump(exclude_none=True)
 
     # Update scalar fields
     scalar_fields = [

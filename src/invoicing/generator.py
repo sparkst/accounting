@@ -417,6 +417,9 @@ def generate_flat_invoice(
     db.add(line_item)
     db.flush()
 
+    # Update customer.last_invoiced_date to the last business day of the month
+    customer.last_invoiced_date = last_biz.isoformat()
+
     # Audit event
     _create_audit_event(db, invoice_id, "status", None, InvoiceStatus.DRAFT.value)
 

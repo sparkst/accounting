@@ -5,6 +5,7 @@
 	import {
 		fetchInvoice,
 		fetchCustomers,
+		patchInvoice,
 		transitionInvoiceStatus,
 		getInvoicePdfUrl,
 		getInvoiceHtmlUrl
@@ -37,6 +38,7 @@
 		'Submit'
 	];
 	let sapChecklist = $state<Record<string, boolean>>({});
+	let sapSaving = $state(false);
 	let allSapChecked = $derived(SAP_STEPS.every((_, i) => sapChecklist[String(i)]));
 
 	// ── Derived ───────────────────────────────────────────────────────────────
@@ -90,8 +92,28 @@
 		return `${diff} days until due`;
 	}
 
-	function toggleSapStep(index: number) {
+	async function toggleSapStep(index: number) {
+		if (!invoice) return;
 		sapChecklist = { ...sapChecklist, [String(index)]: !sapChecklist[String(index)] };
+		sapSaving = true;
+		try {
+			await patchInvoice(invoice.id, { sap_checklist_state: sapChecklist });
+		} catch {
+			// silently ignore — local state is still updated, will retry on next toggle
+		} finally {
+			sapSaving = false;
+		}
+	}
+
+	async function markSubmittedInSap() {
+		if (!invoice) return;
+		try {
+			await transitionInvoiceStatus(invoice.id, 'sent');
+			addToast(`Invoice ${invoice.invoice_number} marked as submitted in SAP Ariba`, 'success');
+			await load();
+		} catch (e) {
+			addToast(e instanceof Error ? e.message : 'Failed to update status', 'error');
+		}
 	}
 
 	// ── Load ─────────────────────────────────────────────────────────────────
@@ -103,10 +125,11 @@
 			const [inv, custs] = await Promise.all([fetchInvoice(invoiceId), fetchCustomers()]);
 			invoice = inv;
 			customers = custs;
-			// Init SAP checklist
+			// Init SAP checklist — restore persisted state if available, else all false
+			const saved = inv.sap_checklist_state as Record<string, boolean> | null;
 			sapChecklist = {};
 			SAP_STEPS.forEach((_, i) => {
-				sapChecklist[String(i)] = false;
+				sapChecklist[String(i)] = saved ? (saved[String(i)] ?? false) : false;
 			});
 		} catch (e) {
 			fetchError = e instanceof Error ? e.message : 'Failed to load invoice';
@@ -358,7 +381,12 @@
 		<!-- SAP Ariba instructions panel -->
 		{#if isSapCustomer}
 			<div class="card sap-panel">
-				<h3 class="sap-title">SAP Ariba Submission Instructions</h3>
+				<div class="sap-header">
+					<h3 class="sap-title">SAP Ariba Submission Instructions</h3>
+					{#if sapSaving}
+						<span class="sap-saving">Saving...</span>
+					{/if}
+				</div>
 				<ol class="sap-steps">
 					{#each SAP_STEPS as step, i}
 						<li class="sap-step" class:sap-step-done={sapChecklist[String(i)]}>
@@ -379,7 +407,7 @@
 										{@const lineDesc = invoice.line_items?.[0]?.description ?? ''}
 										Update description ("{lineDesc}")
 									{:else if step.includes('service period')}
-										Update service period ({fmtDate(invoice.service_period_start)} -
+										Update service period ({fmtDate(invoice.service_period_start)} –
 										{fmtDate(invoice.service_period_end)})
 									{:else}
 										{step}
@@ -389,9 +417,18 @@
 						</li>
 					{/each}
 				</ol>
-				{#if allSapChecked}
-					<div class="sap-complete">All steps completed - invoice submitted in SAP Ariba</div>
-				{/if}
+				<div class="sap-footer">
+					<button
+						class="btn btn-primary"
+						disabled={!allSapChecked || invoice.status === 'sent' || invoice.status === 'paid'}
+						onclick={markSubmittedInSap}
+					>
+						Mark as Submitted in SAP
+					</button>
+					{#if invoice.status === 'sent' || invoice.status === 'paid'}
+						<span class="sap-submitted-note">Already submitted</span>
+					{/if}
+				</div>
 			</div>
 		{/if}
 	{/if}
@@ -576,10 +613,22 @@
 		border-color: var(--blue-500);
 	}
 
-	.sap-title {
+	.sap-header {
+		display: flex;
+		align-items: center;
+		gap: 12px;
 		margin-bottom: 12px;
+	}
+
+	.sap-title {
+		margin: 0;
 		font-size: 0.95rem;
 		color: var(--blue-600);
+	}
+
+	.sap-saving {
+		font-size: 0.75rem;
+		color: var(--text-muted);
 	}
 
 	.sap-steps {
@@ -611,13 +660,18 @@
 		flex-shrink: 0;
 	}
 
-	.sap-complete {
-		margin-top: 12px;
-		padding: 10px 14px;
-		background: var(--green-100);
+	.sap-footer {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		margin-top: 16px;
+		padding-top: 12px;
+		border-top: 1px solid var(--border);
+	}
+
+	.sap-submitted-note {
+		font-size: 0.8rem;
 		color: var(--green-700);
-		border-radius: var(--radius-sm);
-		font-size: 0.85rem;
 		font-weight: 600;
 	}
 

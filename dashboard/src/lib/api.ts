@@ -247,3 +247,107 @@ export async function patchCustomer(id: string, data: Record<string, unknown>): 
 		body: JSON.stringify(data)
 	});
 }
+
+// ── Vendor Rules API ─────────────────────────────────────────────────────────
+
+export interface VendorRule {
+	id: string;
+	vendor_pattern: string;
+	entity: string;
+	tax_category: string;
+	tax_subcategory: string | null;
+	direction: string;
+	deductible_pct: number;
+	confidence: number;
+	source: string;
+	examples: number;
+	last_matched: string | null;
+	created_at: string;
+}
+
+export interface VendorRuleWithMatches extends VendorRule {
+	match_count: number;
+	last_matches: Array<{
+		id: string;
+		date: string;
+		description: string;
+		amount: string | null;
+		entity: string | null;
+		tax_category: string | null;
+		status: string;
+	}>;
+}
+
+export interface VendorRuleListResponse {
+	items: VendorRule[];
+	total: number;
+	limit: number;
+	offset: number;
+}
+
+export interface VendorRuleFilters {
+	search?: string;
+	entity?: string;
+	limit?: number;
+	offset?: number;
+}
+
+export interface VendorRuleCreate {
+	vendor_pattern: string;
+	entity: string;
+	tax_category: string;
+	tax_subcategory?: string | null;
+	direction: string;
+	deductible_pct?: number;
+	confidence?: number;
+	source?: string;
+}
+
+export interface VendorRulePatch {
+	vendor_pattern?: string;
+	entity?: string;
+	tax_category?: string;
+	tax_subcategory?: string | null;
+	direction?: string;
+	deductible_pct?: number;
+	confidence?: number;
+}
+
+export async function fetchVendorRules(
+	filters: VendorRuleFilters = {}
+): Promise<VendorRuleListResponse> {
+	const params = new URLSearchParams();
+	for (const [key, val] of Object.entries(filters)) {
+		if (val !== undefined && val !== '') {
+			params.set(key, String(val));
+		}
+	}
+	const qs = params.toString();
+	return request<VendorRuleListResponse>(`/vendor-rules${qs ? `?${qs}` : ''}`);
+}
+
+export async function fetchVendorRule(id: string): Promise<VendorRuleWithMatches> {
+	return request<VendorRuleWithMatches>(`/vendor-rules/${id}`);
+}
+
+export async function createVendorRule(data: VendorRuleCreate): Promise<VendorRule> {
+	return request<VendorRule>('/vendor-rules', {
+		method: 'POST',
+		body: JSON.stringify(data)
+	});
+}
+
+export async function patchVendorRule(id: string, data: VendorRulePatch): Promise<VendorRule> {
+	return request<VendorRule>(`/vendor-rules/${id}`, {
+		method: 'PATCH',
+		body: JSON.stringify(data)
+	});
+}
+
+export async function deleteVendorRule(id: string): Promise<void> {
+	const res = await fetch(`${BASE}/vendor-rules/${id}`, { method: 'DELETE' });
+	if (!res.ok && res.status !== 204) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`API ${res.status}: ${text}`);
+	}
+}

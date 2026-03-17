@@ -565,6 +565,13 @@ class TestGenerateFlatInvoice:
         with pytest.raises(ValueError, match="Invoice already exists"):
             generate_flat_invoice(db, flat_customer, 2026, 3)
 
+    def test_customer_last_invoiced_date_updated(self, db: Session, flat_customer: Customer):
+        generate_flat_invoice(db, flat_customer, 2026, 3)
+        db.commit()
+        db.refresh(flat_customer)
+        # Last business day of March 2026 is March 31
+        assert flat_customer.last_invoiced_date == "2026-03-31"
+
     def test_no_contract_start_ordinal_defaults_to_one(self, db: Session, flat_customer: Customer):
         flat_customer.contract_start_date = None
         db.commit()

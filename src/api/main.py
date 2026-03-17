@@ -24,6 +24,7 @@ from src.api.routes.ingest import router as ingest_router
 from src.api.routes.invoices import router as invoices_router
 from src.api.routes.reconciliation import router as reconciliation_router
 from src.api.routes.transactions import router as transactions_router
+from src.api.routes.vendor_rules import router as vendor_rules_router
 from src.classification.seed_rules import seed_vendor_rules
 from src.db.connection import SessionLocal, init_db
 from src.invoicing.seed_customers import seed_customers
@@ -91,3 +92,4 @@ app.include_router(transactions_router, prefix="/api")
 app.include_router(ingest_router, prefix="/api")
 app.include_router(invoices_router, prefix="/api")
 app.include_router(reconciliation_router, prefix="/api")
+app.include_router(vendor_rules_router, prefix="/api")

@@ -14,6 +14,11 @@ REQ-ID: INV-TEST-009  POST /api/transactions/bulk-confirm confirms + creates rul
 REQ-ID: INV-TEST-010  Duplicate guards on generate-flat and generate-calendar.
 REQ-ID: INV-TEST-011  Status transition audit events are created.
 REQ-ID: INV-TEST-012  paid->void unlinks payment_transaction_id.
+REQ-ID: INV-TEST-013  GET /api/invoices/{id}/payment-suggestions returns candidates.
+REQ-ID: INV-TEST-014  POST /api/invoices/{id}/match-payment links transaction.
+REQ-ID: INV-TEST-015  Partial payment warning.
+REQ-ID: INV-TEST-016  Overpayment warning.
+REQ-ID: INV-TEST-017  GET /api/invoices/outstanding AR aging report.
 """
 
 from __future__ import annotations
@@ -206,6 +211,8 @@ def _make_transaction(
     amount: str = "-50.00",
     direction: str = Direction.EXPENSE.value,
     status: str = TransactionStatus.NEEDS_REVIEW.value,
+    entity: str | None = None,
+    date: str = "2026-03-01",
 ) -> Transaction:
     import hashlib
     tx_id = str(uuid.uuid4())
@@ -216,11 +223,12 @@ def _make_transaction(
         source=Source.GMAIL_N8N.value,
         source_id=source_id,
         source_hash=source_hash,
-        date="2026-03-01",
+        date=date,
         description=description,
         amount=decimal.Decimal(amount),
         currency="USD",
         direction=direction,
+        entity=entity,
         status=status,
         confidence=0.5,
         confirmed_by=ConfirmedBy.AUTO.value,
@@ -757,3 +765,492 @@ class TestICalUpload:
         data = r.json()
         assert "matched_sessions" in data
         assert "unmatched_events" in data
+
+
+# ---------------------------------------------------------------------------
+# Payment matching
+# ---------------------------------------------------------------------------
+
+
+class TestPaymentSuggestions:
+    """INV-TEST-013: GET /api/invoices/{id}/payment-suggestions"""
+
+    def test_suggestions_exact_amount_match(self, client: TestClient, db_session: Session) -> None:
+        """Income transaction with matching amount is returned as a suggestion."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PS001",
+            status=InvoiceStatus.SENT.value,
+            subtotal="33000.00",
+            submitted_date="2026-01-01",
+            due_date="2026-04-01",
+        )
+        tx = _make_transaction(
+            db_session,
+            description="Cardinal Health Payment",
+            amount="33000.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+            date="2026-02-01",
+        )
+
+        r = client.get(f"/api/invoices/{inv.id}/payment-suggestions")
+        assert r.status_code == 200
+        suggestions = r.json()
+        assert len(suggestions) == 1
+        assert suggestions[0]["transaction_id"] == tx.id
+        assert float(suggestions[0]["amount"]) == 33000.0
+
+    def test_suggestions_within_tolerance(self, client: TestClient, db_session: Session) -> None:
+        """Transaction within $0.01 of invoice total is returned."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PS002",
+            status=InvoiceStatus.SENT.value,
+            subtotal="1000.00",
+            submitted_date="2026-01-01",
+            due_date="2026-02-01",
+        )
+        # $0.005 off — within tolerance
+        _make_transaction(
+            db_session,
+            amount="1000.01",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+            date="2026-01-15",
+        )
+
+        r = client.get(f"/api/invoices/{inv.id}/payment-suggestions")
+        assert r.status_code == 200
+        assert len(r.json()) == 1
+
+    def test_suggestions_excludes_expenses(self, client: TestClient, db_session: Session) -> None:
+        """Expense transactions with matching amount are not suggested."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PS003",
+            status=InvoiceStatus.SENT.value,
+            subtotal="500.00",
+            submitted_date="2026-01-01",
+        )
+        _make_transaction(
+            db_session,
+            amount="-500.00",
+            direction=Direction.EXPENSE.value,
+            date="2026-01-15",
+        )
+
+        r = client.get(f"/api/invoices/{inv.id}/payment-suggestions")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_suggestions_excludes_before_submitted_date(self, client: TestClient, db_session: Session) -> None:
+        """Transactions dated before invoice submitted_date are excluded."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PS004",
+            status=InvoiceStatus.SENT.value,
+            subtotal="1000.00",
+            submitted_date="2026-03-01",
+        )
+        _make_transaction(
+            db_session,
+            amount="1000.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+            date="2026-02-01",  # before submitted_date
+        )
+
+        r = client.get(f"/api/invoices/{inv.id}/payment-suggestions")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_suggestions_returns_top_5(self, client: TestClient, db_session: Session) -> None:
+        """At most 5 suggestions are returned."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PS005",
+            status=InvoiceStatus.SENT.value,
+            subtotal="500.00",
+            submitted_date="2026-01-01",
+            due_date="2026-02-01",
+        )
+        for i in range(7):
+            _make_transaction(
+                db_session,
+                amount="500.00",
+                direction=Direction.INCOME.value,
+                entity="sparkry",
+                date=f"2026-01-{i + 10:02d}",
+            )
+
+        r = client.get(f"/api/invoices/{inv.id}/payment-suggestions")
+        assert r.status_code == 200
+        assert len(r.json()) == 5
+
+    def test_suggestions_sorted_by_date_proximity_to_due(self, client: TestClient, db_session: Session) -> None:
+        """Suggestions are sorted by proximity to due_date (closest first)."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PS006",
+            status=InvoiceStatus.SENT.value,
+            subtotal="1000.00",
+            submitted_date="2026-01-01",
+            due_date="2026-02-15",  # due Feb 15
+        )
+        # tx_close is 1 day from due; tx_far is 30 days from due
+        tx_close = _make_transaction(
+            db_session,
+            description="Close to due",
+            amount="1000.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+            date="2026-02-14",  # 1 day before due
+        )
+        _make_transaction(
+            db_session,
+            description="Far from due",
+            amount="1000.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+            date="2026-01-05",  # 41 days before due
+        )
+
+        r = client.get(f"/api/invoices/{inv.id}/payment-suggestions")
+        assert r.status_code == 200
+        suggestions = r.json()
+        assert len(suggestions) == 2
+        assert suggestions[0]["transaction_id"] == tx_close.id
+
+    def test_suggestions_invoice_not_found(self, client: TestClient) -> None:
+        r = client.get(f"/api/invoices/{uuid.uuid4()}/payment-suggestions")
+        assert r.status_code == 404
+
+
+class TestMatchPayment:
+    """INV-TEST-014: POST /api/invoices/{id}/match-payment"""
+
+    def test_successful_full_payment(self, client: TestClient, db_session: Session) -> None:
+        """Exact-amount match marks invoice paid and links the transaction."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="MP001",
+            status=InvoiceStatus.SENT.value,
+            subtotal="33000.00",
+        )
+        tx = _make_transaction(
+            db_session,
+            amount="33000.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["invoice"]["status"] == "paid"
+        assert data["invoice"]["payment_transaction_id"] == tx.id
+        assert data["invoice"]["paid_date"] is not None
+        assert data["warning"] is None
+
+    def test_match_payment_creates_audit_event(self, client: TestClient, db_session: Session) -> None:
+        """Payment match creates AuditEvent for status transition."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="MP002",
+            status=InvoiceStatus.SENT.value,
+            subtotal="1000.00",
+        )
+        tx = _make_transaction(
+            db_session,
+            amount="1000.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+        )
+        inv_id = inv.id
+
+        client.post(f"/api/invoices/{inv_id}/match-payment", json={"transaction_id": tx.id})
+
+        verify = _TestSession()
+        try:
+            events = verify.query(AuditEvent).filter(
+                AuditEvent.transaction_id == inv_id,
+                AuditEvent.field_changed == "status",
+            ).all()
+            assert len(events) == 1
+            assert events[0].new_value == "paid"
+        finally:
+            verify.close()
+
+    def test_invoice_not_found(self, client: TestClient, db_session: Session) -> None:
+        tx = _make_transaction(db_session, amount="100.00", direction=Direction.INCOME.value)
+        r = client.post(
+            f"/api/invoices/{uuid.uuid4()}/match-payment",
+            json={"transaction_id": tx.id},
+        )
+        assert r.status_code == 404
+
+    def test_transaction_not_found(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="MP003",
+            status=InvoiceStatus.SENT.value,
+        )
+        r = client.post(
+            f"/api/invoices/{inv.id}/match-payment",
+            json={"transaction_id": str(uuid.uuid4())},
+        )
+        assert r.status_code == 404
+
+
+class TestPartialPayment:
+    """INV-TEST-015: Partial payment warning."""
+
+    def test_partial_payment_warning(self, client: TestClient, db_session: Session) -> None:
+        """When transaction amount < invoice total, invoice stays sent and warning is returned."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PP001",
+            status=InvoiceStatus.SENT.value,
+            subtotal="1000.00",
+        )
+        tx = _make_transaction(
+            db_session,
+            amount="500.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["invoice"]["status"] == "sent"  # not marked paid
+        assert data["warning"] is not None
+        assert "Partial payment" in data["warning"]
+        assert "500.00" in data["warning"]
+        assert "1,000.00" in data["warning"]
+
+    def test_partial_payment_links_transaction(self, client: TestClient, db_session: Session) -> None:
+        """Partial payment still links the transaction ID for tracking."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="PP002",
+            status=InvoiceStatus.SENT.value,
+            subtotal="2000.00",
+        )
+        tx = _make_transaction(
+            db_session,
+            amount="1500.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 200
+        assert r.json()["invoice"]["payment_transaction_id"] == tx.id
+
+
+class TestOverpayment:
+    """INV-TEST-016: Overpayment warning."""
+
+    def test_overpayment_marks_paid_with_warning(self, client: TestClient, db_session: Session) -> None:
+        """When transaction amount > invoice total, invoice is marked paid with overpayment warning."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="OP001",
+            status=InvoiceStatus.SENT.value,
+            subtotal="1000.00",
+        )
+        tx = _make_transaction(
+            db_session,
+            amount="1100.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["invoice"]["status"] == "paid"
+        assert data["warning"] is not None
+        assert "Overpayment" in data["warning"]
+        assert "1,100.00" in data["warning"]
+        assert "1,000.00" in data["warning"]
+
+    def test_overpayment_links_transaction(self, client: TestClient, db_session: Session) -> None:
+        """Overpayment links the transaction and sets paid_date."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="OP002",
+            status=InvoiceStatus.SENT.value,
+            subtotal="500.00",
+        )
+        tx = _make_transaction(
+            db_session,
+            amount="600.00",
+            direction=Direction.INCOME.value,
+            entity="sparkry",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 200
+        data = r.json()
+        assert data["invoice"]["payment_transaction_id"] == tx.id
+        assert data["invoice"]["paid_date"] is not None
+
+
+# ---------------------------------------------------------------------------
+# AR Aging Report
+# ---------------------------------------------------------------------------
+
+
+class TestARAgingReport:
+    """INV-TEST-017: GET /api/invoices/outstanding"""
+
+    def test_outstanding_empty(self, client: TestClient) -> None:
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_outstanding_includes_sent_invoices(self, client: TestClient, db_session: Session) -> None:
+        """Sent invoices appear in the outstanding report."""
+        cust = _make_customer(db_session)
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="AR001",
+            status=InvoiceStatus.SENT.value,
+            submitted_date="2026-01-01",
+            due_date="2026-04-01",
+        )
+
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 1
+        assert items[0]["invoice_number"] == "AR001"
+
+    def test_outstanding_excludes_paid_and_draft(self, client: TestClient, db_session: Session) -> None:
+        """Paid, draft, and void invoices are excluded from the outstanding report."""
+        cust = _make_customer(db_session)
+        _make_invoice(db_session, cust.id, invoice_number="PAID01", status=InvoiceStatus.PAID.value)
+        _make_invoice(db_session, cust.id, invoice_number="DRFT01", status=InvoiceStatus.DRAFT.value)
+        _make_invoice(db_session, cust.id, invoice_number="VOID01", status=InvoiceStatus.VOID.value)
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="SENT01",
+            status=InvoiceStatus.SENT.value,
+            submitted_date="2026-01-01",
+        )
+
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 1
+        assert items[0]["invoice_number"] == "SENT01"
+
+    def test_outstanding_fields(self, client: TestClient, db_session: Session) -> None:
+        """Each item includes required AR aging fields."""
+        cust = _make_customer(db_session, name="Cardinal Health")
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="CH001",
+            status=InvoiceStatus.SENT.value,
+            subtotal="33000.00",
+            submitted_date="2026-01-01",
+            due_date="2026-04-01",
+        )
+
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        item = r.json()[0]
+
+        assert item["invoice_number"] == "CH001"
+        assert item["customer_name"] == "Cardinal Health"
+        assert float(item["total"]) == 33000.0
+        assert item["submitted_date"] == "2026-01-01"
+        assert item["due_date"] == "2026-04-01"
+        assert isinstance(item["days_outstanding"], int)
+        assert item["days_outstanding"] >= 0
+        assert item["expected_payment_date"] == "2026-04-01"
+        assert "is_overdue" in item
+
+    def test_outstanding_is_overdue_flag(self, client: TestClient, db_session: Session) -> None:
+        """is_overdue is True when today is past due_date."""
+        cust = _make_customer(db_session)
+        # Past due
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="OVER01",
+            status=InvoiceStatus.SENT.value,
+            submitted_date="2025-01-01",
+            due_date="2025-06-01",  # well in the past
+        )
+        # Not yet due
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="CURR01",
+            status=InvoiceStatus.SENT.value,
+            submitted_date="2026-03-01",
+            due_date="2027-01-01",  # future
+        )
+
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        items = {i["invoice_number"]: i for i in r.json()}
+        assert items["OVER01"]["is_overdue"] is True
+        assert items["CURR01"]["is_overdue"] is False
+
+    def test_outstanding_sorted_oldest_first(self, client: TestClient, db_session: Session) -> None:
+        """Results are sorted by days_outstanding descending (oldest first)."""
+        cust = _make_customer(db_session)
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="NEW01",
+            status=InvoiceStatus.SENT.value,
+            submitted_date="2026-03-10",  # recent
+        )
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="OLD01",
+            status=InvoiceStatus.SENT.value,
+            submitted_date="2025-01-01",  # old
+        )
+
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 2
+        # Oldest (most days outstanding) should be first
+        assert items[0]["invoice_number"] == "OLD01"
+        assert items[1]["invoice_number"] == "NEW01"
+
+    def test_outstanding_includes_overdue_status(self, client: TestClient, db_session: Session) -> None:
+        """Invoices stored with 'overdue' status appear in the outstanding report."""
+        cust = _make_customer(db_session)
+        _make_invoice(
+            db_session, cust.id,
+            invoice_number="OVD01",
+            status=InvoiceStatus.OVERDUE.value,
+            submitted_date="2025-06-01",
+            due_date="2025-09-01",
+        )
+
+        r = client.get("/api/invoices/outstanding")
+        assert r.status_code == 200
+        items = r.json()
+        assert len(items) == 1
+        assert items[0]["invoice_number"] == "OVD01"
+        assert items[0]["is_overdue"] is True

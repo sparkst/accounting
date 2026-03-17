@@ -351,3 +351,69 @@ export async function deleteVendorRule(id: string): Promise<void> {
 		throw new Error(`API ${res.status}: ${text}`);
 	}
 }
+
+// ── Tax Summary & Export API ──────────────────────────────────────────────────
+
+export interface TaxLineItem {
+	tax_category: string;
+	irs_line: string;
+	total: number;
+	is_income: boolean;
+	is_reimbursable: boolean;
+}
+
+export interface TaxReadiness {
+	total_count: number;
+	confirmed_count: number;
+	unconfirmed_count: number;
+	readiness_pct: number;
+	unconfirmed_ids: string[];
+}
+
+export interface TaxWarning {
+	warning: string;
+	unconfirmed_count: number;
+	unconfirmed_ids: string[];
+}
+
+export interface TaxSummary {
+	entity: string;
+	year: number;
+	line_items: TaxLineItem[];
+	gross_income: number;
+	total_expenses: number;
+	net_profit: number;
+	readiness: TaxReadiness;
+	warnings: TaxWarning[];
+}
+
+export async function fetchTaxSummary(entity: string, year: number): Promise<TaxSummary> {
+	return request<TaxSummary>(`/tax-summary?entity=${encodeURIComponent(entity)}&year=${year}`);
+}
+
+/**
+ * Trigger a file download from one of the export endpoints.
+ * Fetches the response as a blob and programmatically triggers a browser download.
+ */
+export async function downloadExport(
+	endpoint: 'freetaxusa' | 'taxact' | 'bno',
+	entity: string,
+	year: number,
+	filename: string
+): Promise<void> {
+	const url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
+	const res = await fetch(url);
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Export failed (${res.status}): ${text}`);
+	}
+	const blob = await res.blob();
+	const objectUrl = URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	a.href = objectUrl;
+	a.download = filename;
+	document.body.appendChild(a);
+	a.click();
+	document.body.removeChild(a);
+	URL.revokeObjectURL(objectUrl);
+}

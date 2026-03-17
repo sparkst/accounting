@@ -18,6 +18,7 @@ POST  /api/transactions/bulk-confirm    — Bulk confirm transactions.
 from __future__ import annotations
 
 import calendar
+import contextlib
 import decimal
 import logging
 import uuid
@@ -325,6 +326,35 @@ class BulkConfirmResponse(BaseModel):
     rules_created: int
 
 
+class PaymentSuggestion(BaseModel):
+    transaction_id: str
+    date: str
+    description: str
+    amount: str
+    days_from_due: int
+
+
+class MatchPaymentRequest(BaseModel):
+    transaction_id: str
+
+
+class MatchPaymentResponse(BaseModel):
+    invoice: InvoiceOut
+    warning: str | None = None
+
+
+class ARAgingItem(BaseModel):
+    id: str
+    invoice_number: str
+    customer_name: str
+    total: str
+    submitted_date: str | None
+    due_date: str | None
+    days_outstanding: int
+    expected_payment_date: str | None
+    is_overdue: bool
+
+
 # ---------------------------------------------------------------------------
 # Invoice CRUD routes
 # ---------------------------------------------------------------------------
@@ -392,6 +422,63 @@ def list_invoices(
         items.append(InvoiceOut.model_validate(data))
 
     return InvoiceListResponse(items=items, total=total)
+
+
+@router.get("/invoices/outstanding", response_model=list[ARAgingItem])
+def get_outstanding_invoices(
+    session: Session = Depends(get_db),  # noqa: B008
+) -> list[ARAgingItem]:
+    """Return all unpaid invoices (sent + overdue) for AR aging report.
+
+    Each item includes days_outstanding (since submitted_date), expected_payment_date,
+    and is_overdue flag. Sorted by days_outstanding descending (oldest first).
+    """
+    invoices = (
+        session.query(Invoice)
+        .filter(Invoice.status.in_([InvoiceStatus.SENT.value, InvoiceStatus.OVERDUE.value]))
+        .all()
+    )
+
+    today = date.today()
+    items: list[ARAgingItem] = []
+
+    for inv in invoices:
+        customer: Customer | None = session.get(Customer, inv.customer_id)
+        customer_name = customer.name if customer else "Unknown"
+
+        days_outstanding = 0
+        if inv.submitted_date:
+            try:
+                submitted = date.fromisoformat(inv.submitted_date)
+                days_outstanding = (today - submitted).days
+            except ValueError:
+                pass
+
+        is_overdue = False
+        if inv.due_date:
+            try:
+                due = date.fromisoformat(inv.due_date)
+                is_overdue = today > due
+            except ValueError:
+                pass
+        # Also flag invoices stored with overdue status
+        if inv.status == InvoiceStatus.OVERDUE.value:
+            is_overdue = True
+
+        items.append(ARAgingItem(
+            id=inv.id,
+            invoice_number=inv.invoice_number,
+            customer_name=customer_name,
+            total=str(inv.total),
+            submitted_date=inv.submitted_date,
+            due_date=inv.due_date,
+            days_outstanding=days_outstanding,
+            expected_payment_date=inv.due_date,
+            is_overdue=is_overdue,
+        ))
+
+    items.sort(key=lambda x: x.days_outstanding, reverse=True)
+    return items
 
 
 @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
@@ -785,6 +872,153 @@ def get_invoice_html(
     from src.invoicing.pdf_renderer import render_html
     html = render_html(inv, line_items, customer)
     return HTMLResponse(content=html)
+
+
+# ---------------------------------------------------------------------------
+# Payment matching
+# ---------------------------------------------------------------------------
+
+
+@router.get("/invoices/{invoice_id}/payment-suggestions", response_model=list[PaymentSuggestion])
+def get_payment_suggestions(
+    invoice_id: str,
+    session: Session = Depends(get_db),  # noqa: B008
+) -> list[PaymentSuggestion]:
+    """Return up to 5 income transactions that are candidates to match this invoice.
+
+    Matching criteria:
+    - direction = 'income'
+    - entity matches the invoice entity
+    - date >= invoice submitted_date
+    - amount within $0.01 of invoice total
+    Sorted by proximity to invoice due_date (closest first).
+    """
+    inv: Invoice | None = session.get(Invoice, invoice_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    if inv.total is None:
+        return []
+
+    invoice_total = decimal.Decimal(str(inv.total))
+    tolerance = decimal.Decimal("0.01")
+
+    query = (
+        session.query(Transaction)
+        .filter(Transaction.direction == "income")
+    )
+
+    if inv.entity:
+        query = query.filter(Transaction.entity == inv.entity)
+
+    if inv.submitted_date:
+        query = query.filter(Transaction.date >= inv.submitted_date)
+
+    candidates = query.all()
+
+    # Filter by amount within tolerance
+    matches = []
+    for tx in candidates:
+        if tx.amount is None:
+            continue
+        tx_amount = decimal.Decimal(str(tx.amount))
+        if abs(tx_amount - invoice_total) <= tolerance:
+            matches.append(tx)
+
+    # Sort by proximity to due_date
+    due_date_obj: date | None = None
+    if inv.due_date:
+        with contextlib.suppress(ValueError):
+            due_date_obj = date.fromisoformat(inv.due_date)
+
+    def _days_from_due(tx: Transaction) -> int:
+        if due_date_obj is None:
+            return 0
+        try:
+            tx_date = date.fromisoformat(tx.date)
+            return abs((tx_date - due_date_obj).days)
+        except ValueError:
+            return 999999
+
+    matches.sort(key=_days_from_due)
+
+    return [
+        PaymentSuggestion(
+            transaction_id=tx.id,
+            date=tx.date,
+            description=tx.description,
+            amount=str(tx.amount),
+            days_from_due=_days_from_due(tx),
+        )
+        for tx in matches[:5]
+    ]
+
+
+@router.post("/invoices/{invoice_id}/match-payment", response_model=MatchPaymentResponse)
+def match_payment(
+    invoice_id: str,
+    body: MatchPaymentRequest,
+    session: Session = Depends(get_db),  # noqa: B008
+) -> MatchPaymentResponse:
+    """Link an income transaction to an invoice as payment.
+
+    - Sets payment_transaction_id and paid_date on the invoice.
+    - If transaction amount == invoice total (within $0.01): transitions to 'paid'.
+    - If transaction amount < invoice total: invoice stays 'sent', returns partial warning.
+    - If transaction amount > invoice total: marks paid, returns overpayment warning.
+    - Creates AuditEvent for the match.
+    """
+    inv: Invoice | None = session.get(Invoice, invoice_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    tx: Transaction | None = session.get(Transaction, body.transaction_id)
+    if tx is None:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    invoice_total = decimal.Decimal(str(inv.total))
+    tx_amount = decimal.Decimal(str(tx.amount)) if tx.amount is not None else decimal.Decimal("0.00")
+    tolerance = decimal.Decimal("0.01")
+
+    warning: str | None = None
+
+    if tx_amount < invoice_total - tolerance:
+        # Partial payment — do not mark paid
+        warning = f"Partial payment: ${tx_amount:,.2f} of ${invoice_total:,.2f}"
+        inv.payment_transaction_id = tx.id
+        inv.updated_at = _now()
+        _create_invoice_audit_event(
+            session, invoice_id,
+            "payment_transaction_id", inv.payment_transaction_id, tx.id,
+        )
+    else:
+        # Full payment or overpayment
+        if tx_amount > invoice_total + tolerance:
+            warning = f"Overpayment: received ${tx_amount:,.2f} for ${invoice_total:,.2f} invoice"
+
+        old_status = inv.status
+        inv.status = InvoiceStatus.PAID.value
+        inv.paid_date = date.today().isoformat()
+        inv.payment_transaction_id = tx.id
+        inv.updated_at = _now()
+
+        _create_invoice_audit_event(
+            session, invoice_id,
+            "payment_transaction_id", None, tx.id,
+        )
+        _create_invoice_audit_event(
+            session, invoice_id,
+            "status", old_status, InvoiceStatus.PAID.value,
+        )
+
+    session.commit()
+    session.refresh(inv)
+
+    data = _enrich_with_aging(inv)
+    return MatchPaymentResponse(
+        invoice=InvoiceOut.model_validate(data),
+        warning=warning,
+    )
 
 
 # ---------------------------------------------------------------------------

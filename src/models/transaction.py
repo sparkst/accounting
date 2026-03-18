@@ -84,6 +84,32 @@ class Transaction(Base):
         server_default="USD",
     )
 
+    # ── Foreign currency tracking ────────────────────────────────────────────
+    currency_code: Mapped[str | None] = mapped_column(
+        String(3),
+        nullable=True,
+        default=None,
+        comment="ISO 4217 code (GBP, EUR, etc.) when original amount is non-USD. None means USD.",
+    )
+    amount_foreign: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=None,
+        comment="Original amount in foreign currency (always positive, sign on amount field)",
+    )
+    exchange_rate: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=None,
+        comment="Exchange rate used: foreign_amount * rate = USD amount",
+    )
+    exchange_rate_source: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=None,
+        comment="frankfurter_api | credit_card_statement | manual",
+    )
+
     # ── Classification ──────────────────────────────────────────────────────────
     entity: Mapped[str | None] = mapped_column(
         String(16),

@@ -366,6 +366,8 @@ export interface TaxReadiness {
 	total_count: number;
 	confirmed_count: number;
 	unconfirmed_count: number;
+	needs_review_count: number;
+	auto_classified_count: number;
 	readiness_pct: number;
 	unconfirmed_ids: string[];
 }

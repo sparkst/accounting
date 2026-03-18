@@ -57,6 +57,8 @@ def _make_txn(
     payment_method: str | None = None,
     status: str = TransactionStatus.CONFIRMED,
     notes: str | None = None,
+    description: str | None = None,
+    direction: str | None = None,
 ) -> Transaction:
     """Insert and return a Transaction."""
     txn_id = str(uuid.uuid4())
@@ -64,13 +66,25 @@ def _make_txn(
     payload = f"{len(source)}:{source}:{source_id}"
     source_hash = hashlib.sha256(payload.encode()).hexdigest()
 
+    # Default description and direction based on source
+    if description is None:
+        if source in (Source.STRIPE, Source.SHOPIFY):
+            description = "PAYOUT transfer"
+        else:
+            description = "Test transaction"
+    if direction is None:
+        if source == Source.BANK_CSV:
+            direction = "income"
+        elif source in (Source.STRIPE, Source.SHOPIFY):
+            direction = "transfer"
+
     txn = Transaction(
         id=txn_id,
         source=source,
         source_id=source_id,
         source_hash=source_hash,
         date=date,
-        description="Test transaction",
+        description=description,
         amount=amount,
         currency="USD",
         status=status,
@@ -78,6 +92,7 @@ def _make_txn(
         raw_data={},
         payment_method=payment_method,
         notes=notes,
+        direction=direction,
     )
     session.add(txn)
     session.commit()

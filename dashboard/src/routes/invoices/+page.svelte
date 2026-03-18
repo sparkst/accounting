@@ -9,7 +9,8 @@
 		generateFlatInvoice,
 		transitionInvoiceStatus,
 		getInvoicePdfUrl,
-		getInvoiceHtmlUrl
+		getInvoiceHtmlUrl,
+		patchInvoice
 	} from '$lib/api';
 	import Toast from '$lib/components/Toast.svelte';
 
@@ -92,11 +93,19 @@
 		return customers.find(c => c.id === id);
 	}
 
-	function nextMonth(): string {
+	function nextMonth(customer?: Customer): string {
+		// If customer has a last_invoiced_date, compute the next month after it.
+		if (customer?.last_invoiced_date) {
+			const last = new Date(customer.last_invoiced_date + 'T00:00:00');
+			const nextM = last.getMonth() + 1; // 0-based, +1 = next month
+			if (nextM > 11) {
+				return `${last.getFullYear() + 1}-01`;
+			}
+			return `${last.getFullYear()}-${String(nextM + 1).padStart(2, '0')}`;
+		}
+		// Default: current month (invoicing for the period that just ended)
 		const now = new Date();
-		const y = now.getMonth() === 11 ? now.getFullYear() + 1 : now.getFullYear();
-		const m = now.getMonth() === 11 ? 1 : now.getMonth() + 2;
-		return `${y}-${String(m).padStart(2, '0')}`;
+		return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 	}
 
 	function dueLabel(inv: Invoice): string {
@@ -141,6 +150,7 @@
 		expandLoading = true;
 		try {
 			expandedInvoice = await fetchInvoice(inv.id);
+			initSapChecklist(expandedInvoice);
 		} catch (e) {
 			addToast('Failed to load invoice detail', 'error');
 			expandedId = null;
@@ -153,7 +163,7 @@
 	async function handleGenerateFlat(customer: Customer) {
 		generatingFlat = customer.id;
 		try {
-			const month = nextMonth();
+			const month = nextMonth(customer);
 			const inv = await generateFlatInvoice(customer.id, month);
 			addToast(`Generated invoice ${inv.invoice_number}`, 'success');
 			await load();
@@ -223,13 +233,24 @@
 
 	let sapChecklist = $state<Record<string, boolean>>({});
 
-	function initSapChecklist() {
+	function initSapChecklist(inv?: Invoice | null) {
+		const saved = inv?.sap_checklist_state as Record<string, boolean> | null;
 		sapChecklist = {};
-		SAP_STEPS.forEach((_, i) => { sapChecklist[String(i)] = false; });
+		SAP_STEPS.forEach((_, i) => {
+			sapChecklist[String(i)] = saved ? (saved[String(i)] ?? false) : false;
+		});
 	}
 
-	function toggleSapStep(index: number) {
+	async function toggleSapStep(index: number) {
 		sapChecklist = { ...sapChecklist, [String(index)]: !sapChecklist[String(index)] };
+		// Persist to backend
+		if (expandedInvoice) {
+			try {
+				await patchInvoice(expandedInvoice.id, { sap_checklist_state: sapChecklist });
+			} catch {
+				// silently ignore — local state is still updated
+			}
+		}
 	}
 
 	let allSapChecked = $derived(
@@ -570,7 +591,7 @@
 										<span class="spinner" aria-hidden="true"></span>
 										Generating...
 									{:else}
-										Generate {nextMonth()}
+										Generate {nextMonth(customer)}
 									{/if}
 								</button>
 							{:else}

@@ -260,3 +260,66 @@ def generate_bno_export(
 
     filename = f"bno_{entity_lower}_{year}.csv"
     return content, filename
+
+
+# ---------------------------------------------------------------------------
+# WA DOR Data Upload format
+# ---------------------------------------------------------------------------
+
+# Account IDs (dashes removed for upload)
+DOR_ACCOUNT_IDS: dict[str, str] = {
+    "sparkry": "605965107",
+    "blackline": "605922410",
+}
+
+# B&O line codes per entity classification
+# Line 7 = Service and Other Activities
+# Line 2 = Retailing
+DOR_LINE_CODES: dict[str, int] = {
+    "ServiceOther": 7,
+    "Retailing": 2,
+}
+
+
+def generate_dor_upload(
+    transactions: list[dict[str, Any]],
+    entity: str,
+    year: int,
+    month: int,
+) -> tuple[str, str]:
+    """Generate WA DOR My DOR Data Upload file for a single filing period.
+
+    Format follows the official My DOR Data Upload Instructions:
+    - ACCOUNT tag: TRA, Period (MMYYYY), Preparer, Email, Phone
+    - TAX tag: Line Code, Location Code (0 for state), Amount
+
+    Returns (file_content, filename).
+    """
+    entity_lower = entity.lower()
+    account_id = DOR_ACCOUNT_IDS.get(entity_lower, "000000000")
+    period = f"{month:02d}{year}"
+
+    lines: list[str] = []
+
+    # ACCOUNT line
+    lines.append(
+        f"ACCOUNT,{account_id},{period},"
+        f"Travis Sparks,travis@sparkry.com,919-491-3894"
+    )
+
+    # Aggregate income for the specified month
+    monthly = _aggregate_income_by_month(transactions, year)
+    month_data = monthly.get(month, {})
+
+    if month_data:
+        for bo_code, amount in sorted(month_data.items()):
+            line_code = DOR_LINE_CODES.get(bo_code, 7)
+            lines.append(f"TAX,{line_code},0,{amount:.2f}")
+    else:
+        # Even if zero, include a TAX line so the file is valid
+        default_line = 7 if entity_lower == "sparkry" else 2
+        lines.append(f"TAX,{default_line},0,0.00")
+
+    content = "\n".join(lines) + "\n"
+    filename = f"dor_upload_{entity_lower}_{year}_{month:02d}.csv"
+    return content, filename

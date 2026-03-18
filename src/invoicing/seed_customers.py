@@ -249,7 +249,7 @@ def seed_customers(session: Session) -> dict[str, int]:
         service_period_end="2026-01-30",
         submitted_date="2026-02-05",
         status=InvoiceStatus.PAID,
-        paid_date="2026-05-06",  # 90 days after submission
+        paid_date="2026-02-28",  # Paid within Net 90 terms
         line_description="AI Product Engineering Coaching Month 1",
     ):
         invoices_inserted += 1

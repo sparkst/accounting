@@ -23,6 +23,7 @@ from decimal import Decimal
 from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
+from src.models.audit_event import AuditEvent
 from src.models.enums import Source, TransactionStatus
 from src.models.transaction import Transaction
 
@@ -110,24 +111,38 @@ def _confidence_score(date_diff: int, card_match: bool, date_window: int) -> flo
 
 
 def _load_payouts(session: Session) -> list[Transaction]:
-    """Load all non-rejected income transactions from payout sources."""
+    """Load payout transactions from Stripe/Shopify sources.
+
+    Only includes actual payout/transfer transactions, not individual charges.
+    Filters to transactions whose description contains 'PAYOUT' (case-insensitive)
+    or whose direction is 'transfer'.
+    """
+    from sqlalchemy import func as sa_func
+
     stmt = select(Transaction).where(
         and_(
             Transaction.source.in_(list(PAYOUT_SOURCES)),
             Transaction.status != TransactionStatus.REJECTED,
             Transaction.amount.is_not(None),
+            sa_func.upper(Transaction.description).contains("PAYOUT")
+            | (Transaction.direction == "transfer"),
         )
     )
     return list(session.scalars(stmt).all())
 
 
 def _load_bank_deposits(session: Session) -> list[Transaction]:
-    """Load all non-rejected income transactions from bank sources."""
+    """Load bank deposit (income) transactions from bank sources.
+
+    Only includes transactions with direction=income (actual deposits),
+    excluding credit card charges (direction=expense).
+    """
     stmt = select(Transaction).where(
         and_(
             Transaction.source.in_(list(BANK_SOURCES)),
             Transaction.status != TransactionStatus.REJECTED,
             Transaction.amount.is_not(None),
+            Transaction.direction == "income",
         )
     )
     return list(session.scalars(stmt).all())
@@ -351,5 +366,67 @@ def apply_manual_match(
     txn_a.notes = f"{RECON_LINK_NOTE_PREFIX}{txn_b.id}"
     txn_b.notes = f"{RECON_LINK_NOTE_PREFIX}{txn_a.id}"
 
+    # If the original transaction has foreign currency and the match is a
+    # CC statement, update the USD amount to the actual amount charged.
+    _update_foreign_currency_from_statement(session, txn_a, txn_b)
+
     session.flush()
     return txn_a, txn_b
+
+
+def _update_foreign_currency_from_statement(
+    session: Session,
+    txn_a: Transaction,
+    txn_b: Transaction,
+) -> None:
+    """When a CC statement is matched to a foreign-currency transaction,
+    update the original with the actual USD amount charged.
+
+    The CC statement amount is the real USD amount on the credit card bill.
+    We update the foreign-currency transaction's amount, exchange_rate, and
+    exchange_rate_source, and log an AuditEvent.
+    """
+    # Determine which is the foreign-currency txn and which is the statement
+    foreign_txn: Transaction | None = None
+    statement_txn: Transaction | None = None
+
+    if getattr(txn_a, "currency_code", None) and txn_b.amount is not None:
+        foreign_txn = txn_a
+        statement_txn = txn_b
+    elif getattr(txn_b, "currency_code", None) and txn_a.amount is not None:
+        foreign_txn = txn_b
+        statement_txn = txn_a
+    else:
+        return  # Neither has foreign currency — nothing to do
+
+    if foreign_txn.amount_foreign is None or foreign_txn.amount_foreign == 0:
+        return
+
+    old_amount = str(foreign_txn.amount)
+    old_rate = str(foreign_txn.exchange_rate)
+    old_source = str(foreign_txn.exchange_rate_source)
+
+    # Update to actual CC statement amount
+    statement_amount = abs(Decimal(str(statement_txn.amount)))
+    foreign_txn.amount = -statement_amount  # expenses are negative
+    foreign_txn.exchange_rate = float(statement_amount) / foreign_txn.amount_foreign
+    foreign_txn.exchange_rate_source = "credit_card_statement"
+
+    # Log audit events
+    for field, old_val, new_val in [
+        ("amount", old_amount, str(foreign_txn.amount)),
+        ("exchange_rate", old_rate, str(foreign_txn.exchange_rate)),
+        ("exchange_rate_source", old_source, "credit_card_statement"),
+    ]:
+        session.add(AuditEvent(
+            transaction_id=foreign_txn.id,
+            field_changed=field,
+            old_value=old_val,
+            new_value=new_val,
+            changed_by="auto",
+        ))
+
+    logger.info(
+        "Updated foreign currency txn %s: amount %s → %s (CC statement rate: %.4f)",
+        foreign_txn.id[:8], old_amount, foreign_txn.amount, foreign_txn.exchange_rate,
+    )

@@ -64,6 +64,10 @@ class TaxCategory(enum.StrEnum):
     INVESTMENT_INCOME = "INVESTMENT_INCOME"
     PERSONAL_NON_DEDUCTIBLE = "PERSONAL_NON_DEDUCTIBLE"
 
+    # ── Equity / Other ─────────────────────────────────────────────────────
+    CAPITAL_CONTRIBUTION = "CAPITAL_CONTRIBUTION"
+    OTHER_EXPENSE = "OTHER_EXPENSE"
+
 
 class TaxSubcategory(enum.StrEnum):
     """Fine-grained subcategories used in split line items and vendor rules."""

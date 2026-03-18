@@ -17,6 +17,7 @@
 	let search = $state('');
 	let entityFilter = $state('');
 	let statusFilter = $state('');
+	let showRejected = $state(false);
 	let dateFrom = $state('');
 	let dateTo = $state('');
 
@@ -50,12 +51,21 @@
 	let runningTotals: number[] = $derived(
 		items.reduce((acc: number[], tx: Transaction, i: number) => {
 			const prev = i > 0 ? acc[i - 1] : 0;
-			acc.push(prev + (tx.amount || 0));
+			acc.push(prev + (parseFloat(String(tx.amount)) || 0));
 			return acc;
 		}, [])
 	);
 
-	onMount(() => load());
+	onMount(() => {
+		// Read URL search params to pre-populate filters
+		const params = new URLSearchParams(window.location.search);
+		if (params.get('entity')) entityFilter = params.get('entity')!;
+		if (params.get('status')) statusFilter = params.get('status')!;
+		if (params.get('dateFrom')) dateFrom = params.get('dateFrom')!;
+		if (params.get('dateTo')) dateTo = params.get('dateTo')!;
+		if (params.get('search')) search = params.get('search')!;
+		load();
+	});
 
 	async function load() {
 		loading = true;
@@ -69,7 +79,11 @@
 			};
 			if (search)       filters.search    = search;
 			if (entityFilter) filters.entity    = entityFilter;
-			if (statusFilter) filters.status    = statusFilter;
+			if (statusFilter) {
+				filters.status = statusFilter;
+			} else if (!showRejected) {
+				filters.status = 'needs_review,auto_classified,confirmed,split_parent';
+			}
 			if (dateFrom)     filters.date_from = dateFrom;
 			if (dateTo)       filters.date_to   = dateTo;
 
@@ -108,12 +122,17 @@
 		}).format(new Date(iso));
 	}
 
-	function formatCurrency(amount: number): string {
+	function parseAmount(v: unknown): number {
+		return parseFloat(String(v)) || 0;
+	}
+
+	function formatCurrency(amount: number | string): string {
+		const n = typeof amount === 'string' ? parseFloat(amount) || 0 : amount;
 		return new Intl.NumberFormat('en-US', {
 			style: 'currency',
 			currency: 'USD',
 			minimumFractionDigits: 2
-		}).format(amount);
+		}).format(n);
 	}
 
 	function entityLabel(e: string | null): string {
@@ -353,6 +372,8 @@
 		{ value: 'MORTGAGE_INTEREST', label: 'Mortgage Interest' },
 		{ value: 'INVESTMENT_INCOME', label: 'Investment Income' },
 		{ value: 'PERSONAL_NON_DEDUCTIBLE', label: 'Personal (Non-deductible)' },
+		{ value: 'CAPITAL_CONTRIBUTION', label: 'Capital Contribution' },
+		{ value: 'OTHER_EXPENSE', label: 'Other Expense (L27a)' },
 	];
 </script>
 
@@ -449,6 +470,11 @@
 			aria-label="End date"
 			class="filter-date-input"
 		/>
+
+		<label class="toggle-label">
+			<input type="checkbox" bind:checked={showRejected} onchange={applyFilters} />
+			Show rejected
+		</label>
 
 		{#if search || entityFilter || statusFilter || dateFrom || dateTo}
 			<button class="btn btn-ghost" onclick={clearFilters}>Clear</button>
@@ -585,8 +611,8 @@
 									<!-- Amount — inline editable -->
 									<td
 										class="col-amount col-editable"
-										class:amount-positive={tx.amount > 0}
-										class:amount-negative={tx.amount < 0}
+										class:amount-positive={parseAmount(tx.amount) > 0}
+										class:amount-negative={parseAmount(tx.amount) < 0}
 										onclick={(e) => { e.stopPropagation(); startEdit(tx.id, 'amount', String(tx.amount || '')); }}
 									>
 										{#if editingCell?.id === tx.id && editingCell?.field === 'amount'}
@@ -601,7 +627,7 @@
 												autofocus
 											/>
 										{:else}
-											{tx.amount ? formatCurrency(tx.amount) : '—'}
+											{tx.amount ? formatCurrency(parseAmount(tx.amount)) : '—'}
 										{/if}
 									</td>
 
@@ -782,6 +808,16 @@
 	.filter-date-input {
 		width: 130px;
 		font-size: .8rem;
+	}
+
+	.toggle-label {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		font-size: .8rem;
+		color: var(--text-muted);
+		cursor: pointer;
+		white-space: nowrap;
 	}
 
 	.filter-date-sep {

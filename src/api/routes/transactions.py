@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -101,13 +101,28 @@ class TransactionOut(BaseModel):
 
     @field_validator("amount", mode="before")
     @classmethod
-    def coerce_amount(cls, v: Any) -> str | None:
-        """Serialise Decimal / float to a plain string to preserve precision."""
+    def coerce_amount(cls, v: Any) -> float | None:
+        """Serialise Decimal / float to a plain float for JSON.
+
+        Returns a float rather than a string so the frontend can do
+        arithmetic without extra parsing.
+        """
         if v is None:
             return None
-        if isinstance(v, Decimal):
-            return str(v)
-        return str(v)
+        return float(v)
+
+    @model_validator(mode="after")
+    def fix_income_sign(self) -> TransactionOut:
+        """Ensure income transactions have positive amounts in the API response.
+
+        The Gmail adapter stores all amounts as negative (expenses).  When the
+        classification engine sets direction=income the sign is never flipped in
+        the DB (preserving raw data).  We fix it here at the response layer so
+        the frontend always sees positive income amounts.
+        """
+        if self.direction == "income" and self.amount is not None and self.amount < 0:
+            self.amount = abs(self.amount)
+        return self
 
 
 class TransactionListResponse(BaseModel):
@@ -399,14 +414,18 @@ def list_transactions(
                     status_code=422,
                     detail=f"Invalid entity value: {entity!r}",
                 ) from exc
+        # Support comma-separated status values (e.g. "confirmed,auto_classified")
+        status_list: list[str] | None = None
         if status is not None:
-            try:
-                TransactionStatus(status)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Invalid status value: {status!r}",
-                ) from exc
+            status_list = [s.strip() for s in status.split(",") if s.strip()]
+            for s in status_list:
+                try:
+                    TransactionStatus(s)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid status value: {s!r}",
+                    ) from exc
         if direction is not None:
             try:
                 Direction(direction)
@@ -420,8 +439,11 @@ def list_transactions(
 
         if entity is not None:
             query = query.filter(Transaction.entity == entity)
-        if status is not None:
-            query = query.filter(Transaction.status == status)
+        if status_list is not None:
+            if len(status_list) == 1:
+                query = query.filter(Transaction.status == status_list[0])
+            else:
+                query = query.filter(Transaction.status.in_(status_list))
         if direction is not None:
             query = query.filter(Transaction.direction == direction)
         if date_from is not None:
@@ -444,19 +466,30 @@ def list_transactions(
 
         total: int = query.count()
 
-        # Aggregate totals across all filtered results (before pagination)
-        income_total: float = (
-            session.query(func.sum(Transaction.amount))
-            .filter(Transaction.id.in_(query.with_entities(Transaction.id)))
-            .filter(Transaction.amount > 0)
+        # Aggregate totals across all filtered results (before pagination).
+        # Use direction-based aggregation because income transactions may be
+        # stored with negative amounts (raw Gmail data).  Income amounts are
+        # reported as positive (abs), expenses as negative.
+        _ids_subq = query.with_entities(Transaction.id)
+        raw_income: float = (
+            session.query(func.sum(func.abs(Transaction.amount)))
+            .filter(Transaction.id.in_(_ids_subq))
+            .filter(Transaction.direction == Direction.INCOME.value)
             .scalar()
         ) or 0.0
-        expense_total: float = (
-            session.query(func.sum(Transaction.amount))
-            .filter(Transaction.id.in_(query.with_entities(Transaction.id)))
-            .filter(Transaction.amount < 0)
+        raw_expense: float = (
+            session.query(func.sum(func.abs(Transaction.amount)))
+            .filter(Transaction.id.in_(_ids_subq))
+            .filter(
+                Transaction.direction.in_([
+                    Direction.EXPENSE.value,
+                    Direction.REIMBURSABLE.value,
+                ])
+            )
             .scalar()
         ) or 0.0
+        income_total: float = raw_income
+        expense_total: float = -raw_expense
 
         # Sorting
         sort_col_map = {

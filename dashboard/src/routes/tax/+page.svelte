@@ -40,7 +40,9 @@
 		STATE_LOCAL_TAX:        'State & Local Tax',
 		MORTGAGE_INTEREST:      'Mortgage Interest',
 		INVESTMENT_INCOME:      'Investment Income',
-		PERSONAL_NON_DEDUCTIBLE:'Personal Non-Deductible'
+		PERSONAL_NON_DEDUCTIBLE:'Personal Non-Deductible',
+		CAPITAL_CONTRIBUTION:   'Capital Contribution',
+		OTHER_EXPENSE:          'Other Expense'
 	};
 
 	// ── State ─────────────────────────────────────────────────────────────────
@@ -67,19 +69,32 @@
 
 	let totalCount = $derived(summary?.readiness.total_count ?? 0);
 
+	let needsReviewCount = $derived(summary?.readiness.needs_review_count ?? 0);
+	let autoClassifiedCount = $derived(summary?.readiness.auto_classified_count ?? 0);
+
 	let reviewLink = $derived(
 		`/?entity=${selectedEntity}&dateFrom=${selectedYear}-01-01&dateTo=${selectedYear}-12-31`
 	);
 
-	// Month-by-month income for Sparkry B&O
+	let registerLink = $derived(
+		`/register?entity=${selectedEntity}&status=auto_classified&dateFrom=${selectedYear}-01-01&dateTo=${selectedYear}-12-31`
+	);
+
+	// Month-by-month income for Sparkry B&O (from API bno_monthly array)
 	let monthlyIncome = $derived.by((): number[] => {
-		// The tax summary doesn't return per-month breakdown; we show N/A placeholders
-		// (the real breakdown comes from the B&O export). Return zeros as placeholder.
+		const data = (summary as any)?.bno_monthly as Array<{month: string; income: number}> | undefined;
+		if (data && data.length === 12) {
+			return data.map((d: {month: string; income: number}) => d.income);
+		}
 		return Array(12).fill(0);
 	});
 
-	// Quarter-by-quarter income for BlackLine B&O
+	// Quarter-by-quarter income for BlackLine B&O (from API bno_quarterly array)
 	let quarterlyIncome = $derived.by((): number[] => {
+		const data = (summary as any)?.bno_quarterly as Array<{quarter: string; income: number}> | undefined;
+		if (data && data.length === 4) {
+			return data.map((d: {quarter: string; income: number}) => d.income);
+		}
 		return Array(4).fill(0);
 	});
 
@@ -247,12 +262,16 @@
 					></div>
 				</div>
 
-				{#if unconfirmedCount > 0}
+				{#if needsReviewCount > 0}
 					<a class="readiness-cta no-print" href={reviewLink}>
-						Review {unconfirmedCount} unconfirmed {unconfirmedCount === 1 ? 'item' : 'items'} →
+						{needsReviewCount} {needsReviewCount === 1 ? 'item needs' : 'items need'} review →
+					</a>
+				{:else if autoClassifiedCount > 0}
+					<a class="readiness-cta readiness-cta-auto no-print" href={registerLink}>
+						{autoClassifiedCount} auto-classified {autoClassifiedCount === 1 ? 'item' : 'items'} (confirm in Register)
 					</a>
 				{:else}
-					<p class="readiness-all-clear">All transactions confirmed</p>
+					<p class="readiness-all-clear">All confirmed</p>
 				{/if}
 			</div>
 		</section>
@@ -695,6 +714,10 @@
 
 	.readiness-cta:hover {
 		text-decoration: underline;
+	}
+
+	.readiness-cta-auto {
+		color: var(--amber-600);
 	}
 
 	.readiness-all-clear {

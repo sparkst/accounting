@@ -15,6 +15,7 @@
 	// Filters (client-side — review queue is typically <200 items)
 	let search = $state('');
 	let entityFilter = $state('');
+	let directionFilter = $state('');
 	let categoryFilter = $state('');
 	let amountFilter = $state(''); // '' | 'has' | 'missing'
 	let datePreset = $state('');
@@ -53,7 +54,9 @@
 		{ value: 'CONSULTING_INCOME',      label: 'Consulting Income' },
 		{ value: 'SUBSCRIPTION_INCOME',    label: 'Subscription Income' },
 		{ value: 'SALES_INCOME',           label: 'Sales Income' },
-		{ value: 'REIMBURSABLE',           label: 'Reimbursable' }
+		{ value: 'REIMBURSABLE',           label: 'Reimbursable' },
+		{ value: 'CAPITAL_CONTRIBUTION',   label: 'Capital Contribution' },
+		{ value: 'OTHER_EXPENSE',          label: 'Other Expense (L27a)' }
 	];
 
 	const PERSONAL_CATEGORIES = [
@@ -89,6 +92,13 @@
 	let filteredItems = $derived(
 		items.filter((tx) => {
 			if (entityFilter && tx.entity !== entityFilter) return false;
+			if (directionFilter) {
+				if (directionFilter === 'other') {
+					if (tx.direction === 'income' || tx.direction === 'expense') return false;
+				} else if (tx.direction !== directionFilter) {
+					return false;
+				}
+			}
 			if (categoryFilter && tx.tax_category !== categoryFilter) return false;
 			if (amountFilter === 'has' && !tx.amount) return false;
 			if (amountFilter === 'missing' && tx.amount) return false;
@@ -104,7 +114,7 @@
 	);
 
 	let hasActiveFilters = $derived(
-		!!search || !!entityFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo
+		!!search || !!entityFilter || !!directionFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo
 	);
 
 	let hasSelection = $derived(selectedIds.size > 0);
@@ -153,6 +163,7 @@
 	function clearFilters() {
 		search = '';
 		entityFilter = '';
+		directionFilter = '';
 		categoryFilter = '';
 		amountFilter = '';
 		datePreset = '';
@@ -441,6 +452,13 @@
 				<option value="sparkry">Sparkry AI LLC</option>
 				<option value="blackline">BlackLine MTB LLC</option>
 				<option value="personal">Personal</option>
+			</select>
+
+			<select bind:value={directionFilter} aria-label="Filter by direction">
+				<option value="">All directions</option>
+				<option value="income">Income</option>
+				<option value="expense">Expense</option>
+				<option value="other">Other (transfers, capital, reimbursable)</option>
 			</select>
 
 			<select bind:value={categoryFilter} aria-label="Filter by category">

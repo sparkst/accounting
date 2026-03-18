@@ -55,6 +55,7 @@ from src.models.enums import FileStatus, Source, TransactionStatus
 from src.models.ingested_file import IngestedFile
 from src.models.transaction import Transaction
 from src.utils.dedup import compute_file_hash, compute_source_hash
+from src.utils.currency import convert_to_usd, detect_currency
 from src.utils.receipt_ocr import (
     OCRResult,
     extract_receipt,
@@ -203,6 +204,51 @@ _SHOPIFY_ORDER_PATTERNS = [
     re.compile(r"\[.*\].*You've got a new order", re.IGNORECASE),
     re.compile(r"\[.*\]\s*New order.*#\d+", re.IGNORECASE),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Non-transaction noise filter
+# ---------------------------------------------------------------------------
+# Emails that look financial to n8n but are actually notifications,
+# marketing, correspondence, or data covered by other adapters.
+
+_NOISE_RULES: list[tuple[str, str, str]] = [
+    # (match_type, pattern, reason)
+    # AmEx statement notifications — charges come from bank CSV import
+    ("from", "americanexpress@", "AmEx notification — charges from bank CSV import"),
+    ("from", "americanexpress.com", "AmEx notification — charges from bank CSV import"),
+    # Shopify admin notifications (not order emails — those are caught above)
+    ("from", "email@email.shopify.com", "Shopify subscription notification"),
+    # Chase card activation/marketing
+    ("from", "chase.com", "Chase notification — not a charge"),
+    # Billing info notifications (actual charges will have amounts)
+    ("from", "no-reply@email.claude.com", "Claude billing notification"),
+    ("from", "cloudplatform-noreply@google.com", "Google Cloud billing notification"),
+    ("from", "no-reply@amazonaws.com", "AWS billing notification"),
+    ("from", "woocommerce.com", "WooPayments account notification"),
+    # SAP Ariba onboarding (not invoices)
+    ("from", "ansmtp.ariba.com", "SAP Ariba config task — not an invoice"),
+    # Insurance marketing/quotes (not purchases)
+    ("from+subject", "hiscox.*quote", "Insurance quote — not a charge"),
+    ("from+subject", "hiscox.*specialist", "Insurance marketing — not a charge"),
+    # Cardinal Health internal correspondence (not expense receipts)
+    ("from", "cardinalhealth.com", "Cardinal Health correspondence — not an expense"),
+]
+
+
+def _is_non_transaction_noise(from_field: str, subject: str) -> str | None:
+    """Return rejection reason if the email is non-transaction noise, else None."""
+    from_lower = from_field.lower()
+    subject_lower = subject.lower()
+
+    for match_type, pattern, reason in _NOISE_RULES:
+        if match_type == "from" and pattern.lower() in from_lower:
+            return reason
+        if match_type == "from+subject":
+            parts = pattern.lower().split(".*")
+            if len(parts) == 2 and parts[0] in from_lower and parts[1] in subject_lower:
+                return reason
+    return None
 
 
 def _is_shopify_order_email(subject: str, from_field: str) -> bool:
@@ -576,6 +622,14 @@ class GmailN8nAdapter(BaseAdapter):
             result.records_processed += 1
             return
 
+        # Skip non-transaction noise: notifications, marketing, correspondence
+        skip_reason = _is_non_transaction_noise(from_field, subject)
+        if skip_reason:
+            logger.debug("Skipping noise email: %s — %s", subject[:60], skip_reason)
+            result.records_skipped += 1
+            result.records_processed += 1
+            return
+
         vendor = extract_vendor(from_field, body_text)
 
         amount = extract_amount(body_text, subject)
@@ -584,6 +638,42 @@ class GmailN8nAdapter(BaseAdapter):
         if amount is None and body_html:
             amount = extract_amount(body_html, subject)
         payment_method = extract_payment_method(body_text) or extract_payment_method(body_html)
+
+        # ── Foreign currency detection ────────────────────────────────
+        # Scan body text (and HTML fallback) for non-USD currency amounts.
+        search_text = body_text or body_html or ""
+        foreign_hits = detect_currency(search_text)
+        if not foreign_hits and body_html and search_text == body_text:
+            foreign_hits = detect_currency(body_html)
+
+        currency_code = None
+        amount_foreign = None
+        exchange_rate = None
+        exchange_rate_source = None
+
+        if foreign_hits:
+            best = foreign_hits[0]  # first/most prominent match
+            currency_code = best.currency_code
+            amount_foreign = best.amount
+
+            if amount is None:
+                # No USD amount found — convert foreign amount to USD
+                conversion = convert_to_usd(best.amount, best.currency_code, date_str)
+                if conversion is not None:
+                    amount = Decimal(str(conversion.usd_amount))
+                    exchange_rate = conversion.rate
+                    exchange_rate_source = conversion.source
+                    logger.info(
+                        "Converted %s %.2f → USD %.2f (rate=%.4f) for %s",
+                        best.currency_code, best.amount, conversion.usd_amount,
+                        conversion.rate, json_path.name,
+                    )
+            else:
+                # USD amount exists AND foreign currency found — store both for reference.
+                # Compute the implied exchange rate from the USD amount we already have.
+                if best.amount > 0:
+                    exchange_rate = float(abs(amount)) / best.amount
+                    exchange_rate_source = "email_extracted"
 
         # Determine status: needs_review when amount could not be extracted.
         # Store None (NULL) for unknown amounts so the dashboard shows
@@ -618,6 +708,10 @@ class GmailN8nAdapter(BaseAdapter):
             description=vendor,
             amount=signed_amount,
             currency="USD",
+            currency_code=currency_code,
+            amount_foreign=amount_foreign,
+            exchange_rate=exchange_rate,
+            exchange_rate_source=exchange_rate_source,
             status=status,
             confidence=confidence,
             review_reason=review_reason,

@@ -20,7 +20,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
-from src.export.bno_tax import generate_bno_export
+from src.export.bno_tax import generate_bno_export, generate_dor_upload
 from src.export.freetaxusa import generate_freetaxusa_export
 from src.export.taxact import generate_taxact_export
 from src.models.enums import Entity, TransactionStatus
@@ -58,6 +58,8 @@ IRS_LINE_MAPPING: dict[str, str] = {
     "MORTGAGE_INTEREST": "Sch A - Mortgage Interest",
     "INVESTMENT_INCOME": "Sch D / 8949",
     "PERSONAL_NON_DEDUCTIBLE": "N/A",
+    "CAPITAL_CONTRIBUTION": "N/A",
+    "OTHER_EXPENSE": "L27a",
 }
 
 INCOME_CATEGORIES = {"CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME"}
@@ -65,7 +67,11 @@ INCOME_CATEGORIES = {"CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME"}
 # Threshold: warn/block when unconfirmed fraction exceeds this
 UNCONFIRMED_WARN_THRESHOLD = 0.20
 
-CONFIRMED_STATUSES = {TransactionStatus.CONFIRMED.value, TransactionStatus.SPLIT_PARENT.value}
+CONFIRMED_STATUSES = {
+    TransactionStatus.CONFIRMED.value,
+    TransactionStatus.SPLIT_PARENT.value,
+    TransactionStatus.AUTO_CLASSIFIED.value,
+}
 ACTIVE_STATUSES = {
     TransactionStatus.CONFIRMED.value,
     TransactionStatus.SPLIT_PARENT.value,
@@ -133,11 +139,15 @@ def _readiness(transactions: list[Transaction]) -> dict[str, Any]:
     total = len(transactions)
     confirmed = [tx for tx in transactions if tx.status in CONFIRMED_STATUSES]
     unconfirmed = [tx for tx in transactions if tx.status not in CONFIRMED_STATUSES]
+    needs_review = [tx for tx in transactions if tx.status == TransactionStatus.NEEDS_REVIEW.value]
+    auto_classified = [tx for tx in transactions if tx.status == TransactionStatus.AUTO_CLASSIFIED.value]
     pct = (len(confirmed) / total * 100) if total else 100.0
     return {
         "total_count": total,
         "confirmed_count": len(confirmed),
         "unconfirmed_count": len(unconfirmed),
+        "needs_review_count": len(needs_review),
+        "auto_classified_count": len(auto_classified),
         "readiness_pct": round(pct, 1),
         "unconfirmed_ids": [tx.id for tx in unconfirmed],
     }
@@ -196,7 +206,7 @@ def get_tax_summary(
     category_totals: dict[str, Decimal] = {}
     for tx in transactions:
         cat = tx.tax_category
-        if not cat or cat == "PERSONAL_NON_DEDUCTIBLE":
+        if not cat or cat in ("PERSONAL_NON_DEDUCTIBLE", "CAPITAL_CONTRIBUTION"):
             continue
         amt = Decimal(str(tx.amount)) if tx.amount is not None else Decimal("0")
         pct = Decimal(str(tx.deductible_pct))
@@ -236,6 +246,35 @@ def get_tax_summary(
     if warn:
         warnings.append(warn)
 
+    # ── Per-month / per-quarter income breakdown for B&O table ────────────
+    monthly_income: dict[int, float] = {m: 0.0 for m in range(1, 13)}
+    for tx in transactions:
+        cat = tx.tax_category
+        if cat not in INCOME_CATEGORIES:
+            continue
+        date_str = tx.date or ""
+        try:
+            month_num = int(date_str[5:7])
+        except (IndexError, ValueError):
+            continue
+        amt = abs(float(tx.amount)) if tx.amount is not None else 0.0
+        monthly_income[month_num] += amt
+
+    bno_monthly = [
+        {"month": f"{year}-{m:02d}", "income": round(monthly_income[m], 2)}
+        for m in range(1, 13)
+    ]
+
+    # Quarterly rollup
+    quarterly_income = [0.0] * 4
+    for m in range(1, 13):
+        q = (m - 1) // 3
+        quarterly_income[q] += monthly_income[m]
+    bno_quarterly = [
+        {"quarter": f"Q{q + 1}", "income": round(quarterly_income[q], 2)}
+        for q in range(4)
+    ]
+
     return {
         "entity": entity,
         "year": year,
@@ -245,6 +284,8 @@ def get_tax_summary(
         "net_profit": float(net_profit),
         "readiness": readiness,
         "warnings": warnings,
+        "bno_monthly": bno_monthly,
+        "bno_quarterly": bno_quarterly,
     }
 
 
@@ -329,6 +370,16 @@ def export_taxact(
 def export_bno(
     entity: str = Query(..., description="Entity: sparkry | blackline"),
     year: int = Query(..., description="Tax year (e.g. 2025)"),
+    month: int | None = Query(
+        default=None,
+        ge=1,
+        le=12,
+        description="Month (1-12) for single-month filing (DOR format)",
+    ),
+    format: str = Query(
+        default="summary",
+        description="Export format: 'summary' (default CSV) or 'dor' (WA DOR upload)",
+    ),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> Response:
     """Download a WA B&O tax report CSV.
@@ -336,6 +387,9 @@ def export_bno(
     Sparkry: monthly breakdown (12 rows).
     BlackLine: quarterly breakdown (4 rows per classification).
     Adds a WARNING row if >20% of transactions are unconfirmed.
+
+    With format=dor and month=N, returns a WA DOR My DOR Data Upload file
+    for the specified single month.
     """
     entity = _validate_entity(entity)
     _validate_year(year)
@@ -350,6 +404,22 @@ def export_bno(
     warn = _check_unconfirmed_threshold(transactions, hard_block=False)
 
     tx_dicts = [_tx_to_dict(tx) for tx in transactions]
+
+    # DOR upload format (single-month filing)
+    if format.lower() == "dor":
+        if month is None:
+            raise HTTPException(
+                status_code=422,
+                detail="month parameter is required for DOR upload format.",
+            )
+        content, filename = generate_dor_upload(tx_dicts, entity, year, month)
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # Standard summary format
     content, filename = generate_bno_export(tx_dicts, entity, year)
 
     if warn:

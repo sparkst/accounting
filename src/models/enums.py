@@ -157,6 +157,7 @@ class Source(enum.StrEnum):
     BANK_CSV = "bank_csv"
     PHOTO_RECEIPT = "photo_receipt"
     DEDUCTION_EMAIL = "deduction_email"
+    WOOCOMMERCE_CSV = "woocommerce_csv"
 
 
 class VendorRuleSource(enum.StrEnum):

@@ -1,581 +1,316 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import type { Transaction } from '$lib/types';
-	import { fetchReviewQueue, updateTransaction, confirmTransaction } from '$lib/api';
-	import TransactionCard from '$lib/components/TransactionCard.svelte';
-	import Toast from '$lib/components/Toast.svelte';
-	import ShortcutOverlay from '$lib/components/ShortcutOverlay.svelte';
-	import { DATE_PRESETS } from '$lib/datePresets';
+	import type { HealthResponse, Transaction, Invoice, SourceFreshness, TaxDeadline } from '$lib/types';
+	import { fetchHealth, fetchTransactions, fetchInvoices, triggerIngest } from '$lib/api';
 
-	let items: Transaction[] = $state([]);
 	let loading = $state(true);
+	let health = $state<HealthResponse | null>(null);
+	let recentTxns = $state<Transaction[]>([]);
+	let outstandingInvoices = $state<Invoice[]>([]);
+	let monthIncome = $state(0);
+	let monthExpenses = $state(0);
 	let fetchError = $state('');
-	let focusedIndex = $state(0);
 
-	// Filters (client-side — review queue is typically <200 items)
-	let search = $state('');
-	let entityFilter = $state('');
-	let directionFilter = $state('');
-	let categoryFilter = $state('');
-	let amountFilter = $state(''); // '' | 'has' | 'missing'
-	let datePreset = $state('');
-	let dateFrom = $state('');
-	let dateTo = $state('');
+	// Time-based greeting
+	let greeting = $derived(() => {
+		const hour = new Date().getHours();
+		if (hour < 12) return 'Good morning';
+		if (hour < 17) return 'Good afternoon';
+		return 'Good evening';
+	});
 
-	// Batch selection
-	let selectedIds = $state<Set<string>>(new Set());
-	let lastSelectedIndex = $state<number | null>(null);
-	let batchEntity = $state('');
-	let batchCategory = $state('');
-	let batchSaving = $state(false);
-
-	// Toast state
-	let toasts = $state<Array<{ id: number; message: string; type: 'info' | 'success' | 'error'; undoAction?: () => void }>>([]);
-	let toastCounter = $state(0);
-
-	// Shortcut overlay
-	let showShortcuts = $state(false);
-
-	// Card component refs
-	let cardRefs = $state<Record<string, TransactionCard>>({});
-
-	const BUSINESS_CATEGORIES = [
-		{ value: 'ADVERTISING',           label: 'Advertising' },
-		{ value: 'CAR_AND_TRUCK',          label: 'Car & Truck' },
-		{ value: 'CONTRACT_LABOR',         label: 'Contract Labor' },
-		{ value: 'INSURANCE',              label: 'Insurance' },
-		{ value: 'LEGAL_AND_PROFESSIONAL', label: 'Legal & Professional' },
-		{ value: 'OFFICE_EXPENSE',         label: 'Office Expense' },
-		{ value: 'SUPPLIES',               label: 'Supplies' },
-		{ value: 'TAXES_AND_LICENSES',     label: 'Taxes & Licenses' },
-		{ value: 'TRAVEL',                 label: 'Travel' },
-		{ value: 'MEALS',                  label: 'Meals (50%)' },
-		{ value: 'COGS',                   label: 'COGS' },
-		{ value: 'CONSULTING_INCOME',      label: 'Consulting Income' },
-		{ value: 'SUBSCRIPTION_INCOME',    label: 'Subscription Income' },
-		{ value: 'SALES_INCOME',           label: 'Sales Income' },
-		{ value: 'REIMBURSABLE',           label: 'Reimbursable' },
-		{ value: 'CAPITAL_CONTRIBUTION',   label: 'Capital Contribution' },
-		{ value: 'OTHER_EXPENSE',          label: 'Other Expense (L27a)' }
-	];
-
-	const PERSONAL_CATEGORIES = [
-		{ value: 'CHARITABLE_CASH',         label: 'Charitable (Cash)' },
-		{ value: 'CHARITABLE_STOCK',        label: 'Charitable (Stock)' },
-		{ value: 'MEDICAL',                 label: 'Medical' },
-		{ value: 'STATE_LOCAL_TAX',         label: 'State & Local Tax' },
-		{ value: 'MORTGAGE_INTEREST',       label: 'Mortgage Interest' },
-		{ value: 'INVESTMENT_INCOME',       label: 'Investment Income' },
-		{ value: 'PERSONAL_NON_DEDUCTIBLE', label: 'Personal (Non-deductible)' }
-	];
-
-	// Priority sorting for review queue
-	function priorityScore(tx: Transaction): number {
-		// Lower score = higher priority
-		if (tx.status === 'needs_review') {
-			// errors first (no amount or missing entity)
-			if (!tx.amount) return 0;
-			// duplicates (check for duplicate-related notes/reasoning)
-			const text = `${tx.reasoning ?? ''} ${tx.notes ?? ''}`.toLowerCase();
-			if (text.includes('duplicate')) return 1;
-			// low confidence
-			if (tx.confidence !== null && tx.confidence < 0.7) return 2;
-			// first-time vendors (no confidence = never seen)
-			if (tx.confidence === null) return 3;
-			// pending reimbursables
-			if (tx.direction === 'reimbursable') return 4;
-			return 5;
-		}
-		return 10;
+	// Current month boundaries
+	function currentMonthRange(): { from: string; to: string } {
+		const now = new Date();
+		const y = now.getFullYear();
+		const m = String(now.getMonth() + 1).padStart(2, '0');
+		const lastDay = new Date(y, now.getMonth() + 1, 0).getDate();
+		return { from: `${y}-${m}-01`, to: `${y}-${m}-${String(lastDay).padStart(2, '0')}` };
 	}
 
-	let filteredItems = $derived(
-		items.filter((tx) => {
-			if (entityFilter && tx.entity !== entityFilter) return false;
-			if (directionFilter) {
-				if (directionFilter === 'other') {
-					if (tx.direction === 'income' || tx.direction === 'expense') return false;
-				} else if (tx.direction !== directionFilter) {
-					return false;
-				}
-			}
-			if (categoryFilter && tx.tax_category !== categoryFilter) return false;
-			if (amountFilter === 'has' && !tx.amount) return false;
-			if (amountFilter === 'missing' && tx.amount) return false;
-			if (dateFrom && tx.date < dateFrom) return false;
-			if (dateTo && tx.date > dateTo) return false;
-			if (search) {
-				const q = search.toLowerCase();
-				const haystack = `${tx.vendor ?? ''} ${tx.description}`.toLowerCase();
-				if (!haystack.includes(q)) return false;
-			}
-			return true;
-		}).sort((a, b) => priorityScore(a) - priorityScore(b))
-	);
+	let reviewCount = $derived(health?.needs_review_count ?? 0);
 
-	let hasActiveFilters = $derived(
-		!!search || !!entityFilter || !!directionFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo
-	);
+	let deadlines = $derived<TaxDeadline[]>(health?.tax_deadlines ?? []);
 
-	let hasSelection = $derived(selectedIds.size > 0);
+	let sourceFreshness = $derived<SourceFreshness[]>(health?.source_freshness ?? []);
 
-	const datePresetGroups = [...new Set(DATE_PRESETS.map(p => p.group))];
+	let netIncome = $derived(monthIncome - monthExpenses);
 
-	function handleDatePreset() {
-		if (!datePreset) {
-			dateFrom = '';
-			dateTo = '';
-		} else {
-			const preset = DATE_PRESETS.find(p => p.label === datePreset);
-			if (preset) {
-				const range = preset.range();
-				dateFrom = range.from;
-				dateTo = range.to;
-			}
-		}
+	function deadlineUrgency(d: TaxDeadline): 'red' | 'amber' | 'gray' {
+		if (d.days_until_due < 7) return 'red';
+		if (d.days_until_due < 30) return 'amber';
+		return 'gray';
+	}
+
+	function freshnessColor(s: SourceFreshness): string {
+		if (s.freshness_status === 'green') return 'var(--green-500)';
+		if (s.freshness_status === 'amber') return 'var(--amber-500)';
+		if (s.freshness_status === 'red') return 'var(--red-500)';
+		return 'var(--gray-400)';
+	}
+
+	function freshnessLabel(s: SourceFreshness): string {
+		if (s.freshness_status === 'green') return 'Fresh';
+		if (s.freshness_status === 'never') return 'Never synced';
+		if (!s.last_run_at) return 'Unknown';
+		const days = Math.floor((Date.now() - new Date(s.last_run_at).getTime()) / 86400000);
+		if (days === 0) return 'Today';
+		if (days === 1) return '1d ago';
+		return `${days}d stale`;
+	}
+
+	function sourceName(source: string): string {
+		const names: Record<string, string> = {
+			gmail: 'Gmail',
+			stripe_sparkry: 'Stripe (Sparkry)',
+			stripe_blackline: 'Stripe (BL)',
+			shopify: 'Shopify',
+			bank_csv: 'Bank CSV',
+			manual: 'Manual',
+		};
+		return names[source] ?? source;
+	}
+
+	function formatAmount(n: number): string {
+		return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 });
+	}
+
+	function formatAmountFull(n: number): string {
+		return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2 });
+	}
+
+	function formatDate(iso: string): string {
+		const d = new Date(iso + 'T00:00:00');
+		const now = new Date();
+		const today = now.toISOString().slice(0, 10);
+		const yesterday = new Date(now.getTime() - 86400000).toISOString().slice(0, 10);
+		if (iso === today) return 'Today';
+		if (iso === yesterday) return 'Yesterday';
+		return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+	}
+
+	function entityLabel(e: string | null): string {
+		if (e === 'sparkry') return 'Sparkry';
+		if (e === 'blackline') return 'BlackLine';
+		if (e === 'personal') return 'Personal';
+		return '';
 	}
 
 	onMount(async () => {
-		await load();
-	});
-
-	async function load() {
-		loading = true;
-		fetchError = '';
 		try {
-			items = await fetchReviewQueue();
+			const range = currentMonthRange();
+
+			const [healthData, recentData, monthData, invoiceData] = await Promise.all([
+				fetchHealth(),
+				fetchTransactions({ limit: 8, sort_by: 'date', sort_order: 'desc' }),
+				fetchTransactions({ date_from: range.from, date_to: range.to, limit: 1 }),
+				fetchInvoices(),
+			]);
+
+			health = healthData;
+			recentTxns = recentData.items;
+			monthIncome = monthData.income_total;
+			monthExpenses = monthData.expense_total;
+
+			const today = new Date().toISOString().slice(0, 10);
+			outstandingInvoices = invoiceData.items.filter((inv) => {
+				const s = inv.status as string;
+				return s === 'sent' || s === 'overdue' || (s === 'sent' && inv.due_date && inv.due_date < today);
+			});
 		} catch (e) {
-			fetchError = e instanceof Error ? e.message : 'Failed to load review queue';
+			fetchError = e instanceof Error ? e.message : 'Failed to load dashboard data';
 		} finally {
 			loading = false;
 		}
-	}
+	});
 
-	function handleConfirmed(tx: Transaction) {
-		items = items.filter((t) => t.id !== tx.id);
-		selectedIds.delete(tx.id);
-		selectedIds = new Set(selectedIds);
-		if (focusedIndex >= filteredItems.length) {
-			focusedIndex = Math.max(0, filteredItems.length - 1);
-		}
-	}
-
-	function clearFilters() {
-		search = '';
-		entityFilter = '';
-		directionFilter = '';
-		categoryFilter = '';
-		amountFilter = '';
-		datePreset = '';
-		dateFrom = '';
-		dateTo = '';
-	}
-
-	// ── Toast helpers ────────────────────────────────────────────────────────
-
-	function addToast(message: string, type: 'info' | 'success' | 'error' = 'info', undoAction?: () => void) {
-		const id = ++toastCounter;
-		toasts = [...toasts, { id, message, type, undoAction }];
-		return id;
-	}
-
-	function removeToast(id: number) {
-		toasts = toasts.filter(t => t.id !== id);
-	}
-
-	// ── Reject with undo ─────────────────────────────────────────────────────
-
-	async function rejectWithUndo() {
-		const tx = filteredItems[focusedIndex];
-		if (!tx) return;
-
-		// Optimistically remove
-		const originalItems = [...items];
-		items = items.filter(t => t.id !== tx.id);
-		if (focusedIndex >= filteredItems.length) {
-			focusedIndex = Math.max(0, filteredItems.length - 1);
-		}
-
-		let undone = false;
-		const toastId = addToast(`Rejected "${tx.vendor ?? tx.description}"`, 'info', () => {
-			undone = true;
-			items = originalItems;
-			removeToast(toastId);
-		});
-
-		// After 5 seconds, actually persist if not undone
-		setTimeout(async () => {
-			removeToast(toastId);
-			if (!undone) {
-				try {
-					await updateTransaction(tx.id, { status: 'rejected' });
-				} catch {
-					// If the API call fails, restore the item
-					items = originalItems;
-					addToast('Failed to reject transaction', 'error');
-				}
-			}
-		}, 5000);
-	}
-
-	// ── Selection ────────────────────────────────────────────────────────────
-
-	function toggleSelect(tx: Transaction) {
-		if (selectedIds.has(tx.id)) {
-			selectedIds.delete(tx.id);
-		} else {
-			selectedIds.add(tx.id);
-		}
-		selectedIds = new Set(selectedIds);
-		lastSelectedIndex = filteredItems.findIndex(t => t.id === tx.id);
-	}
-
-	function handleShiftClick(tx: Transaction, index: number) {
-		if (lastSelectedIndex === null) {
-			toggleSelect(tx);
-			return;
-		}
-		const start = Math.min(lastSelectedIndex, index);
-		const end = Math.max(lastSelectedIndex, index);
-		for (let i = start; i <= end; i++) {
-			selectedIds.add(filteredItems[i].id);
-		}
-		selectedIds = new Set(selectedIds);
-		lastSelectedIndex = index;
-	}
-
-	function clearSelection() {
-		selectedIds = new Set();
-		lastSelectedIndex = null;
-	}
-
-	async function bulkConfirm() {
-		if (batchSaving || selectedIds.size === 0) return;
-		batchSaving = true;
+	let importing = $state(false);
+	async function handleImport() {
+		importing = true;
 		try {
-			const updates: Record<string, string> = {};
-			if (batchEntity) updates.entity = batchEntity;
-			if (batchCategory) updates.tax_category = batchCategory;
-
-			for (const id of selectedIds) {
-				if (Object.keys(updates).length > 0) {
-					await updateTransaction(id, updates);
-				}
-				await confirmTransaction(id);
-			}
-			items = items.filter(t => !selectedIds.has(t.id));
-			const count = selectedIds.size;
-			clearSelection();
-			batchEntity = '';
-			batchCategory = '';
-			addToast(`Confirmed ${count} transaction${count !== 1 ? 's' : ''}`, 'success');
-			if (focusedIndex >= filteredItems.length) {
-				focusedIndex = Math.max(0, filteredItems.length - 1);
-			}
-		} catch (e) {
-			addToast(e instanceof Error ? e.message : 'Bulk confirm failed', 'error');
+			await triggerIngest();
+			// Reload data after import
+			const healthData = await fetchHealth();
+			health = healthData;
+		} catch {
+			// Silent fail — import runs in background
 		} finally {
-			batchSaving = false;
+			importing = false;
 		}
-	}
-
-	// ── Keyboard ─────────────────────────────────────────────────────────────
-
-	function handleKeydown(e: KeyboardEvent) {
-		const tag = (e.target as HTMLElement)?.tagName;
-		if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-
-		if (e.key === '?') {
-			e.preventDefault();
-			showShortcuts = !showShortcuts;
-			return;
-		}
-
-		if (showShortcuts) return;
-
-		if (e.key === 'j' || e.key === 'ArrowDown') {
-			e.preventDefault();
-			focusedIndex = Math.min(focusedIndex + 1, filteredItems.length - 1);
-			scrollToFocused();
-		} else if (e.key === 'k' || e.key === 'ArrowUp') {
-			e.preventDefault();
-			focusedIndex = Math.max(focusedIndex - 1, 0);
-			scrollToFocused();
-		} else if (e.key === 'e') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.focusEntityField();
-			}
-		} else if (e.key === 's') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.doToggleSplit();
-			}
-		} else if (e.key === 'd') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				// Mark as duplicate = reject
-				rejectWithUndo();
-			}
-		} else if (e.key === 'r') {
-			e.preventDefault();
-			rejectWithUndo();
-		} else if (e.key === 'n') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.focusNotesField();
-			}
-		} else if (e.key === 'c') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.focusCategoryField();
-			}
-		} else if (e.key === '1') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.setEntity('sparkry');
-			}
-		} else if (e.key === '2') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.setEntity('blackline');
-			}
-		} else if (e.key === '3') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) {
-				const ref = cardRefs[tx.id];
-				ref?.setEntity('personal');
-			}
-		} else if (e.key === 'x') {
-			e.preventDefault();
-			const tx = filteredItems[focusedIndex];
-			if (tx) toggleSelect(tx);
-		}
-	}
-
-	function scrollToFocused() {
-		requestAnimationFrame(() => {
-			const el = document.querySelector('.tx-card.card-focused');
-			el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-		});
 	}
 </script>
-
-<svelte:window onkeydown={handleKeydown} />
-
-{#if showShortcuts}
-	<ShortcutOverlay onclose={() => (showShortcuts = false)} />
-{/if}
-
-<!-- Toasts -->
-{#each toasts as toast (toast.id)}
-	<Toast
-		message={toast.message}
-		type={toast.type}
-		undoLabel={toast.undoAction ? 'Undo' : undefined}
-		onundo={toast.undoAction}
-		ondismiss={() => removeToast(toast.id)}
-	/>
-{/each}
 
 <div class="container page-shell">
 	<header class="page-header">
 		<div>
-			<h1>Review Queue</h1>
-			{#if !loading}
-				<p class="page-subtitle">
-					{#if items.length > 0}
-						{items.length} item{items.length !== 1 ? 's' : ''} need attention
-					{:else}
-						All caught up
-					{/if}
-				</p>
-			{/if}
-		</div>
-		<div class="page-header-actions">
-			<button class="btn btn-ghost" onclick={load} disabled={loading}>
-				{loading ? 'Loading…' : 'Refresh'}
-			</button>
+			<h1>Dashboard</h1>
+			<p class="page-subtitle">{greeting()}, Travis</p>
 		</div>
 	</header>
 
 	{#if loading}
-		<div class="queue-list">
-			{#each Array(3) as _}
-				<div class="card skeleton-card">
-					<div class="skeleton" style="height: 18px; width: 40%; margin-bottom: 10px;"></div>
-					<div class="skeleton" style="height: 28px; width: 65%; margin-bottom: 16px;"></div>
-					<div class="skeleton" style="height: 36px; margin-bottom: 10px;"></div>
-					<div class="skeleton" style="height: 36px; width: 50%;"></div>
-				</div>
-			{/each}
+		<div class="dash-grid">
+			<div class="card skeleton-block" style="grid-column: 1 / -1; height: 56px;"></div>
+			<div class="card skeleton-block" style="height: 140px;"></div>
+			<div class="card skeleton-block" style="height: 140px;"></div>
+			<div class="card skeleton-block" style="grid-column: 1 / -1; height: 200px;"></div>
 		</div>
 	{:else if fetchError}
 		<div class="card error-card">
 			<p class="error-msg">{fetchError}</p>
-			<button class="btn btn-ghost" onclick={load}>Try again</button>
-		</div>
-	{:else if items.length === 0}
-		<div class="empty-state">
-			<span class="icon">✓</span>
-			<h2>All caught up!</h2>
-			<p>There are no transactions waiting for review.</p>
-			<button class="btn btn-ghost" onclick={load}>Refresh</button>
 		</div>
 	{:else}
-		<!-- Filter bar -->
-		<div class="filter-bar card">
-			<input
-				type="search"
-				placeholder="Search…"
-				bind:value={search}
-				class="filter-search filter-search-compact"
-				aria-label="Search transactions"
-			/>
-
-			<select bind:value={entityFilter} aria-label="Filter by entity">
-				<option value="">All entities</option>
-				<option value="sparkry">Sparkry AI LLC</option>
-				<option value="blackline">BlackLine MTB LLC</option>
-				<option value="personal">Personal</option>
-			</select>
-
-			<select bind:value={directionFilter} aria-label="Filter by direction">
-				<option value="">All directions</option>
-				<option value="income">Income</option>
-				<option value="expense">Expense</option>
-				<option value="other">Other (transfers, capital, reimbursable)</option>
-			</select>
-
-			<select bind:value={categoryFilter} aria-label="Filter by category">
-				<option value="">All categories</option>
-				<optgroup label="Business (Schedule C / 1065)">
-					{#each BUSINESS_CATEGORIES as cat}
-						<option value={cat.value}>{cat.label}</option>
-					{/each}
-				</optgroup>
-				<optgroup label="Personal (Schedule A)">
-					{#each PERSONAL_CATEGORIES as cat}
-						<option value={cat.value}>{cat.label}</option>
-					{/each}
-				</optgroup>
-			</select>
-
-			<select bind:value={amountFilter} aria-label="Filter by amount">
-				<option value="">All amounts</option>
-				<option value="has">Has amount</option>
-				<option value="missing">Missing amount</option>
-			</select>
-
-			<select bind:value={datePreset} onchange={handleDatePreset} aria-label="Date range" class="filter-date-preset">
-				<option value="">Date range…</option>
-				{#each datePresetGroups as group}
-					<optgroup label={group}>
-						{#each DATE_PRESETS.filter(p => p.group === group) as preset}
-							<option value={preset.label}>{preset.label}</option>
-						{/each}
-					</optgroup>
-				{/each}
-			</select>
-
-			{#if hasActiveFilters}
-				<button class="btn btn-ghost filter-clear" onclick={clearFilters}>Clear</button>
-			{/if}
-		</div>
-
-		<!-- Batch bar (appears when items selected) -->
-		{#if hasSelection}
-			<div class="batch-bar card">
-				<span class="batch-count">{selectedIds.size} selected</span>
-
-				<select bind:value={batchEntity} aria-label="Set entity for selection" class="batch-select">
-					<option value="">Entity…</option>
-					<option value="sparkry">Sparkry AI LLC</option>
-					<option value="blackline">BlackLine MTB LLC</option>
-					<option value="personal">Personal</option>
-				</select>
-
-				<select bind:value={batchCategory} aria-label="Set category for selection" class="batch-select">
-					<option value="">Category…</option>
-					<optgroup label="Business">
-						{#each BUSINESS_CATEGORIES as cat}
-							<option value={cat.value}>{cat.label}</option>
-						{/each}
-					</optgroup>
-					<optgroup label="Personal">
-						{#each PERSONAL_CATEGORIES as cat}
-							<option value={cat.value}>{cat.label}</option>
-						{/each}
-					</optgroup>
-				</select>
-
-				<button class="btn btn-primary" onclick={bulkConfirm} disabled={batchSaving}>
-					{batchSaving ? 'Confirming…' : `Bulk Confirm (${selectedIds.size})`}
-				</button>
-				<button class="btn btn-ghost" onclick={clearSelection}>Cancel</button>
-			</div>
-		{/if}
-
-		<!-- Result count -->
-		<p class="results-count" aria-live="polite">
-			{#if hasActiveFilters}
-				Showing {filteredItems.length} of {items.length} item{items.length !== 1 ? 's' : ''}
+		<!-- Quick Actions -->
+		<section class="quick-actions card" aria-label="Quick actions">
+			<a
+				href="/review"
+				class="btn {reviewCount > 0 ? 'btn-primary' : 'btn-ghost'}"
+			>
+				{#if reviewCount > 0}
+					Review {reviewCount} item{reviewCount !== 1 ? 's' : ''}
+				{:else}
+					Review Queue
+				{/if}
+			</a>
+			<a href="/invoices" class="btn btn-ghost">Generate Invoice</a>
+			{#if deadlines.some((d: TaxDeadline) => d.label.includes('B&O') && d.days_until_due <= 14)}
+				<a href="/tax" class="btn btn-primary">File B&O</a>
 			{:else}
-				{filteredItems.length} item{filteredItems.length !== 1 ? 's' : ''}
+				<a href="/tax" class="btn btn-ghost">Tax Summary</a>
 			{/if}
-		</p>
+			<button class="btn btn-ghost" onclick={handleImport} disabled={importing}>
+				{importing ? 'Importing...' : 'Import'}
+			</button>
+		</section>
 
-		<div class="keyboard-hint" aria-live="polite">
-			<kbd>j</kbd><kbd>k</kbd> navigate &nbsp;·&nbsp;
-			<kbd>y</kbd> confirm &nbsp;·&nbsp;
-			<kbd>e</kbd> edit &nbsp;·&nbsp;
-			<kbd>s</kbd> split &nbsp;·&nbsp;
-			<kbd>r</kbd> reject &nbsp;·&nbsp;
-			<kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> entity &nbsp;·&nbsp;
-			<kbd>?</kbd> all shortcuts
+		<div class="dash-grid">
+			<!-- This Month -->
+			<section class="card dash-card" aria-label="This month summary">
+				<h2 class="dash-card-title">This Month</h2>
+				<div class="summary-rows">
+					<div class="summary-row">
+						<span class="summary-label">Income</span>
+						<span class="summary-value amount-positive">{formatAmount(monthIncome)}</span>
+					</div>
+					<div class="summary-row">
+						<span class="summary-label">Expenses</span>
+						<span class="summary-value amount-negative">-{formatAmount(monthExpenses)}</span>
+					</div>
+					<div class="summary-row summary-row-total">
+						<span class="summary-label">Net</span>
+						<span class="summary-value {netIncome >= 0 ? 'amount-positive' : 'amount-negative'}">
+							{formatAmount(netIncome)}
+						</span>
+					</div>
+				</div>
+			</section>
+
+			<!-- Outstanding -->
+			<section class="card dash-card" aria-label="Outstanding items">
+				<h2 class="dash-card-title">Outstanding</h2>
+				<div class="outstanding-list">
+					{#if outstandingInvoices.length > 0}
+						{#each outstandingInvoices as inv}
+							<a href="/invoices" class="outstanding-item">
+								<span class="outstanding-icon">&#x25CB;</span>
+								<span>
+									{inv.invoice_number}: {formatAmountFull(Number(inv.total ?? 0))}
+									{#if inv.days_outstanding}
+										<span class="outstanding-age">({inv.days_outstanding}d)</span>
+									{/if}
+								</span>
+							</a>
+						{/each}
+					{:else}
+						<span class="outstanding-none">No outstanding invoices</span>
+					{/if}
+
+					{#if reviewCount > 0}
+						<a href="/review" class="outstanding-item">
+							<span class="outstanding-icon outstanding-icon-amber">&#x25CF;</span>
+							<span>{reviewCount} item{reviewCount !== 1 ? 's' : ''} need review</span>
+						</a>
+					{/if}
+
+					{#each deadlines.filter((d: TaxDeadline) => d.days_until_due <= 14) as d}
+						<span class="outstanding-item outstanding-deadline">
+							<span class="outstanding-icon outstanding-icon-{deadlineUrgency(d)}">&#x25CF;</span>
+							<span>{d.label} due in {d.days_until_due}d</span>
+						</span>
+					{/each}
+				</div>
+			</section>
+
+			<!-- Recent Activity -->
+			<section class="card dash-card dash-card-wide" aria-label="Recent activity">
+				<h2 class="dash-card-title">Recent Activity</h2>
+				{#if recentTxns.length === 0}
+					<p class="dash-empty">No recent transactions</p>
+				{:else}
+					<ul class="activity-list">
+						{#each recentTxns as tx}
+							<li class="activity-item">
+								<span class="activity-date">{formatDate(tx.date)}</span>
+								<span class="activity-desc truncate">
+									{tx.vendor ?? tx.description}
+									{#if tx.entity}
+										<span class="activity-entity">{entityLabel(tx.entity)}</span>
+									{/if}
+								</span>
+								<span class="activity-amount {tx.direction === 'income' ? 'amount-positive' : tx.direction === 'expense' ? 'amount-negative' : ''}">
+									{#if tx.amount}
+										{tx.direction === 'expense' ? '-' : ''}{formatAmountFull(tx.amount)}
+									{:else}
+										--
+									{/if}
+								</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
+
+			<!-- Upcoming Deadlines -->
+			{#if deadlines.length > 0}
+				<section class="card dash-card dash-card-wide" aria-label="Upcoming deadlines">
+					<h2 class="dash-card-title">Upcoming Deadlines</h2>
+					<ul class="deadline-list">
+						{#each deadlines as d}
+							{@const urgency = deadlineUrgency(d)}
+							<li class="deadline-item">
+								<span class="deadline-date">{formatDate(d.due_date)}</span>
+								<span class="deadline-label truncate">
+									{d.label}
+									<span class="deadline-entity">{entityLabel(d.entity)}</span>
+								</span>
+								<span class="deadline-days deadline-{urgency}">
+									{d.days_until_due}d
+									{#if urgency === 'red'}
+										&#x26A0;
+									{/if}
+								</span>
+							</li>
+						{/each}
+					</ul>
+				</section>
+			{/if}
+
+			<!-- Source Health -->
+			{#if sourceFreshness.length > 0}
+				<section class="card dash-card dash-card-wide" aria-label="Source health">
+					<h2 class="dash-card-title">Source Health</h2>
+					<div class="source-row">
+						{#each sourceFreshness as s}
+							<span class="source-item">
+								<span class="source-dot" style="color: {freshnessColor(s)}">&#x25CF;</span>
+								<span class="source-name">{sourceName(s.source)}</span>
+								<span class="source-status">{freshnessLabel(s)}</span>
+							</span>
+						{/each}
+					</div>
+				</section>
+			{/if}
 		</div>
-
-		{#if filteredItems.length === 0}
-			<div class="empty-state">
-				<span class="icon">○</span>
-				<h2>No matches</h2>
-				<p>No items match your current filters.</p>
-				<button class="btn btn-ghost" onclick={clearFilters}>Clear filters</button>
-			</div>
-		{:else}
-			<ul class="queue-list" aria-label="Review queue">
-				{#each filteredItems as tx, i (tx.id)}
-					<li>
-						<TransactionCard
-							bind:this={cardRefs[tx.id]}
-							transaction={tx}
-							focused={focusedIndex === i}
-							selected={selectedIds.has(tx.id)}
-							onconfirmed={handleConfirmed}
-							onfocusrequest={() => (focusedIndex = i)}
-							onselect={(t) => toggleSelect(t)}
-							onreject={(t) => {
-								// handled by onconfirmed removing from list
-							}}
-						/>
-					</li>
-				{/each}
-			</ul>
-		{/if}
 	{/if}
 </div>
 
@@ -599,99 +334,8 @@
 		font-size: .9rem;
 	}
 
-	.page-header-actions {
-		display: flex;
-		gap: 8px;
-		align-items: center;
-		flex-shrink: 0;
-	}
-
-	/* ── Filter bar ──────────────────────────────────────────────────────── */
-	.filter-bar {
-		display: flex;
-		align-items: center;
-		flex-wrap: wrap;
-		gap: 8px;
-		padding: 12px 16px;
-		margin-bottom: 10px;
-	}
-
-	.filter-search {
-		flex: 1;
-		min-width: 120px;
-	}
-
-	.filter-search-compact {
-		max-width: 160px;
-	}
-
-	.filter-date-preset {
-		min-width: 140px;
-	}
-
-	.filter-clear {
-		flex-shrink: 0;
-	}
-
-	/* ── Batch bar ───────────────────────────────────────────────────────── */
-	.batch-bar {
-		display: flex;
-		align-items: center;
-		gap: 10px;
-		padding: 10px 16px;
-		margin-bottom: 10px;
-		background: rgba(59,130,246,.06);
-		border-color: var(--blue-500);
-		flex-wrap: wrap;
-	}
-
-	.batch-count {
-		font-size: .85rem;
-		font-weight: 600;
-		color: var(--blue-600);
-	}
-
-	.batch-select {
-		font-size: .82rem;
-		padding: 5px 8px;
-		min-width: 120px;
-	}
-
-	.results-count {
-		font-size: .8rem;
-		color: var(--text-muted);
-		margin-bottom: 10px;
-	}
-
-	/* ── Keyboard hint ───────────────────────────────────────────────────── */
-	.keyboard-hint {
-		font-size: .75rem;
-		color: var(--text-muted);
-		margin-bottom: 14px;
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		flex-wrap: wrap;
-	}
-
-	/* ── Queue list ──────────────────────────────────────────────────────── */
-	.queue-list {
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		list-style: none;
-	}
-
-	.skeleton-card {
-		padding: 20px 22px;
-	}
-
 	.error-card {
 		padding: 24px;
-		display: flex;
-		flex-direction: column;
-		gap: 12px;
-		align-items: flex-start;
 	}
 
 	.error-msg {
@@ -699,18 +343,266 @@
 		font-size: .875rem;
 	}
 
-	kbd {
+	/* ── Quick Actions ──────────────────────────────────────────────────── */
+	.quick-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 12px 16px;
+		margin-bottom: 20px;
+		flex-wrap: wrap;
+	}
+
+	/* ── Grid ───────────────────────────────────────────────────────────── */
+	.dash-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 16px;
+	}
+
+	.dash-card {
+		padding: 20px 22px;
+	}
+
+	.dash-card-wide {
+		grid-column: 1 / -1;
+	}
+
+	.dash-card-title {
+		font-size: .8rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: .05em;
+		color: var(--text-muted);
+		margin-bottom: 14px;
+	}
+
+	.dash-empty {
+		color: var(--text-muted);
+		font-size: .875rem;
+	}
+
+	/* ── Skeleton ───────────────────────────────────────────────────────── */
+	.skeleton-block {
+		animation: pulse 1.5s ease-in-out infinite;
+		background: var(--gray-100);
+	}
+
+	@keyframes pulse {
+		0%, 100% { opacity: 1; }
+		50% { opacity: .4; }
+	}
+
+	/* ── This Month summary ─────────────────────────────────────────────── */
+	.summary-rows {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.summary-row {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		font-size: .9rem;
+	}
+
+	.summary-row-total {
+		border-top: 1px solid var(--border);
+		padding-top: 8px;
+		margin-top: 4px;
+		font-weight: 600;
+	}
+
+	.summary-label {
+		color: var(--text-muted);
+	}
+
+	.summary-value {
+		font-variant-numeric: tabular-nums;
+		font-weight: 500;
+	}
+
+	/* ── Outstanding ────────────────────────────────────────────────────── */
+	.outstanding-list {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.outstanding-item {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: .875rem;
+		color: var(--text);
+		text-decoration: none;
+	}
+
+	.outstanding-item:hover {
+		color: var(--blue-600);
+	}
+
+	.outstanding-icon {
+		font-size: .6rem;
+		color: var(--gray-400);
+		flex-shrink: 0;
+	}
+
+	.outstanding-icon-amber {
+		color: var(--amber-500);
+	}
+
+	.outstanding-icon-red {
+		color: var(--red-500);
+	}
+
+	.outstanding-age {
+		color: var(--text-muted);
+		font-size: .8rem;
+	}
+
+	.outstanding-none {
+		color: var(--text-muted);
+		font-size: .875rem;
+	}
+
+	.outstanding-deadline {
+		cursor: default;
+	}
+
+	/* ── Activity list ──────────────────────────────────────────────────── */
+	.activity-list {
+		list-style: none;
+	}
+
+	.activity-item {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		padding: 6px 0;
+		font-size: .875rem;
+		border-bottom: 1px solid var(--gray-100);
+	}
+
+	.activity-item:last-child {
+		border-bottom: none;
+	}
+
+	.activity-date {
+		flex-shrink: 0;
+		width: 72px;
+		color: var(--text-muted);
+		font-size: .8rem;
+	}
+
+	.activity-desc {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.activity-entity {
+		font-size: .75rem;
+		color: var(--text-muted);
+		margin-left: 4px;
+	}
+
+	.activity-amount {
+		flex-shrink: 0;
+		font-variant-numeric: tabular-nums;
+		font-weight: 500;
+		text-align: right;
+		min-width: 80px;
+	}
+
+	/* ── Deadline list ──────────────────────────────────────────────────── */
+	.deadline-list {
+		list-style: none;
+	}
+
+	.deadline-item {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		padding: 6px 0;
+		font-size: .875rem;
+		border-bottom: 1px solid var(--gray-100);
+	}
+
+	.deadline-item:last-child {
+		border-bottom: none;
+	}
+
+	.deadline-date {
+		flex-shrink: 0;
+		width: 72px;
+		color: var(--text-muted);
+		font-size: .8rem;
+	}
+
+	.deadline-label {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.deadline-entity {
+		font-size: .75rem;
+		color: var(--text-muted);
+		margin-left: 4px;
+	}
+
+	.deadline-days {
+		flex-shrink: 0;
+		font-weight: 600;
+		font-size: .8rem;
+		text-align: right;
+		min-width: 48px;
+	}
+
+	.deadline-red {
+		color: var(--red-600);
+	}
+
+	.deadline-amber {
+		color: var(--amber-600);
+	}
+
+	.deadline-gray {
+		color: var(--text-muted);
+	}
+
+	/* ── Source health ───────────────────────────────────────────────────── */
+	.source-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 16px;
+	}
+
+	.source-item {
 		display: inline-flex;
 		align-items: center;
-		justify-content: center;
-		min-width: 18px;
-		height: 18px;
-		padding: 0 4px;
-		background: var(--gray-100);
-		border: 1px solid var(--gray-300);
-		border-radius: 3px;
-		font-family: var(--font-mono);
-		font-size: .65rem;
-		color: var(--gray-700);
+		gap: 6px;
+		font-size: .85rem;
+	}
+
+	.source-dot {
+		font-size: .7rem;
+		line-height: 1;
+	}
+
+	.source-name {
+		font-weight: 500;
+	}
+
+	.source-status {
+		color: var(--text-muted);
+		font-size: .8rem;
+	}
+
+	/* ── Responsive ─────────────────────────────────────────────────────── */
+	@media (max-width: 640px) {
+		.dash-grid {
+			grid-template-columns: 1fr;
+		}
 	}
 </style>

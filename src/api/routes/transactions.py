@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.api.routes.tax_year_locks import check_lock
 from src.classification.splitter import (
     SplitLineItem,
     SplitValidationError,
@@ -522,6 +523,266 @@ def list_transactions(
         session.close()
 
 
+@router.get("/transactions/aggregations")
+def get_aggregations(
+    entity: str | None = Query(default=None, description="Filter by entity"),
+    date_from: str | None = Query(default=None, description="Start date YYYY-MM-DD"),
+    date_to: str | None = Query(default=None, description="End date YYYY-MM-DD"),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Return time-series, top-vendor, and month-over-month aggregation data.
+
+    Buckets by month when the date range exceeds 14 days, otherwise by day.
+    Rejected transactions are excluded from all aggregations.
+    """
+    from datetime import date as _date
+
+    try:
+        query = session.query(Transaction).filter(
+            Transaction.status != TransactionStatus.REJECTED.value,
+        )
+        if entity is not None:
+            query = query.filter(Transaction.entity == entity)
+        if date_from is not None:
+            query = query.filter(Transaction.date >= date_from)
+        if date_to is not None:
+            query = query.filter(Transaction.date <= date_to)
+
+        txns: list[Transaction] = query.all()
+
+        # Determine bucket size
+        use_day = False
+        if date_from and date_to:
+            try:
+                d0 = _date.fromisoformat(date_from)
+                d1 = _date.fromisoformat(date_to)
+                if (d1 - d0).days < 14:
+                    use_day = True
+            except ValueError:
+                pass
+
+        def _period(tx_date: str) -> str:
+            if use_day:
+                return tx_date[:10]  # YYYY-MM-DD
+            return tx_date[:7]  # YYYY-MM
+
+        # Build time series + category accumulator
+        income_buckets: dict[str, float] = {}
+        expense_buckets: dict[str, float] = {}
+        vendor_income: dict[str, float] = {}
+        vendor_expense: dict[str, float] = {}
+        category_totals: dict[str, float] = {}
+
+        # Per-vendor historical amounts across ALL non-rejected expense records
+        # (not filtered to current date range — used as baseline for anomaly detection)
+        all_expense_q = session.query(Transaction).filter(
+            Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.direction.in_([Direction.EXPENSE.value, Direction.REIMBURSABLE.value]),
+        )
+        if entity is not None:
+            all_expense_q = all_expense_q.filter(Transaction.entity == entity)
+        vendor_history: dict[str, list[float]] = {}
+        for htx in all_expense_q.all():
+            if htx.amount is not None and htx.description:
+                vendor_history.setdefault(htx.description, []).append(float(abs(htx.amount)))
+
+        for tx in txns:
+            period = _period(tx.date) if tx.date else "unknown"
+            amt = float(abs(tx.amount)) if tx.amount is not None else 0.0
+            if tx.direction == Direction.INCOME.value:
+                income_buckets[period] = income_buckets.get(period, 0.0) + amt
+                vendor_income[tx.description] = vendor_income.get(tx.description, 0.0) + amt
+            elif tx.direction in (Direction.EXPENSE.value, Direction.REIMBURSABLE.value):
+                expense_buckets[period] = expense_buckets.get(period, 0.0) + amt
+                vendor_expense[tx.description] = vendor_expense.get(tx.description, 0.0) + amt
+                cat = tx.tax_category or "OTHER"
+                category_totals[cat] = category_totals.get(cat, 0.0) + amt
+
+        time_series = {
+            "income": [{"period": p, "total": t} for p, t in sorted(income_buckets.items())],
+            "expenses": [{"period": p, "total": t} for p, t in sorted(expense_buckets.items())],
+        }
+
+        # Top vendors: ranked by total, capped at 5, with percentages
+        def _top_vendors(vendor_map: dict[str, float]) -> list[dict[str, Any]]:
+            total = sum(vendor_map.values())
+            if total == 0:
+                return []
+            ranked = sorted(vendor_map.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            return [
+                {"vendor": v, "total": t, "pct": round(t / total * 100, 1)}
+                for v, t in ranked
+            ]
+
+        top_vendors = {
+            "income": _top_vendors(vendor_income),
+            "expense": _top_vendors(vendor_expense),
+        }
+
+        # Concentration warnings: flag income vendors with >80% share
+        def _concentration_warnings(vendor_map: dict[str, float]) -> list[dict[str, Any]]:
+            total = sum(vendor_map.values())
+            if total == 0:
+                return []
+            warnings = []
+            for vendor, amount in vendor_map.items():
+                pct = amount / total * 100
+                if pct > 80:
+                    warnings.append({
+                        "vendor": vendor,
+                        "pct": round(pct, 1),
+                        "message": f"{round(pct)}% of income from {vendor} — diversification risk",
+                    })
+            return warnings
+
+        concentration_warnings = _concentration_warnings(vendor_income)
+
+        # Anomaly detection: expenses in current period > 2x vendor historical avg
+        anomalies: list[dict[str, Any]] = []
+        for tx in txns:
+            if tx.direction not in (Direction.EXPENSE.value, Direction.REIMBURSABLE.value):
+                continue
+            if tx.amount is None or not tx.description:
+                continue
+            amt = float(abs(tx.amount))
+            history = vendor_history.get(tx.description, [])
+            if len(history) < 2:
+                continue  # not enough history for a reliable baseline
+            avg = sum(history) / len(history)
+            if avg > 0 and amt > 2 * avg:
+                cat_label = (tx.tax_category or "").replace("_", " ").title()
+                anomalies.append({
+                    "tx_id": tx.id,
+                    "vendor": tx.description,
+                    "amount": round(amt, 2),
+                    "avg_for_vendor": round(avg, 2),
+                    "message": (
+                        f"Unusual: ${amt:,.0f} at {tx.description}"
+                        f" (avg ${avg:,.0f} for {cat_label})"
+                    ),
+                })
+        anomalies.sort(
+            key=lambda a: a["amount"] / a["avg_for_vendor"] if a["avg_for_vendor"] else 0,
+            reverse=True,
+        )
+
+        # Category breakdown: top 5 expense categories with percentages
+        cat_total_all = sum(category_totals.values())
+        if cat_total_all > 0:
+            ranked_cats = sorted(category_totals.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            category_breakdown: list[dict[str, Any]] = [
+                {
+                    "category": cat,
+                    "total": round(total, 2),
+                    "pct": round(total / cat_total_all * 100, 1),
+                }
+                for cat, total in ranked_cats
+            ]
+        else:
+            category_breakdown = []
+
+        # Month-over-month: compare current range to prior period of equal length
+        mom: dict[str, float] = {
+            "income_delta": 0.0,
+            "income_pct": 0.0,
+            "expense_delta": 0.0,
+            "expense_pct": 0.0,
+        }
+        prior_category_totals: dict[str, float] = {}
+        if date_from and date_to:
+            try:
+                d0 = _date.fromisoformat(date_from)
+                d1 = _date.fromisoformat(date_to)
+                span = (d1 - d0).days
+                prior_from = (d0 - timedelta(days=span + 1)).isoformat()
+                prior_to = (d0 - timedelta(days=1)).isoformat()
+
+                prior_q = session.query(Transaction).filter(
+                    Transaction.status != TransactionStatus.REJECTED.value,
+                    Transaction.date >= prior_from,
+                    Transaction.date <= prior_to,
+                )
+                if entity is not None:
+                    prior_q = prior_q.filter(Transaction.entity == entity)
+
+                prior_txns = prior_q.all()
+                prior_income = sum(
+                    float(abs(t.amount)) for t in prior_txns
+                    if t.direction == Direction.INCOME.value and t.amount
+                )
+                prior_expense = sum(
+                    float(abs(t.amount)) for t in prior_txns
+                    if t.direction in (Direction.EXPENSE.value, Direction.REIMBURSABLE.value) and t.amount
+                )
+                for t in prior_txns:
+                    if t.direction in (Direction.EXPENSE.value, Direction.REIMBURSABLE.value) and t.amount:
+                        pcat = t.tax_category or "OTHER"
+                        prior_category_totals[pcat] = prior_category_totals.get(pcat, 0.0) + float(abs(t.amount))
+                curr_income = sum(income_buckets.values())
+                curr_expense = sum(expense_buckets.values())
+
+                mom["income_delta"] = curr_income - prior_income
+                mom["expense_delta"] = curr_expense - prior_expense
+                if prior_income:
+                    mom["income_pct"] = round((curr_income - prior_income) / prior_income * 100, 1)
+                if prior_expense:
+                    mom["expense_pct"] = round((curr_expense - prior_expense) / prior_expense * 100, 1)
+            except ValueError:
+                pass
+
+        expense_attribution = _build_expense_attribution(mom, category_totals, prior_category_totals)
+
+        return {
+            "time_series": time_series,
+            "top_vendors": top_vendors,
+            "mom_change": mom,
+            "concentration_warnings": concentration_warnings,
+            "anomalies": anomalies,
+            "category_breakdown": category_breakdown,
+            "expense_attribution": expense_attribution,
+        }
+    finally:
+        session.close()
+
+
+def _build_expense_attribution(
+    mom: dict[str, float],
+    curr_cats: dict[str, float],
+    prior_cats: dict[str, float],
+) -> str:
+    """Build a human-readable sentence explaining MoM expense movement.
+
+    Example: "Expenses up $1,200 vs prior period — mainly from Travel (+$800)"
+    """
+    delta = mom.get("expense_delta", 0.0)
+    if delta == 0.0:
+        return "No change in expenses vs prior period"
+
+    direction_word = "up" if delta > 0 else "down"
+    abs_delta = abs(delta)
+
+    all_cats = set(curr_cats) | set(prior_cats)
+    if all_cats:
+        cat_deltas = {
+            cat: curr_cats.get(cat, 0.0) - prior_cats.get(cat, 0.0)
+            for cat in all_cats
+        }
+        same_sign = {
+            cat: d for cat, d in cat_deltas.items()
+            if (delta > 0 and d > 0) or (delta < 0 and d < 0)
+        }
+        if same_sign:
+            top_cat, top_delta = max(same_sign.items(), key=lambda kv: abs(kv[1]))
+            cat_label = top_cat.replace("_", " ").title()
+            sign = "+" if top_delta > 0 else "-"
+            return (
+                f"Expenses {direction_word} ${abs_delta:,.0f} vs prior period"
+                f" — mainly from {cat_label} ({sign}${abs(top_delta):,.0f})"
+            )
+
+    return f"Expenses {direction_word} ${abs_delta:,.0f} vs prior period"
+
+
 @router.get("/transactions/review", response_model=list[TransactionOut])
 def list_review_transactions(
     session: Session = Depends(get_db),  # noqa: B008
@@ -597,6 +858,9 @@ def patch_transaction(
         )
         if tx is None:
             raise HTTPException(status_code=404, detail="Transaction not found")
+
+        # ── Tax year lock guard ──────────────────────────────────────────────
+        check_lock(session, tx.entity, tx.date)
 
         # ── Collect changes ───────────────────────────────────────────────────
         changes: dict[str, tuple[Any, Any]] = {}
@@ -737,6 +1001,9 @@ def split_transaction_endpoint(
         )
         if tx is None:
             raise HTTPException(status_code=404, detail="Transaction not found")
+
+        # ── Tax year lock guard ──────────────────────────────────────────────
+        check_lock(session, tx.entity, tx.date)
 
         # Cannot re-split an already-split parent.
         if tx.status == TransactionStatus.SPLIT_PARENT.value:

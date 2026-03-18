@@ -54,8 +54,8 @@ from src.adapters.base import AdapterResult, BaseAdapter
 from src.models.enums import FileStatus, Source, TransactionStatus
 from src.models.ingested_file import IngestedFile
 from src.models.transaction import Transaction
-from src.utils.dedup import compute_file_hash, compute_source_hash
 from src.utils.currency import convert_to_usd, detect_currency
+from src.utils.dedup import compute_file_hash, compute_source_hash
 from src.utils.receipt_ocr import (
     OCRResult,
     extract_receipt,

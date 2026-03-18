@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { fetchTaxSummary, downloadExport } from '$lib/api';
-	import type { TaxSummary, TaxLineItem } from '$lib/api';
+	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip } from '$lib/api';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
@@ -46,15 +46,31 @@
 	};
 
 	// ── State ─────────────────────────────────────────────────────────────────
-	let selectedEntity = $state<'sparkry' | 'blackline' | 'personal'>('sparkry');
-	let selectedYear   = $state(CURRENT_YEAR);
-	let summary        = $state<TaxSummary | null>(null);
-	let loading        = $state(false);
-	let fetchError     = $state('');
-	let downloading    = $state<string | null>(null);
-	let downloadError  = $state('');
+	let selectedEntity   = $state<'sparkry' | 'blackline' | 'personal'>('sparkry');
+	let selectedYear     = $state(CURRENT_YEAR);
+	let summary          = $state<TaxSummary | null>(null);
+	let loading          = $state(false);
+	let fetchError       = $state('');
+	let downloading      = $state<string | null>(null);
+	let downloadError    = $state('');
+	let compareEnabled   = $state(false);
+	let showDismissed    = $state(false);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
+	let compareYear = $derived(selectedYear - 1);
+
+	let comparison = $derived(summary?.comparison ?? null);
+
+	let deltasByCat = $derived.by((): Map<string, TaxYoyDelta> => {
+		const m = new Map<string, TaxYoyDelta>();
+		if (comparison) {
+			for (const d of comparison.deltas) {
+				m.set(d.tax_category, d);
+			}
+		}
+		return m;
+	});
+
 	let incomeItems = $derived.by(() =>
 		(summary?.line_items ?? []).filter((li: TaxLineItem) => li.is_income)
 	);
@@ -73,12 +89,40 @@
 	let autoClassifiedCount = $derived(summary?.readiness.auto_classified_count ?? 0);
 
 	let reviewLink = $derived(
-		`/?entity=${selectedEntity}&dateFrom=${selectedYear}-01-01&dateTo=${selectedYear}-12-31`
+		`/review?entity=${selectedEntity}&dateFrom=${selectedYear}-01-01&dateTo=${selectedYear}-12-31`
 	);
 
 	let registerLink = $derived(
 		`/register?entity=${selectedEntity}&status=auto_classified&dateFrom=${selectedYear}-01-01&dateTo=${selectedYear}-12-31`
 	);
+
+	// ── Tax tips (dismissible) ────────────────────────────────────────────────
+	function tipStorageKey(tipId: string): string {
+		return `tip-${tipId}-${selectedYear}`;
+	}
+
+	function isTipDismissed(tipId: string): boolean {
+		if (typeof localStorage === 'undefined') return false;
+		return localStorage.getItem(tipStorageKey(tipId)) === 'dismissed';
+	}
+
+	function dismissTip(tipId: string): void {
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem(tipStorageKey(tipId), 'dismissed');
+		}
+		// Force reactivity by reassigning summary (shallow trigger)
+		summary = summary;
+	}
+
+	let allTips = $derived<TaxTip[]>(summary?.tax_tips ?? []);
+
+	let visibleTips = $derived.by((): TaxTip[] => {
+		return allTips.filter(t => !isTipDismissed(t.id));
+	});
+
+	let dismissedTips = $derived.by((): TaxTip[] => {
+		return allTips.filter(t => isTipDismissed(t.id));
+	});
 
 	// Month-by-month income for Sparkry B&O (from API bno_monthly array)
 	let monthlyIncome = $derived.by((): number[] => {
@@ -89,6 +133,20 @@
 		return Array(12).fill(0);
 	});
 
+	// Prior-year month-by-month income for B&O comparison
+	let priorMonthlyIncome = $derived.by((): number[] => {
+		if (!comparison) return Array(12).fill(0);
+		const deltas = comparison.bno_monthly_deltas;
+		if (!deltas || deltas.length === 0) return Array(12).fill(0);
+		// Map by month string (YYYY-MM) → prior value
+		const out = Array(12).fill(0);
+		for (const d of deltas) {
+			const month = parseInt(d.month.split('-')[1] ?? '0', 10) - 1;
+			if (month >= 0 && month < 12) out[month] = d.prior;
+		}
+		return out;
+	});
+
 	// Quarter-by-quarter income for BlackLine B&O (from API bno_quarterly array)
 	let quarterlyIncome = $derived.by((): number[] => {
 		const data = (summary as any)?.bno_quarterly as Array<{quarter: string; income: number}> | undefined;
@@ -96,6 +154,20 @@
 			return data.map((d: {quarter: string; income: number}) => d.income);
 		}
 		return Array(4).fill(0);
+	});
+
+	// Prior-year quarter-by-quarter income for B&O comparison
+	let priorQuarterlyIncome = $derived.by((): number[] => {
+		if (!comparison) return Array(4).fill(0);
+		const deltas = comparison.bno_quarterly_deltas;
+		if (!deltas || deltas.length === 0) return Array(4).fill(0);
+		// Map by quarter string (Q1..Q4) → prior value
+		const out = Array(4).fill(0);
+		for (const d of deltas) {
+			const q = parseInt(d.quarter.replace('Q', ''), 10) - 1;
+			if (q >= 0 && q < 4) out[q] = d.prior;
+		}
+		return out;
 	});
 
 	let showBno = $derived(selectedEntity !== 'personal');
@@ -128,18 +200,56 @@
 		return `${entitySlug}-${selectedYear}-${type}.${ext}`;
 	}
 
+	/** Format a delta amount with sign: +$1,234 or −$1,234 */
+	function fmtDelta(delta: number): string {
+		if (delta === 0) return '—';
+		const abs = fmtCurrency(Math.abs(delta));
+		return delta > 0 ? `+${abs}` : `−${abs}`;
+	}
+
+	/** Format a delta percentage with sign: +12.3% or −4.5% */
+	function fmtDeltaPct(pct: number | null): string {
+		if (pct === null) return '';
+		if (pct === 0) return '';
+		const sign = pct > 0 ? '+' : '−';
+		return `${sign}${Math.abs(pct).toFixed(1)}%`;
+	}
+
+	/**
+	 * CSS class for a line-item delta.
+	 * For income: positive delta = good (green). For expenses: negative delta = good (green).
+	 */
+	function deltaClass(delta: number, isIncome: boolean): string {
+		if (delta === 0) return 'delta-neutral';
+		if (isIncome) return delta > 0 ? 'delta-positive' : 'delta-negative';
+		// expenses: less spending is good
+		return delta < 0 ? 'delta-positive' : 'delta-negative';
+	}
+
+	/** CSS class for net profit delta (higher net profit = good). */
+	function netProfitDeltaClass(delta: number): string {
+		if (delta === 0) return 'delta-neutral';
+		return delta > 0 ? 'delta-positive' : 'delta-negative';
+	}
+
 	// ── Load ─────────────────────────────────────────────────────────────────
 	async function load() {
 		loading = true;
 		fetchError = '';
 		summary = null;
 		try {
-			summary = await fetchTaxSummary(selectedEntity, selectedYear);
+			const cy = compareEnabled ? compareYear : undefined;
+			summary = await fetchTaxSummary(selectedEntity, selectedYear, cy);
 		} catch (e) {
 			fetchError = e instanceof Error ? e.message : 'Failed to load tax summary';
 		} finally {
 			loading = false;
 		}
+	}
+
+	function toggleCompare() {
+		compareEnabled = !compareEnabled;
+		load();
 	}
 
 	async function triggerDownload(type: 'freetaxusa' | 'taxact' | 'bno') {
@@ -167,6 +277,15 @@
 			<p class="page-subtitle">IRS line-item breakdown, B&amp;O totals, and export</p>
 		</div>
 		<div class="page-header-actions no-print">
+			<button
+				class="compare-toggle"
+				class:compare-toggle-active={compareEnabled}
+				onclick={toggleCompare}
+				aria-pressed={compareEnabled}
+				title={compareEnabled ? `Hide ${compareYear} comparison` : `Compare with ${compareYear}`}
+			>
+				{compareEnabled ? `Comparing ${compareYear}` : `vs ${compareYear}`}
+			</button>
 			<select
 				class="year-select"
 				bind:value={selectedYear}
@@ -285,6 +404,62 @@
 			{/each}
 		{/if}
 
+		<!-- ── Tax Optimization Insights ─────────────────────────────────────── -->
+		{#if allTips.length > 0}
+			<section class="dashboard-section no-print">
+				<h2 class="section-title">Insights</h2>
+
+				{#if visibleTips.length > 0}
+					<div class="tips-list">
+						{#each visibleTips as tip (tip.id)}
+							<div class="tip-card">
+								<div class="tip-icon" aria-hidden="true">ℹ</div>
+								<div class="tip-body">
+									<p class="tip-title">{tip.title}</p>
+									<p class="tip-detail">{tip.detail}</p>
+									{#if tip.action_url}
+										<a class="tip-action" href={tip.action_url}>Review →</a>
+									{/if}
+								</div>
+								{#if tip.dismissible}
+									<button
+										class="tip-dismiss"
+										onclick={() => dismissTip(tip.id)}
+										aria-label="Dismiss tip"
+										title="Dismiss"
+									>✕</button>
+								{/if}
+							</div>
+						{/each}
+					</div>
+				{:else}
+					<p class="tips-all-dismissed">All insights dismissed.</p>
+				{/if}
+
+				{#if dismissedTips.length > 0}
+					<button
+						class="tips-show-dismissed"
+						onclick={() => (showDismissed = !showDismissed)}
+					>
+						{showDismissed ? 'Hide dismissed' : `Show ${dismissedTips.length} dismissed ${dismissedTips.length === 1 ? 'tip' : 'tips'}`}
+					</button>
+
+					{#if showDismissed}
+						<div class="tips-list tips-list-dismissed">
+							{#each dismissedTips as tip (tip.id)}
+								<div class="tip-card tip-card-dismissed">
+									<div class="tip-icon" aria-hidden="true">ℹ</div>
+									<div class="tip-body">
+										<p class="tip-title">{tip.title}</p>
+									</div>
+								</div>
+							{/each}
+						</div>
+					{/if}
+				{/if}
+			</section>
+		{/if}
+
 		<!-- ── IRS Line-Item Breakdown ────────────────────────────────────────── -->
 		<section class="dashboard-section">
 			<h2 class="section-title">IRS Line-Item Breakdown</h2>
@@ -296,7 +471,11 @@
 						<thead>
 							<tr>
 								<th>Category</th>
-								<th class="th-right">Amount</th>
+								<th class="th-right">{selectedYear}</th>
+								{#if compareEnabled && comparison}
+									<th class="th-right td-prior">{compareYear}</th>
+									<th class="th-right td-change">Change</th>
+								{/if}
 								<th>IRS Line</th>
 							</tr>
 						</thead>
@@ -304,18 +483,40 @@
 							<!-- Income section -->
 							{#if incomeItems.length > 0}
 								<tr class="section-header-row">
-									<td colspan="3" class="section-label">Income</td>
+									<td colspan={compareEnabled && comparison ? 5 : 3} class="section-label">Income</td>
 								</tr>
 								{#each incomeItems as item (item.tax_category)}
+									{@const delta = deltasByCat.get(item.tax_category)}
 									<tr>
 										<td class="td-category">{categoryLabel(item.tax_category)}</td>
 										<td class="td-amount amount-positive">{fmtCurrency(item.total)}</td>
+										{#if compareEnabled && comparison}
+											<td class="td-amount td-prior">
+												{delta ? fmtCurrency(delta.prior) : '—'}
+											</td>
+											<td class="td-amount td-change {delta ? deltaClass(delta.delta, true) : 'delta-neutral'}">
+												{#if delta}
+													{fmtDelta(delta.delta)}
+													{#if delta.delta_pct !== null && delta.delta_pct !== 0}
+														<span class="delta-pct">{fmtDeltaPct(delta.delta_pct)}</span>
+													{/if}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+										{/if}
 										<td class="td-irs-line">{item.irs_line}</td>
 									</tr>
 								{/each}
 								<tr class="subtotal-row">
 									<td class="subtotal-label">Gross Income</td>
 									<td class="td-amount amount-positive subtotal-val">{fmtCurrency(summary.gross_income)}</td>
+									{#if compareEnabled && comparison}
+										<td class="td-amount td-prior subtotal-val">{fmtCurrency(comparison.prior_gross_income)}</td>
+										<td class="td-amount td-change subtotal-val {netProfitDeltaClass(summary.gross_income - comparison.prior_gross_income)}">
+											{fmtDelta(summary.gross_income - comparison.prior_gross_income)}
+										</td>
+									{/if}
 									<td></td>
 								</tr>
 							{/if}
@@ -323,18 +524,40 @@
 							<!-- Expenses section -->
 							{#if expenseItems.length > 0}
 								<tr class="section-header-row">
-									<td colspan="3" class="section-label">Expenses</td>
+									<td colspan={compareEnabled && comparison ? 5 : 3} class="section-label">Expenses</td>
 								</tr>
 								{#each expenseItems as item (item.tax_category)}
+									{@const delta = deltasByCat.get(item.tax_category)}
 									<tr>
 										<td class="td-category">{categoryLabel(item.tax_category)}</td>
 										<td class="td-amount amount-negative">({fmtCurrency(item.total)})</td>
+										{#if compareEnabled && comparison}
+											<td class="td-amount td-prior">
+												{delta ? `(${fmtCurrency(delta.prior)})` : '—'}
+											</td>
+											<td class="td-amount td-change {delta ? deltaClass(delta.delta, false) : 'delta-neutral'}">
+												{#if delta}
+													{fmtDelta(delta.delta)}
+													{#if delta.delta_pct !== null && delta.delta_pct !== 0}
+														<span class="delta-pct">{fmtDeltaPct(delta.delta_pct)}</span>
+													{/if}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+										{/if}
 										<td class="td-irs-line">{item.irs_line}</td>
 									</tr>
 								{/each}
 								<tr class="subtotal-row">
 									<td class="subtotal-label">Total Expenses</td>
 									<td class="td-amount amount-negative subtotal-val">({fmtCurrency(summary.total_expenses)})</td>
+									{#if compareEnabled && comparison}
+										<td class="td-amount td-prior subtotal-val">({fmtCurrency(comparison.prior_total_expenses)})</td>
+										<td class="td-amount td-change subtotal-val {deltaClass(summary.total_expenses - comparison.prior_total_expenses, false)}">
+											{fmtDelta(summary.total_expenses - comparison.prior_total_expenses)}
+										</td>
+									{/if}
 									<td></td>
 								</tr>
 							{/if}
@@ -353,6 +576,21 @@
 										{fmtCurrency(summary.net_profit)}
 									{/if}
 								</td>
+								{#if compareEnabled && comparison}
+									<td class="td-amount td-prior net-profit-amount">
+										{#if comparison.prior_net_profit < 0}
+											({fmtCurrency(Math.abs(comparison.prior_net_profit))})
+										{:else}
+											{fmtCurrency(comparison.prior_net_profit)}
+										{/if}
+									</td>
+									<td class="td-amount td-change net-profit-amount {netProfitDeltaClass(comparison.net_profit_delta)}">
+										{fmtDelta(comparison.net_profit_delta)}
+										{#if comparison.net_profit_delta_pct !== null && comparison.net_profit_delta_pct !== 0}
+											<span class="delta-pct">{fmtDeltaPct(comparison.net_profit_delta_pct)}</span>
+										{/if}
+									</td>
+								{/if}
 								<td class="td-irs-line net-profit-line">
 									{selectedEntity === 'personal' ? 'Schedule A' : 'Schedule C Line 31'}
 								</td>
@@ -377,34 +615,76 @@
 						<thead>
 							<tr>
 								<th>{selectedEntity === 'sparkry' ? 'Month' : 'Quarter'}</th>
-								<th class="th-right">Income</th>
+								<th class="th-right">{selectedYear}</th>
+								{#if compareEnabled && comparison}
+									<th class="th-right td-prior">{compareYear}</th>
+									<th class="th-right td-change">Change</th>
+								{/if}
 							</tr>
 						</thead>
 						<tbody>
 							{#if selectedEntity === 'sparkry'}
 								{#each MONTHS as month, i (month)}
+									{@const curr = monthlyIncome[i]}
+									{@const prior = priorMonthlyIncome[i]}
+									{@const bnoD = curr - prior}
 									<tr>
 										<td class="td-period">{month} {selectedYear}</td>
 										<td class="td-amount">
-											{#if monthlyIncome[i] > 0}
-												<span class="amount-positive">{fmtCurrency(monthlyIncome[i])}</span>
+											{#if curr > 0}
+												<span class="amount-positive">{fmtCurrency(curr)}</span>
 											{:else}
 												<span class="no-data">—</span>
 											{/if}
 										</td>
+										{#if compareEnabled && comparison}
+											<td class="td-amount td-prior">
+												{#if prior > 0}
+													{fmtCurrency(prior)}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+											<td class="td-amount td-change {netProfitDeltaClass(bnoD)}">
+												{#if curr > 0 || prior > 0}
+													{fmtDelta(bnoD)}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+										{/if}
 									</tr>
 								{/each}
 							{:else}
 								{#each QUARTERS as quarter, i (quarter)}
+									{@const curr = quarterlyIncome[i]}
+									{@const prior = priorQuarterlyIncome[i]}
+									{@const bnoD = curr - prior}
 									<tr>
 										<td class="td-period">{quarter} {selectedYear}</td>
 										<td class="td-amount">
-											{#if quarterlyIncome[i] > 0}
-												<span class="amount-positive">{fmtCurrency(quarterlyIncome[i])}</span>
+											{#if curr > 0}
+												<span class="amount-positive">{fmtCurrency(curr)}</span>
 											{:else}
 												<span class="no-data">—</span>
 											{/if}
 										</td>
+										{#if compareEnabled && comparison}
+											<td class="td-amount td-prior">
+												{#if prior > 0}
+													{fmtCurrency(prior)}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+											<td class="td-amount td-change {netProfitDeltaClass(bnoD)}">
+												{#if curr > 0 || prior > 0}
+													{fmtDelta(bnoD)}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+										{/if}
 									</tr>
 								{/each}
 							{/if}
@@ -413,6 +693,12 @@
 							<tr>
 								<td>Total</td>
 								<td class="td-amount amount-positive">{fmtCurrency(summary.gross_income)}</td>
+								{#if compareEnabled && comparison}
+									<td class="td-amount td-prior">{fmtCurrency(comparison.prior_gross_income)}</td>
+									<td class="td-amount td-change {netProfitDeltaClass(summary.gross_income - comparison.prior_gross_income)}">
+										{fmtDelta(summary.gross_income - comparison.prior_gross_income)}
+									</td>
+								{/if}
 							</tr>
 						</tfoot>
 					</table>
@@ -531,6 +817,38 @@
 
 	.year-select {
 		min-width: 90px;
+	}
+
+	/* ── Compare toggle button ───────────────────────────────────────────────── */
+	.compare-toggle {
+		padding: 6px 14px;
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		font-family: var(--font);
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		cursor: pointer;
+		transition: background 0.12s, color 0.12s, border-color 0.12s;
+		white-space: nowrap;
+	}
+
+	.compare-toggle:hover {
+		color: var(--text);
+		border-color: var(--gray-400);
+	}
+
+	.compare-toggle-active {
+		background: var(--gray-900);
+		border-color: var(--gray-900);
+		color: var(--gray-50);
+	}
+
+	.compare-toggle-active:hover {
+		background: var(--gray-700);
+		border-color: var(--gray-700);
+		color: var(--gray-50);
 	}
 
 	/* ── Entity tabs ─────────────────────────────────────────────────────────── */
@@ -759,6 +1077,34 @@
 		font-weight: 500;
 	}
 
+	/* ── YoY comparison columns ──────────────────────────────────────────────── */
+	.td-prior {
+		color: var(--text-muted);
+		font-size: 0.875rem;
+	}
+
+	.td-change {
+		min-width: 100px;
+	}
+
+	.delta-positive {
+		color: var(--green-600);
+	}
+
+	.delta-negative {
+		color: var(--red-600);
+	}
+
+	.delta-neutral {
+		color: var(--text-muted);
+	}
+
+	.delta-pct {
+		margin-left: 6px;
+		font-size: 0.75rem;
+		opacity: 0.8;
+	}
+
 	/* Section header rows (Income / Expenses labels within the table) */
 	.section-header-row td {
 		padding: 6px 14px 4px;
@@ -819,7 +1165,7 @@
 
 	/* B&O table */
 	.bno-table {
-		max-width: 480px;
+		max-width: 640px;
 	}
 
 	.bno-note {
@@ -879,6 +1225,120 @@
 
 	@keyframes spin {
 		to { transform: rotate(360deg); }
+	}
+
+	/* ── Tax insight tips ────────────────────────────────────────────────────── */
+	.tips-list {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+	}
+
+	.tip-card {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		padding: 14px 16px;
+		background: var(--blue-50, #eff6ff);
+		border-left: 3px solid var(--blue-500, #3b82f6);
+		border-radius: var(--radius-sm);
+	}
+
+	.tip-card-dismissed {
+		opacity: 0.5;
+		background: var(--gray-50);
+		border-left-color: var(--gray-300);
+	}
+
+	.tip-icon {
+		flex-shrink: 0;
+		width: 18px;
+		height: 18px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: 0.85rem;
+		color: var(--blue-500, #3b82f6);
+		margin-top: 1px;
+	}
+
+	.tip-body {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+
+	.tip-title {
+		font-size: 0.875rem;
+		font-weight: 600;
+		color: var(--text);
+		margin: 0;
+	}
+
+	.tip-detail {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		margin: 0;
+		line-height: 1.45;
+	}
+
+	.tip-action {
+		display: inline-block;
+		margin-top: 4px;
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--blue-600, #2563eb);
+		text-decoration: none;
+	}
+
+	.tip-action:hover {
+		text-decoration: underline;
+	}
+
+	.tip-dismiss {
+		flex-shrink: 0;
+		background: none;
+		border: none;
+		cursor: pointer;
+		color: var(--text-muted);
+		font-size: 0.8rem;
+		padding: 2px 4px;
+		border-radius: 2px;
+		line-height: 1;
+		transition: color 0.1s;
+	}
+
+	.tip-dismiss:hover {
+		color: var(--text);
+	}
+
+	.tips-all-dismissed {
+		font-size: 0.875rem;
+		color: var(--text-muted);
+		padding: 8px 0;
+	}
+
+	.tips-show-dismissed {
+		margin-top: 10px;
+		background: none;
+		border: none;
+		cursor: pointer;
+		font-family: var(--font);
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		padding: 0;
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+
+	.tips-show-dismissed:hover {
+		color: var(--text);
+	}
+
+	.tips-list-dismissed {
+		margin-top: 8px;
 	}
 
 	/* ── Print ───────────────────────────────────────────────────────────────── */

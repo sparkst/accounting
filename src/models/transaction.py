@@ -176,6 +176,20 @@ class Transaction(Base):
         comment="Links an expense to its reimbursement payment",
     )
 
+    # ── 1099 tracking ─────────────────────────────────────────────────────────
+    payer_1099: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+        comment="Name of 1099 payer (e.g. 'Cardinal Health Inc') for income documentation",
+    )
+    payer_1099_type: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        default=None,
+        comment="1099 form type: NEC, MISC, K, etc.",
+    )
+
     # ── Payment method ─────────────────────────────────────────────────────────
     payment_method: Mapped[str | None] = mapped_column(
         String(32),

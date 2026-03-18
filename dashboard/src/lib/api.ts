@@ -378,6 +378,53 @@ export interface TaxWarning {
 	unconfirmed_ids: string[];
 }
 
+export interface TaxYoyDelta {
+	tax_category: string;
+	irs_line: string;
+	is_income: boolean;
+	is_reimbursable: boolean;
+	current: number;
+	prior: number;
+	delta: number;
+	delta_pct: number | null;
+}
+
+export interface TaxBnoMonthlyDelta {
+	month: string;
+	current: number;
+	prior: number;
+	delta: number;
+}
+
+export interface TaxBnoQuarterlyDelta {
+	quarter: string;
+	current: number;
+	prior: number;
+	delta: number;
+}
+
+export interface TaxYoyComparison {
+	prior_year: number;
+	prior_year_items: TaxLineItem[];
+	prior_gross_income: number;
+	prior_total_expenses: number;
+	prior_net_profit: number;
+	deltas: TaxYoyDelta[];
+	net_profit_delta: number;
+	net_profit_delta_pct: number | null;
+	bno_monthly_deltas: TaxBnoMonthlyDelta[];
+	bno_quarterly_deltas: TaxBnoQuarterlyDelta[];
+}
+
+export interface TaxTip {
+	id: string;
+	type: 'home_office' | 'estimated_tax' | 'reimbursable' | 'vehicle' | 'unlinked_income';
+	title: string;
+	detail: string;
+	action_url: string | null;
+	dismissible: boolean;
+}
+
 export interface TaxSummary {
 	entity: string;
 	year: number;
@@ -387,10 +434,20 @@ export interface TaxSummary {
 	net_profit: number;
 	readiness: TaxReadiness;
 	warnings: TaxWarning[];
+	comparison: TaxYoyComparison | null;
+	tax_tips: TaxTip[];
 }
 
-export async function fetchTaxSummary(entity: string, year: number): Promise<TaxSummary> {
-	return request<TaxSummary>(`/tax-summary?entity=${encodeURIComponent(entity)}&year=${year}`);
+export async function fetchTaxSummary(
+	entity: string,
+	year: number,
+	compareYear?: number
+): Promise<TaxSummary> {
+	let url = `/tax-summary?entity=${encodeURIComponent(entity)}&year=${year}`;
+	if (compareYear !== undefined) {
+		url += `&compare_year=${compareYear}`;
+	}
+	return request<TaxSummary>(url);
 }
 
 /**
@@ -418,4 +475,74 @@ export async function downloadExport(
 	a.click();
 	document.body.removeChild(a);
 	URL.revokeObjectURL(objectUrl);
+}
+
+// --- Aggregations (for InsightPanel) ---
+
+export interface TimeSeriesPoint {
+	period: string;
+	total: number;
+}
+
+export interface TopVendorItem {
+	vendor: string;
+	total: number;
+	pct: number;
+}
+
+export interface MoMChange {
+	income_delta: number;
+	income_pct: number;
+	expense_delta: number;
+	expense_pct: number;
+}
+
+export interface ConcentrationWarning {
+	vendor: string;
+	pct: number;
+	message: string;
+}
+
+export interface AnomalyItem {
+	tx_id: string;
+	vendor: string;
+	amount: number;
+	avg_for_vendor: number;
+	message: string;
+}
+
+export interface CategoryBreakdownItem {
+	category: string;
+	total: number;
+	pct: number;
+}
+
+export interface AggregationData {
+	time_series: {
+		income: TimeSeriesPoint[];
+		expenses: TimeSeriesPoint[];
+	};
+	top_vendors: {
+		income: TopVendorItem[];
+		expense: TopVendorItem[];
+	};
+	mom_change: MoMChange;
+	concentration_warnings: ConcentrationWarning[];
+	anomalies: AnomalyItem[];
+	category_breakdown: CategoryBreakdownItem[];
+	expense_attribution: string;
+}
+
+export async function fetchAggregations(params: {
+	entity?: string;
+	date_from?: string;
+	date_to?: string;
+}): Promise<AggregationData> {
+	const qs = new URLSearchParams();
+	if (params.entity) qs.set('entity', params.entity);
+	if (params.date_from) qs.set('date_from', params.date_from);
+	if (params.date_to) qs.set('date_to', params.date_to);
+	const res = await fetch(`${BASE}/transactions/aggregations?${qs}`);
+	if (!res.ok) throw new Error(`Aggregations failed: ${res.status}`);
+	return res.json();
 }

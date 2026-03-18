@@ -106,6 +106,7 @@ class TestSourceEnum:
             "gmail_n8n", "stripe", "shopify",
             "brokerage_csv", "bank_csv",
             "photo_receipt", "deduction_email",
+            "woocommerce_csv",
         }
 
 

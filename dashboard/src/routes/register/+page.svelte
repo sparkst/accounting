@@ -4,7 +4,10 @@
 	import { fetchTransactions, updateTransaction, confirmTransaction } from '$lib/api';
 	import type { TransactionFilters } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
+	import InsightPanel from '$lib/components/InsightPanel.svelte';
 	import { DATE_PRESETS } from '$lib/datePresets';
+	import { fetchAggregations } from '$lib/api';
+	import type { AggregationData } from '$lib/api';
 
 	const PAGE_SIZES = [25, 50, 100, 200];
 	let pageSize = $state(50);
@@ -33,6 +36,11 @@
 
 	// Keyboard navigation
 	let focusedRow = $state(0);
+
+	// Insight panel
+	let activeInsightCard = $state<'income' | 'expenses' | 'net' | null>(null);
+	let aggregationData = $state<AggregationData | null>(null);
+	let aggregationLoading = $state(false);
 
 	// Inline editing
 	let editingCell = $state<{ id: string; field: string } | null>(null);
@@ -197,6 +205,33 @@
 		dateTo = '';
 		datePreset = '';
 		applyFilters();
+	}
+
+	async function openInsight(card: 'income' | 'expenses' | 'net') {
+		if (activeInsightCard === card) {
+			// Toggle off
+			activeInsightCard = null;
+			return;
+		}
+		activeInsightCard = card;
+		if (!aggregationData) {
+			aggregationLoading = true;
+			try {
+				const params: { entity?: string; date_from?: string; date_to?: string } = {};
+				if (entityFilter) params.entity = entityFilter;
+				if (dateFrom) params.date_from = dateFrom;
+				if (dateTo) params.date_to = dateTo;
+				aggregationData = await fetchAggregations(params);
+			} catch {
+				// Non-fatal — panel stays empty
+			} finally {
+				aggregationLoading = false;
+			}
+		}
+	}
+
+	function closeInsight() {
+		activeInsightCard = null;
 	}
 
 	function toggleRow(id: string) {
@@ -397,25 +432,54 @@
 	<!-- Summary cards -->
 	{#if data && data.total > 0}
 		<div class="summary-row">
-			<div class="summary-card">
+			<button
+				class="summary-card summary-card-btn"
+				class:summary-card-active={activeInsightCard === 'income'}
+				onclick={() => openInsight('income')}
+				aria-expanded={activeInsightCard === 'income'}
+				aria-label="Income — click to view insights"
+			>
 				<span class="summary-label">Income</span>
 				<span class="summary-value amount-positive">{formatCurrency(incomeTotalAll)}</span>
-			</div>
-			<div class="summary-card">
+			</button>
+			<button
+				class="summary-card summary-card-btn"
+				class:summary-card-active={activeInsightCard === 'expenses'}
+				onclick={() => openInsight('expenses')}
+				aria-expanded={activeInsightCard === 'expenses'}
+				aria-label="Expenses — click to view insights"
+			>
 				<span class="summary-label">Expenses</span>
 				<span class="summary-value amount-negative">{formatCurrency(expenseTotalAll)}</span>
-			</div>
-			<div class="summary-card">
+			</button>
+			<button
+				class="summary-card summary-card-btn"
+				class:summary-card-active={activeInsightCard === 'net'}
+				onclick={() => openInsight('net')}
+				aria-expanded={activeInsightCard === 'net'}
+				aria-label="Net — click to view insights"
+			>
 				<span class="summary-label">Net</span>
 				<span class="summary-value" class:amount-positive={netAll >= 0} class:amount-negative={netAll < 0}>
 					{formatCurrency(netAll)}
 				</span>
-			</div>
+			</button>
 			<div class="summary-card">
 				<span class="summary-label">Transactions</span>
 				<span class="summary-value">{data.total.toLocaleString()}</span>
 			</div>
 		</div>
+
+		<!-- Insight panel (shown when a summary card is active) -->
+		{#if activeInsightCard && aggregationData}
+			<InsightPanel
+				data={aggregationData}
+				card={activeInsightCard}
+				onclose={closeInsight}
+			/>
+		{:else if activeInsightCard && aggregationLoading}
+			<div class="insight-loading card">Loading insights…</div>
+		{/if}
 	{/if}
 
 	<!-- Filter bar -->
@@ -767,6 +831,29 @@
 		display: flex;
 		flex-direction: column;
 		gap: 4px;
+	}
+
+	.summary-card-btn {
+		cursor: pointer;
+		text-align: left;
+		transition: border-color 0.15s, box-shadow 0.15s;
+	}
+
+	.summary-card-btn:hover {
+		border-color: var(--blue-400);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-500) 15%, transparent);
+	}
+
+	.summary-card-active {
+		border-color: var(--blue-500);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-500) 20%, transparent);
+	}
+
+	.insight-loading {
+		padding: 20px 24px;
+		color: var(--text-muted);
+		font-size: .875rem;
+		margin-bottom: 16px;
 	}
 
 	.summary-label {

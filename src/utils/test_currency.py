@@ -10,21 +10,14 @@ Covers:
 from __future__ import annotations
 
 import json
-from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from src.utils.currency import (
-    ConversionResult,
-    CurrencyAmount,
-    ExchangeRateResult,
     clear_rate_cache,
     convert_to_usd,
     detect_currency,
     fetch_exchange_rate,
 )
-
 
 # ---------------------------------------------------------------------------
 # detect_currency tests

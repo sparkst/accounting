@@ -293,7 +293,7 @@
 
 					{#if health.classification_stats.pending_count > 0}
 						<div class="stats-cta">
-							<a href="/" class="btn btn-primary btn-sm">
+							<a href="/review" class="btn btn-primary btn-sm">
 								Review {health.classification_stats.pending_count} pending
 							</a>
 						</div>

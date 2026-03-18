@@ -16,11 +16,13 @@ from datetime import UTC, date, datetime, timedelta
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy import func as sa_func
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal
 from src.models.enums import Source, TransactionStatus
 from src.models.ingestion_log import IngestionLog
+from src.models.llm_usage import LLMUsageLog
 from src.models.transaction import Transaction
 from src.utils.staleness import compute_source_freshness
 
@@ -164,6 +166,16 @@ class FailureLogEntry(BaseModel):
     records_failed: int
 
 
+class LLMUsageOut(BaseModel):
+    """Monthly LLM usage aggregation."""
+
+    calls_this_month: int
+    total_input_tokens: int
+    total_output_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float
+
+
 class HealthResponse(BaseModel):
     """Full health check response."""
 
@@ -175,6 +187,7 @@ class HealthResponse(BaseModel):
     total_transactions: int
     needs_review_count: int
     checked_at: datetime
+    llm_usage: LLMUsageOut
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +283,26 @@ def get_health(session: Session = Depends(get_db)) -> HealthResponse:  # noqa: B
             for lg in recent_failures
         ]
 
+        # ── LLM usage this month ─────────────────────────────────────────────
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        llm_rows = (
+            session.query(
+                sa_func.count(LLMUsageLog.id).label("calls"),
+                sa_func.coalesce(sa_func.sum(LLMUsageLog.input_tokens), 0).label("input_tokens"),
+                sa_func.coalesce(sa_func.sum(LLMUsageLog.output_tokens), 0).label("output_tokens"),
+                sa_func.coalesce(sa_func.sum(LLMUsageLog.cost_estimate), 0.0).label("cost"),
+            )
+            .filter(LLMUsageLog.timestamp >= month_start)
+            .one()
+        )
+        llm_usage = LLMUsageOut(
+            calls_this_month=int(llm_rows.calls),
+            total_input_tokens=int(llm_rows.input_tokens),
+            total_output_tokens=int(llm_rows.output_tokens),
+            total_tokens=int(llm_rows.input_tokens) + int(llm_rows.output_tokens),
+            estimated_cost_usd=float(llm_rows.cost),
+        )
+
         return HealthResponse(
             ok=True,
             source_freshness=freshness_out,
@@ -279,6 +312,7 @@ def get_health(session: Session = Depends(get_db)) -> HealthResponse:  # noqa: B
             total_transactions=total,
             needs_review_count=needs_review,
             checked_at=now,
+            llm_usage=llm_usage,
         )
     finally:
         session.close()

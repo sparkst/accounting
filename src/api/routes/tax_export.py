@@ -12,6 +12,9 @@ requested entity+year are unconfirmed.
 from __future__ import annotations
 
 import logging
+from datetime import date as _stdlib_date
+from datetime import date as date_type
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -96,7 +99,7 @@ def _validate_year(year: int) -> None:
     if year < 2020 or year > 2100:
         raise HTTPException(
             status_code=422,
-            detail=f"Year {year} out of range (2020–2100).",
+            detail=f"Year {year} out of range (2020\u20132100).",
         )
 
 
@@ -181,6 +184,467 @@ def _check_unconfirmed_threshold(
 
 
 # ---------------------------------------------------------------------------
+# Year-over-year comparison helpers
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_for_yoy(
+    transactions: list[Transaction],
+    entity: str,
+    year: int,
+) -> dict[str, Any]:
+    """Aggregate transactions into a lightweight dict for YoY comparison.
+
+    Returns line_items, gross_income, total_expenses, net_profit,
+    bno_monthly, bno_quarterly.
+    """
+    category_totals: dict[str, Decimal] = {}
+    for tx in transactions:
+        cat = tx.tax_category
+        if not cat or cat in ("PERSONAL_NON_DEDUCTIBLE", "CAPITAL_CONTRIBUTION"):
+            continue
+        amt = Decimal(str(tx.amount)) if tx.amount is not None else Decimal("0")
+        pct = Decimal(str(tx.deductible_pct))
+        deductible = abs(amt) * pct
+        category_totals[cat] = category_totals.get(cat, Decimal("0")) + deductible
+
+    line_items = []
+    gross_income = Decimal("0")
+    total_expenses = Decimal("0")
+
+    for cat, total in sorted(category_totals.items()):
+        irs_line = IRS_LINE_MAPPING.get(cat, "Other")
+        is_income = cat in INCOME_CATEGORIES
+        is_reimbursable = cat == "REIMBURSABLE"
+
+        if is_income:
+            gross_income += total
+        elif not is_reimbursable:
+            total_expenses += total
+
+        line_items.append(
+            {
+                "tax_category": cat,
+                "irs_line": irs_line,
+                "total": float(total),
+                "is_income": is_income,
+                "is_reimbursable": is_reimbursable,
+            }
+        )
+
+    # Include home office deduction for the entity
+    home_office = Decimal(str(_HOME_OFFICE_DEDUCTION.get(entity, 0.0)))
+    if home_office > 0:
+        total_expenses += home_office
+
+    net_profit = gross_income - total_expenses
+
+    monthly_income: dict[int, float] = {m: 0.0 for m in range(1, 13)}
+    for tx in transactions:
+        if tx.tax_category not in INCOME_CATEGORIES:
+            continue
+        date_str = tx.date or ""
+        try:
+            month_num = int(date_str[5:7])
+        except (IndexError, ValueError):
+            continue
+        monthly_income[month_num] += abs(float(tx.amount)) if tx.amount is not None else 0.0
+
+    bno_monthly = [
+        {"month": f"{year}-{m:02d}", "income": round(monthly_income[m], 2)}
+        for m in range(1, 13)
+    ]
+
+    quarterly_income = [0.0] * 4
+    for m in range(1, 13):
+        quarterly_income[(m - 1) // 3] += monthly_income[m]
+    bno_quarterly = [
+        {"quarter": f"Q{q + 1}", "income": round(quarterly_income[q], 2)}
+        for q in range(4)
+    ]
+
+    return {
+        "line_items": line_items,
+        "gross_income": float(gross_income),
+        "total_expenses": float(total_expenses),
+        "net_profit": float(net_profit),
+        "bno_monthly": bno_monthly,
+        "bno_quarterly": bno_quarterly,
+    }
+
+
+def _build_yoy_comparison(
+    current_agg: dict[str, Any],
+    prior_agg: dict[str, Any],
+    prior_year: int,
+) -> dict[str, Any]:
+    """Build a year-over-year comparison object from two _aggregate_for_yoy results."""
+    prior_by_cat: dict[str, dict[str, Any]] = {
+        item["tax_category"]: item for item in prior_agg["line_items"]
+    }
+    current_by_cat: dict[str, dict[str, Any]] = {
+        item["tax_category"]: item for item in current_agg["line_items"]
+    }
+
+    all_cats = sorted(set(prior_by_cat) | set(current_by_cat))
+    deltas = []
+    for cat in all_cats:
+        current_val = current_by_cat[cat]["total"] if cat in current_by_cat else 0.0
+        prior_val = prior_by_cat[cat]["total"] if cat in prior_by_cat else 0.0
+        delta = current_val - prior_val
+        delta_pct = ((delta / prior_val) * 100.0) if prior_val != 0.0 else None
+        meta = current_by_cat.get(cat) or prior_by_cat.get(cat, {})
+        deltas.append(
+            {
+                "tax_category": cat,
+                "irs_line": meta.get("irs_line", "Other"),
+                "is_income": meta.get("is_income", False),
+                "is_reimbursable": meta.get("is_reimbursable", False),
+                "current": current_val,
+                "prior": prior_val,
+                "delta": round(delta, 2),
+                "delta_pct": round(delta_pct, 1) if delta_pct is not None else None,
+            }
+        )
+
+    profit_delta = current_agg["net_profit"] - prior_agg["net_profit"]
+    prior_profit = prior_agg["net_profit"]
+    profit_delta_pct = (
+        (profit_delta / abs(prior_profit) * 100.0) if prior_profit != 0.0 else None
+    )
+
+    prior_bno_by_month: dict[str, float] = {
+        item["month"][-2:]: item["income"] for item in prior_agg["bno_monthly"]
+    }
+    bno_monthly_deltas = [
+        {
+            "month": item["month"],
+            "current": item["income"],
+            "prior": prior_bno_by_month.get(item["month"][-2:], 0.0),
+            "delta": round(
+                item["income"] - prior_bno_by_month.get(item["month"][-2:], 0.0), 2
+            ),
+        }
+        for item in current_agg["bno_monthly"]
+    ]
+
+    prior_bno_by_q: dict[str, float] = {
+        item["quarter"]: item["income"] for item in prior_agg["bno_quarterly"]
+    }
+    bno_quarterly_deltas = [
+        {
+            "quarter": item["quarter"],
+            "current": item["income"],
+            "prior": prior_bno_by_q.get(item["quarter"], 0.0),
+            "delta": round(item["income"] - prior_bno_by_q.get(item["quarter"], 0.0), 2),
+        }
+        for item in current_agg["bno_quarterly"]
+    ]
+
+    return {
+        "prior_year": prior_year,
+        "prior_year_items": prior_agg["line_items"],
+        "prior_gross_income": prior_agg["gross_income"],
+        "prior_total_expenses": prior_agg["total_expenses"],
+        "prior_net_profit": prior_agg["net_profit"],
+        "deltas": deltas,
+        "net_profit_delta": round(profit_delta, 2),
+        "net_profit_delta_pct": (
+            round(profit_delta_pct, 1) if profit_delta_pct is not None else None
+        ),
+        "bno_monthly_deltas": bno_monthly_deltas,
+        "bno_quarterly_deltas": bno_quarterly_deltas,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Home office deduction
+# ---------------------------------------------------------------------------
+
+# Simplified home office deduction per IRS guidelines:
+# 36 sqft × $5/sqft = $180/month × 12 = $2,160/year (simplified method cap $1,500)
+# Using simplified method: 36 sqft × $5 = $180/year
+_HOME_OFFICE_DEDUCTION: dict[str, float] = {
+    Entity.SPARKRY.value: 180.0,
+    Entity.BLACKLINE.value: 0.0,
+    Entity.PERSONAL.value: 0.0,
+}
+
+
+# ---------------------------------------------------------------------------
+# 1099 income breakdown
+# ---------------------------------------------------------------------------
+
+
+def _build_1099_breakdown(transactions: list[Transaction]) -> list[dict[str, Any]]:
+    """Group income transactions by payer_1099 and return sorted by total desc.
+
+    Only income transactions with payer_1099 set are included.
+    """
+    payer_totals: dict[str, dict[str, Any]] = {}
+    for tx in transactions:
+        if not tx.payer_1099:
+            continue
+        if tx.direction not in ("income",) and tx.tax_category not in INCOME_CATEGORIES:
+            continue
+        # Only include actual income
+        if tx.direction != "income":
+            continue
+        payer = tx.payer_1099
+        if payer not in payer_totals:
+            payer_totals[payer] = {
+                "payer": payer,
+                "type": getattr(tx, "payer_1099_type", None),
+                "total": 0.0,
+            }
+        amt = abs(float(tx.amount)) if tx.amount is not None else 0.0
+        payer_totals[payer]["total"] += amt
+
+    result = sorted(payer_totals.values(), key=lambda x: x["total"], reverse=True)
+    for item in result:
+        item["total"] = round(item["total"], 2)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tax tips generation
+# ---------------------------------------------------------------------------
+
+
+def _generate_tax_tips(
+    transactions: list[Transaction],
+    entity: str,
+    year: int,
+    home_office_deduction: float,
+    net_profit: Decimal,
+) -> list[dict[str, Any]]:
+    """Generate actionable tax optimization tips based on transaction data.
+
+    Each tip has: id, type, title, detail, action_url (optional), dismissible.
+
+    Tips generated:
+      - home_office:    Sparkry with home_office_deduction > 0 but no HOME_OFFICE transactions
+      - estimated_tax:  income > $10K and no estimated tax payments recorded
+      - reimbursable:   unlinked reimbursable expenses older than 30 days
+      - vehicle:        no CAR_AND_TRUCK transactions
+      - unlinked_income: income transactions without payer_1099 set
+    """
+    today = date_type.today()
+    tips: list[dict[str, Any]] = []
+
+    # ── Home office tip ────────────────────────────────────────────────────
+    if entity == Entity.SPARKRY.value and home_office_deduction > 0:
+        has_home_office_tx = any(
+            tx.tax_category == "HOME_OFFICE" for tx in transactions
+        )
+        if not has_home_office_tx:
+            tips.append({
+                "id": f"home_office_{entity}_{year}",
+                "type": "home_office",
+                "title": f"You qualify for a ${home_office_deduction:,.0f}/year home office deduction",
+                "detail": (
+                    "IRS simplified method: 36 sq ft × $5/sq ft. "
+                    "Already included in your net profit calculation. "
+                    "No HOME_OFFICE transactions are required — this deduction is automatic."
+                ),
+                "action_url": "/tax",
+                "dismissible": True,
+            })
+
+    # ── Estimated tax tip ──────────────────────────────────────────────────
+    if entity in (Entity.SPARKRY.value, Entity.BLACKLINE.value):
+        gross_income = sum(
+            abs(float(tx.amount))
+            for tx in transactions
+            if tx.tax_category in INCOME_CATEGORIES and tx.amount is not None
+        )
+        has_estimated_payments = any(
+            "estimated" in (tx.tax_subcategory or "").lower()
+            for tx in transactions
+        )
+        if gross_income > 10_000 and not has_estimated_payments:
+            tips.append({
+                "id": f"estimated_tax_{entity}_{year}",
+                "type": "estimated_tax",
+                "title": "No estimated tax payments recorded — you may owe penalties",
+                "detail": (
+                    f"Based on ${gross_income:,.0f} YTD income, the IRS expects quarterly "
+                    "estimated payments. Tag any payments with subcategory 'estimated'."
+                ),
+                "action_url": "/register",
+                "dismissible": True,
+            })
+
+    # ── Reimbursable tip ───────────────────────────────────────────────────
+    cutoff = today - timedelta(days=30)
+    cutoff_str = cutoff.isoformat()
+    unlinked_reimbursable = [
+        tx for tx in transactions
+        if tx.direction == "reimbursable"
+        and tx.reimbursement_link is None
+        and (tx.date or "") < cutoff_str
+    ]
+    if unlinked_reimbursable:
+        total_pending = sum(
+            abs(float(tx.amount)) for tx in unlinked_reimbursable if tx.amount is not None
+        )
+        count = len(unlinked_reimbursable)
+        tips.append({
+            "id": f"reimbursable_{entity}_{year}",
+            "type": "reimbursable",
+            "title": f"${total_pending:,.2f} in expenses pending reimbursement",
+            "detail": (
+                f"{count} reimbursable {'expense' if count == 1 else 'expenses'} "
+                f"older than 30 days {'has' if count == 1 else 'have'} not been linked "
+                "to a reimbursement payment."
+            ),
+            "action_url": f"/register?entity={entity}&direction=reimbursable",
+            "dismissible": True,
+        })
+
+    # ── Vehicle tip ────────────────────────────────────────────────────────
+    if entity in (Entity.SPARKRY.value, Entity.BLACKLINE.value):
+        has_vehicle = any(tx.tax_category == "CAR_AND_TRUCK" for tx in transactions)
+        if not has_vehicle:
+            tips.append({
+                "id": f"vehicle_{entity}_{year}",
+                "type": "vehicle",
+                "title": "No vehicle expenses recorded — do you drive for business?",
+                "detail": (
+                    "Business mileage is deductible (IRS standard rate: 67¢/mile for 2024). "
+                    "Add CAR_AND_TRUCK transactions if you use a vehicle for work."
+                ),
+                "action_url": "/register",
+                "dismissible": True,
+            })
+
+    # ── Unlinked income (Stripe charges not matched to invoices) ───────────
+    stripe_income = [
+        tx for tx in transactions
+        if tx.source in ("stripe_sparkry", "stripe_blackline", "stripe")
+        and tx.tax_category in INCOME_CATEGORIES
+        and not tx.payer_1099
+    ]
+    if stripe_income:
+        total_unlinked = sum(
+            abs(float(tx.amount)) for tx in stripe_income if tx.amount is not None
+        )
+        n = len(stripe_income)
+        tips.append({
+            "id": f"unlinked_income_{entity}_{year}",
+            "type": "unlinked_income",
+            "title": f"{n} Stripe {'charge' if n == 1 else 'charges'} (${total_unlinked:,.2f}) not matched to invoices",
+            "detail": (
+                "These Stripe income transactions have no 1099 payer set. "
+                "Match them to invoices or tag the payer for accurate 1099 documentation."
+            ),
+            "action_url": "/register",
+            "dismissible": True,
+        })
+
+    return tips
+
+
+# ---------------------------------------------------------------------------
+# Estimated tax computation
+# ---------------------------------------------------------------------------
+
+
+def _compute_estimated_tax(
+    transactions: list[Any],
+    net_profit: Decimal,
+    year: int,
+) -> dict[str, Any]:
+    """Compute estimated quarterly tax liability for self-employment income.
+
+    Formulas:
+      SE tax = projected_annual_net × 92.35% × 15.3%
+      Income tax = (projected_annual_net - 50% of SE tax) × 22%
+      quarterly_payment = total_annual / 4
+
+    Args:
+        transactions: Transaction-like objects (need .tax_subcategory, .amount).
+        net_profit:   Year-to-date net profit (income - expenses).
+        year:         Tax year being computed.
+
+    Returns:
+        Dict with projected amounts, quarter details, and total_paid.
+    """
+    today = date_type.today()
+
+    # Determine months elapsed
+    if year < today.year:
+        months_elapsed = 12
+    elif year == today.year:
+        months_elapsed = max(1, today.month)
+    else:
+        months_elapsed = 1
+
+    ytd = float(net_profit)
+    projected = ytd * (12 / months_elapsed) if months_elapsed > 0 else 0.0
+
+    # SE tax: projected × 92.35% × 15.3%
+    se_tax = max(0.0, projected * 0.9235 * 0.153)
+    se_tax = round(se_tax, 2)
+
+    # Income tax: (projected - 50% SE) × 22%
+    income_tax = max(0.0, (projected - se_tax * 0.5) * 0.22)
+    income_tax = round(income_tax, 2)
+
+    total_annual = round(se_tax + income_tax, 2)
+    quarterly = round(total_annual / 4, 2)
+
+    # Total paid: sum of estimated tax payments
+    total_paid = 0.0
+    for tx in transactions:
+        subcat = getattr(tx, "tax_subcategory", None) or ""
+        if "estimated" in subcat.lower():
+            total_paid += abs(float(tx.amount)) if tx.amount is not None else 0.0
+    total_paid = round(total_paid, 2)
+
+    # Quarter due dates
+    q_due = [
+        ("Q1", f"{year}-04-15"),
+        ("Q2", f"{year}-06-15"),
+        ("Q3", f"{year}-09-15"),
+        ("Q4", f"{year + 1}-01-15"),
+    ]
+
+    quarters = []
+    for q_name, due_date in q_due:
+        due = _stdlib_date.fromisoformat(due_date)
+        if total_paid >= quarterly:
+            state = "paid"
+        elif due < today:
+            state = "overdue"
+        else:
+            state = "upcoming"
+
+        remaining = max(0.0, round(quarterly - total_paid, 2)) if state != "paid" else 0.0
+
+        quarters.append({
+            "quarter": q_name,
+            "due_date": due_date,
+            "projected_amount": quarterly,
+            "paid": total_paid,
+            "remaining": remaining,
+            "state": state,
+        })
+
+    return {
+        "months_elapsed": months_elapsed,
+        "ytd_net_profit": round(ytd, 2),
+        "projected_annual_net": round(projected, 2),
+        "se_tax_annual": se_tax,
+        "income_tax_annual": income_tax,
+        "total_annual": total_annual,
+        "quarterly_payment": quarterly,
+        "total_paid": total_paid,
+        "quarters": quarters,
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /api/tax-summary
 # ---------------------------------------------------------------------------
 
@@ -189,15 +653,34 @@ def _check_unconfirmed_threshold(
 def get_tax_summary(
     entity: str = Query(..., description="Entity: sparkry | blackline | personal"),
     year: int = Query(..., description="Tax year (e.g. 2025)"),
+    compare_year: int | None = Query(
+        default=None,
+        description=(
+            "Optional prior year to compare against (e.g. 2024). "
+            "When present the response includes a 'comparison' object with "
+            "prior_year_items and per-category deltas."
+        ),
+    ),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """Return per-tax-category totals aggregated from confirmed transactions.
 
     Includes IRS line number mapping, readiness percentage, and net profit.
     Emits a warning (not a block) when unconfirmed transactions exist.
+
+    When compare_year is provided, the response includes a 'comparison' object
+    with prior_year_items and per-category deltas (delta, delta_pct).
     """
     entity = _validate_entity(entity)
     _validate_year(year)
+
+    if compare_year is not None:
+        _validate_year(compare_year)
+        if compare_year == year:
+            raise HTTPException(
+                status_code=422,
+                detail="compare_year must differ from year.",
+            )
 
     transactions = _fetch_transactions(session, entity, year)
     readiness = _readiness(transactions)
@@ -275,6 +758,45 @@ def get_tax_summary(
         for q in range(4)
     ]
 
+    # ── Year-over-year comparison ─────────────────────────────────────────
+    comparison: dict[str, Any] | None = None
+    if compare_year is not None:
+        prior_transactions = _fetch_transactions(session, entity, compare_year)
+        current_agg = _aggregate_for_yoy(transactions, entity, year)
+        prior_agg = _aggregate_for_yoy(prior_transactions, entity, compare_year)
+        comparison = _build_yoy_comparison(current_agg, prior_agg, compare_year)
+
+    # ── Home office deduction ────────────────────────────────────────────
+    home_office = _HOME_OFFICE_DEDUCTION.get(entity, 0.0)
+    if home_office > 0:
+        total_expenses += Decimal(str(home_office))
+        net_profit = gross_income - total_expenses
+
+    # ── 1099 income breakdown ─────────────────────────────────────────
+    income_1099_breakdown = _build_1099_breakdown(transactions)
+
+    # ── Undocumented income warning ───────────────────────────────────
+    tagged_amount = sum(entry["total"] for entry in income_1099_breakdown)
+    total_income_amount = float(gross_income)
+    if total_income_amount > 0 and tagged_amount < total_income_amount:
+        undocumented = total_income_amount - tagged_amount
+        warnings.append({
+            "warning": (
+                f"1099 documentation gap: ${undocumented:,.2f} of ${total_income_amount:,.2f} "
+                f"gross income is not tagged to a 1099 payer."
+            ),
+            "undocumented_amount": round(undocumented, 2),
+            "tagged_amount": round(tagged_amount, 2),
+        })
+
+    # ── Estimated tax ─────────────────────────────────────────────────
+    estimated_tax: dict[str, Any] | None = None
+    if entity in (Entity.SPARKRY.value, Entity.BLACKLINE.value):
+        estimated_tax = _compute_estimated_tax(transactions, net_profit, year)
+
+    # ── Tax tips ──────────────────────────────────────────────────────
+    tax_tips = _generate_tax_tips(transactions, entity, year, home_office, net_profit)
+
     return {
         "entity": entity,
         "year": year,
@@ -286,6 +808,11 @@ def get_tax_summary(
         "warnings": warnings,
         "bno_monthly": bno_monthly,
         "bno_quarterly": bno_quarterly,
+        "comparison": comparison,
+        "home_office_deduction": home_office,
+        "income_1099_breakdown": income_1099_breakdown,
+        "estimated_tax": estimated_tax,
+        "tax_tips": tax_tips,
     }
 
 

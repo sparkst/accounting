@@ -44,6 +44,11 @@
 			<ul class="nav-links">
 				<li>
 					<a href="/" class="nav-link" aria-current={isActive('/') ? 'page' : undefined}>
+						Dashboard
+					</a>
+				</li>
+				<li>
+					<a href="/review" class="nav-link" aria-current={isActive('/review') ? 'page' : undefined}>
 						Review
 						{#if reviewCount > 0}
 							<span class="nav-badge" aria-label="{reviewCount} items need review">

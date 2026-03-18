@@ -24,6 +24,8 @@ from src.models.base import Base
 from src.models.ingested_file import IngestedFile  # noqa: F401
 from src.models.ingestion_log import IngestionLog  # noqa: F401
 from src.models.invoice import Customer, Invoice, InvoiceLineItem  # noqa: F401
+from src.models.llm_usage import LLMUsageLog  # noqa: F401
+from src.models.tax_year_lock import TaxYearLock  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
 

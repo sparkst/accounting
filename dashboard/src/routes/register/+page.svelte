@@ -49,7 +49,7 @@
 	let editSaving = $state(false);
 
 	// Derived
-	$: showReviewReason = statusFilter === 'rejected' || (statusFilter?.includes('rejected') ?? false);
+	let showReviewReason = $derived(statusFilter === 'rejected' || (statusFilter?.includes('rejected') ?? false));
 
 	let items = $derived((data as TransactionList | null)?.items ?? []);
 	let incomeTotalAll  = $derived((data as TransactionList | null)?.income_total ?? 0);

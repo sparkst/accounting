@@ -6,6 +6,7 @@
 	import Toast from '$lib/components/Toast.svelte';
 	import ShortcutOverlay from '$lib/components/ShortcutOverlay.svelte';
 	import { DATE_PRESETS } from '$lib/datePresets';
+	import { BUSINESS_CATEGORIES, PERSONAL_CATEGORIES } from '$lib/categories';
 
 	let items: Transaction[] = $state([]);
 	let loading = $state(true);
@@ -39,35 +40,6 @@
 	// Card component refs
 	let cardRefs = $state<Record<string, TransactionCard>>({});
 
-	const BUSINESS_CATEGORIES = [
-		{ value: 'ADVERTISING',           label: 'Advertising' },
-		{ value: 'CAR_AND_TRUCK',          label: 'Car & Truck' },
-		{ value: 'CONTRACT_LABOR',         label: 'Contract Labor' },
-		{ value: 'INSURANCE',              label: 'Insurance' },
-		{ value: 'LEGAL_AND_PROFESSIONAL', label: 'Legal & Professional' },
-		{ value: 'OFFICE_EXPENSE',         label: 'Office Expense' },
-		{ value: 'SUPPLIES',               label: 'Supplies' },
-		{ value: 'TAXES_AND_LICENSES',     label: 'Taxes & Licenses' },
-		{ value: 'TRAVEL',                 label: 'Travel' },
-		{ value: 'MEALS',                  label: 'Meals (50%)' },
-		{ value: 'COGS',                   label: 'COGS' },
-		{ value: 'CONSULTING_INCOME',      label: 'Consulting Income' },
-		{ value: 'SUBSCRIPTION_INCOME',    label: 'Subscription Income' },
-		{ value: 'SALES_INCOME',           label: 'Sales Income' },
-		{ value: 'REIMBURSABLE',           label: 'Reimbursable' },
-		{ value: 'CAPITAL_CONTRIBUTION',   label: 'Capital Contribution' },
-		{ value: 'OTHER_EXPENSE',          label: 'Other Expense (L27a)' }
-	];
-
-	const PERSONAL_CATEGORIES = [
-		{ value: 'CHARITABLE_CASH',         label: 'Charitable (Cash)' },
-		{ value: 'CHARITABLE_STOCK',        label: 'Charitable (Stock)' },
-		{ value: 'MEDICAL',                 label: 'Medical' },
-		{ value: 'STATE_LOCAL_TAX',         label: 'State & Local Tax' },
-		{ value: 'MORTGAGE_INTEREST',       label: 'Mortgage Interest' },
-		{ value: 'INVESTMENT_INCOME',       label: 'Investment Income' },
-		{ value: 'PERSONAL_NON_DEDUCTIBLE', label: 'Personal (Non-deductible)' }
-	];
 
 	// Priority sorting for review queue
 	function priorityScore(tx: Transaction): number {

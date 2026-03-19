@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { fetchTaxSummary, downloadExport } from '$lib/api';
 	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip } from '$lib/api';
+	import { CATEGORY_LABELS } from '$lib/categories';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
@@ -17,33 +18,6 @@
 	const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 	const QUARTERS = ['Q1','Q2','Q3','Q4'];
 
-	// ── Category display labels ───────────────────────────────────────────────
-	const CATEGORY_LABELS: Record<string, string> = {
-		ADVERTISING:            'Advertising',
-		CAR_AND_TRUCK:          'Car & Truck',
-		CONTRACT_LABOR:         'Contract Labor',
-		INSURANCE:              'Insurance',
-		LEGAL_AND_PROFESSIONAL: 'Legal & Professional',
-		OFFICE_EXPENSE:         'Office Expense',
-		SUPPLIES:               'Supplies',
-		TAXES_AND_LICENSES:     'Taxes & Licenses',
-		TRAVEL:                 'Travel',
-		MEALS:                  'Meals',
-		COGS:                   'Cost of Goods Sold',
-		CONSULTING_INCOME:      'Consulting Income',
-		SUBSCRIPTION_INCOME:    'Subscription Income',
-		SALES_INCOME:           'Sales Income',
-		REIMBURSABLE:           'Reimbursable',
-		CHARITABLE_CASH:        'Charitable (Cash)',
-		CHARITABLE_STOCK:       'Charitable (Non-Cash)',
-		MEDICAL:                'Medical',
-		STATE_LOCAL_TAX:        'State & Local Tax',
-		MORTGAGE_INTEREST:      'Mortgage Interest',
-		INVESTMENT_INCOME:      'Investment Income',
-		PERSONAL_NON_DEDUCTIBLE:'Personal Non-Deductible',
-		CAPITAL_CONTRIBUTION:   'Capital Contribution',
-		OTHER_EXPENSE:          'Other Expense'
-	};
 
 	// ── State ─────────────────────────────────────────────────────────────────
 	let selectedEntity   = $state<'sparkry' | 'blackline' | 'personal'>('sparkry');

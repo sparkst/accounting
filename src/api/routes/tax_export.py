@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 from datetime import date as _stdlib_date
-from datetime import date as date_type
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -362,7 +361,7 @@ def _build_yoy_comparison(
 # ---------------------------------------------------------------------------
 
 # Simplified home office deduction per IRS guidelines:
-# 36 sqft × $5/sqft = $180/month × 12 = $2,160/year (simplified method cap $1,500)
+# IRS Simplified Method: 36 sqft × $5/sqft = $180/year (max 300 sqft, cap $1,500)
 # Using simplified method: 36 sqft × $5 = $180/year
 _HOME_OFFICE_DEDUCTION: dict[str, float] = {
     Entity.SPARKRY.value: 180.0,
@@ -429,7 +428,7 @@ def _generate_tax_tips(
       - vehicle:        no CAR_AND_TRUCK transactions
       - unlinked_income: income transactions without payer_1099 set
     """
-    today = date_type.today()
+    today = _stdlib_date.today()
     tips: list[dict[str, Any]] = []
 
     # ── Home office tip ────────────────────────────────────────────────────
@@ -570,7 +569,7 @@ def _compute_estimated_tax(
     Returns:
         Dict with projected amounts, quarter details, and total_paid.
     """
-    today = date_type.today()
+    today = _stdlib_date.today()
 
     # Determine months elapsed
     if year < today.year:
@@ -611,22 +610,26 @@ def _compute_estimated_tax(
     ]
 
     quarters = []
+    remaining_paid = total_paid
     for q_name, due_date in q_due:
         due = _stdlib_date.fromisoformat(due_date)
-        if total_paid >= quarterly:
+        paid_for_quarter = min(remaining_paid, quarterly)
+        remaining_paid -= paid_for_quarter
+
+        if paid_for_quarter >= quarterly:
             state = "paid"
         elif due < today:
             state = "overdue"
         else:
             state = "upcoming"
 
-        remaining = max(0.0, round(quarterly - total_paid, 2)) if state != "paid" else 0.0
+        remaining = max(0.0, round(quarterly - paid_for_quarter, 2))
 
         quarters.append({
             "quarter": q_name,
             "due_date": due_date,
             "projected_amount": quarterly,
-            "paid": total_paid,
+            "paid": round(paid_for_quarter, 2),
             "remaining": remaining,
             "state": state,
         })

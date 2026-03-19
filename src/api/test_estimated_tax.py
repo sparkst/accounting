@@ -240,8 +240,9 @@ class TestEstimatedTaxMath:
         import src.api.routes.tax_export as _te
 
         txs = txs or []
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = today
+            mock_date.fromisoformat = date.fromisoformat
             return _te._compute_estimated_tax(txs, net, year)
 
     def test_se_tax_formula(self) -> None:
@@ -319,8 +320,9 @@ class TestDueDates:
         """EST-TAX-006: Due dates shift correctly for a different tax year."""
         import src.api.routes.tax_export as _te
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2025, 3, 1)
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax([], Decimal("0"), 2025)
         quarters = {q["quarter"]: q["due_date"] for q in result["quarters"]}
         assert quarters["Q4"] == "2026-01-15"
@@ -382,8 +384,9 @@ class TestTotalPaid:
             tax_subcategory = "office_supplies"
             amount = Decimal("100.00")
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2026, 3, 18)
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax(
                 [_FakeTx(), _FakeTxNo()],  # type: ignore[list-item]
                 Decimal("99000"),
@@ -402,8 +405,9 @@ class TestQuarterState:
         """EST-TAX-008: Overdue when due date has passed and nothing paid."""
         import src.api.routes.tax_export as _te
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2026, 5, 1)
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax([], Decimal("99000"), 2026)
 
         q1 = next(q for q in result["quarters"] if q["quarter"] == "Q1")
@@ -413,8 +417,9 @@ class TestQuarterState:
         """EST-TAX-008: Upcoming when due date is in the future."""
         import src.api.routes.tax_export as _te
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2026, 5, 1)  # before Jun 15
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax([], Decimal("99000"), 2026)
 
         q2 = next(q for q in result["quarters"] if q["quarter"] == "Q2")
@@ -428,8 +433,9 @@ class TestQuarterState:
             tax_subcategory = "estimated_federal"
             amount = Decimal("999999.00")  # wildly overpaid
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2026, 5, 1)
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax([_FakeTx()], Decimal("99000"), 2026)  # type: ignore[list-item]
 
         for q in result["quarters"]:
@@ -447,8 +453,9 @@ class TestPriorYearProjection:
         """EST-TAX-010: months_elapsed=12 and projected==ytd for a prior year."""
         import src.api.routes.tax_export as _te
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2026, 3, 18)  # today is 2026
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax([], Decimal("396000"), 2025)
 
         assert result["months_elapsed"] == 12
@@ -474,8 +481,9 @@ class TestEmptyTransactions:
         """EST-TAX-011: All tax amounts are 0.0 when net profit is zero."""
         import src.api.routes.tax_export as _te
 
-        with patch("src.api.routes.tax_export.date_type") as mock_date:
+        with patch("src.api.routes.tax_export._stdlib_date") as mock_date:
             mock_date.today.return_value = date(2026, 3, 18)
+            mock_date.fromisoformat = date.fromisoformat
             result = _te._compute_estimated_tax([], Decimal("0"), 2026)
 
         assert result["projected_annual_net"] == 0.0

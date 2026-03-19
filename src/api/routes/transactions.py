@@ -80,7 +80,7 @@ class TransactionOut(BaseModel):
     source_id: str | None
     date: str
     description: str
-    amount: Any | None = None  # Decimal serialised as string; None = unknown
+    amount: float | None = None  # Decimal converted to float; None = unknown
     currency: str
     entity: str | None
     direction: str | None

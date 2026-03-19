@@ -406,9 +406,10 @@ def _update_foreign_currency_from_statement(
     old_rate = str(foreign_txn.exchange_rate)
     old_source = str(foreign_txn.exchange_rate_source)
 
-    # Update to actual CC statement amount
+    # Update to actual CC statement amount, preserving original sign
     statement_amount = abs(Decimal(str(statement_txn.amount)))
-    foreign_txn.amount = -statement_amount  # expenses are negative
+    original_sign = -1 if (foreign_txn.amount is not None and float(foreign_txn.amount) < 0) else 1
+    foreign_txn.amount = original_sign * statement_amount
     foreign_txn.exchange_rate = float(statement_amount) / foreign_txn.amount_foreign
     foreign_txn.exchange_rate_source = "credit_card_statement"
 

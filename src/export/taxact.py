@@ -33,6 +33,7 @@ FORM_1065_LINES: dict[str, tuple[str, str, bool]] = {
     "CONSULTING_INCOME": ("1a", "Gross receipts or sales", True),
     "SUBSCRIPTION_INCOME": ("1a", "Gross receipts or sales (subscriptions)", True),
     "SALES_INCOME": ("1a", "Gross receipts or sales (product)", True),
+    "WHOLESALE_INCOME": ("1a", "Gross receipts or sales (wholesale)", True),
     "COGS": ("2", "Cost of goods sold", False),
     "ADVERTISING": ("19", "Advertising", False),
     "CAR_AND_TRUCK": ("20", "Travel and entertainment — car and truck", False),
@@ -109,7 +110,7 @@ def build_form_1065_summary(
     deductions: list[tuple[str, str, Decimal]] = []
 
     for cat, amt in totals.items():
-        if cat in ("CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME"):
+        if cat in INCOME_CATEGORIES:
             gross_income += amt
         elif cat == "COGS":
             cogs += amt

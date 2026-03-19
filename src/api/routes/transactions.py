@@ -816,11 +816,7 @@ def list_review_transactions(
     try:
         txns: list[Transaction] = (
             session.query(Transaction)
-            .filter(
-                Transaction.status.in_(status_list)
-                if len(status_list) > 1
-                else Transaction.status == status_list[0]
-            )
+            .filter(Transaction.status.in_(status_list))
             .all()
         )
 

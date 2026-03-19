@@ -49,7 +49,7 @@
 	let editSaving = $state(false);
 
 	// Derived
-	let showReviewReason = $derived(statusFilter === 'rejected' || (statusFilter?.includes('rejected') ?? false));
+	let showReviewReason = $derived(statusFilter === 'rejected' || statusFilter.includes('rejected'));
 
 	let items = $derived((data as TransactionList | null)?.items ?? []);
 	let incomeTotalAll  = $derived((data as TransactionList | null)?.income_total ?? 0);
@@ -711,7 +711,7 @@
 									>
 										{formatCurrency(runningTotals[rowIdx])}
 									</td>
-									{#if showReviewReason}<td class="review-reason" title={tx.review_reason}>{tx.review_reason ? tx.review_reason.substring(0, 40) + (tx.review_reason.length > 40 ? '...' : '') : ''}</td>{/if}
+									{#if showReviewReason}<td class="review-reason" title={tx.review_reason}>{tx.review_reason ?? ''}</td>{/if}
 								</tr>
 								{#if expandedId === tx.id}
 									<tr class="expanded-row">

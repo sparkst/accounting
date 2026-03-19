@@ -54,7 +54,9 @@ FORM_1040_ADJUSTMENTS: dict[str, tuple[str, str]] = {
 }
 
 # Income categories
-INCOME_CATEGORIES = {"CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME"}
+INCOME_CATEGORIES = {
+    "CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME", "WHOLESALE_INCOME",
+}
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -255,32 +257,24 @@ def build_form_1065_summary(
     Covers ordinary business income (Part II) and deductions aligned to IRS
     Form 1065 line numbers.  Skips REIMBURSABLE and PERSONAL_NON_DEDUCTIBLE.
     """
-    # Form 1065 income/deduction line mapping
-    FORM_1065_INCOME_CATEGORIES = {
-        "CONSULTING_INCOME",
-        "SUBSCRIPTION_INCOME",
-        "SALES_INCOME",
-        "WHOLESALE_INCOME",
-    }
-
     FORM_1065_LINES: dict[str, tuple[str, str]] = {
         # Income
         "CONSULTING_INCOME": ("L1a", "Gross receipts or sales"),
         "SUBSCRIPTION_INCOME": ("L1a", "Gross receipts or sales"),
         "SALES_INCOME": ("L1a", "Gross receipts or sales"),
         "WHOLESALE_INCOME": ("L1a", "Gross receipts or sales"),
-        # Deductions (Part II)
-        "ADVERTISING": ("L20", "Other deductions — Advertising"),
-        "CAR_AND_TRUCK": ("L20", "Other deductions — Car and truck"),
-        "CONTRACT_LABOR": ("L20", "Other deductions — Contract labor"),
-        "INSURANCE": ("L20", "Other deductions — Insurance"),
-        "LEGAL_AND_PROFESSIONAL": ("L20", "Other deductions — Legal and professional"),
-        "OFFICE_EXPENSE": ("L20", "Other deductions — Office expense"),
-        "SUPPLIES": ("L20", "Other deductions — Supplies"),
-        "TAXES_AND_LICENSES": ("L14", "Taxes and licenses"),
+        # Deductions (Part II) — aligned with TaxAct Form 1065 mapping
+        "COGS": ("L2", "Cost of goods sold"),
+        "INSURANCE": ("L13", "Insurance"),
+        "TAXES_AND_LICENSES": ("L15", "Taxes and licenses"),
+        "LEGAL_AND_PROFESSIONAL": ("L16b", "Legal and professional fees"),
+        "OFFICE_EXPENSE": ("L18", "Office expenses"),
+        "SUPPLIES": ("L18", "Office expenses — Supplies"),
+        "ADVERTISING": ("L19", "Advertising"),
         "TRAVEL": ("L20", "Other deductions — Travel"),
         "MEALS": ("L20", "Other deductions — Meals (50% deductible)"),
-        "COGS": ("L2", "Cost of goods sold"),
+        "CAR_AND_TRUCK": ("L20", "Other deductions — Car and truck"),
+        "CONTRACT_LABOR": ("L21", "Other deductions — Contract labor"),
     }
 
     totals: dict[str, Decimal] = {}
@@ -300,7 +294,7 @@ def build_form_1065_summary(
     # Consolidate income categories that share the same IRS line (L1a)
     l1a_total = Decimal("0")
     l1a_detail: list[str] = []
-    for cat in list(FORM_1065_INCOME_CATEGORIES):
+    for cat in INCOME_CATEGORIES:
         if cat in totals:
             l1a_total += totals[cat]
             l1a_detail.append(f"{cat.replace('_', ' ').title()}: ${totals[cat]:,.2f}")
@@ -310,7 +304,7 @@ def build_form_1065_summary(
         income_lines.append(("L1a", "Gross receipts or sales", l1a_total))
 
     for cat, total in sorted(totals.items(), key=lambda x: FORM_1065_LINES[x[0]][0]):
-        if cat in FORM_1065_INCOME_CATEGORIES:
+        if cat in INCOME_CATEGORIES:
             continue
         irs_line, label = FORM_1065_LINES[cat]
         deduction_lines.append((irs_line, label, total))

@@ -151,9 +151,12 @@ export async function bulkConfirmTransactions(
 	entity: string,
 	tax_category: string
 ): Promise<{ confirmed: number; rules_created: number }> {
+	const payload: Record<string, unknown> = { ids };
+	if (entity) payload.entity = entity;
+	if (tax_category) payload.tax_category = tax_category;
 	return request<{ confirmed: number; rules_created: number }>('/transactions/bulk-confirm', {
 		method: 'POST',
-		body: JSON.stringify({ ids, entity, tax_category })
+		body: JSON.stringify(payload)
 	});
 }
 

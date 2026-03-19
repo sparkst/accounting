@@ -72,6 +72,9 @@ class TestTaxCategoryEnum:
         "CHARITABLE_CASH", "CHARITABLE_STOCK", "MEDICAL", "STATE_LOCAL_TAX",
         "MORTGAGE_INTEREST", "INVESTMENT_INCOME", "PERSONAL_NON_DEDUCTIBLE",
     }
+    EQUITY_OTHER = {
+        "CAPITAL_CONTRIBUTION", "OTHER_EXPENSE",
+    }
 
     def test_business_categories_present(self) -> None:
         values = {c.value for c in TaxCategory}
@@ -81,8 +84,12 @@ class TestTaxCategoryEnum:
         values = {c.value for c in TaxCategory}
         assert self.PERSONAL.issubset(values)
 
+    def test_equity_other_categories_present(self) -> None:
+        values = {c.value for c in TaxCategory}
+        assert self.EQUITY_OTHER.issubset(values)
+
     def test_total_count(self) -> None:
-        assert len(TaxCategory) == len(self.BUSINESS) + len(self.PERSONAL)
+        assert len(TaxCategory) == len(self.BUSINESS) + len(self.PERSONAL) + len(self.EQUITY_OTHER)
 
 
 class TestTransactionStatusEnum:
@@ -99,6 +106,7 @@ class TestSourceEnum:
             "gmail_n8n", "stripe", "shopify",
             "brokerage_csv", "bank_csv",
             "photo_receipt", "deduction_email",
+            "woocommerce_csv",
         }
 
 

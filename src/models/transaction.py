@@ -84,6 +84,32 @@ class Transaction(Base):
         server_default="USD",
     )
 
+    # ── Foreign currency tracking ────────────────────────────────────────────
+    currency_code: Mapped[str | None] = mapped_column(
+        String(3),
+        nullable=True,
+        default=None,
+        comment="ISO 4217 code (GBP, EUR, etc.) when original amount is non-USD. None means USD.",
+    )
+    amount_foreign: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=None,
+        comment="Original amount in foreign currency (always positive, sign on amount field)",
+    )
+    exchange_rate: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        default=None,
+        comment="Exchange rate used: foreign_amount * rate = USD amount",
+    )
+    exchange_rate_source: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=None,
+        comment="frankfurter_api | credit_card_statement | manual",
+    )
+
     # ── Classification ──────────────────────────────────────────────────────────
     entity: Mapped[str | None] = mapped_column(
         String(16),
@@ -148,6 +174,20 @@ class Transaction(Base):
         ForeignKey("transactions.id"),
         nullable=True,
         comment="Links an expense to its reimbursement payment",
+    )
+
+    # ── 1099 tracking ─────────────────────────────────────────────────────────
+    payer_1099: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        default=None,
+        comment="Name of 1099 payer (e.g. 'Cardinal Health Inc') for income documentation",
+    )
+    payer_1099_type: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        default=None,
+        comment="1099 form type: NEC, MISC, K, etc.",
     )
 
     # ── Payment method ─────────────────────────────────────────────────────────

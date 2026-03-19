@@ -64,6 +64,10 @@ class TaxCategory(enum.StrEnum):
     INVESTMENT_INCOME = "INVESTMENT_INCOME"
     PERSONAL_NON_DEDUCTIBLE = "PERSONAL_NON_DEDUCTIBLE"
 
+    # ── Equity / Other ─────────────────────────────────────────────────────
+    CAPITAL_CONTRIBUTION = "CAPITAL_CONTRIBUTION"
+    OTHER_EXPENSE = "OTHER_EXPENSE"
+
 
 class TaxSubcategory(enum.StrEnum):
     """Fine-grained subcategories used in split line items and vendor rules."""
@@ -153,6 +157,7 @@ class Source(enum.StrEnum):
     BANK_CSV = "bank_csv"
     PHOTO_RECEIPT = "photo_receipt"
     DEDUCTION_EMAIL = "deduction_email"
+    WOOCOMMERCE_CSV = "woocommerce_csv"
 
 
 class VendorRuleSource(enum.StrEnum):
@@ -183,3 +188,39 @@ class ConfirmedBy(enum.StrEnum):
 
     AUTO = "auto"
     HUMAN = "human"
+
+
+class InvoiceStatus(enum.StrEnum):
+    """Lifecycle status of an invoice.
+
+    State machine:
+      draft   → sent | void
+      sent    → paid | void | overdue
+      paid    → void
+      overdue → paid | void
+      void    → (terminal)
+    """
+
+    DRAFT = "draft"
+    SENT = "sent"
+    PAID = "paid"
+    OVERDUE = "overdue"
+    VOID = "void"
+
+
+class BillingModel(enum.StrEnum):
+    """Customer billing model."""
+
+    HOURLY = "hourly"
+    FLAT_RATE = "flat_rate"
+    PROJECT = "project"
+
+
+# Allowed status transitions: current → set of valid next statuses
+INVOICE_STATUS_TRANSITIONS: dict[str, set[str]] = {
+    InvoiceStatus.DRAFT: {InvoiceStatus.SENT, InvoiceStatus.VOID},
+    InvoiceStatus.SENT: {InvoiceStatus.PAID, InvoiceStatus.VOID, InvoiceStatus.OVERDUE},
+    InvoiceStatus.PAID: {InvoiceStatus.VOID},
+    InvoiceStatus.OVERDUE: {InvoiceStatus.PAID, InvoiceStatus.VOID},
+    InvoiceStatus.VOID: set(),  # terminal
+}

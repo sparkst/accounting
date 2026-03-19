@@ -1,9 +1,10 @@
 <script lang="ts">
 	import { page } from '$app/stores';
 	import { onMount } from 'svelte';
-	import { fetchHealth } from '$lib/api';
+	import { fetchHealth, fetchInvoices } from '$lib/api';
 
 	let reviewCount = $state(0);
+	let overdueCount = $state(0);
 
 	onMount(async () => {
 		try {
@@ -11,6 +12,17 @@
 			reviewCount = health.needs_review_count ?? 0;
 		} catch {
 			// health endpoint not critical for nav rendering
+		}
+		try {
+			const allInvoices = await fetchInvoices();
+			const today = new Date().toISOString().slice(0, 10);
+			overdueCount = allInvoices.items.filter(
+				(inv) =>
+					inv.status === 'overdue' ||
+					(inv.status === 'sent' && inv.due_date && inv.due_date < today)
+			).length;
+		} catch {
+			// invoice endpoint not critical for nav rendering
 		}
 	});
 
@@ -23,19 +35,20 @@
 
 <header class="nav-shell">
 	<div class="nav-inner container">
-		<a href="/" class="nav-brand" aria-label="Accounting — home">
-			<span class="brand-mark">▣</span>
+		<a href="/" class="nav-brand" aria-label="Accounting home">
+			<span class="brand-mark">&#x25A3;</span>
 			<span class="brand-name">Accounting</span>
 		</a>
 
 		<nav aria-label="Main navigation">
 			<ul class="nav-links">
 				<li>
-					<a
-						href="/"
-						class="nav-link"
-						aria-current={isActive('/') ? 'page' : undefined}
-					>
+					<a href="/" class="nav-link" aria-current={isActive('/') ? 'page' : undefined}>
+						Dashboard
+					</a>
+				</li>
+				<li>
+					<a href="/review" class="nav-link" aria-current={isActive('/review') ? 'page' : undefined}>
 						Review
 						{#if reviewCount > 0}
 							<span class="nav-badge" aria-label="{reviewCount} items need review">
@@ -51,6 +64,23 @@
 						aria-current={isActive('/register') ? 'page' : undefined}
 					>
 						Register
+					</a>
+				</li>
+				<li>
+					<a
+						href="/invoices"
+						class="nav-link"
+						aria-current={isActive('/invoices') ? 'page' : undefined}
+					>
+						Invoices
+						{#if overdueCount > 0}
+							<span
+								class="nav-badge nav-badge-red"
+								aria-label="{overdueCount} overdue invoices"
+							>
+								{overdueCount > 99 ? '99+' : overdueCount}
+							</span>
+						{/if}
 					</a>
 				</li>
 				<li>
@@ -78,6 +108,15 @@
 						aria-current={isActive('/accounts') ? 'page' : undefined}
 					>
 						Accounts
+					</a>
+				</li>
+				<li>
+					<a
+						href="/reconciliation"
+						class="nav-link"
+						aria-current={isActive('/reconciliation') ? 'page' : undefined}
+					>
+						Reconciliation
 					</a>
 				</li>
 			</ul>
@@ -118,9 +157,9 @@
 	}
 
 	.brand-name {
-		font-size: .9rem;
+		font-size: 0.9rem;
 		font-weight: 600;
-		letter-spacing: -.2px;
+		letter-spacing: -0.2px;
 	}
 
 	nav {
@@ -140,10 +179,12 @@
 		padding: 5px 12px;
 		border-radius: var(--radius-sm);
 		text-decoration: none;
-		font-size: .875rem;
+		font-size: 0.875rem;
 		font-weight: 500;
 		color: var(--text-muted);
-		transition: color .12s, background .12s;
+		transition:
+			color 0.12s,
+			background 0.12s;
 	}
 
 	.nav-link:hover {
@@ -151,7 +192,7 @@
 		background: var(--gray-100);
 	}
 
-	.nav-link[aria-current="page"] {
+	.nav-link[aria-current='page'] {
 		color: var(--text);
 		background: var(--gray-200);
 	}
@@ -166,8 +207,12 @@
 		background: var(--amber-500);
 		color: #fff;
 		border-radius: 999px;
-		font-size: .65rem;
+		font-size: 0.65rem;
 		font-weight: 700;
 		line-height: 1;
+	}
+
+	.nav-badge-red {
+		background: var(--red-500);
 	}
 </style>

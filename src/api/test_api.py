@@ -214,9 +214,45 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
         data = resp.json()
         freshness = data["source_freshness"]
-        assert len(freshness) == 1
-        assert freshness[0]["source"] == "gmail_n8n"
-        assert freshness[0]["records_processed"] == 5
+        # All known sources are returned (including those with no log entries).
+        gmail_entry = next(
+            (f for f in freshness if f["source"] == "gmail_n8n"), None
+        )
+        assert gmail_entry is not None
+        assert gmail_entry["records_processed"] == 5
+        assert gmail_entry["freshness_status"] in ("green", "amber", "red")
+
+    def test_health_includes_tax_deadlines_and_failure_log(
+        self, client: TestClient
+    ) -> None:
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "tax_deadlines" in data
+        assert "failure_log" in data
+        assert isinstance(data["tax_deadlines"], list)
+        assert isinstance(data["failure_log"], list)
+        assert "needs_review_count" in data
+
+    def test_health_failure_log_contains_failures(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            fail_log = IngestionLog(
+                source=Source.SHOPIFY.value,
+                status=IngestionStatus.FAILURE.value,
+                records_processed=0,
+                records_failed=3,
+                error_detail="Connection timeout",
+            )
+            s.add(fail_log)
+            s.commit()
+
+        resp = client.get("/api/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        failure_log = data["failure_log"]
+        assert len(failure_log) == 1
+        assert failure_log[0]["source"] == "shopify"
+        assert failure_log[0]["error_detail"] == "Connection timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -622,26 +658,39 @@ class TestPatchTransaction:
 class TestIngestRun:
     def test_ingest_run_returns_summary(self, client: TestClient) -> None:
         """POST /api/ingest/run runs the adapter and returns a summary dict."""
+        from src.models.enums import IngestionStatus as _IngestionStatus
+
         mock_result = AdapterResult(
             source=Source.GMAIL_N8N.value,
-            status=IngestionStatus.SUCCESS,
+            status=_IngestionStatus.SUCCESS,
             records_processed=3,
             records_created=2,
             records_skipped=1,
             records_failed=0,
         )
 
+        class _FakeAdapter:
+            source = Source.GMAIL_N8N.value
+
+            def run(self, session: object) -> AdapterResult:
+                return mock_result
+
+        def _fake_get_adapter(src: object) -> object | None:
+            if str(src) == Source.GMAIL_N8N.value or src == Source.GMAIL_N8N:
+                return _FakeAdapter()
+            return None
+
         with (
             patch(
-                "src.api.routes.ingest.GmailN8nAdapter.run",
-                return_value=mock_result,
+                "src.api.routes.ingest.get_adapter",
+                side_effect=_fake_get_adapter,
             ),
             patch(
                 "src.api.routes.ingest.classify",
                 side_effect=Exception("LLM unavailable"),
             ),
         ):
-            resp = client.post("/api/ingest/run")
+            resp = client.post("/api/ingest/run?source=gmail_n8n")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -652,11 +701,22 @@ class TestIngestRun:
 
     def test_ingest_run_adapter_error_captured(self, client: TestClient) -> None:
         """Adapter crash surfaces in errors, not as HTTP 500."""
+        class _BrokenAdapter:
+            source = Source.GMAIL_N8N.value
+
+            def run(self, session: object) -> None:
+                raise RuntimeError("Connection refused")
+
+        def _fake_get_adapter(src: object) -> object | None:
+            if src == Source.GMAIL_N8N:
+                return _BrokenAdapter()
+            return None
+
         with patch(
-            "src.api.routes.ingest.GmailN8nAdapter.run",
-            side_effect=RuntimeError("Connection refused"),
+            "src.api.routes.ingest.get_adapter",
+            side_effect=_fake_get_adapter,
         ):
-            resp = client.post("/api/ingest/run")
+            resp = client.post("/api/ingest/run?source=gmail_n8n")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -665,6 +725,7 @@ class TestIngestRun:
     def test_ingest_run_classifies_pending(self, client: TestClient) -> None:
         """If transactions already in DB are needs_review, classify is called."""
         from src.classification.engine import ClassificationResult
+        from src.models.enums import IngestionStatus as _IngestionStatus
 
         with _TestSession() as s:
             _make_tx(
@@ -678,7 +739,7 @@ class TestIngestRun:
 
         mock_result = AdapterResult(
             source=Source.GMAIL_N8N.value,
-            status=IngestionStatus.SUCCESS,
+            status=_IngestionStatus.SUCCESS,
             records_processed=0,
             records_created=0,
         )
@@ -692,17 +753,28 @@ class TestIngestRun:
             reasoning="Test rule match",
         )
 
+        class _FakeAdapter:
+            source = Source.GMAIL_N8N.value
+
+            def run(self, session: object) -> AdapterResult:
+                return mock_result
+
+        def _fake_get_adapter(src: object) -> object | None:
+            if src == Source.GMAIL_N8N:
+                return _FakeAdapter()
+            return None
+
         with (
             patch(
-                "src.api.routes.ingest.GmailN8nAdapter.run",
-                return_value=mock_result,
+                "src.api.routes.ingest.get_adapter",
+                side_effect=_fake_get_adapter,
             ),
             patch(
                 "src.api.routes.ingest.classify",
                 return_value=classify_result,
             ),
         ):
-            resp = client.post("/api/ingest/run")
+            resp = client.post("/api/ingest/run?source=gmail_n8n")
 
         assert resp.status_code == 200
         data = resp.json()

@@ -107,7 +107,11 @@ def _fetch_transactions(
     entity: str,
     year: int,
 ) -> list[Transaction]:
-    """Return non-rejected transactions for the given entity + year."""
+    """Return non-rejected, non-split-parent transactions for the given entity + year.
+
+    Split-parent transactions are excluded because their children carry
+    the actual amounts — including both would double-count.
+    """
     year_prefix = str(year)
     return (
         session.query(Transaction)
@@ -115,6 +119,7 @@ def _fetch_transactions(
             Transaction.entity == entity,
             Transaction.date.like(f"{year_prefix}-%"),
             Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.status != TransactionStatus.SPLIT_PARENT.value,
         )
         .all()
     )
@@ -357,17 +362,19 @@ def _build_yoy_comparison(
 
 
 # ---------------------------------------------------------------------------
-# Home office deduction
+# Home office and mileage constants
 # ---------------------------------------------------------------------------
 
-# Simplified home office deduction per IRS guidelines:
 # IRS Simplified Method: 36 sqft × $5/sqft = $180/year (max 300 sqft, cap $1,500)
-# Using simplified method: 36 sqft × $5 = $180/year
 _HOME_OFFICE_DEDUCTION: dict[str, float] = {
     Entity.SPARKRY.value: 180.0,
     Entity.BLACKLINE.value: 0.0,
     Entity.PERSONAL.value: 0.0,
 }
+
+# IRS standard mileage rate for business use
+_IRS_MILEAGE_RATE_CENTS = 67  # cents per mile (2024)
+_IRS_MILEAGE_RATE_YEAR = 2024
 
 
 # ---------------------------------------------------------------------------
@@ -384,9 +391,6 @@ def _build_1099_breakdown(transactions: list[Transaction]) -> list[dict[str, Any
     for tx in transactions:
         if not tx.payer_1099:
             continue
-        if tx.direction not in ("income",) and tx.tax_category not in INCOME_CATEGORIES:
-            continue
-        # Only include actual income
         if tx.direction != "income":
             continue
         payer = tx.payer_1099
@@ -510,7 +514,8 @@ def _generate_tax_tips(
                 "type": "vehicle",
                 "title": "No vehicle expenses recorded — do you drive for business?",
                 "detail": (
-                    "Business mileage is deductible (IRS standard rate: 67¢/mile for 2024). "
+                    f"Business mileage is deductible "
+                    f"(IRS standard rate: {_IRS_MILEAGE_RATE_CENTS}¢/mile for {_IRS_MILEAGE_RATE_YEAR}). "
                     "Add CAR_AND_TRUCK transactions if you use a vehicle for work."
                 ),
                 "action_url": "/register",

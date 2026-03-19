@@ -98,13 +98,16 @@ def _create_invoice_audit_event(
 ) -> None:
     """Create an AuditEvent for an invoice status/field change.
 
-    Reuses the AuditEvent model (which has transaction_id FK). For invoice
-    audit events we store the invoice_id in the transaction_id field.
-    We temporarily disable FK checks for the insert since invoice IDs are
-    not in the transactions table.
+    Reuses the AuditEvent model. Since transaction_id has a FK to
+    transactions and invoice IDs are not in that table, we temporarily
+    disable FK enforcement for the insert. The PRAGMA must be issued
+    before any implicit transaction starts on this connection, so we
+    commit any pending work first.
     """
     from sqlalchemy import text
 
+    # Flush pending work so we start clean, then disable FK for this insert
+    session.flush()
     session.execute(text("PRAGMA foreign_keys=OFF"))
     event = AuditEvent(
         id=_new_uuid(),

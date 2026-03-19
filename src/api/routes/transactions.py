@@ -786,6 +786,7 @@ def _build_expense_attribution(
 
 @router.get("/transactions/review", response_model=list[TransactionOut])
 def list_review_transactions(
+    status: str | None = Query(default=None, description="Comma-separated statuses (default: needs_review)"),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> list[TransactionOut]:
     """Return needs_review transactions ordered by review priority.
@@ -795,11 +796,31 @@ def list_review_transactions(
       2. Duplicate suspects (review_reason contains "duplicate")
       3. Low confidence (confidence < 0.5)
       4. First-time vendors / everything else
+
+    Pass ?status=needs_review,auto_classified to include auto-classified items.
     """
+    # Parse and validate comma-separated status values; default to needs_review
+    if status is not None:
+        status_list = [s.strip() for s in status.split(",") if s.strip()]
+        for s in status_list:
+            try:
+                TransactionStatus(s)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid status value: {s!r}",
+                ) from exc
+    else:
+        status_list = [TransactionStatus.NEEDS_REVIEW.value]
+
     try:
         txns: list[Transaction] = (
             session.query(Transaction)
-            .filter(Transaction.status == TransactionStatus.NEEDS_REVIEW.value)
+            .filter(
+                Transaction.status.in_(status_list)
+                if len(status_list) > 1
+                else Transaction.status == status_list[0]
+            )
             .all()
         )
 

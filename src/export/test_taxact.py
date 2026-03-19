@@ -81,8 +81,11 @@ class TestBuildForm1065Summary:
     def test_deductions_section(self):
         out = build_form_1065_summary(BLACKLINE_TRANSACTIONS, 2025)
         assert "DEDUCTIONS" in out
-        assert "1,200.00" in out  # advertising
-        assert "900.00" in out    # insurance
+        assert "1,200.00" in out  # advertising (Line 19)
+        assert "900.00" in out    # insurance (Line 13)
+        # Verify proper IRS line numbers appear (not all lumped into Line 20)
+        assert "Line 13" in out   # Insurance
+        assert "Line 19" in out   # Advertising
 
     def test_meals_halved(self):
         """Meals 50% rule applied before display."""

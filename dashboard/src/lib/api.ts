@@ -49,8 +49,9 @@ export async function fetchTransactions(filters: TransactionFilters = {}): Promi
 	return request<TransactionList>(`/transactions${qs ? `?${qs}` : ''}`);
 }
 
-export async function fetchReviewQueue(): Promise<Transaction[]> {
-	return request<Transaction[]>('/transactions/review');
+export async function fetchReviewQueue(status?: string): Promise<Transaction[]> {
+	const params = status ? `?status=${encodeURIComponent(status)}` : '';
+	return request<Transaction[]>(`/transactions/review${params}`);
 }
 
 export async function fetchTransaction(id: string): Promise<Transaction> {
@@ -142,6 +143,17 @@ export async function splitTransaction(id: string, lineItems: SplitLineItem[]): 
 	return request<SplitResponse>(`/transactions/${id}/split`, {
 		method: 'POST',
 		body: JSON.stringify({ line_items: lineItems })
+	});
+}
+
+export async function bulkConfirmTransactions(
+	ids: string[],
+	entity: string,
+	tax_category: string
+): Promise<{ confirmed: number; rules_created: number }> {
+	return request<{ confirmed: number; rules_created: number }>('/transactions/bulk-confirm', {
+		method: 'POST',
+		body: JSON.stringify({ ids, entity, tax_category })
 	});
 }
 
@@ -457,6 +469,7 @@ export interface EstimatedTax {
 	quarterly_payment: number;
 	total_paid: number;
 	quarters: EstimatedTaxQuarter[];
+	warning?: string;
 }
 
 export interface TaxSummary {

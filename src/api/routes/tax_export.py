@@ -41,6 +41,7 @@ IRS_LINE_MAPPING: dict[str, str] = {
     "CAR_AND_TRUCK": "L9",
     "CONTRACT_LABOR": "L11",
     "INSURANCE": "L15",
+    "HEALTH_INSURANCE": "1040 Line 17 — Self-employed health insurance deduction",
     "LEGAL_AND_PROFESSIONAL": "L17",
     "OFFICE_EXPENSE": "L18",
     "SUPPLIES": "L22",
@@ -51,6 +52,7 @@ IRS_LINE_MAPPING: dict[str, str] = {
     "CONSULTING_INCOME": "Gross receipts",
     "SUBSCRIPTION_INCOME": "Gross receipts",
     "SALES_INCOME": "Gross receipts",
+    "WHOLESALE_INCOME": "Gross receipts",
     "REIMBURSABLE": "N/A",
     # Schedule A
     "CHARITABLE_CASH": "Sch A - Charitable",
@@ -373,8 +375,8 @@ _HOME_OFFICE_DEDUCTION: dict[str, float] = {
 }
 
 # IRS standard mileage rate for business use
-_IRS_MILEAGE_RATE_CENTS = 67  # cents per mile (2024)
-_IRS_MILEAGE_RATE_YEAR = 2024
+_IRS_MILEAGE_RATE_CENTS = 70  # cents per mile (2025)
+_IRS_MILEAGE_RATE_YEAR = 2025
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +651,12 @@ def _compute_estimated_tax(
         "quarterly_payment": quarterly,
         "total_paid": total_paid,
         "quarters": quarters,
+        "warning": (
+            "ESTIMATE ONLY — This uses a flat 22% income tax rate and per-entity calculation. "
+            "Does not include QBI deduction or combined 1040-ES worksheet. "
+            "Consult your CPA for actual 1040-ES voucher amounts. "
+            "At higher income levels, this may understate quarterly payments by 30-40%."
+        ),
     }
 
 
@@ -847,7 +855,10 @@ def export_freetaxusa(
     warn = _check_unconfirmed_threshold(transactions, hard_block=False)
 
     tx_dicts = [_tx_to_dict(tx) for tx in transactions]
-    content, filename = generate_freetaxusa_export(tx_dicts, entity, year)
+    home_office = _HOME_OFFICE_DEDUCTION.get(entity, 0.0)
+    content, filename = generate_freetaxusa_export(
+        tx_dicts, entity, year, home_office_deduction=home_office
+    )
 
     if warn:
         banner = f"*** {warn['warning']} ***\n\n"

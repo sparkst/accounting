@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import type { Transaction } from '$lib/types';
-	import { fetchReviewQueue, updateTransaction, confirmTransaction } from '$lib/api';
+	import { fetchReviewQueue, updateTransaction, bulkConfirmTransactions } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
 	import Toast from '$lib/components/Toast.svelte';
 	import ShortcutOverlay from '$lib/components/ShortcutOverlay.svelte';
@@ -12,6 +12,9 @@
 	let loading = $state(true);
 	let fetchError = $state('');
 	let focusedIndex = $state(0);
+
+	// Status filter (server-side — determines which statuses are fetched)
+	let statusFilter = $state('needs_review'); // 'needs_review' | 'needs_review,auto_classified' | 'auto_classified'
 
 	// Filters (client-side — review queue is typically <200 items)
 	let search = $state('');
@@ -86,10 +89,22 @@
 	);
 
 	let hasActiveFilters = $derived(
-		!!search || !!entityFilter || !!directionFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo
+		!!search || !!entityFilter || !!directionFilter || !!categoryFilter || !!amountFilter || !!dateFrom || !!dateTo || statusFilter !== 'needs_review'
 	);
 
 	let hasSelection = $derived(selectedIds.size > 0);
+
+	let allVisibleSelected = $derived(
+		filteredItems.length > 0 && filteredItems.every(item => selectedIds.has(item.id))
+	);
+
+	function toggleSelectAll() {
+		if (allVisibleSelected) {
+			selectedIds = new Set();
+		} else {
+			selectedIds = new Set(filteredItems.map(item => item.id));
+		}
+	}
 
 	const datePresetGroups = [...new Set(DATE_PRESETS.map(p => p.group))];
 
@@ -115,12 +130,16 @@
 		loading = true;
 		fetchError = '';
 		try {
-			items = await fetchReviewQueue();
+			items = await fetchReviewQueue(statusFilter);
 		} catch (e) {
 			fetchError = e instanceof Error ? e.message : 'Failed to load review queue';
 		} finally {
 			loading = false;
 		}
+	}
+
+	async function handleStatusFilterChange() {
+		await load();
 	}
 
 	function handleConfirmed(tx: Transaction) {
@@ -225,18 +244,10 @@
 		if (batchSaving || selectedIds.size === 0) return;
 		batchSaving = true;
 		try {
-			const updates: Record<string, string> = {};
-			if (batchEntity) updates.entity = batchEntity;
-			if (batchCategory) updates.tax_category = batchCategory;
-
-			for (const id of selectedIds) {
-				if (Object.keys(updates).length > 0) {
-					await updateTransaction(id, updates);
-				}
-				await confirmTransaction(id);
-			}
+			const ids = [...selectedIds];
+			await bulkConfirmTransactions(ids, batchEntity, batchCategory);
 			items = items.filter(t => !selectedIds.has(t.id));
-			const count = selectedIds.size;
+			const count = ids.length;
 			clearSelection();
 			batchEntity = '';
 			batchCategory = '';
@@ -336,6 +347,9 @@
 			e.preventDefault();
 			const tx = filteredItems[focusedIndex];
 			if (tx) toggleSelect(tx);
+		} else if (e.key === 'A' && e.shiftKey) {
+			e.preventDefault();
+			toggleSelectAll();
 		}
 	}
 
@@ -371,7 +385,13 @@
 			{#if !loading}
 				<p class="page-subtitle">
 					{#if items.length > 0}
-						{items.length} item{items.length !== 1 ? 's' : ''} need attention
+						{#if statusFilter === 'auto_classified'}
+							{items.length} auto-classified item{items.length !== 1 ? 's' : ''} to review
+						{:else if statusFilter === 'needs_review,auto_classified'}
+							{items.length} item{items.length !== 1 ? 's' : ''} need attention (including auto-classified)
+						{:else}
+							{items.length} item{items.length !== 1 ? 's' : ''} need attention
+						{/if}
 					{:else}
 						All caught up
 					{/if}
@@ -411,6 +431,17 @@
 	{:else}
 		<!-- Filter bar -->
 		<div class="filter-bar card">
+			<select
+				bind:value={statusFilter}
+				onchange={handleStatusFilterChange}
+				aria-label="Status filter"
+				class="filter-status"
+			>
+				<option value="needs_review">Needs review only</option>
+				<option value="needs_review,auto_classified">Include auto-classified</option>
+				<option value="auto_classified">Auto-classified only</option>
+			</select>
+
 			<input
 				type="search"
 				placeholder="Search…"
@@ -463,6 +494,14 @@
 					</optgroup>
 				{/each}
 			</select>
+
+			<button
+				class="btn btn-ghost"
+				onclick={toggleSelectAll}
+				title="Shift+A"
+			>
+				{allVisibleSelected ? 'Deselect all' : `Select all (${filteredItems.length})`}
+			</button>
 
 			{#if hasActiveFilters}
 				<button class="btn btn-ghost filter-clear" onclick={clearFilters}>Clear</button>
@@ -586,6 +625,11 @@
 		gap: 8px;
 		padding: 12px 16px;
 		margin-bottom: 10px;
+	}
+
+	.filter-status {
+		min-width: 180px;
+		flex-shrink: 0;
 	}
 
 	.filter-search {

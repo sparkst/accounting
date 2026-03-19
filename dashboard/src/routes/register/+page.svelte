@@ -49,6 +49,8 @@
 	let editSaving = $state(false);
 
 	// Derived
+	$: showReviewReason = statusFilter === 'rejected' || (statusFilter?.includes('rejected') ?? false);
+
 	let items = $derived((data as TransactionList | null)?.items ?? []);
 	let incomeTotalAll  = $derived((data as TransactionList | null)?.income_total ?? 0);
 	let expenseTotalAll = $derived((data as TransactionList | null)?.expense_total ?? 0);
@@ -597,6 +599,7 @@
 									Status{sortIndicator('status')}
 								</th>
 								<th class="col-running-total">Balance</th>
+								{#if showReviewReason}<th class="col-review-reason">Review Reason</th>{/if}
 							</tr>
 						</thead>
 						<tbody>
@@ -708,10 +711,11 @@
 									>
 										{formatCurrency(runningTotals[rowIdx])}
 									</td>
+									{#if showReviewReason}<td class="review-reason" title={tx.review_reason}>{tx.review_reason ? tx.review_reason.substring(0, 40) + (tx.review_reason.length > 40 ? '...' : '') : ''}</td>{/if}
 								</tr>
 								{#if expandedId === tx.id}
 									<tr class="expanded-row">
-										<td colspan="7">
+										<td colspan={showReviewReason ? 8 : 7}>
 											<div class="expanded-card-wrap">
 												<TransactionCard
 													transaction={tx}
@@ -1039,5 +1043,20 @@
 	.error-msg {
 		color: var(--red-600);
 		font-size: .875rem;
+	}
+
+	.col-review-reason {
+		white-space: nowrap;
+		font-size: .8rem;
+		color: var(--text-muted);
+	}
+
+	.review-reason {
+		max-width: 220px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: .8rem;
+		color: var(--text-muted);
 	}
 </style>

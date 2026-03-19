@@ -587,6 +587,11 @@
 		{#if estimatedTax}
 			<section class="dashboard-section">
 				<h2 class="section-title">Estimated Quarterly Tax</h2>
+				{#if estimatedTax?.warning}
+				<div class="alert-banner alert-warning" style="margin-bottom: 16px;">
+					{estimatedTax.warning}
+				</div>
+				{/if}
 				<div class="card est-card">
 					<div class="est-summary">
 						<div class="est-summary-item">

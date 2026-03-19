@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.exc import IntegrityError
+from collections.abc import Generator
+
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal
@@ -29,14 +31,13 @@ router = APIRouter(tags=["tax-year-locks"])
 # ---------------------------------------------------------------------------
 
 
-def get_db() -> Session:
-    """Return a database session. Caller must close it."""
+def get_db() -> Generator[Session, None, None]:
+    """Yield a database session, ensuring cleanup."""
     session = SessionLocal()
     try:
-        return session
-    except Exception:
+        yield session
+    finally:
         session.close()
-        raise
 
 
 # ---------------------------------------------------------------------------

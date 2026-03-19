@@ -17,6 +17,8 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from collections.abc import Generator
+
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal
@@ -37,13 +39,13 @@ router = APIRouter(prefix="/reconcile", tags=["reconciliation"])
 # ---------------------------------------------------------------------------
 
 
-def get_db() -> Session:
+def get_db() -> Generator[Session, None, None]:
+    """Yield a database session, ensuring cleanup."""
     session = SessionLocal()
     try:
-        return session
-    except Exception:
+        yield session
+    finally:
         session.close()
-        raise
 
 
 # ---------------------------------------------------------------------------

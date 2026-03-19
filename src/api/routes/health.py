@@ -18,6 +18,8 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy import func as sa_func
+from collections.abc import Generator
+
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal
@@ -103,14 +105,13 @@ def _build_tax_deadlines(today: date | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def get_db() -> Session:
-    """Yield a database session, closing it when the request is done."""
+def get_db() -> Generator[Session, None, None]:
+    """Yield a database session, ensuring cleanup."""
     session = SessionLocal()
     try:
-        return session
-    except Exception:
+        yield session
+    finally:
         session.close()
-        raise
 
 
 # ---------------------------------------------------------------------------

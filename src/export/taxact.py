@@ -19,21 +19,32 @@ from src.export.freetaxusa import INCOME_CATEGORIES, SCHEDULE_C_LINES
 # ---------------------------------------------------------------------------
 
 # (irs_line, label, is_income)
+# Line references: Form 1065 (2024)
+#   L13  — Insurance
+#   L14  — Rent (not used here)
+#   L15  — Taxes and licenses
+#   L16b — Legal and professional fees
+#   L17  — Depreciation (not used here)
+#   L18  — Office expenses (supplies, office)
+#   L19  — Advertising
+#   L20  — Travel and entertainment (travel, meals)
+#   L21  — Other deductions (catch-all)
 FORM_1065_LINES: dict[str, tuple[str, str, bool]] = {
     "CONSULTING_INCOME": ("1a", "Gross receipts or sales", True),
     "SUBSCRIPTION_INCOME": ("1a", "Gross receipts or sales (subscriptions)", True),
     "SALES_INCOME": ("1a", "Gross receipts or sales (product)", True),
+    "WHOLESALE_INCOME": ("1a", "Gross receipts or sales (wholesale)", True),
     "COGS": ("2", "Cost of goods sold", False),
-    "ADVERTISING": ("20", "Advertising", False),
-    "CAR_AND_TRUCK": ("20", "Car and truck expenses", False),
-    "CONTRACT_LABOR": ("20", "Contract labor", False),
-    "INSURANCE": ("20", "Insurance", False),
-    "LEGAL_AND_PROFESSIONAL": ("20", "Legal and professional fees", False),
-    "OFFICE_EXPENSE": ("20", "Office expenses", False),
-    "SUPPLIES": ("20", "Supplies", False),
-    "TAXES_AND_LICENSES": ("20", "Taxes and licenses", False),
-    "TRAVEL": ("20", "Travel", False),
-    "MEALS": ("20", "Meals (50% deductible)", False),
+    "ADVERTISING": ("19", "Advertising", False),
+    "CAR_AND_TRUCK": ("20", "Travel and entertainment — car and truck", False),
+    "CONTRACT_LABOR": ("21", "Other deductions — contract labor", False),
+    "INSURANCE": ("13", "Insurance", False),
+    "LEGAL_AND_PROFESSIONAL": ("16b", "Legal and professional fees", False),
+    "OFFICE_EXPENSE": ("18", "Office expenses", False),
+    "SUPPLIES": ("18", "Office expenses (supplies)", False),
+    "TAXES_AND_LICENSES": ("15", "Taxes and licenses", False),
+    "TRAVEL": ("20", "Travel and entertainment", False),
+    "MEALS": ("20", "Travel and entertainment — meals (50% deductible)", False),
 }
 
 SKIP_CATEGORIES = {"REIMBURSABLE", "PERSONAL_NON_DEDUCTIBLE"}
@@ -99,16 +110,16 @@ def build_form_1065_summary(
     deductions: list[tuple[str, str, Decimal]] = []
 
     for cat, amt in totals.items():
-        if cat in ("CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME"):
+        if cat in INCOME_CATEGORIES:
             gross_income += amt
         elif cat == "COGS":
             cogs += amt
         elif cat in FORM_1065_LINES:
-            _, label, _ = FORM_1065_LINES[cat]
-            deductions.append((label, amt))
+            irs_line, label, _ = FORM_1065_LINES[cat]
+            deductions.append((irs_line, label, amt))
 
     gross_profit = gross_income - cogs
-    total_deductions = sum(amt for _, amt in deductions)
+    total_deductions = sum(amt for _, _, amt in deductions)
     ordinary_income = gross_profit - total_deductions
 
     lines: list[str] = []
@@ -124,10 +135,10 @@ def build_form_1065_summary(
     lines.append(f"  Line 3   {'Gross profit':<34} ${gross_profit:>10,.2f}")
 
     lines.append("")
-    lines.append("DEDUCTIONS (Line 20 — Other deductions, attach statement)")
+    lines.append("DEDUCTIONS")
     lines.append("-" * 60)
-    for label, amt in sorted(deductions, key=lambda x: x[0]):
-        lines.append(f"  {'':9} {label:<34} ${amt:>10,.2f}")
+    for irs_line, label, amt in sorted(deductions, key=lambda x: (x[0].zfill(4), x[1])):
+        lines.append(f"  Line {irs_line:<6} {label:<34} ${amt:>10,.2f}")
     lines.append(f"  {'':9} {'Total deductions':<34} ${total_deductions:>10,.2f}")
 
     lines.append("")
@@ -137,7 +148,8 @@ def build_form_1065_summary(
     )
     lines.append("")
     lines.append(
-        "NOTE: Enter these amounts in TaxAct Business > Form 1065 > Income/Deductions."
+        "NOTE: Enter these amounts in TaxAct Business > Form 1065 > Deductions."
+        " Lines 13/15/16b/18/19/20/21 shown above."
     )
     lines.append("Meals are already reduced to 50% deductible amount above.")
     lines.append(

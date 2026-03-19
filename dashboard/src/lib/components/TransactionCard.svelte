@@ -589,6 +589,7 @@
 				<option value="income">Income</option>
 				<option value="expense">Expense</option>
 				<option value="reimbursable">Reimbursable</option>
+				<option value="transfer" title="Transfer — excluded from P&L">Transfer</option>
 			</select>
 		</div>
 	</div>

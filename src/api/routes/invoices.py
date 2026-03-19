@@ -320,8 +320,8 @@ class CustomerPatch(BaseModel):
 
 class BulkConfirmRequest(BaseModel):
     ids: list[str]
-    entity: str
-    tax_category: str
+    entity: str | None = None
+    tax_category: str | None = None
 
 
 class BulkConfirmResponse(BaseModel):
@@ -1109,8 +1109,10 @@ def bulk_confirm_transactions(
         if tx is None:
             continue
 
-        tx.entity = body.entity
-        tx.tax_category = body.tax_category
+        if body.entity:
+            tx.entity = body.entity
+        if body.tax_category:
+            tx.tax_category = body.tax_category
         tx.status = "confirmed"
         tx.confirmed_by = ConfirmedBy.HUMAN.value
         tx.updated_at = now
@@ -1118,20 +1120,22 @@ def bulk_confirm_transactions(
 
         # Learning loop: create vendor rule for unique vendors
         vendor_pattern = tx.description
-        if vendor_pattern and tx.direction:
+        rule_entity = body.entity or tx.entity
+        rule_category = body.tax_category or tx.tax_category
+        if vendor_pattern and tx.direction and rule_entity:
             existing_rule = (
                 session.query(VendorRule)
                 .filter(
                     VendorRule.vendor_pattern == vendor_pattern,
-                    VendorRule.entity == body.entity,
+                    VendorRule.entity == rule_entity,
                 )
                 .first()
             )
             if existing_rule is None:
                 rule = VendorRule(
                     vendor_pattern=vendor_pattern,
-                    entity=body.entity,
-                    tax_category=body.tax_category,
+                    entity=rule_entity,
+                    tax_category=rule_category,
                     direction=tx.direction,
                     confidence=0.80,
                     source=VendorRuleSource.LEARNED.value,

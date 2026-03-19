@@ -29,12 +29,14 @@ BO_CLASSIFICATION: dict[str, tuple[str, str]] = {
     "CONSULTING_INCOME": ("ServiceOther", "Service and Other Activities"),
     "SUBSCRIPTION_INCOME": ("ServiceOther", "Service and Other Activities"),
     "SALES_INCOME": ("Retailing", "Retailing"),
+    "WHOLESALE_INCOME": ("Wholesaling", "Wholesaling"),
 }
 
 # WA B&O tax rates (2025 — verify annually)
 BO_RATE: dict[str, Decimal] = {
     "ServiceOther": Decimal("0.015"),   # 1.5% for services
     "Retailing": Decimal("0.00471"),    # 0.471% for retail sales
+    "Wholesaling": Decimal("0.00484"),  # 0.484% for wholesale sales
 }
 
 INCOME_CATEGORIES = set(BO_CLASSIFICATION.keys())
@@ -278,6 +280,7 @@ DOR_ACCOUNT_IDS: dict[str, str] = {
 DOR_LINE_CODES: dict[str, int] = {
     "ServiceOther": 7,
     "Retailing": 2,
+    "Wholesaling": 6,
 }
 
 

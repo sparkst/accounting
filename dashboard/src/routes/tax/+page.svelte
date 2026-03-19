@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { fetchTaxSummary, downloadExport } from '$lib/api';
-	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip } from '$lib/api';
+	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip, EstimatedTax } from '$lib/api';
 	import { CATEGORY_LABELS } from '$lib/categories';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
@@ -144,6 +144,8 @@
 		return out;
 	});
 
+	let estimatedTax = $derived<EstimatedTax | null>(summary?.estimated_tax ?? null);
+
 	let showBno = $derived(selectedEntity !== 'personal');
 	let showTaxact = $derived(selectedEntity === 'blackline');
 
@@ -166,6 +168,12 @@
 		if (pct >= 90) return 'var(--green-500)';
 		if (pct >= 70) return 'var(--amber-500)';
 		return 'var(--red-500)';
+	}
+
+	function estStateBadge(state: string): { cls: string; label: string } {
+		if (state === 'paid') return { cls: 'est-paid', label: 'Paid' };
+		if (state === 'overdue') return { cls: 'est-overdue', label: 'Overdue' };
+		return { cls: 'est-upcoming', label: 'Upcoming' };
 	}
 
 	function exportFilename(type: 'freetaxusa' | 'taxact' | 'bno'): string {
@@ -574,6 +582,80 @@
 				{/if}
 			</div>
 		</section>
+
+		<!-- ── Estimated Tax ──────────────────────────────────────────────────── -->
+		{#if estimatedTax}
+			<section class="dashboard-section">
+				<h2 class="section-title">Estimated Quarterly Tax</h2>
+				<div class="card est-card">
+					<div class="est-summary">
+						<div class="est-summary-item">
+							<span class="est-label">YTD Net Profit</span>
+							<span class="est-value">{fmtCurrency(estimatedTax.ytd_net_profit)}</span>
+						</div>
+						<div class="est-summary-item">
+							<span class="est-label">Projected Annual</span>
+							<span class="est-value">{fmtCurrency(estimatedTax.projected_annual_net)}</span>
+						</div>
+						<div class="est-summary-item">
+							<span class="est-label">SE Tax</span>
+							<span class="est-value">{fmtCurrency(estimatedTax.se_tax_annual)}</span>
+						</div>
+						<div class="est-summary-item">
+							<span class="est-label">Income Tax</span>
+							<span class="est-value">{fmtCurrency(estimatedTax.income_tax_annual)}</span>
+						</div>
+						<div class="est-summary-item est-summary-total">
+							<span class="est-label">Total Annual</span>
+							<span class="est-value">{fmtCurrency(estimatedTax.total_annual)}</span>
+						</div>
+						<div class="est-summary-item">
+							<span class="est-label">Quarterly Payment</span>
+							<span class="est-value">{fmtCurrency(estimatedTax.quarterly_payment)}</span>
+						</div>
+					</div>
+
+					<table class="data-table est-table">
+						<thead>
+							<tr>
+								<th>Quarter</th>
+								<th class="th-right">Projected</th>
+								<th class="th-right">Paid</th>
+								<th class="th-right">Remaining</th>
+								<th>Status</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each estimatedTax.quarters as q (q.quarter)}
+								{@const badge = estStateBadge(q.state)}
+								<tr>
+									<td class="td-period">{q.quarter}</td>
+									<td class="td-amount">{fmtCurrency(q.projected_amount)}</td>
+									<td class="td-amount">{fmtCurrency(q.paid)}</td>
+									<td class="td-amount">{q.remaining > 0 ? fmtCurrency(q.remaining) : '--'}</td>
+									<td>
+										<span class="est-badge {badge.cls}">{badge.label}</span>
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+						<tfoot>
+							<tr>
+								<td>Total</td>
+								<td class="td-amount">{fmtCurrency(estimatedTax.total_annual)}</td>
+								<td class="td-amount">{fmtCurrency(estimatedTax.total_paid)}</td>
+								<td class="td-amount">
+									{estimatedTax.total_annual - estimatedTax.total_paid > 0
+										? fmtCurrency(estimatedTax.total_annual - estimatedTax.total_paid)
+										: '--'}
+								</td>
+								<td></td>
+							</tr>
+						</tfoot>
+					</table>
+				</div>
+			</section>
+		{/if}
 
 		<!-- ── B&O Subtotals ──────────────────────────────────────────────────── -->
 		{#if showBno}
@@ -1313,6 +1395,68 @@
 
 	.tips-list-dismissed {
 		margin-top: 8px;
+	}
+
+	/* ── Estimated tax ──────────────────────────────────────────────────────── */
+	.est-card {
+		padding: 20px 22px;
+	}
+
+	.est-summary {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+		gap: 12px;
+		margin-bottom: 20px;
+	}
+
+	.est-summary-item {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+
+	.est-summary-total {
+		font-weight: 700;
+	}
+
+	.est-label {
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		font-weight: 600;
+	}
+
+	.est-value {
+		font-size: 1rem;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.est-table {
+		max-width: 640px;
+	}
+
+	.est-badge {
+		font-size: 0.7rem;
+		font-weight: 600;
+		padding: 2px 8px;
+		border-radius: 999px;
+		white-space: nowrap;
+	}
+
+	.est-paid {
+		background: var(--green-100);
+		color: var(--green-700);
+	}
+
+	.est-overdue {
+		background: var(--red-100);
+		color: var(--red-700);
+	}
+
+	.est-upcoming {
+		background: var(--gray-100);
+		color: var(--gray-600);
 	}
 
 	/* ── Print ───────────────────────────────────────────────────────────────── */

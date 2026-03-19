@@ -149,6 +149,26 @@ class BankCsvConfig:
 _PARENTHETICAL_RE = re.compile(r"^\s*\(([^)]+)\)\s*$")
 
 
+def clean_bank_description(raw: str) -> str:
+    """Extract a human-readable vendor name from raw ACH bank descriptions.
+
+    Handles Chase-style ACH strings like:
+      ``ORIG CO NAME:SHOPIFY ORIG ID:SHOPIFYPMT ...``
+      ``... IND NAME:JOHN DOE TRN:...``
+
+    Returns the cleaned vendor name, or the original string if no pattern matches.
+    """
+    # Extract from "ORIG CO NAME:SHOPIFY" pattern
+    match = re.search(r"ORIG CO NAME:\s*(\S+(?:\s+\S+)*?)\s+ORIG ID:", raw)
+    if match:
+        return match.group(1).strip().title()
+    # Extract from "IND NAME:" pattern
+    match = re.search(r"IND NAME:\s*(.+?)(?:\s+TRN:|$)", raw)
+    if match:
+        return match.group(1).strip().title()
+    return raw
+
+
 def parse_amount(raw: str) -> Decimal | None:
     """Parse a bank CSV amount string into a Decimal.
 
@@ -324,7 +344,8 @@ def parse_csv_bytes(
                 ) from exc
 
             # ── Description ───────────────────────────────────────────────
-            description = _get(norm_row, config.description_column) or "(no description)"
+            raw_desc = _get(norm_row, config.description_column) or "(no description)"
+            description = clean_bank_description(raw_desc)
 
             # ── Amount ────────────────────────────────────────────────────
             if config.debit_column or config.credit_column:

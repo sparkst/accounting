@@ -131,6 +131,14 @@ export interface FailureLogEntry {
 	records_failed: number;
 }
 
+export interface LLMUsage {
+	calls_this_month: number;
+	total_input_tokens: number;
+	total_output_tokens: number;
+	total_tokens: number;
+	estimated_cost_usd: number;
+}
+
 export interface HealthResponse {
 	ok: boolean;
 	source_freshness: SourceFreshness[];
@@ -140,6 +148,7 @@ export interface HealthResponse {
 	total_transactions: number;
 	needs_review_count: number;
 	checked_at: string;       // ISO datetime
+	llm_usage: LLMUsage;
 }
 
 export interface IngestResult {

@@ -13,6 +13,7 @@ GET /api/health — Returns:
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -316,3 +317,99 @@ def get_health(session: Session = Depends(get_db)) -> HealthResponse:  # noqa: B
         )
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# Source config guidance
+# ---------------------------------------------------------------------------
+
+# Describes expected config per source: which env vars or files are needed,
+# and whether the source requires manual import (CSV upload) vs automated sync.
+_SOURCE_CONFIG: dict[str, dict[str, Any]] = {
+    "gmail_n8n": {
+        "label": "Gmail / n8n",
+        "mode": "automated",
+        "env_vars": [],
+        "notes": "Receives webhooks from n8n Gmail integration.",
+    },
+    "stripe": {
+        "label": "Stripe",
+        "mode": "automated",
+        "env_vars": ["STRIPE_API_KEY_SPARKRY", "STRIPE_API_KEY_BLACKLINE"],
+        "notes": "Requires Stripe API keys in .env for each entity.",
+    },
+    "shopify": {
+        "label": "Shopify",
+        "mode": "automated",
+        "env_vars": ["SHOPIFY_API_KEY", "SHOPIFY_STORE_URL"],
+        "notes": "Requires Shopify API key and store URL in .env.",
+    },
+    "bank_csv": {
+        "label": "Bank CSV",
+        "mode": "import_only",
+        "env_vars": [],
+        "notes": "Upload bank statement CSVs via the import page.",
+    },
+    "brokerage_csv": {
+        "label": "Brokerage CSV",
+        "mode": "import_only",
+        "env_vars": [],
+        "notes": "Upload brokerage statements via the import page.",
+    },
+    "photo_receipt": {
+        "label": "Photo Receipts",
+        "mode": "import_only",
+        "env_vars": ["ANTHROPIC_API_KEY"],
+        "notes": "Upload receipt photos; uses Claude Vision for extraction.",
+    },
+    "deduction_email": {
+        "label": "Deduction Email",
+        "mode": "automated",
+        "env_vars": [],
+        "notes": "Receives forwarded deduction emails via n8n.",
+    },
+    "woocommerce_csv": {
+        "label": "WooCommerce CSV",
+        "mode": "import_only",
+        "env_vars": [],
+        "notes": "Upload WooCommerce export CSVs via the import page.",
+    },
+}
+
+
+class SourceConfigItem(BaseModel):
+    """Configuration status for a single data source."""
+
+    source: str
+    label: str
+    mode: str  # "automated" or "import_only"
+    configured: bool
+    missing_env_vars: list[str]
+    notes: str
+
+
+@router.get("/health/source-config", response_model=list[SourceConfigItem])
+def get_source_config() -> list[SourceConfigItem]:
+    """Return setup guidance for each data source.
+
+    For automated sources, checks whether required environment variables are
+    present.  Import-only sources are always marked as configured (they just
+    need file uploads).
+    """
+    import os
+
+    items: list[SourceConfigItem] = []
+    for source_key, cfg in _SOURCE_CONFIG.items():
+        missing = [v for v in cfg["env_vars"] if not os.environ.get(v)]
+        configured = len(missing) == 0
+        items.append(
+            SourceConfigItem(
+                source=source_key,
+                label=cfg["label"],
+                mode=cfg["mode"],
+                configured=configured,
+                missing_env_vars=missing,
+                notes=cfg["notes"],
+            )
+        )
+    return items

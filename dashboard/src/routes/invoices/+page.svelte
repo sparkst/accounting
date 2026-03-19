@@ -108,6 +108,13 @@
 		return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
 	}
 
+	function nextMonthLabel(customer?: Customer): string {
+		const ym = nextMonth(customer);
+		const [y, m] = ym.split('-');
+		const d = new Date(parseInt(y), parseInt(m) - 1, 1);
+		return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+	}
+
 	function dueLabel(inv: Invoice): string {
 		if (inv.status === 'paid') return `Paid ${fmtDate(inv.paid_date)}`;
 		if (inv.status === 'void') return 'Voided';
@@ -591,7 +598,7 @@
 										<span class="spinner" aria-hidden="true"></span>
 										Generating...
 									{:else}
-										Generate {nextMonth(customer)}
+										Generate {nextMonthLabel(customer)}
 									{/if}
 								</button>
 							{:else}

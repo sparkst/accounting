@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { fetchHealth, triggerSourceIngest } from '$lib/api';
-	import type { HealthResponse, SourceFreshness, TaxDeadline, FailureLogEntry } from '$lib/types';
+	import { fetchHealth, triggerSourceIngest, fetchSourceConfig } from '$lib/api';
+	import type { SourceConfigItem } from '$lib/api';
+	import type { HealthResponse, SourceFreshness, TaxDeadline, FailureLogEntry, LLMUsage } from '$lib/types';
 
 	// ── State ─────────────────────────────────────────────────────────────────
 	let health: HealthResponse | null = $state(null);
@@ -11,6 +12,7 @@
 	let secondsSinceRefresh = $state(0);
 	let syncingSource = $state<string | null>(null);
 	let syncError = $state('');
+	let sourceConfig = $state<SourceConfigItem[]>([]);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	const FRESHNESS_ORDER: Record<string, number> = {
@@ -90,7 +92,12 @@
 		loading = true;
 		fetchError = '';
 		try {
-			health = await fetchHealth();
+			const [healthData, configData] = await Promise.all([
+				fetchHealth(),
+				fetchSourceConfig().catch(() => [] as SourceConfigItem[])
+			]);
+			health = healthData;
+			sourceConfig = configData;
 			lastRefreshed = new Date();
 			secondsSinceRefresh = 0;
 		} catch (e) {
@@ -98,6 +105,10 @@
 		} finally {
 			loading = false;
 		}
+	}
+
+	function sourceConfigFor(source: string): SourceConfigItem | undefined {
+		return sourceConfig.find(c => c.source === source);
 	}
 
 	async function syncSource(source: string) {
@@ -231,6 +242,20 @@
 							</details>
 						{/if}
 
+						{#if sourceConfigFor(sf.source)}
+							{@const cfg = sourceConfigFor(sf.source)!}
+							<div class="source-config-info">
+								{#if cfg.mode === 'import_only'}
+									<span class="config-badge config-import">Import Only</span>
+								{:else if !cfg.configured}
+									<span class="config-badge config-setup">Setup Required</span>
+									{#if cfg.missing_env_vars.length > 0}
+										<span class="config-missing">Missing: {cfg.missing_env_vars.join(', ')}</span>
+									{/if}
+								{/if}
+							</div>
+						{/if}
+
 						<div class="source-actions">
 							<button
 								class="btn btn-ghost btn-sm"
@@ -341,6 +366,38 @@
 						<div class="legend-item"><span class="legend-dot legend-rejected"></span>Rejected</div>
 					</div>
 				</div>
+			</div>
+		</section>
+
+		<!-- ── Claude API Usage ─────────────────────────────────────────────── -->
+		<section class="dashboard-section">
+			<h2 class="section-title">Claude API Usage</h2>
+			<div class="card stats-card">
+				{#if health.llm_usage}
+					<div class="stat-row">
+						<span class="stat-label">Calls this month</span>
+						<span class="stat-value">{health.llm_usage.calls_this_month.toLocaleString()}</span>
+					</div>
+					<div class="stat-row">
+						<span class="stat-label">Input tokens</span>
+						<span class="stat-value">{health.llm_usage.total_input_tokens.toLocaleString()}</span>
+					</div>
+					<div class="stat-row">
+						<span class="stat-label">Output tokens</span>
+						<span class="stat-value">{health.llm_usage.total_output_tokens.toLocaleString()}</span>
+					</div>
+					<div class="stat-row">
+						<span class="stat-label">Total tokens</span>
+						<span class="stat-value">{health.llm_usage.total_tokens.toLocaleString()}</span>
+					</div>
+					<div class="stat-divider"></div>
+					<div class="stat-row stat-row-highlight">
+						<span class="stat-label">Estimated cost</span>
+						<span class="stat-value">${health.llm_usage.estimated_cost_usd.toFixed(2)}</span>
+					</div>
+				{:else}
+					<p class="no-data">0 calls this month, $0.00 estimated</p>
+				{/if}
 			</div>
 		</section>
 
@@ -648,6 +705,36 @@
 	.source-actions {
 		display: flex;
 		gap: 8px;
+	}
+
+	.source-config-info {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-wrap: wrap;
+	}
+
+	.config-badge {
+		font-size: 0.68rem;
+		font-weight: 600;
+		padding: 2px 7px;
+		border-radius: 999px;
+		white-space: nowrap;
+	}
+
+	.config-import {
+		background: var(--gray-100);
+		color: var(--gray-600);
+	}
+
+	.config-setup {
+		background: var(--amber-100);
+		color: var(--amber-700);
+	}
+
+	.config-missing {
+		font-size: 0.7rem;
+		color: var(--amber-600);
 	}
 
 	.btn-sm {

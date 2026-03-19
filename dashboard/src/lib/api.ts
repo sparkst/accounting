@@ -89,6 +89,19 @@ export async function fetchHealth(): Promise<HealthResponse> {
 	return request<HealthResponse>('/health');
 }
 
+export interface SourceConfigItem {
+	source: string;
+	label: string;
+	mode: string;
+	configured: boolean;
+	missing_env_vars: string[];
+	notes: string;
+}
+
+export async function fetchSourceConfig(): Promise<SourceConfigItem[]> {
+	return request<SourceConfigItem[]>('/health/source-config');
+}
+
 export interface ExtractReceiptResponse {
 	transaction: Transaction;
 	extraction: Record<string, unknown>;
@@ -425,6 +438,27 @@ export interface TaxTip {
 	dismissible: boolean;
 }
 
+export interface EstimatedTaxQuarter {
+	quarter: string;
+	due_date: string;
+	projected_amount: number;
+	paid: number;
+	remaining: number;
+	state: 'paid' | 'overdue' | 'upcoming';
+}
+
+export interface EstimatedTax {
+	months_elapsed: number;
+	ytd_net_profit: number;
+	projected_annual_net: number;
+	se_tax_annual: number;
+	income_tax_annual: number;
+	total_annual: number;
+	quarterly_payment: number;
+	total_paid: number;
+	quarters: EstimatedTaxQuarter[];
+}
+
 export interface TaxSummary {
 	entity: string;
 	year: number;
@@ -436,6 +470,7 @@ export interface TaxSummary {
 	warnings: TaxWarning[];
 	comparison: TaxYoyComparison | null;
 	tax_tips: TaxTip[];
+	estimated_tax: EstimatedTax | null;
 }
 
 export async function fetchTaxSummary(

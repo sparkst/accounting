@@ -34,7 +34,7 @@
 
 	let sourceFreshness = $derived<SourceFreshness[]>(health?.source_freshness ?? []);
 
-	let netIncome = $derived(monthIncome - monthExpenses);
+	let netIncome = $derived(monthIncome + monthExpenses);
 
 	function deadlineUrgency(d: TaxDeadline): 'red' | 'amber' | 'gray' {
 		if (d.days_until_due < 7) return 'red';
@@ -194,7 +194,7 @@
 					</div>
 					<div class="summary-row">
 						<span class="summary-label">Expenses</span>
-						<span class="summary-value amount-negative">-{formatAmount(monthExpenses)}</span>
+						<span class="summary-value amount-negative">-{formatAmount(Math.abs(monthExpenses))}</span>
 					</div>
 					<div class="summary-row summary-row-total">
 						<span class="summary-label">Net</span>

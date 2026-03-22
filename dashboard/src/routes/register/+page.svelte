@@ -5,6 +5,7 @@
 	import type { TransactionFilters } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
 	import InsightPanel from '$lib/components/InsightPanel.svelte';
+	import Toast from '$lib/components/Toast.svelte';
 	import { DATE_PRESETS } from '$lib/datePresets';
 	import { fetchAggregations } from '$lib/api';
 	import type { AggregationData } from '$lib/api';
@@ -47,6 +48,15 @@
 	let editingCell = $state<{ id: string; field: string } | null>(null);
 	let editValue = $state('');
 	let editSaving = $state(false);
+
+	// Undo toast
+	interface UndoToast {
+		message: string;
+		id: string;
+		field: string;
+		previousValue: unknown;
+	}
+	let undoToast = $state<UndoToast | null>(null);
 
 	// Derived
 	let showReviewReason = $derived(statusFilter === 'rejected' || statusFilter.includes('rejected'));
@@ -251,6 +261,15 @@
 		if (!editingCell || editSaving) return;
 		const { id, field } = editingCell;
 
+		// Capture previous value for undo before patching
+		const tx = items.find((t: Transaction) => t.id === id);
+		let previousValue: unknown = null;
+		if (tx) {
+			if (field === 'entity') previousValue = tx.entity ?? null;
+			else if (field === 'tax_category') previousValue = tx.tax_category ?? null;
+			else if (field === 'amount') previousValue = tx.amount;
+		}
+
 		// Determine the update payload
 		let updates: Record<string, unknown> = {};
 		if (field === 'entity') {
@@ -266,11 +285,24 @@
 			updates.amount = parsed;
 		}
 
+		// Skip if value didn't change
+		const newValue = updates[field];
+		if (newValue === previousValue || String(newValue ?? '') === String(previousValue ?? '')) {
+			editingCell = null;
+			editValue = '';
+			return;
+		}
+
 		editSaving = true;
 		try {
 			await updateTransaction(id, updates);
 			editingCell = null;
 			editValue = '';
+
+			// Show undo toast
+			const fieldLabel = field === 'tax_category' ? 'category' : field;
+			undoToast = { message: `${fieldLabel} updated`, id, field, previousValue };
+
 			load(); // refresh data
 		} catch {
 			// on error, just cancel
@@ -282,6 +314,18 @@
 		editingCell = null;
 		editValue = '';
 		editSaving = false;
+	}
+
+	async function handleUndoEdit() {
+		if (!undoToast) return;
+		const { id, field, previousValue } = undoToast;
+		undoToast = null;
+		try {
+			await updateTransaction(id, { [field]: previousValue });
+			load();
+		} catch {
+			// undo failed silently
+		}
 	}
 
 	function handleEditKeydown(e: KeyboardEvent) {
@@ -380,6 +424,17 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+{#if undoToast}
+	<Toast
+		message={undoToast.message}
+		type="success"
+		undoLabel="Undo"
+		duration={5000}
+		onundo={handleUndoEdit}
+		ondismiss={() => { undoToast = null; }}
+	/>
+{/if}
 
 <div class="container page-shell">
 	<header class="page-header">

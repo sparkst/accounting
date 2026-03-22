@@ -9,6 +9,7 @@
 		type VendorRuleCreate
 	} from '$lib/api';
 	import { entityBadgeClass } from '$lib/categories';
+	import Toast from '$lib/components/Toast.svelte';
 
 	// ── Constants ────────────────────────────────────────────────────────────
 	const ENTITIES = ['sparkry', 'blackline', 'personal'] as const;
@@ -40,6 +41,15 @@
 	let editingCell = $state<{ ruleId: string; field: string } | null>(null);
 	let editValue = $state('');
 	let savingCell = $state(false);
+
+	// Undo toast
+	interface UndoToast {
+		message: string;
+		ruleId: string;
+		field: string;
+		previousValue: string;
+	}
+	let undoToast = $state<UndoToast | null>(null);
 
 	// Add rule form
 	let showAddForm = $state(false);
@@ -129,9 +139,25 @@
 
 	async function saveEdit() {
 		if (!editingCell) return;
+		const { ruleId, field } = editingCell;
+
+		// Capture previous value for undo
+		const rule = rules.find((r) => r.id === ruleId);
+		const previousValue = rule ? String((rule as unknown as Record<string, unknown>)[field] ?? '') : '';
+
+		// Skip if value didn't change
+		if (editValue === previousValue) {
+			cancelEdit();
+			return;
+		}
+
 		savingCell = true;
 		try {
-			await patchVendorRule(editingCell.ruleId, { [editingCell.field]: editValue });
+			await patchVendorRule(ruleId, { [field]: editValue });
+			const fieldLabel = field === 'vendor_pattern' ? 'pattern'
+				: field === 'tax_category' ? 'category'
+				: field;
+			undoToast = { message: `${fieldLabel} updated`, ruleId, field, previousValue };
 			editingCell = null;
 			editValue = '';
 			await load();
@@ -139,6 +165,18 @@
 			error = e instanceof Error ? e.message : 'Save failed';
 		} finally {
 			savingCell = false;
+		}
+	}
+
+	async function handleUndoEdit() {
+		if (!undoToast) return;
+		const { ruleId, field, previousValue } = undoToast;
+		undoToast = null;
+		try {
+			await patchVendorRule(ruleId, { [field]: previousValue });
+			await load();
+		} catch {
+			// undo failed silently
 		}
 	}
 
@@ -543,6 +581,17 @@
 		<a href="/">View upcoming deadlines on Dashboard &rarr;</a>
 	</p>
 </div>
+
+{#if undoToast}
+	<Toast
+		message={undoToast.message}
+		type="success"
+		undoLabel="Undo"
+		duration={5000}
+		onundo={handleUndoEdit}
+		ondismiss={() => { undoToast = null; }}
+	/>
+{/if}
 
 <!-- ── Delete Confirmation Dialog ───────────────────────────────────────── -->
 {#if deleteTarget}

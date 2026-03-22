@@ -374,6 +374,64 @@ def apply_manual_match(
     return txn_a, txn_b
 
 
+def remove_manual_match(
+    session: Session,
+    transaction_id_a: str,
+    transaction_id_b: str,
+) -> tuple[Transaction, Transaction]:
+    """Remove the reconciliation link between two transactions.
+
+    Strips the ``reconciled:<other_id>`` segment from both transactions' notes.
+    Any other content in the notes field is preserved.  The pair must currently
+    be linked — if either ID is missing or the link is not present a ValueError
+    is raised so the caller can return a 404.
+
+    Args:
+        session:          Active SQLAlchemy session.
+        transaction_id_a: ID of the first transaction.
+        transaction_id_b: ID of the second transaction.
+
+    Returns:
+        The two updated Transaction objects (notes cleared of recon link).
+
+    Raises:
+        ValueError: If either transaction is not found, or if neither side
+                    carries a ``reconciled:`` note pointing to the other.
+    """
+    txn_a = session.get(Transaction, transaction_id_a)
+    txn_b = session.get(Transaction, transaction_id_b)
+
+    if txn_a is None:
+        raise ValueError(f"Transaction not found: {transaction_id_a}")
+    if txn_b is None:
+        raise ValueError(f"Transaction not found: {transaction_id_b}")
+
+    # Verify that the two transactions are actually linked to each other
+    a_link = f"{RECON_LINK_NOTE_PREFIX}{transaction_id_b}"
+    b_link = f"{RECON_LINK_NOTE_PREFIX}{transaction_id_a}"
+
+    if not (txn_a.notes and a_link in txn_a.notes) and \
+       not (txn_b.notes and b_link in txn_b.notes):
+        raise ValueError(
+            f"Transactions {transaction_id_a[:8]} and {transaction_id_b[:8]} "
+            "are not linked as a reconciliation pair"
+        )
+
+    def _strip_recon_note(notes: str | None, link_to_remove: str) -> str | None:
+        """Remove the reconciled: segment, preserving any other note content."""
+        if not notes:
+            return notes
+        # Split on the recon link and rejoin remaining parts
+        cleaned = notes.replace(link_to_remove, "").strip()
+        return cleaned if cleaned else None
+
+    txn_a.notes = _strip_recon_note(txn_a.notes, a_link)
+    txn_b.notes = _strip_recon_note(txn_b.notes, b_link)
+
+    session.flush()
+    return txn_a, txn_b
+
+
 def _update_foreign_currency_from_statement(
     session: Session,
     txn_a: Transaction,

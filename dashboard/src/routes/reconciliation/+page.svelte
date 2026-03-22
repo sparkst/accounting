@@ -61,6 +61,10 @@
 	let linkingInProgress = $state(false);
 	let linkSuccess = $state('');
 
+	// Unlink confirmation
+	let unlinkConfirmKey = $state<string | null>(null); // composite key: payoutId+bankId
+	let unlinkingInProgress = $state(false);
+
 	// View toggle
 	let activeTab = $state<'matched' | 'unmatched' | 'monthly'>('matched');
 
@@ -165,6 +169,26 @@
 			actionError = e instanceof Error ? e.message : 'Link failed';
 		} finally {
 			linkingInProgress = false;
+		}
+	}
+
+	async function unlinkPair(payoutId: string, bankId: string) {
+		unlinkingInProgress = true;
+		actionError = '';
+		linkSuccess = '';
+		try {
+			await apiPost('/reconcile/unlink', {
+				transaction_id_a: payoutId,
+				transaction_id_b: bankId
+			});
+			unlinkConfirmKey = null;
+			linkSuccess = 'Pair unlinked. Refreshing…';
+			await load();
+			linkSuccess = '';
+		} catch (e) {
+			actionError = e instanceof Error ? e.message : 'Unlink failed';
+		} finally {
+			unlinkingInProgress = false;
 		}
 	}
 
@@ -369,10 +393,12 @@
 								<th>Date diff</th>
 								<th>Card</th>
 								<th>Confidence</th>
+								<th class="action-col">Action</th>
 							</tr>
 						</thead>
 						<tbody>
 							{#each matched as pair (pair.payout.id + pair.bank.id)}
+								{@const pairKey = pair.payout.id + pair.bank.id}
 								<tr class="row-matched">
 									<td class="td-date">{fmtDate(pair.payout.date)}</td>
 									<td>
@@ -399,6 +425,34 @@
 										<span class="confidence-badge {confidenceClass(pair.confidence)}">
 											{confidenceLabel(pair.confidence)}
 										</span>
+									</td>
+									<td class="action-col">
+										{#if unlinkConfirmKey === pairKey}
+											<span class="unlink-confirm-inline">
+												Unlink?
+												<button
+													class="btn-inline-confirm"
+													disabled={unlinkingInProgress}
+													onclick={() => unlinkPair(pair.payout.id, pair.bank.id)}
+												>
+													{unlinkingInProgress ? '…' : 'Yes'}
+												</button>
+												<button
+													class="btn-inline-cancel"
+													disabled={unlinkingInProgress}
+													onclick={() => (unlinkConfirmKey = null)}
+												>
+													No
+												</button>
+											</span>
+										{:else}
+											<button
+												class="btn btn-ghost btn-sm"
+												onclick={() => (unlinkConfirmKey = pairKey)}
+											>
+												Unlink
+											</button>
+										{/if}
 									</td>
 								</tr>
 							{/each}
@@ -919,6 +973,55 @@
 		padding: 1px 5px;
 		border-radius: 4px;
 		font-size: 0.8rem;
+	}
+
+	/* ── Action column ─────────────────────────────────────────────────────── */
+	.action-col {
+		width: 120px;
+		white-space: nowrap;
+	}
+
+	.btn-sm {
+		padding: 3px 10px;
+		font-size: 0.75rem;
+	}
+
+	.unlink-confirm-inline {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		white-space: nowrap;
+	}
+
+	.btn-inline-confirm {
+		padding: 2px 8px;
+		font-size: 0.75rem;
+		font-weight: 600;
+		color: var(--red-700);
+		background: var(--red-100);
+		border: 1px solid var(--red-300);
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+
+	.btn-inline-confirm:hover:not(:disabled) {
+		background: var(--red-200);
+	}
+
+	.btn-inline-cancel {
+		padding: 2px 8px;
+		font-size: 0.75rem;
+		color: var(--text-muted);
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		cursor: pointer;
+	}
+
+	.btn-inline-cancel:hover:not(:disabled) {
+		color: var(--text);
 	}
 
 	/* ── Empty states ──────────────────────────────────────────────────────── */

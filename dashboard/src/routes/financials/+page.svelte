@@ -29,6 +29,8 @@
 	// Comparison data (both entities)
 	let sparkrySummary = $state<TaxSummary | null>(null);
 	let blacklineSummary = $state<TaxSummary | null>(null);
+	let sparkryAgg = $state<AggregationData | null>(null);
+	let blacklineAgg = $state<AggregationData | null>(null);
 
 	// Section collapse state — BLUF progressive disclosure
 	let showExpenseDetail = $state(false);
@@ -93,18 +95,49 @@
 		[...new Set([...spExpenses.map(li => li.tax_category), ...blExpenses.map(li => li.tax_category)])]
 	);
 
+	// Expense bars in compare mode — each entity sorted, scaled to its own max
+	let spSortedExpenses = $derived.by(() =>
+		[...spExpenses].sort((a, b) => Math.abs(b.total) - Math.abs(a.total))
+	);
+	let blSortedExpenses = $derived.by(() =>
+		[...blExpenses].sort((a, b) => Math.abs(b.total) - Math.abs(a.total))
+	);
+	let spMaxExpense = $derived(Math.max(...spExpenses.map(li => Math.abs(li.total)), 1));
+	let blMaxExpense = $derived(Math.max(...blExpenses.map(li => Math.abs(li.total)), 1));
+
+	// Concentration warnings from both entities combined (deduplicated by message)
+	let compareWarnings = $derived.by(() => {
+		const spWarn = sparkryAgg?.concentration_warnings ?? [];
+		const blWarn = blacklineAgg?.concentration_warnings ?? [];
+		const seen = new Set<string>();
+		const result = [];
+		for (const w of [...spWarn, ...blWarn]) {
+			if (!seen.has(w.message)) {
+				seen.add(w.message);
+				result.push(w);
+			}
+		}
+		return result;
+	});
+
 	// ── Load ─────────────────────────────────────────────────────────────────
 	async function load() {
 		loading = true;
 		fetchError = '';
 		try {
 			if (compareMode) {
-				const [sp, bl] = await Promise.all([
+				const dateFrom = `${selectedYear}-01-01`;
+				const dateTo = `${selectedYear}-12-31`;
+				const [sp, bl, spAgg, blAgg] = await Promise.all([
 					fetchTaxSummary('sparkry', selectedYear),
-					fetchTaxSummary('blackline', selectedYear)
+					fetchTaxSummary('blackline', selectedYear),
+					fetchAggregations({ entity: 'sparkry', date_from: dateFrom, date_to: dateTo }).catch(() => null),
+					fetchAggregations({ entity: 'blackline', date_from: dateFrom, date_to: dateTo }).catch(() => null)
 				]);
 				sparkrySummary = sp;
 				blacklineSummary = bl;
+				sparkryAgg = spAgg;
+				blacklineAgg = blAgg;
 				summary = selectedEntity === 'sparkry' ? sp : bl;
 			} else {
 				const [sum, agg] = await Promise.all([
@@ -119,6 +152,8 @@
 				aggregations = agg;
 				sparkrySummary = null;
 				blacklineSummary = null;
+				sparkryAgg = null;
+				blacklineAgg = null;
 			}
 		} catch (e) {
 			fetchError = e instanceof Error ? e.message : 'Failed to load financial data';
@@ -315,6 +350,145 @@
 				</table>
 			</div>
 		</section>
+
+		<!-- Expense Breakdown — side-by-side bars per entity -->
+		{#if spSortedExpenses.length > 0 || blSortedExpenses.length > 0}
+			<section class="dashboard-section">
+				<h2 class="section-title">Expense Breakdown — {selectedYear}</h2>
+				<div class="compare-bars-grid">
+					<!-- Sparkry -->
+					<div class="card expense-bars-card">
+						<div class="compare-bars-header">
+							<span class={entityBadgeClass('sparkry')}>Sparkry AI</span>
+						</div>
+						{#if spSortedExpenses.length > 0}
+							{#each spSortedExpenses as li}
+								<div class="expense-bar-row">
+									<span class="expense-bar-label">{catLabel(li.tax_category)}</span>
+									<div class="expense-bar-track">
+										<div
+											class="expense-bar-fill"
+											style="width: {(Math.abs(li.total) / spMaxExpense) * 100}%"
+											role="meter"
+											aria-valuenow={Math.abs(li.total)}
+											aria-valuemin={0}
+											aria-valuemax={spMaxExpense}
+											aria-label="{catLabel(li.tax_category)} {formatAmount(Math.abs(li.total))}"
+										></div>
+									</div>
+									<span class="expense-bar-amount">{formatAmount(Math.abs(li.total))}</span>
+								</div>
+							{/each}
+						{:else}
+							<p class="no-data-note">No expenses recorded</p>
+						{/if}
+					</div>
+					<!-- BlackLine -->
+					<div class="card expense-bars-card">
+						<div class="compare-bars-header">
+							<span class={entityBadgeClass('blackline')}>BlackLine MTB</span>
+						</div>
+						{#if blSortedExpenses.length > 0}
+							{#each blSortedExpenses as li}
+								<div class="expense-bar-row">
+									<span class="expense-bar-label">{catLabel(li.tax_category)}</span>
+									<div class="expense-bar-track">
+										<div
+											class="expense-bar-fill"
+											style="width: {(Math.abs(li.total) / blMaxExpense) * 100}%"
+											role="meter"
+											aria-valuenow={Math.abs(li.total)}
+											aria-valuemin={0}
+											aria-valuemax={blMaxExpense}
+											aria-label="{catLabel(li.tax_category)} {formatAmount(Math.abs(li.total))}"
+										></div>
+									</div>
+									<span class="expense-bar-amount">{formatAmount(Math.abs(li.total))}</span>
+								</div>
+							{/each}
+						{:else}
+							<p class="no-data-note">No expenses recorded</p>
+						{/if}
+					</div>
+				</div>
+			</section>
+		{/if}
+
+		<!-- Revenue Sources — per-entity vendor breakdown -->
+		{#if (sparkryAgg && sparkryAgg.top_vendors.income.length > 0) || (blacklineAgg && blacklineAgg.top_vendors.income.length > 0)}
+			<section class="dashboard-section">
+				<h2 class="section-title">Revenue Sources — {selectedYear}</h2>
+				<div class="compare-bars-grid">
+					<!-- Sparkry -->
+					<div class="card">
+						<div class="compare-bars-header">
+							<span class={entityBadgeClass('sparkry')}>Sparkry AI</span>
+						</div>
+						{#if sparkryAgg && sparkryAgg.top_vendors.income.length > 0}
+							<table class="data-table">
+								<thead>
+									<tr>
+										<th>Source</th>
+										<th class="amt-col">Revenue</th>
+										<th class="pct-col">%</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each sparkryAgg.top_vendors.income as v}
+										<tr>
+											<td>{v.vendor}</td>
+											<td class="amt-cell {amountClass(v.total)}">{formatAmount(v.total)}</td>
+											<td class="pct-cell">{v.pct.toFixed(1)}%</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{:else}
+							<p class="no-data-note">No revenue data available</p>
+						{/if}
+					</div>
+					<!-- BlackLine -->
+					<div class="card">
+						<div class="compare-bars-header">
+							<span class={entityBadgeClass('blackline')}>BlackLine MTB</span>
+						</div>
+						{#if blacklineAgg && blacklineAgg.top_vendors.income.length > 0}
+							<table class="data-table">
+								<thead>
+									<tr>
+										<th>Source</th>
+										<th class="amt-col">Revenue</th>
+										<th class="pct-col">%</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each blacklineAgg.top_vendors.income as v}
+										<tr>
+											<td>{v.vendor}</td>
+											<td class="amt-cell {amountClass(v.total)}">{formatAmount(v.total)}</td>
+											<td class="pct-cell">{v.pct.toFixed(1)}%</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{:else}
+							<p class="no-data-note">No revenue data available</p>
+						{/if}
+					</div>
+				</div>
+			</section>
+		{/if}
+
+		<!-- Concentration Warnings — from either entity -->
+		{#if compareWarnings.length > 0}
+			<section class="dashboard-section">
+				{#each compareWarnings as w}
+					<div class="alert-banner alert-warning">
+						{w.message}
+					</div>
+				{/each}
+			</section>
+		{/if}
 
 	{:else if summary}
 		<!-- ═══════════════════════════════════════════════════════════════════ -->
@@ -939,6 +1113,30 @@
 		color: var(--text-muted);
 		font-style: italic;
 		font-size: .8rem;
+	}
+
+	/* ── Compare Bars Grid ────────────────────────────────────────────────── */
+	.compare-bars-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px;
+	}
+
+	@media (max-width: 700px) {
+		.compare-bars-grid {
+			grid-template-columns: 1fr;
+		}
+	}
+
+	.compare-bars-header {
+		margin-bottom: 12px;
+	}
+
+	.no-data-note {
+		font-size: .8rem;
+		color: var(--text-muted);
+		font-style: italic;
+		margin: 0;
 	}
 
 	/* ── Expense Bars ─────────────────────────────────────────────────────── */

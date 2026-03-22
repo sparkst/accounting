@@ -76,8 +76,15 @@
 	let readinessPct = $derived(summary?.readiness.readiness_pct ?? 0);
 	let needsReviewCount = $derived(summary?.readiness.needs_review_count ?? 0);
 
-	// MoM data
+	// MoM data with explicit month labels
 	let momIncomePct = $derived(aggregations?.mom_change.income_pct ?? 0);
+	let momLabel = $derived.by(() => {
+		const now = new Date();
+		const curMonth = now.toLocaleString('en-US', { month: 'short' });
+		const prevDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+		const prevMonth = prevDate.toLocaleString('en-US', { month: 'short' });
+		return `${curMonth} vs ${prevMonth} ${now.getFullYear()}`;
+	});
 	let momExpensePct = $derived(aggregations?.mom_change.expense_pct ?? 0);
 
 	// Expenses sorted by absolute value (used for bar chart and top-5 summary)
@@ -568,7 +575,7 @@
 				<div class="bluf-amount {amountClass(grossIncome)}">{formatAmount(grossIncome)}</div>
 				{#if aggregations}
 					<span class="bluf-trend {pctBadge(momIncomePct)}">
-						{momIncomePct > 0 ? '+' : ''}{momIncomePct.toFixed(0)}% vs prior month
+						{momIncomePct > 0 ? '+' : ''}{momIncomePct.toFixed(0)}% {momLabel}
 					</span>
 				{/if}
 			</div>
@@ -577,7 +584,7 @@
 				<div class="bluf-amount">{formatAmount(Math.abs(totalExpenses))}</div>
 				{#if aggregations}
 					<span class="bluf-trend {pctBadge(-momExpensePct)}">
-						{momExpensePct > 0 ? '+' : ''}{momExpensePct.toFixed(0)}% vs prior month
+						{momExpensePct > 0 ? '+' : ''}{momExpensePct.toFixed(0)}% {momLabel}
 					</span>
 				{/if}
 			</div>

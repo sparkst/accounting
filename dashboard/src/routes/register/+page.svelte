@@ -379,6 +379,28 @@
 			e.preventDefault();
 			focusedRow = Math.max(focusedRow - 1, 0);
 			scrollToFocusedRow();
+		} else if (e.key === 'Enter') {
+			if (focusedRow >= 0 && focusedRow < items.length) {
+				e.preventDefault();
+				toggleRow(items[focusedRow].id);
+			}
+		} else if (e.key === 'Escape') {
+			if (expandedId) {
+				e.preventDefault();
+				expandedId = null;
+			}
+		} else if (e.key === 'y') {
+			if (focusedRow >= 0 && focusedRow < items.length) {
+				e.preventDefault();
+				const tx = items[focusedRow];
+				confirmTransaction(tx.id).then(() => load()).catch(() => {});
+			}
+		} else if (e.key === 'e') {
+			if (focusedRow >= 0 && focusedRow < items.length) {
+				e.preventDefault();
+				const tx = items[focusedRow];
+				startEdit(tx.id, 'tax_category', tx.tax_category ?? '');
+			}
 		}
 	}
 
@@ -568,7 +590,12 @@
 	</div>
 
 	<div class="keyboard-hint">
-		<kbd>j</kbd><kbd>k</kbd> navigate rows &nbsp;·&nbsp; click cell to edit inline
+		<kbd>j</kbd><kbd>k</kbd> navigate &nbsp;·&nbsp;
+		<kbd>Enter</kbd> expand &nbsp;·&nbsp;
+		<kbd>y</kbd> confirm &nbsp;·&nbsp;
+		<kbd>e</kbd> edit category &nbsp;·&nbsp;
+		<kbd>Esc</kbd> collapse &nbsp;·&nbsp;
+		click cell to edit inline
 	</div>
 
 	{#if fetchError}
@@ -651,13 +678,21 @@
 						</thead>
 						<tbody>
 							{#each items as tx, rowIdx (tx.id)}
-								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<tr
 									class="row-{tx.status}"
 									class:row-expandable={true}
 									class:row-expanded={expandedId === tx.id}
 									class:register-row-focused={focusedRow === rowIdx}
+									role="row"
+									tabindex="0"
+									aria-expanded={expandedId === tx.id}
 									onclick={() => toggleRow(tx.id)}
+									onkeydown={(e) => {
+										if (e.key === 'Enter' || e.key === ' ') {
+											e.preventDefault();
+											toggleRow(tx.id);
+										}
+									}}
 								>
 									<td class="col-date">{formatDate(tx.date)}</td>
 									<td class="col-vendor">
@@ -1012,6 +1047,15 @@
 
 	.register-row-focused td {
 		background: color-mix(in srgb, var(--blue-500) 8%, var(--surface));
+	}
+
+	tr[role="row"]:focus {
+		outline: 2px solid var(--blue-500);
+		outline-offset: -2px;
+	}
+
+	tr[role="row"]:focus:not(:focus-visible) {
+		outline: none;
 	}
 
 	.expanded-row td {

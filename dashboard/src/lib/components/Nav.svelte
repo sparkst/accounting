@@ -196,7 +196,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/invoices', '/financials', '/cashflow', '/tax'])}
+						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'money'}
 						data-trigger="money"
@@ -232,6 +232,18 @@
 											{overdueCount > 99 ? '99+' : overdueCount}
 										</span>
 									{/if}
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/ar-aging"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/ar-aging') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									AR Aging
 								</a>
 							</li>
 							<li role="none">
@@ -278,7 +290,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation'])}
+						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation', '/monthly-close'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'system'}
 						data-trigger="system"
@@ -328,6 +340,18 @@
 									onkeydown={(e) => handleMenuKeydown(e, 'system')}
 								>
 									Reconciliation
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/monthly-close"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/monthly-close') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Monthly Close
 								</a>
 							</li>
 						</ul>

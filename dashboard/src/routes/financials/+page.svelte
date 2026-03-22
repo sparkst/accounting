@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { fetchTaxSummary, fetchAggregations } from '$lib/api';
 	import type { TaxSummary, TaxLineItem, AggregationData } from '$lib/api';
 	import { CATEGORY_LABELS, formatAmount, amountClass, entityBadgeClass } from '$lib/categories';
@@ -14,10 +13,7 @@
 	const YEARS: number[] = [];
 	for (let y = 2024; y <= CURRENT_YEAR + 1; y++) YEARS.push(y);
 
-	const INCOME_CATS = new Set([
-		'CONSULTING_INCOME', 'SUBSCRIPTION_INCOME', 'SALES_INCOME', 'WHOLESALE_INCOME', 'INVESTMENT_INCOME'
-	]);
-	const COGS_CATS = new Set(['COGS']);
+	const COGS_CAT = 'COGS';
 
 	// ── State ─────────────────────────────────────────────────────────────────
 	let selectedEntity = $state<'sparkry' | 'blackline'>('sparkry');
@@ -45,12 +41,12 @@
 	);
 
 	let cogsItems = $derived.by((): TaxLineItem[] =>
-		(summary?.line_items ?? []).filter(li => COGS_CATS.has(li.tax_category))
+		(summary?.line_items ?? []).filter(li => li.tax_category === COGS_CAT)
 	);
 
 	let expenseItems = $derived.by((): TaxLineItem[] =>
 		(summary?.line_items ?? []).filter(li =>
-			!li.is_income && !li.is_reimbursable && !COGS_CATS.has(li.tax_category)
+			!li.is_income && !li.is_reimbursable && li.tax_category !== COGS_CAT
 		)
 	);
 
@@ -73,20 +69,16 @@
 	let readinessPct = $derived(summary?.readiness.readiness_pct ?? 0);
 	let needsReviewCount = $derived(summary?.readiness.needs_review_count ?? 0);
 
-	// Top expenses for the summary
-	let topExpenses = $derived.by((): TaxLineItem[] => {
-		return [...expenseItems].sort((a, b) => Math.abs(b.total) - Math.abs(a.total)).slice(0, 5);
-	});
-
 	// MoM data
 	let momIncomePct = $derived(aggregations?.mom_change.income_pct ?? 0);
 	let momExpensePct = $derived(aggregations?.mom_change.expense_pct ?? 0);
 
-	// Max expense for bar chart scaling
-	let maxExpense = $derived(Math.max(...expenseItems.map(li => Math.abs(li.total)), 1));
+	// Expenses sorted by absolute value (used for bar chart and top-5 summary)
 	let sortedExpenses = $derived.by(() =>
 		[...expenseItems].sort((a, b) => Math.abs(b.total) - Math.abs(a.total))
 	);
+	let topExpenses = $derived(sortedExpenses.slice(0, 5));
+	let maxExpense = $derived(Math.max(...expenseItems.map(li => Math.abs(li.total)), 1));
 
 	// ── Derived: comparison mode ─────────────────────────────────────────
 	let spIncome = $derived.by(() => extractItems(sparkrySummary, li => li.is_income));
@@ -135,11 +127,8 @@
 		}
 	}
 
-	onMount(load);
-
-	// Reload when entity/year/mode changes
+	// Load on mount and reload when entity/year/mode changes
 	$effect(() => {
-		// Track dependencies
 		void selectedEntity;
 		void selectedYear;
 		void compareMode;

@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { fetchTaxSummary, downloadExport } from '$lib/api';
 	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip, EstimatedTax } from '$lib/api';
-	import { CATEGORY_LABELS } from '$lib/categories';
+	import { CATEGORY_LABELS, formatAmount, amountClass } from '$lib/categories';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
@@ -29,6 +29,8 @@
 	let downloadError    = $state('');
 	let compareEnabled   = $state(false);
 	let showDismissed    = $state(false);
+	let insightsOpen     = $state(false);
+	let bnoExpanded      = $state(false);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let compareYear = $derived(selectedYear - 1);
@@ -386,57 +388,68 @@
 			{/each}
 		{/if}
 
-		<!-- ── Tax Optimization Insights ─────────────────────────────────────── -->
+		<!-- ── Tax Optimization Insights (collapsible) ────────────────────────── -->
 		{#if allTips.length > 0}
 			<section class="dashboard-section no-print">
-				<h2 class="section-title">Insights</h2>
+				<button
+					class="insights-toggle"
+					onclick={() => (insightsOpen = !insightsOpen)}
+					aria-expanded={insightsOpen}
+				>
+					<span class="insights-toggle-text">
+						{allTips.length} tax optimization {allTips.length === 1 ? 'tip' : 'tips'}
+					</span>
+					<span class="chevron" class:chevron-open={insightsOpen} aria-hidden="true">&#x25B8;</span>
+				</button>
 
-				{#if visibleTips.length > 0}
-					<div class="tips-list">
-						{#each visibleTips as tip (tip.id)}
-							<div class="tip-card">
-								<div class="tip-icon" aria-hidden="true">ℹ</div>
-								<div class="tip-body">
-									<p class="tip-title">{tip.title}</p>
-									<p class="tip-detail">{tip.detail}</p>
-									{#if tip.action_url}
-										<a class="tip-action" href={tip.action_url}>Review →</a>
-									{/if}
-								</div>
-								{#if tip.dismissible}
-									<button
-										class="tip-dismiss"
-										onclick={() => dismissTip(tip.id)}
-										aria-label="Dismiss tip"
-										title="Dismiss"
-									>✕</button>
-								{/if}
-							</div>
-						{/each}
-					</div>
-				{:else}
-					<p class="tips-all-dismissed">All insights dismissed.</p>
-				{/if}
-
-				{#if dismissedTips.length > 0}
-					<button
-						class="tips-show-dismissed"
-						onclick={() => (showDismissed = !showDismissed)}
-					>
-						{showDismissed ? 'Hide dismissed' : `Show ${dismissedTips.length} dismissed ${dismissedTips.length === 1 ? 'tip' : 'tips'}`}
-					</button>
-
-					{#if showDismissed}
-						<div class="tips-list tips-list-dismissed">
-							{#each dismissedTips as tip (tip.id)}
-								<div class="tip-card tip-card-dismissed">
+				{#if insightsOpen}
+					{#if visibleTips.length > 0}
+						<div class="tips-list" style="margin-top: 12px;">
+							{#each visibleTips as tip (tip.id)}
+								<div class="tip-card">
 									<div class="tip-icon" aria-hidden="true">ℹ</div>
 									<div class="tip-body">
 										<p class="tip-title">{tip.title}</p>
+										<p class="tip-detail">{tip.detail}</p>
+										{#if tip.action_url}
+											<a class="tip-action" href={tip.action_url}>Review →</a>
+										{/if}
 									</div>
+									{#if tip.dismissible}
+										<button
+											class="tip-dismiss"
+											onclick={() => dismissTip(tip.id)}
+											aria-label="Dismiss tip"
+											title="Dismiss"
+										>✕</button>
+									{/if}
 								</div>
 							{/each}
 						</div>
+					{:else}
+						<p class="tips-all-dismissed">All insights dismissed.</p>
+					{/if}
+
+					{#if dismissedTips.length > 0}
+						<button
+							class="tips-show-dismissed"
+							onclick={() => (showDismissed = !showDismissed)}
+						>
+							{showDismissed ? 'Hide dismissed' : `Show ${dismissedTips.length} dismissed ${dismissedTips.length === 1 ? 'tip' : 'tips'}`}
+						</button>
+
+						{#if showDismissed}
+							<div class="tips-list tips-list-dismissed">
+								{#each dismissedTips as tip (tip.id)}
+									<div class="tip-card tip-card-dismissed">
+										<div class="tip-icon" aria-hidden="true">ℹ</div>
+										<div class="tip-body">
+											<p class="tip-title">{tip.title}</p>
+										</div>
+									</div>
+								{/each}
+							</div>
+						{/if}
 					{/if}
 				{/if}
 			</section>
@@ -471,7 +484,7 @@
 									{@const delta = deltasByCat.get(item.tax_category)}
 									<tr>
 										<td class="td-category">{categoryLabel(item.tax_category)}</td>
-										<td class="td-amount amount-positive">{fmtCurrency(item.total)}</td>
+										<td class="td-amount {amountClass(item.total)}">{formatAmount(item.total)}</td>
 										{#if compareEnabled && comparison}
 											<td class="td-amount td-prior">
 												{delta ? fmtCurrency(delta.prior) : '—'}
@@ -492,7 +505,7 @@
 								{/each}
 								<tr class="subtotal-row">
 									<td class="subtotal-label">Gross Income</td>
-									<td class="td-amount amount-positive subtotal-val">{fmtCurrency(summary.gross_income)}</td>
+									<td class="td-amount {amountClass(summary.gross_income)} subtotal-val">{formatAmount(summary.gross_income)}</td>
 									{#if compareEnabled && comparison}
 										<td class="td-amount td-prior subtotal-val">{fmtCurrency(comparison.prior_gross_income)}</td>
 										<td class="td-amount td-change subtotal-val {netProfitDeltaClass(summary.gross_income - comparison.prior_gross_income)}">
@@ -512,7 +525,7 @@
 									{@const delta = deltasByCat.get(item.tax_category)}
 									<tr>
 										<td class="td-category">{categoryLabel(item.tax_category)}</td>
-										<td class="td-amount amount-negative">({fmtCurrency(item.total)})</td>
+										<td class="td-amount {amountClass(-item.total)}">{formatAmount(-item.total)}</td>
 										{#if compareEnabled && comparison}
 											<td class="td-amount td-prior">
 												{delta ? `(${fmtCurrency(delta.prior)})` : '—'}
@@ -533,7 +546,7 @@
 								{/each}
 								<tr class="subtotal-row">
 									<td class="subtotal-label">Total Expenses</td>
-									<td class="td-amount amount-negative subtotal-val">({fmtCurrency(summary.total_expenses)})</td>
+									<td class="td-amount {amountClass(-summary.total_expenses)} subtotal-val">{formatAmount(-summary.total_expenses)}</td>
 									{#if compareEnabled && comparison}
 										<td class="td-amount td-prior subtotal-val">({fmtCurrency(comparison.prior_total_expenses)})</td>
 										<td class="td-amount td-change subtotal-val {deltaClass(summary.total_expenses - comparison.prior_total_expenses, false)}">
@@ -552,19 +565,11 @@
 									{selectedEntity === 'personal' ? 'Net Deductions' : 'Net Profit'}
 								</td>
 								<td class="td-amount net-profit-amount">
-									{#if summary.net_profit < 0}
-										({fmtCurrency(Math.abs(summary.net_profit))})
-									{:else}
-										{fmtCurrency(summary.net_profit)}
-									{/if}
+									{formatAmount(summary.net_profit)}
 								</td>
 								{#if compareEnabled && comparison}
 									<td class="td-amount td-prior net-profit-amount">
-										{#if comparison.prior_net_profit < 0}
-											({fmtCurrency(Math.abs(comparison.prior_net_profit))})
-										{:else}
-											{fmtCurrency(comparison.prior_net_profit)}
-										{/if}
+										{formatAmount(comparison.prior_net_profit)}
 									</td>
 									<td class="td-amount td-change net-profit-amount {netProfitDeltaClass(comparison.net_profit_delta)}">
 										{fmtDelta(comparison.net_profit_delta)}
@@ -588,9 +593,13 @@
 			<section class="dashboard-section">
 				<h2 class="section-title">Estimated Quarterly Tax</h2>
 				{#if estimatedTax.warning}
-				<div class="alert-banner alert-warning" style="margin-bottom: 16px;">
-					{estimatedTax.warning}
-				</div>
+				<details class="est-warning-details">
+					<summary class="est-warning-summary">
+						<span class="est-warning-icon" aria-hidden="true">&#x26A0;&#xFE0E;</span>
+						<span>Estimated tax notice</span>
+					</summary>
+					<p class="est-warning-text">{estimatedTax.warning}</p>
+				</details>
 				{/if}
 				<div class="card est-card">
 					<div class="est-summary">
@@ -683,79 +692,81 @@
 								{/if}
 							</tr>
 						</thead>
-						<tbody>
-							{#if selectedEntity === 'sparkry'}
-								{#each MONTHS as month, i (month)}
-									{@const curr = monthlyIncome[i]}
-									{@const prior = priorMonthlyIncome[i]}
-									{@const bnoD = curr - prior}
-									<tr>
-										<td class="td-period">{month} {selectedYear}</td>
-										<td class="td-amount">
-											{#if curr > 0}
-												<span class="amount-positive">{fmtCurrency(curr)}</span>
-											{:else}
-												<span class="no-data">—</span>
+						{#if bnoExpanded}
+							<tbody>
+								{#if selectedEntity === 'sparkry'}
+									{#each MONTHS as month, i (month)}
+										{@const curr = monthlyIncome[i]}
+										{@const prior = priorMonthlyIncome[i]}
+										{@const bnoD = curr - prior}
+										<tr>
+											<td class="td-period">{month} {selectedYear}</td>
+											<td class="td-amount">
+												{#if curr > 0}
+													<span class="amount-positive">{formatAmount(curr)}</span>
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+											{#if compareEnabled && comparison}
+												<td class="td-amount td-prior">
+													{#if prior > 0}
+														{formatAmount(prior)}
+													{:else}
+														<span class="no-data">—</span>
+													{/if}
+												</td>
+												<td class="td-amount td-change {netProfitDeltaClass(bnoD)}">
+													{#if curr > 0 || prior > 0}
+														{fmtDelta(bnoD)}
+													{:else}
+														<span class="no-data">—</span>
+													{/if}
+												</td>
 											{/if}
-										</td>
-										{#if compareEnabled && comparison}
-											<td class="td-amount td-prior">
-												{#if prior > 0}
-													{fmtCurrency(prior)}
+										</tr>
+									{/each}
+								{:else}
+									{#each QUARTERS as quarter, i (quarter)}
+										{@const curr = quarterlyIncome[i]}
+										{@const prior = priorQuarterlyIncome[i]}
+										{@const bnoD = curr - prior}
+										<tr>
+											<td class="td-period">{quarter} {selectedYear}</td>
+											<td class="td-amount">
+												{#if curr > 0}
+													<span class="amount-positive">{formatAmount(curr)}</span>
 												{:else}
 													<span class="no-data">—</span>
 												{/if}
 											</td>
-											<td class="td-amount td-change {netProfitDeltaClass(bnoD)}">
-												{#if curr > 0 || prior > 0}
-													{fmtDelta(bnoD)}
-												{:else}
-													<span class="no-data">—</span>
-												{/if}
-											</td>
-										{/if}
-									</tr>
-								{/each}
-							{:else}
-								{#each QUARTERS as quarter, i (quarter)}
-									{@const curr = quarterlyIncome[i]}
-									{@const prior = priorQuarterlyIncome[i]}
-									{@const bnoD = curr - prior}
-									<tr>
-										<td class="td-period">{quarter} {selectedYear}</td>
-										<td class="td-amount">
-											{#if curr > 0}
-												<span class="amount-positive">{fmtCurrency(curr)}</span>
-											{:else}
-												<span class="no-data">—</span>
+											{#if compareEnabled && comparison}
+												<td class="td-amount td-prior">
+													{#if prior > 0}
+														{formatAmount(prior)}
+													{:else}
+														<span class="no-data">—</span>
+													{/if}
+												</td>
+												<td class="td-amount td-change {netProfitDeltaClass(bnoD)}">
+													{#if curr > 0 || prior > 0}
+														{fmtDelta(bnoD)}
+													{:else}
+														<span class="no-data">—</span>
+													{/if}
+												</td>
 											{/if}
-										</td>
-										{#if compareEnabled && comparison}
-											<td class="td-amount td-prior">
-												{#if prior > 0}
-													{fmtCurrency(prior)}
-												{:else}
-													<span class="no-data">—</span>
-												{/if}
-											</td>
-											<td class="td-amount td-change {netProfitDeltaClass(bnoD)}">
-												{#if curr > 0 || prior > 0}
-													{fmtDelta(bnoD)}
-												{:else}
-													<span class="no-data">—</span>
-												{/if}
-											</td>
-										{/if}
-									</tr>
-								{/each}
-							{/if}
-						</tbody>
+										</tr>
+									{/each}
+								{/if}
+							</tbody>
+						{/if}
 						<tfoot>
 							<tr>
 								<td>Total</td>
-								<td class="td-amount amount-positive">{fmtCurrency(summary.gross_income)}</td>
+								<td class="td-amount {amountClass(summary.gross_income)}">{formatAmount(summary.gross_income)}</td>
 								{#if compareEnabled && comparison}
-									<td class="td-amount td-prior">{fmtCurrency(comparison.prior_gross_income)}</td>
+									<td class="td-amount td-prior">{formatAmount(comparison.prior_gross_income)}</td>
 									<td class="td-amount td-change {netProfitDeltaClass(summary.gross_income - comparison.prior_gross_income)}">
 										{fmtDelta(summary.gross_income - comparison.prior_gross_income)}
 									</td>
@@ -763,6 +774,13 @@
 							</tr>
 						</tfoot>
 					</table>
+					<button
+						class="bno-toggle-link no-print"
+						onclick={() => (bnoExpanded = !bnoExpanded)}
+						aria-expanded={bnoExpanded}
+					>
+						{bnoExpanded ? 'Hide' : 'View'} {selectedEntity === 'sparkry' ? 'monthly' : 'quarterly'} breakdown
+					</button>
 					<p class="bno-note no-print">
 						Download the B&amp;O report for per-period breakdown with all classifications.
 					</p>
@@ -1462,6 +1480,104 @@
 	.est-upcoming {
 		background: var(--gray-100);
 		color: var(--gray-600);
+	}
+
+	/* ── Insights toggle (collapsible) ──────────────────────────────────────── */
+	.insights-toggle {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		padding: 10px 16px;
+		width: 100%;
+		cursor: pointer;
+		font-family: var(--font);
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		transition: background 0.12s, color 0.12s;
+	}
+
+	.insights-toggle:hover {
+		background: var(--gray-50);
+		color: var(--text);
+	}
+
+	.insights-toggle-text {
+		flex: 1;
+		text-align: left;
+	}
+
+	.chevron {
+		font-size: 0.75rem;
+		transition: transform 0.15s ease;
+		display: inline-block;
+	}
+
+	.chevron-open {
+		transform: rotate(90deg);
+	}
+
+	/* ── Estimated tax warning (details/summary) ───────────────────────────── */
+	.est-warning-details {
+		margin-bottom: 16px;
+	}
+
+	.est-warning-summary {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		cursor: pointer;
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--amber-700);
+		padding: 4px 0;
+		list-style: none;
+	}
+
+	.est-warning-summary::-webkit-details-marker {
+		display: none;
+	}
+
+	.est-warning-summary::marker {
+		content: '';
+	}
+
+	.est-warning-icon {
+		font-size: 0.9rem;
+	}
+
+	.est-warning-text {
+		margin: 6px 0 0 0;
+		padding: 8px 12px;
+		background: var(--amber-100);
+		border-left: 3px solid var(--amber-500);
+		border-radius: var(--radius-sm);
+		font-size: 0.825rem;
+		color: var(--amber-700);
+		line-height: 1.5;
+	}
+
+	/* ── B&O toggle link ────────────────────────────────────────────────────── */
+	.bno-toggle-link {
+		display: block;
+		background: none;
+		border: none;
+		cursor: pointer;
+		font-family: var(--font);
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--blue-600);
+		padding: 10px 14px;
+		text-decoration: none;
+		text-align: left;
+		border-top: 1px solid var(--border);
+	}
+
+	.bno-toggle-link:hover {
+		text-decoration: underline;
 	}
 
 	/* ── Print ───────────────────────────────────────────────────────────────── */

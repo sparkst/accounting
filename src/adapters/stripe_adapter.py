@@ -1,8 +1,8 @@
 """Stripe adapter — ingests charges, payouts, invoices, and refunds.
 
-REQ-ID: ADAPTER-STRIPE-001  Connects with two API keys (Sparkry, BlackLine).
+REQ-ID: ADAPTER-STRIPE-001  Connects via Stripe Connect (one platform key, two connected accounts).
 REQ-ID: ADAPTER-STRIPE-002  Maps charges, payouts, invoices, refunds to Transactions.
-REQ-ID: ADAPTER-STRIPE-003  Entity is determined by which API key retrieved the record.
+REQ-ID: ADAPTER-STRIPE-003  Entity is determined by which connected account retrieved the record.
 REQ-ID: ADAPTER-STRIPE-004  Identifies Substack income by description/metadata.
 REQ-ID: ADAPTER-STRIPE-005  AuthenticationError halts immediately (no retry).
 REQ-ID: ADAPTER-STRIPE-006  RateLimitError / APIConnectionError retry with jittered backoff.
@@ -11,9 +11,10 @@ REQ-ID: ADAPTER-STRIPE-008  One-entity failure → PARTIAL_FAILURE; other entity
 REQ-ID: ADAPTER-STRIPE-009  Deduplication by source_hash; re-run creates no duplicates.
 REQ-ID: ADAPTER-STRIPE-010  IngestionLog entry created for every run.
 
-API keys in .env:
-    STRIPE_API_KEY_SPARKRY    — Sparkry AI LLC Stripe account
-    STRIPE_API_KEY_BLACKLINE  — BlackLine MTB LLC Stripe account
+Environment variables in .env:
+    STRIPE_API_KEY              — Platform API key (shared across both entities)
+    STRIPE_ACCOUNT_SPARKRY      — Connected account ID for Sparkry AI LLC (acct_xxx)
+    STRIPE_ACCOUNT_BLACKLINE    — Connected account ID for BlackLine MTB LLC (acct_xxx)
 
 Design spec: §Stripe Adapter
 """
@@ -266,15 +267,17 @@ def _fetch_all(
     client: stripe.StripeClient,
     resource: str,
     entity: Entity,
+    stripe_account: str | None = None,
     **list_kwargs: Any,
 ) -> list[Any]:
     """Fetch all pages of a Stripe resource via auto-paging.
 
     Args:
-        client:       Configured StripeClient with entity-specific API key.
-        resource:     One of ``"charges"``, ``"payouts"``, ``"refunds"``.
-        entity:       The entity this client belongs to (used for logging).
-        **list_kwargs: Extra parameters passed to the list call (e.g. ``limit``).
+        client:         Configured StripeClient with platform API key.
+        resource:       One of ``"charges"``, ``"payouts"``, ``"refunds"``.
+        entity:         The entity this client belongs to (used for logging).
+        stripe_account: Connected account ID (acct_xxx) for Stripe Connect.
+        **list_kwargs:  Extra parameters passed to the list call (e.g. ``limit``).
 
     Returns:
         Flat list of Stripe objects.
@@ -290,10 +293,13 @@ def _fetch_all(
     }
     api_resource = resource_map[resource]
     params = {"limit": 100, **list_kwargs}
+    options: dict[str, Any] = {}
+    if stripe_account:
+        options["stripe_account"] = stripe_account
 
     for attempt in range(_MAX_RETRIES):
         try:
-            page = api_resource.list(params)
+            page = api_resource.list(params, options=options)
             return list(page.auto_paging_iter())
         except stripe.AuthenticationError:
             # Not transient — re-raise immediately without retry.
@@ -327,6 +333,7 @@ def _ingest_entity(
     entity: Entity,
     session: Session,
     result: AdapterResult,
+    stripe_account: str | None = None,
 ) -> None:
     """Pull all resources for one entity and insert new Transaction rows.
 
@@ -353,11 +360,11 @@ def _ingest_entity(
 
     for resource in _RESOURCE_TYPES:
         try:
-            items = _fetch_all(client, resource, entity)
+            items = _fetch_all(client, resource, entity, stripe_account=stripe_account)
         except stripe.AuthenticationError as exc:
             msg = (
                 f"Authentication failed for entity '{entity_label}' "
-                f"(STRIPE_API_KEY_{entity_label.upper()}): {exc}. "
+                f"(STRIPE_API_KEY, account={stripe_account or 'platform'}): {exc}. "
                 "Check that the API key is correct and has read permissions."
             )
             logger.error(msg)
@@ -416,40 +423,40 @@ def _ingest_entity(
 
 class StripeAdapter(BaseAdapter):
     """Ingests Stripe charges, payouts, and refunds for Sparkry AI LLC and
-    BlackLine MTB LLC.
+    BlackLine MTB LLC via Stripe Connect.
 
-    Reads two environment variables:
-        ``STRIPE_API_KEY_SPARKRY``    — Sparkry AI LLC
-        ``STRIPE_API_KEY_BLACKLINE``  — BlackLine MTB LLC
+    Uses one platform API key and two connected account IDs:
+        ``STRIPE_API_KEY``             — Platform key (shared)
+        ``STRIPE_ACCOUNT_SPARKRY``     — Connected account for Sparkry AI LLC
+        ``STRIPE_ACCOUNT_BLACKLINE``   — Connected account for BlackLine MTB LLC
 
-    Both keys must be present at construction time (``EnvironmentError`` otherwise).
+    The platform key must be present at construction time. Connected account
+    IDs are optional — if omitted, the adapter fetches from the platform
+    account directly (useful for single-entity setups).
 
     Args:
-        sparkry_key:   Override for testing; omit to read from env.
-        blackline_key: Override for testing; omit to read from env.
+        api_key:           Override for testing; omit to read from env.
+        account_sparkry:   Connected account ID override; omit to read from env.
+        account_blackline: Connected account ID override; omit to read from env.
     """
 
     def __init__(
         self,
-        sparkry_key: str | None = None,
-        blackline_key: str | None = None,
+        api_key: str | None = None,
+        account_sparkry: str | None = None,
+        account_blackline: str | None = None,
     ) -> None:
-        sp = sparkry_key or os.environ.get("STRIPE_API_KEY_SPARKRY")
-        bl = blackline_key or os.environ.get("STRIPE_API_KEY_BLACKLINE")
+        key = api_key or os.environ.get("STRIPE_API_KEY")
 
-        if not sp:
+        if not key:
             raise OSError(
-                "STRIPE_API_KEY_SPARKRY is not set. "
-                "Add it to your .env file or pass sparkry_key= to StripeAdapter()."
-            )
-        if not bl:
-            raise OSError(
-                "STRIPE_API_KEY_BLACKLINE is not set. "
-                "Add it to your .env file or pass blackline_key= to StripeAdapter()."
+                "STRIPE_API_KEY is not set. "
+                "Add it to your .env file or pass api_key= to StripeAdapter()."
             )
 
-        self._sparkry_key = sp
-        self._blackline_key = bl
+        self._api_key = key
+        self._account_sparkry = account_sparkry or os.environ.get("STRIPE_ACCOUNT_SPARKRY")
+        self._account_blackline = account_blackline or os.environ.get("STRIPE_ACCOUNT_BLACKLINE")
 
     @property
     def source(self) -> str:
@@ -467,12 +474,12 @@ class StripeAdapter(BaseAdapter):
         result = AdapterResult(source=self.source)
 
         entities = [
-            (self._sparkry_key, Entity.SPARKRY),
-            (self._blackline_key, Entity.BLACKLINE),
+            (Entity.SPARKRY, self._account_sparkry),
+            (Entity.BLACKLINE, self._account_blackline),
         ]
 
-        for api_key, entity in entities:
-            _ingest_entity(api_key, entity, session, result)
+        for entity, acct_id in entities:
+            _ingest_entity(self._api_key, entity, session, result, stripe_account=acct_id)
 
         # Upgrade PARTIAL_FAILURE → FAILURE when nothing was created and there
         # were errors (e.g. both entities failed authentication).

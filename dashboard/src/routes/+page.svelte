@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import type { HealthResponse, Transaction, Invoice, SourceFreshness, TaxDeadline } from '$lib/types';
 	import { fetchHealth, fetchTransactions, fetchInvoices, triggerIngest } from '$lib/api';
+	import { formatAmount, amountClass } from '$lib/categories';
 
 	let loading = $state(true);
 	let health = $state<HealthResponse | null>(null);
@@ -10,6 +11,7 @@
 	let monthIncome = $state(0);
 	let monthExpenses = $state(0);
 	let fetchError = $state('');
+	let importStatus = $state<'idle' | 'success' | 'error'>('idle');
 
 	// Time-based greeting
 	let greeting = $derived(() => {
@@ -28,6 +30,8 @@
 		return { from: `${y}-${m}-01`, to: `${y}-${m}-${String(lastDay).padStart(2, '0')}` };
 	}
 
+	let monthRange = $derived.by(() => currentMonthRange());
+
 	let reviewCount = $derived(health?.needs_review_count ?? 0);
 
 	let deadlines = $derived<TaxDeadline[]>(health?.tax_deadlines ?? []);
@@ -36,47 +40,61 @@
 
 	let netIncome = $derived(monthIncome + monthExpenses);
 
+	// Overdue invoices
+	let overdueInvoices = $derived(outstandingInvoices.filter((inv) => (inv.status as string) === 'overdue'));
+	let overdueTotal = $derived(overdueInvoices.reduce((sum, inv) => sum + Number(inv.total ?? 0), 0));
+
+	// Upcoming deadlines within 7 days
+	let urgentDeadlines = $derived(deadlines.filter((d: TaxDeadline) => d.days_until_due <= 7));
+
+	// BLUF next action
+	let nextAction = $derived.by<{ type: 'overdue' | 'deadline' | 'review' | 'clear'; message: string; href: string; urgency: 'red' | 'amber' | 'green' }>(() => {
+		if (overdueInvoices.length > 0) {
+			return {
+				type: 'overdue',
+				message: `You have ${overdueInvoices.length} overdue invoice${overdueInvoices.length !== 1 ? 's' : ''} totaling ${formatAmount(overdueTotal)}`,
+				href: '/invoices',
+				urgency: 'red',
+			};
+		}
+		if (urgentDeadlines.length > 0) {
+			const nearest = urgentDeadlines.reduce((a, b) => (a.days_until_due < b.days_until_due ? a : b));
+			return {
+				type: 'deadline',
+				message: `B&O filing due in ${nearest.days_until_due} day${nearest.days_until_due !== 1 ? 's' : ''}`,
+				href: '/tax',
+				urgency: 'amber',
+			};
+		}
+		if (reviewCount > 0) {
+			return {
+				type: 'review',
+				message: `${reviewCount} transaction${reviewCount !== 1 ? 's' : ''} need review`,
+				href: '/review',
+				urgency: 'amber',
+			};
+		}
+		return {
+			type: 'clear',
+			message: "You're all set! No urgent actions.",
+			href: '',
+			urgency: 'green',
+		};
+	});
+
+	// Capped lists for progressive disclosure
+	let recentTxnsCapped = $derived(recentTxns.slice(0, 5));
+	let deadlinesCapped = $derived(deadlines.slice(0, 3));
+
+	// Source health summary
+	let healthySourceCount = $derived(sourceFreshness.filter((s: SourceFreshness) => s.freshness_status === 'green').length);
+	let totalSourceCount = $derived(sourceFreshness.length);
+	let allSourcesHealthy = $derived(healthySourceCount === totalSourceCount);
+
 	function deadlineUrgency(d: TaxDeadline): 'red' | 'amber' | 'gray' {
 		if (d.days_until_due < 7) return 'red';
 		if (d.days_until_due < 30) return 'amber';
 		return 'gray';
-	}
-
-	function freshnessColor(s: SourceFreshness): string {
-		if (s.freshness_status === 'green') return 'var(--green-500)';
-		if (s.freshness_status === 'amber') return 'var(--amber-500)';
-		if (s.freshness_status === 'red') return 'var(--red-500)';
-		return 'var(--gray-400)';
-	}
-
-	function freshnessLabel(s: SourceFreshness): string {
-		if (s.freshness_status === 'green') return 'Fresh';
-		if (s.freshness_status === 'never') return 'Never synced';
-		if (!s.last_run_at) return 'Unknown';
-		const days = Math.floor((Date.now() - new Date(s.last_run_at).getTime()) / 86400000);
-		if (days === 0) return 'Today';
-		if (days === 1) return '1d ago';
-		return `${days}d stale`;
-	}
-
-	function sourceName(source: string): string {
-		const names: Record<string, string> = {
-			gmail: 'Gmail',
-			stripe_sparkry: 'Stripe (Sparkry)',
-			stripe_blackline: 'Stripe (BL)',
-			shopify: 'Shopify',
-			bank_csv: 'Bank CSV',
-			manual: 'Manual',
-		};
-		return names[source] ?? source;
-	}
-
-	function formatAmount(n: number): string {
-		return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 0, maximumFractionDigits: 0 });
-	}
-
-	function formatAmountFull(n: number): string {
-		return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2 });
 	}
 
 	function formatDate(iso: string): string {
@@ -127,13 +145,16 @@
 	let importing = $state(false);
 	async function handleImport() {
 		importing = true;
+		importStatus = 'idle';
 		try {
 			await triggerIngest();
-			// Reload data after import
 			const healthData = await fetchHealth();
 			health = healthData;
+			importStatus = 'success';
+			setTimeout(() => { importStatus = 'idle'; }, 3000);
 		} catch {
-			// Silent fail — import runs in background
+			importStatus = 'error';
+			setTimeout(() => { importStatus = 'idle'; }, 5000);
 		} finally {
 			importing = false;
 		}
@@ -160,6 +181,21 @@
 			<p class="error-msg">{fetchError}</p>
 		</div>
 	{:else}
+		{@const action = nextAction}
+
+		<!-- BLUF Next Action -->
+		<section class="bluf-card bluf-{action.urgency}" aria-label="Next action">
+			<div class="bluf-content">
+				<span class="bluf-message">{action.message}</span>
+				{#if action.href}
+					<a href={action.href} class="bluf-cta">
+						{#if action.type === 'overdue'}Follow up now{:else if action.type === 'deadline'}Review now{:else if action.type === 'review'}Review now{/if}
+						&rarr;
+					</a>
+				{/if}
+			</div>
+		</section>
+
 		<!-- Quick Actions -->
 		<section class="quick-actions card" aria-label="Quick actions">
 			<a
@@ -173,36 +209,40 @@
 				{/if}
 			</a>
 			<a href="/invoices" class="btn btn-ghost">Generate Invoice</a>
-			{#if deadlines.some((d: TaxDeadline) => d.label.includes('B&O') && d.days_until_due <= 14)}
-				<a href="/tax" class="btn btn-primary">File B&O</a>
-			{:else}
-				<a href="/tax" class="btn btn-ghost">Tax Summary</a>
-			{/if}
 			<button class="btn btn-ghost" onclick={handleImport} disabled={importing}>
 				{importing ? 'Importing...' : 'Import'}
 			</button>
+			{#if importStatus === 'success'}
+				<span class="import-toast import-success">Data imported</span>
+			{:else if importStatus === 'error'}
+				<span class="import-toast import-error">Import failed — check Health page</span>
+			{/if}
 		</section>
 
 		<div class="dash-grid">
 			<!-- This Month -->
 			<section class="card dash-card" aria-label="This month summary">
-				<h2 class="dash-card-title">This Month</h2>
+				<div class="dash-card-header">
+					<h2 class="dash-card-title">This Month</h2>
+					<span class="entity-context">All Entities</span>
+				</div>
 				<div class="summary-rows">
 					<div class="summary-row">
 						<span class="summary-label">Income</span>
-						<span class="summary-value amount-positive">{formatAmount(monthIncome)}</span>
+						<span class="summary-value {amountClass(monthIncome)}">{formatAmount(monthIncome)}</span>
 					</div>
 					<div class="summary-row">
 						<span class="summary-label">Expenses</span>
-						<span class="summary-value amount-negative">-{formatAmount(Math.abs(monthExpenses))}</span>
+						<span class="summary-value {amountClass(monthExpenses)}">{formatAmount(monthExpenses)}</span>
 					</div>
 					<div class="summary-row summary-row-total">
 						<span class="summary-label">Net</span>
-						<span class="summary-value {netIncome >= 0 ? 'amount-positive' : 'amount-negative'}">
+						<span class="summary-value {amountClass(netIncome)}">
 							{formatAmount(netIncome)}
 						</span>
 					</div>
 				</div>
+				<a href="/register?date_from={currentMonthRange().from}&date_to={currentMonthRange().to}" class="section-link">View in Register &rarr;</a>
 			</section>
 
 			<!-- Outstanding -->
@@ -214,7 +254,7 @@
 							<a href="/invoices" class="outstanding-item">
 								<span class="outstanding-icon">&#x25CB;</span>
 								<span>
-									{inv.invoice_number}: {formatAmountFull(Number(inv.total ?? 0))}
+									{inv.invoice_number}: {formatAmount(Number(inv.total ?? 0))}
 									{#if inv.days_outstanding}
 										<span class="outstanding-age">({inv.days_outstanding}d)</span>
 									{/if}
@@ -241,14 +281,14 @@
 				</div>
 			</section>
 
-			<!-- Recent Activity -->
+			<!-- Recent Activity (capped to 5) -->
 			<section class="card dash-card dash-card-wide" aria-label="Recent activity">
 				<h2 class="dash-card-title">Recent Activity</h2>
 				{#if recentTxns.length === 0}
 					<p class="dash-empty">No recent transactions</p>
 				{:else}
 					<ul class="activity-list">
-						{#each recentTxns as tx}
+						{#each recentTxnsCapped as tx}
 							<li class="activity-item">
 								<span class="activity-date">{formatDate(tx.date)}</span>
 								<span class="activity-desc truncate">
@@ -257,9 +297,9 @@
 										<span class="activity-entity">{entityLabel(tx.entity)}</span>
 									{/if}
 								</span>
-								<span class="activity-amount {tx.direction === 'income' ? 'amount-positive' : tx.direction === 'expense' ? 'amount-negative' : ''}">
+								<span class="activity-amount {tx.amount ? amountClass(tx.direction === 'expense' ? -Math.abs(tx.amount) : tx.amount) : ''}">
 									{#if tx.amount}
-										{tx.direction === 'expense' ? '-' : ''}{formatAmountFull(tx.amount)}
+										{formatAmount(tx.direction === 'expense' ? -Math.abs(tx.amount) : tx.amount)}
 									{:else}
 										--
 									{/if}
@@ -267,15 +307,18 @@
 							</li>
 						{/each}
 					</ul>
+					{#if recentTxns.length > 5}
+						<a href="/register" class="section-link">View all in Register &rarr;</a>
+					{/if}
 				{/if}
 			</section>
 
-			<!-- Upcoming Deadlines -->
+			<!-- Upcoming Deadlines (capped to 3) -->
 			{#if deadlines.length > 0}
 				<section class="card dash-card dash-card-wide" aria-label="Upcoming deadlines">
 					<h2 class="dash-card-title">Upcoming Deadlines</h2>
 					<ul class="deadline-list">
-						{#each deadlines as d}
+						{#each deadlinesCapped as d}
 							{@const urgency = deadlineUrgency(d)}
 							<li class="deadline-item">
 								<span class="deadline-date">{formatDate(d.due_date)}</span>
@@ -292,22 +335,18 @@
 							</li>
 						{/each}
 					</ul>
+					{#if deadlines.length > 3}
+						<a href="/tax" class="section-link">View all {deadlines.length} deadlines &rarr;</a>
+					{/if}
 				</section>
 			{/if}
 
-			<!-- Source Health -->
+			<!-- Source Health (collapsed summary) -->
 			{#if sourceFreshness.length > 0}
-				<section class="card dash-card dash-card-wide" aria-label="Source health">
-					<h2 class="dash-card-title">Source Health</h2>
-					<div class="source-row">
-						{#each sourceFreshness as s}
-							<span class="source-item">
-								<span class="source-dot" style="color: {freshnessColor(s)}">&#x25CF;</span>
-								<span class="source-name">{sourceName(s.source)}</span>
-								<span class="source-status">{freshnessLabel(s)}</span>
-							</span>
-						{/each}
-					</div>
+				<section class="card dash-card dash-card-wide source-summary" aria-label="Source health">
+					<span class="source-summary-dot" class:source-all-healthy={allSourcesHealthy} class:source-some-unhealthy={!allSourcesHealthy}>&#x25CF;</span>
+					<span class="source-summary-text">{healthySourceCount} of {totalSourceCount} sources healthy</span>
+					<a href="/health" class="section-link">View Health Dashboard &rarr;</a>
 				</section>
 			{/if}
 		</div>
@@ -343,6 +382,56 @@
 		font-size: .875rem;
 	}
 
+	/* ── BLUF Next Action ──────────────────────────────────────────────── */
+	.bluf-card {
+		border-radius: 8px;
+		padding: 16px 20px;
+		margin-bottom: 16px;
+		border-left: 4px solid;
+		background: var(--surface);
+	}
+
+	.bluf-red {
+		border-left-color: var(--red-500);
+		background: color-mix(in srgb, var(--red-500) 6%, var(--surface));
+	}
+
+	.bluf-amber {
+		border-left-color: var(--amber-500);
+		background: color-mix(in srgb, var(--amber-500) 6%, var(--surface));
+	}
+
+	.bluf-green {
+		border-left-color: var(--green-500);
+		background: color-mix(in srgb, var(--green-500) 6%, var(--surface));
+	}
+
+	.bluf-content {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		flex-wrap: wrap;
+	}
+
+	.bluf-message {
+		font-size: 1.05rem;
+		font-weight: 600;
+		color: var(--text);
+	}
+
+	.bluf-cta {
+		font-size: .9rem;
+		font-weight: 600;
+		color: var(--blue-600);
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.bluf-cta:hover {
+		text-decoration: underline;
+	}
+
 	/* ── Quick Actions ──────────────────────────────────────────────────── */
 	.quick-actions {
 		display: flex;
@@ -351,6 +440,23 @@
 		padding: 12px 16px;
 		margin-bottom: 20px;
 		flex-wrap: wrap;
+	}
+
+	.import-toast {
+		font-size: .8rem;
+		font-weight: 500;
+		padding: 3px 10px;
+		border-radius: var(--radius-sm);
+	}
+
+	.import-success {
+		color: var(--green-700);
+		background: var(--green-100);
+	}
+
+	.import-error {
+		color: var(--red-700);
+		background: var(--red-100);
 	}
 
 	/* ── Grid ───────────────────────────────────────────────────────────── */
@@ -368,6 +474,28 @@
 		grid-column: 1 / -1;
 	}
 
+	.dash-card-header {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 8px;
+		margin-bottom: 14px;
+	}
+
+	.dash-card-header .dash-card-title {
+		margin-bottom: 0;
+	}
+
+	.entity-context {
+		font-size: .7rem;
+		font-weight: 600;
+		color: var(--text-muted);
+		padding: 2px 7px;
+		background: var(--gray-100);
+		border-radius: 999px;
+		white-space: nowrap;
+	}
+
 	.dash-card-title {
 		font-size: .8rem;
 		font-weight: 600;
@@ -380,6 +508,20 @@
 	.dash-empty {
 		color: var(--text-muted);
 		font-size: .875rem;
+	}
+
+	/* ── Section link (view all) ───────────────────────────────────────── */
+	.section-link {
+		display: inline-block;
+		margin-top: 12px;
+		font-size: .825rem;
+		font-weight: 500;
+		color: var(--blue-600);
+		text-decoration: none;
+	}
+
+	.section-link:hover {
+		text-decoration: underline;
 	}
 
 	/* ── Skeleton ───────────────────────────────────────────────────────── */
@@ -571,32 +713,32 @@
 		color: var(--text-muted);
 	}
 
-	/* ── Source health ───────────────────────────────────────────────────── */
-	.source-row {
+	/* ── Source health (collapsed summary) ──────────────────────────────── */
+	.source-summary {
 		display: flex;
-		flex-wrap: wrap;
-		gap: 16px;
-	}
-
-	.source-item {
-		display: inline-flex;
 		align-items: center;
-		gap: 6px;
-		font-size: .85rem;
+		gap: 10px;
+		padding: 14px 20px;
 	}
 
-	.source-dot {
-		font-size: .7rem;
+	.source-summary-dot {
+		font-size: .85rem;
 		line-height: 1;
 	}
 
-	.source-name {
-		font-weight: 500;
+	.source-all-healthy {
+		color: var(--green-500);
 	}
 
-	.source-status {
-		color: var(--text-muted);
-		font-size: .8rem;
+	.source-some-unhealthy {
+		color: var(--amber-500);
+	}
+
+	.source-summary-text {
+		font-size: .875rem;
+		font-weight: 500;
+		color: var(--text);
+		flex: 1;
 	}
 
 	/* ── Responsive ─────────────────────────────────────────────────────── */

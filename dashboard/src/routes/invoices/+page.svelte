@@ -12,6 +12,7 @@
 		getInvoiceHtmlUrl,
 		patchInvoice
 	} from '$lib/api';
+	import { formatAmount, amountClass } from '$lib/categories';
 	import Toast from '$lib/components/Toast.svelte';
 
 	// ── State ─────────────────────────────────────────────────────────────────
@@ -31,6 +32,10 @@
 
 	// Void confirmation
 	let voidConfirmId = $state<string | null>(null);
+
+	// Mark Sent / Mark Paid confirmation
+	let sentConfirmId = $state<string | null>(null);
+	let paidConfirmId = $state<string | null>(null);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let filteredInvoices = $derived(
@@ -62,10 +67,23 @@
 		toasts = toasts.filter(t => t.id !== id);
 	}
 
-	function fmtCurrency(val: string | null): string {
-		if (!val) return '$0.00';
-		const n = parseFloat(val);
-		return n.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+	/** Map invoice status → register-style icon class key */
+	const STATUS_ICON_MAP: Record<string, string> = {
+		draft: 'auto_classified',
+		sent: 'needs_review',
+		paid: 'confirmed',
+		overdue: 'rejected',
+		void: 'rejected'
+	};
+
+	function fmtCurrencyAmount(val: string | null): string {
+		if (!val) return formatAmount(0);
+		return formatAmount(parseFloat(val));
+	}
+
+	function parseCurrencyNum(val: string | null): number {
+		if (!val) return 0;
+		return parseFloat(val);
 	}
 
 	function fmtDate(iso: string | null): string {
@@ -322,7 +340,7 @@
 					<span class="ar-label">
 						{arSummary.count} invoice{arSummary.count !== 1 ? 's' : ''} outstanding:
 					</span>
-					<span class="ar-amount">{fmtCurrency(String(arSummary.totalAmount))}</span>
+					<span class="ar-amount {amountClass(arSummary.totalAmount)}">{formatAmount(arSummary.totalAmount)}</span>
 					{#if arSummary.maxDays > 0}
 						<span class="ar-aging">({arSummary.maxDays} days oldest)</span>
 					{/if}
@@ -371,9 +389,10 @@
 								<td class="td-number">{inv.invoice_number}</td>
 								<td class="td-date">{fmtDate(inv.service_period_start)}</td>
 								<td class="td-customer">{customerName(inv.customer_id)}</td>
-								<td class="td-amount">{fmtCurrency(inv.total)}</td>
+								<td class="td-amount {amountClass(parseCurrencyNum(inv.total))}">{fmtCurrencyAmount(inv.total)}</td>
 								<td>
 									<span class="status-pill {statusClass(inv.status)}">
+										<span class="status-pill-icon status-icon-{STATUS_ICON_MAP[inv.status] ?? inv.status}"></span>
 										{inv.status}
 									</span>
 								</td>
@@ -443,25 +462,25 @@
 																	<td>{li.description}</td>
 																	<td class="td-date">{fmtDate(li.date)}</td>
 																	<td class="td-qty">{li.quantity ?? '--'}</td>
-																	<td class="td-amount">{fmtCurrency(li.unit_price)}</td>
-																	<td class="td-amount">{fmtCurrency(li.total_price)}</td>
+																	<td class="td-amount">{fmtCurrencyAmount(li.unit_price)}</td>
+																	<td class="td-amount">{fmtCurrencyAmount(li.total_price)}</td>
 																</tr>
 															{/each}
 														</tbody>
 														<tfoot>
 															<tr>
 																<td colspan="4">Subtotal</td>
-																<td class="td-amount">{fmtCurrency(expandedInvoice.subtotal)}</td>
+																<td class="td-amount">{fmtCurrencyAmount(expandedInvoice.subtotal)}</td>
 															</tr>
 															{#if expandedInvoice.adjustments && parseFloat(expandedInvoice.adjustments) !== 0}
 																<tr>
 																	<td colspan="4">Adjustments</td>
-																	<td class="td-amount">{fmtCurrency(expandedInvoice.adjustments)}</td>
+																	<td class="td-amount">{fmtCurrencyAmount(expandedInvoice.adjustments)}</td>
 																</tr>
 															{/if}
 															<tr class="total-row">
 																<td colspan="4">Total</td>
-																<td class="td-amount td-total">{fmtCurrency(expandedInvoice.total)}</td>
+																<td class="td-amount td-total">{fmtCurrencyAmount(expandedInvoice.total)}</td>
 															</tr>
 														</tfoot>
 													</table>
@@ -494,14 +513,38 @@
 													</a>
 
 													{#if expandedInvoice.status === 'draft'}
-														<button class="btn btn-primary" onclick={() => markSent(expandedInvoice!)}>
-															Mark Sent
-														</button>
+														{#if sentConfirmId === expandedInvoice.id}
+															<span class="void-confirm">
+																Mark as sent?
+																<button class="btn btn-primary" onclick={() => { sentConfirmId = null; markSent(expandedInvoice!); }}>
+																	Yes, Mark Sent
+																</button>
+																<button class="btn btn-ghost" onclick={() => (sentConfirmId = null)}>
+																	Cancel
+																</button>
+															</span>
+														{:else}
+															<button class="btn btn-primary" onclick={() => (sentConfirmId = expandedInvoice!.id)}>
+																Mark Sent
+															</button>
+														{/if}
 													{/if}
 													{#if expandedInvoice.status === 'sent' || expandedInvoice.status === 'overdue'}
-														<button class="btn btn-primary" onclick={() => markPaid(expandedInvoice!)}>
-															Mark Paid
-														</button>
+														{#if paidConfirmId === expandedInvoice.id}
+															<span class="void-confirm">
+																Mark as paid?
+																<button class="btn btn-primary" onclick={() => { paidConfirmId = null; markPaid(expandedInvoice!); }}>
+																	Yes, Mark Paid
+																</button>
+																<button class="btn btn-ghost" onclick={() => (paidConfirmId = null)}>
+																	Cancel
+																</button>
+															</span>
+														{:else}
+															<button class="btn btn-primary" onclick={() => (paidConfirmId = expandedInvoice!.id)}>
+																Mark Paid
+															</button>
+														{/if}
 													{/if}
 													{#if expandedInvoice.status !== 'void'}
 														{#if voidConfirmId === expandedInvoice.id}
@@ -539,7 +582,7 @@
 																			{#if step.includes('PO#')}
 																				{step.replace('PO# shown below', `PO# ${expandedInvoice.po_number}`)}
 																			{:else if step.includes('Verify amount')}
-																				Verify amount ({fmtCurrency(expandedInvoice.total)})
+																				Verify amount ({fmtCurrencyAmount(expandedInvoice.total)})
 																			{:else if step.includes('invoice number')}
 																				Enter Sparkry invoice number ({expandedInvoice.invoice_number})
 																			{:else if step.includes('description')}
@@ -584,7 +627,7 @@
 								<span class="generate-name">{customer.name}</span>
 								<span class="generate-model">
 									{customer.billing_model === 'flat_rate' ? 'Flat rate' : 'Hourly'} -
-									{customer.default_rate ? fmtCurrency(customer.default_rate) : '--'}
+									{customer.default_rate ? fmtCurrencyAmount(customer.default_rate) : '--'}
 									{customer.billing_model === 'flat_rate' ? '/mo' : '/hr'}
 								</span>
 							</div>

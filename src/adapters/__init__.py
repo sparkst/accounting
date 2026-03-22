@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _REQUIRED_ENV: dict[Source, list[str]] = {
-    Source.STRIPE: ["STRIPE_API_KEY_SPARKRY", "STRIPE_API_KEY_BLACKLINE"],
+    Source.STRIPE: ["STRIPE_API_KEY"],
     Source.SHOPIFY: ["SHOPIFY_API_KEY", "SHOPIFY_STORE_URL"],
     # File-based adapters need no API keys
     Source.GMAIL_N8N: [],

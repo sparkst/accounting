@@ -34,10 +34,9 @@ def test_get_adapter_deduction_email_returns_adapter() -> None:
     assert adapter.source == Source.DEDUCTION_EMAIL.value
 
 
-def test_get_adapter_stripe_returns_adapter_when_keys_present(monkeypatch: pytest.MonkeyPatch) -> None:
-    """StripeAdapter is returned when both Stripe API keys are set."""
-    monkeypatch.setenv("STRIPE_API_KEY_SPARKRY", "sk_test_sparkry")
-    monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "sk_test_blackline")
+def test_get_adapter_stripe_returns_adapter_when_key_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    """StripeAdapter is returned when the Stripe API key is set."""
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
 
     adapter = get_adapter(Source.STRIPE)
     assert adapter is not None
@@ -59,19 +58,9 @@ def test_get_adapter_shopify_returns_adapter_when_keys_present(monkeypatch: pyte
 # ---------------------------------------------------------------------------
 
 
-def test_get_adapter_stripe_missing_sparkry_key_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Missing STRIPE_API_KEY_SPARKRY → None (no exception)."""
-    monkeypatch.delenv("STRIPE_API_KEY_SPARKRY", raising=False)
-    monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "sk_test_blackline")
-
-    adapter = get_adapter(Source.STRIPE)
-    assert adapter is None
-
-
-def test_get_adapter_stripe_missing_both_keys_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both Stripe keys missing → None."""
-    monkeypatch.delenv("STRIPE_API_KEY_SPARKRY", raising=False)
-    monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
+def test_get_adapter_stripe_missing_key_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing STRIPE_API_KEY → None (no exception)."""
+    monkeypatch.delenv("STRIPE_API_KEY", raising=False)
 
     adapter = get_adapter(Source.STRIPE)
     assert adapter is None
@@ -102,8 +91,7 @@ def test_get_adapter_missing_keys_logs_warning(
     """A WARNING is emitted (not an ERROR or exception) for missing keys."""
     import logging
 
-    monkeypatch.delenv("STRIPE_API_KEY_SPARKRY", raising=False)
-    monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
+    monkeypatch.delenv("STRIPE_API_KEY", raising=False)
 
     with caplog.at_level(logging.WARNING, logger="src.adapters"):
         get_adapter(Source.STRIPE)

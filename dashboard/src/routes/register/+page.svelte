@@ -702,7 +702,7 @@
 									>
 										<span class="{amountClass(runningTotals[rowIdx])} tabular-nums">{formatAmount(runningTotals[rowIdx])}</span>
 									</td>
-									{#if showReviewReason}<td class="review-reason" title={(tx as any).review_reason}>{(tx as any).review_reason ?? ''}</td>{/if}
+									{#if showReviewReason}<td class="review-reason" title={tx.review_reason}>{tx.review_reason ?? ''}</td>{/if}
 								</tr>
 								{#if expandedId === tx.id}
 									<tr class="expanded-row">
@@ -954,7 +954,7 @@
 	}
 
 	.register-row-focused td {
-		background: #eff6ff;
+		background: color-mix(in srgb, var(--blue-500) 8%, var(--surface));
 	}
 
 	.expanded-row td {

@@ -70,6 +70,7 @@ export interface Transaction {
 	confirmed_by: string | null;
 	created_at: string;
 	updated_at: string;
+	review_reason: string | null;
 	raw_data: RawEmailData | null;
 	attachments: string[] | null;
 }

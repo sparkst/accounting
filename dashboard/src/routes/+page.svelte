@@ -242,7 +242,7 @@
 						</span>
 					</div>
 				</div>
-				<a href="/register?date_from={currentMonthRange().from}&date_to={currentMonthRange().to}" class="section-link">View in Register &rarr;</a>
+				<a href="/register?date_from={monthRange.from}&date_to={monthRange.to}" class="section-link">View in Register &rarr;</a>
 			</section>
 
 			<!-- Outstanding -->

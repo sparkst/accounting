@@ -487,7 +487,7 @@
 										<td class="td-amount {amountClass(item.total)}">{formatAmount(item.total)}</td>
 										{#if compareEnabled && comparison}
 											<td class="td-amount td-prior">
-												{delta ? fmtCurrency(delta.prior) : '—'}
+												{delta ? formatAmount(delta.prior) : '—'}
 											</td>
 											<td class="td-amount td-change {delta ? deltaClass(delta.delta, true) : 'delta-neutral'}">
 												{#if delta}
@@ -507,7 +507,7 @@
 									<td class="subtotal-label">Gross Income</td>
 									<td class="td-amount {amountClass(summary.gross_income)} subtotal-val">{formatAmount(summary.gross_income)}</td>
 									{#if compareEnabled && comparison}
-										<td class="td-amount td-prior subtotal-val">{fmtCurrency(comparison.prior_gross_income)}</td>
+										<td class="td-amount td-prior subtotal-val">{formatAmount(comparison.prior_gross_income)}</td>
 										<td class="td-amount td-change subtotal-val {netProfitDeltaClass(summary.gross_income - comparison.prior_gross_income)}">
 											{fmtDelta(summary.gross_income - comparison.prior_gross_income)}
 										</td>
@@ -548,7 +548,7 @@
 									<td class="subtotal-label">Total Expenses</td>
 									<td class="td-amount {amountClass(-summary.total_expenses)} subtotal-val">{formatAmount(-summary.total_expenses)}</td>
 									{#if compareEnabled && comparison}
-										<td class="td-amount td-prior subtotal-val">({fmtCurrency(comparison.prior_total_expenses)})</td>
+										<td class="td-amount td-prior subtotal-val">{formatAmount(comparison.prior_total_expenses)}</td>
 										<td class="td-amount td-change subtotal-val {deltaClass(summary.total_expenses - comparison.prior_total_expenses, false)}">
 											{fmtDelta(summary.total_expenses - comparison.prior_total_expenses)}
 										</td>

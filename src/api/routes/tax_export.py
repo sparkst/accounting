@@ -661,6 +661,101 @@ def _compute_estimated_tax(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/tax-summary/monthly
+# ---------------------------------------------------------------------------
+
+
+@router.get("/tax-summary/monthly")
+def get_monthly_breakdown(
+    entity: str = Query(..., description="Entity: sparkry | blackline | personal"),
+    year: int = Query(..., description="Tax year (e.g. 2025)"),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Return per-category totals broken down by month.
+
+    Response shape::
+
+        {
+          "entity": "sparkry",
+          "year": 2026,
+          "months": [
+            {
+              "month": "2026-01",
+              "categories": [
+                {"tax_category": "CONSULTING_INCOME", "total": 5000.0, "is_income": true, "is_reimbursable": false},
+                ...
+              ]
+            },
+            ...
+          ]
+        }
+
+    Only months with at least one transaction are included; the ``months``
+    array is ordered Jan → Dec.  Per-category totals use the same
+    absolute-deductible-amount calculation as ``/api/tax-summary``.
+    """
+    entity = _validate_entity(entity)
+    _validate_year(year)
+
+    transactions = _fetch_transactions(session, entity, year)
+
+    # Accumulate: month_num -> category -> deductible total
+    month_cat: dict[int, dict[str, Decimal]] = {m: {} for m in range(1, 13)}
+
+    for tx in transactions:
+        cat = tx.tax_category
+        if not cat or cat in ("PERSONAL_NON_DEDUCTIBLE", "CAPITAL_CONTRIBUTION"):
+            continue
+        date_str = tx.date or ""
+        try:
+            month_num = int(date_str[5:7])
+        except (IndexError, ValueError):
+            continue
+        if month_num < 1 or month_num > 12:
+            continue
+
+        amt = Decimal(str(tx.amount)) if tx.amount is not None else Decimal("0")
+        pct = Decimal(str(tx.deductible_pct))
+        deductible = abs(amt) * pct
+
+        bucket = month_cat[month_num]
+        bucket[cat] = bucket.get(cat, Decimal("0")) + deductible
+
+    # Determine today so we only emit months up to the current month for the
+    # current year (avoids confusing all-zero future months).
+    today = _stdlib_date.today()
+    if year < today.year:
+        max_month = 12
+    elif year == today.year:
+        max_month = today.month
+    else:
+        max_month = 0  # future year — no months yet
+
+    months_out = []
+    for m in range(1, max_month + 1):
+        bucket = month_cat[m]
+        if not bucket:
+            # Still include the month so the frontend can show $0 for each
+            # category; it makes the table columns consistent.
+            pass
+        categories = []
+        for cat, total in sorted(bucket.items()):
+            is_income = cat in INCOME_CATEGORIES
+            is_reimbursable = cat == "REIMBURSABLE"
+            categories.append(
+                {
+                    "tax_category": cat,
+                    "total": float(total),
+                    "is_income": is_income,
+                    "is_reimbursable": is_reimbursable,
+                }
+            )
+        months_out.append({"month": f"{year}-{m:02d}", "categories": categories})
+
+    return {"entity": entity, "year": year, "months": months_out}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/tax-summary
 # ---------------------------------------------------------------------------
 

@@ -416,7 +416,7 @@
 												type="text"
 												bind:value={editValue}
 												onkeydown={onCellKeydown}
-												onblur={cancelEdit}
+												onblur={saveEdit}
 												autofocus
 											/>
 										{:else}
@@ -438,7 +438,7 @@
 												class="cell-select"
 												bind:value={editValue}
 												onkeydown={onCellKeydown}
-												onblur={cancelEdit}
+												onblur={saveEdit}
 												autofocus
 											>
 												{#each ENTITIES as e}
@@ -463,7 +463,7 @@
 												class="cell-select"
 												bind:value={editValue}
 												onkeydown={onCellKeydown}
-												onblur={cancelEdit}
+												onblur={saveEdit}
 												autofocus
 											>
 												{#each TAX_CATEGORIES as c}

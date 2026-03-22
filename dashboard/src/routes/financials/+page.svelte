@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { fetchTaxSummary, fetchAggregations } from '$lib/api';
-	import type { TaxSummary, TaxLineItem, AggregationData } from '$lib/api';
+	import { fetchTaxSummary, fetchAggregations, fetchMonthlyBreakdown } from '$lib/api';
+	import type { TaxSummary, TaxLineItem, AggregationData, MonthlyBreakdown, MonthlyBreakdownMonth } from '$lib/api';
 	import { CATEGORY_LABELS, formatAmount, amountClass, entityBadgeClass } from '$lib/categories';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
@@ -36,6 +36,11 @@
 	let showExpenseDetail = $state(false);
 	let showIncomeDetail = $state(false);
 	let showMargins = $state(true);
+
+	// Monthly drill-down
+	let showMonthly = $state(false);
+	let monthlyData = $state<MonthlyBreakdown | null>(null);
+	let monthlyLoading = $state(false);
 
 	// ── Derived: single entity ───────────────────────────────────────────────
 	let incomeItems = $derived.by((): TaxLineItem[] =>
@@ -81,6 +86,33 @@
 	);
 	let topExpenses = $derived(sortedExpenses.slice(0, 5));
 	let maxExpense = $derived(Math.max(...expenseItems.map(li => Math.abs(li.total)), 1));
+
+	// ── Derived: monthly breakdown ───────────────────────────────────────
+	// List of month labels from the monthly data (e.g. ["Jan", "Feb", ...])
+	let monthColumns = $derived.by((): Array<{ key: string; label: string }> => {
+		if (!monthlyData) return [];
+		return monthlyData.months.map(m => {
+			const [, monthNum] = m.month.split('-');
+			const label = new Date(Number(m.month.split('-')[0]), Number(monthNum) - 1, 1)
+				.toLocaleString('en-US', { month: 'short' });
+			return { key: m.month, label };
+		});
+	});
+
+	// Build a lookup: category -> month -> total
+	let monthlyByCategory = $derived.by((): Map<string, Map<string, number>> => {
+		const result = new Map<string, Map<string, number>>();
+		if (!monthlyData) return result;
+		for (const m of monthlyData.months) {
+			for (const cat of m.categories) {
+				if (!result.has(cat.tax_category)) {
+					result.set(cat.tax_category, new Map());
+				}
+				result.get(cat.tax_category)!.set(m.month, cat.total);
+			}
+		}
+		return result;
+	});
 
 	// ── Derived: comparison mode ─────────────────────────────────────────
 	let spIncome = $derived.by(() => extractItems(sparkrySummary, li => li.is_income));
@@ -167,8 +199,31 @@
 		void selectedEntity;
 		void selectedYear;
 		void compareMode;
+		// Reset monthly data when entity/year changes so stale columns don't persist
+		showMonthly = false;
+		monthlyData = null;
 		load();
 	});
+
+	// Fetch monthly breakdown on demand when showMonthly is toggled on
+	async function loadMonthly() {
+		if (monthlyData || monthlyLoading) return;
+		monthlyLoading = true;
+		try {
+			monthlyData = await fetchMonthlyBreakdown(selectedEntity, selectedYear);
+		} catch {
+			// non-fatal — monthly columns just won't render
+		} finally {
+			monthlyLoading = false;
+		}
+	}
+
+	function toggleMonthly() {
+		showMonthly = !showMonthly;
+		if (showMonthly && !monthlyData) {
+			void loadMonthly();
+		}
+	}
 
 	// ── Helpers ───────────────────────────────────────────────────────────────
 	function catLabel(cat: string): string {
@@ -603,22 +658,41 @@
 
 		<!-- Income Statement -->
 		<section class="dashboard-section">
-			<h2 class="section-title">
-				Income Statement — {entityLabel(selectedEntity)}, {selectedYear}
-			</h2>
+			<div class="income-stmt-header">
+				<h2 class="section-title">
+					Income Statement — {entityLabel(selectedEntity)}, {selectedYear}
+				</h2>
+				<button
+					class="btn-monthly-toggle {showMonthly ? 'active' : ''}"
+					onclick={toggleMonthly}
+					aria-pressed={showMonthly}
+					title={showMonthly ? 'Collapse monthly columns' : 'Expand monthly columns'}
+				>
+					{#if monthlyLoading}
+						Loading…
+					{:else}
+						{showMonthly ? 'Hide months' : 'By month'}
+					{/if}
+				</button>
+			</div>
 
 			<div class="card table-card">
-				<table class="data-table financial-table">
+				<table class="data-table financial-table {showMonthly ? 'monthly-expanded' : ''}">
 					<thead>
 						<tr>
 							<th class="cat-col">Category</th>
-							<th class="amt-col">Amount</th>
+							<th class="amt-col">YTD</th>
+							{#if showMonthly && monthlyData}
+								{#each monthColumns as col}
+									<th class="amt-col month-col">{col.label}</th>
+								{/each}
+							{/if}
 						</tr>
 					</thead>
 					<tbody>
 						<!-- Revenue -->
 						<tr class="section-header-row">
-							<td colspan="2">
+							<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}>
 								<button class="inline-toggle" onclick={() => showIncomeDetail = !showIncomeDetail} aria-expanded={showIncomeDetail}>
 									<strong>Revenue</strong>
 									<span class="toggle-hint" aria-hidden="true">{showIncomeDetail ? '−' : '+'}</span>
@@ -630,6 +704,12 @@
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
 									<td class="amt-cell {amountClass(li.total)}">{formatAmount(li.total)}</td>
+									{#if showMonthly && monthlyData}
+										{#each monthColumns as col}
+											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
+											<td class="amt-cell month-cell {mAmt > 0 ? 'income' : ''}">{mAmt > 0 ? formatAmount(mAmt) : '—'}</td>
+										{/each}
+									{/if}
 								</tr>
 							{/each}
 						{/if}
@@ -638,17 +718,33 @@
 							<td class="amt-cell {amountClass(grossIncome)}">
 								<strong>{formatAmount(grossIncome)}</strong>
 							</td>
+							{#if showMonthly && monthlyData}
+								{#each monthColumns as col}
+									{@const mTotal = [...(monthlyData?.months.find(m => m.month === col.key)?.categories ?? [])]
+										.filter(c => c.is_income)
+										.reduce((s, c) => s + c.total, 0)}
+									<td class="amt-cell month-cell subtotal-month">
+										<strong>{mTotal > 0 ? formatAmount(mTotal) : '—'}</strong>
+									</td>
+								{/each}
+							{/if}
 						</tr>
 
 						<!-- COGS -->
 						{#if cogsItems.length > 0}
 							<tr class="section-header-row">
-								<td colspan="2"><strong>Cost of Goods Sold</strong></td>
+								<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}><strong>Cost of Goods Sold</strong></td>
 							</tr>
 							{#each cogsItems as li}
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
 									<td class="amt-cell">{formatAmount(Math.abs(li.total))}</td>
+									{#if showMonthly && monthlyData}
+										{#each monthColumns as col}
+											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
+											<td class="amt-cell month-cell">{mAmt > 0 ? formatAmount(mAmt) : '—'}</td>
+										{/each}
+									{/if}
 								</tr>
 							{/each}
 							<tr class="subtotal-row">
@@ -656,12 +752,23 @@
 								<td class="amt-cell {amountClass(grossProfit)}">
 									<strong>{formatAmount(grossProfit)}</strong>
 								</td>
+								{#if showMonthly && monthlyData}
+									{#each monthColumns as col}
+										{@const mIncome = [...(monthlyData?.months.find(m => m.month === col.key)?.categories ?? [])]
+											.filter(c => c.is_income).reduce((s, c) => s + c.total, 0)}
+										{@const mCogs = monthlyByCategory.get(COGS_CAT)?.get(col.key) ?? 0}
+										{@const mGP = mIncome - mCogs}
+										<td class="amt-cell month-cell subtotal-month {amountClass(mGP)}">
+											<strong>{mIncome > 0 || mCogs > 0 ? formatAmount(mGP) : '—'}</strong>
+										</td>
+									{/each}
+								{/if}
 							</tr>
 						{/if}
 
 						<!-- Operating Expenses -->
 						<tr class="section-header-row">
-							<td colspan="2">
+							<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}>
 								<button class="inline-toggle" onclick={() => showExpenseDetail = !showExpenseDetail} aria-expanded={showExpenseDetail}>
 									<strong>Operating Expenses</strong>
 									<span class="toggle-hint" aria-hidden="true">{showExpenseDetail ? '−' : '+'}</span>
@@ -673,6 +780,12 @@
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
 									<td class="amt-cell">{formatAmount(Math.abs(li.total))}</td>
+									{#if showMonthly && monthlyData}
+										{#each monthColumns as col}
+											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
+											<td class="amt-cell month-cell">{mAmt > 0 ? formatAmount(mAmt) : '—'}</td>
+										{/each}
+									{/if}
 								</tr>
 							{/each}
 						{:else}
@@ -681,11 +794,17 @@
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
 									<td class="amt-cell">{formatAmount(Math.abs(li.total))}</td>
+									{#if showMonthly && monthlyData}
+										{#each monthColumns as col}
+											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
+											<td class="amt-cell month-cell">{mAmt > 0 ? formatAmount(mAmt) : '—'}</td>
+										{/each}
+									{/if}
 								</tr>
 							{/each}
 							{#if expenseItems.length > 5}
 								<tr>
-									<td class="indent-1" colspan="2">
+									<td class="indent-1" colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}>
 										<button class="inline-toggle text-muted" onclick={() => showExpenseDetail = true}>
 											+{expenseItems.length - 5} more categories
 										</button>
@@ -698,17 +817,33 @@
 							<td class="amt-cell">
 								<strong>{formatAmount(operatingExpenses)}</strong>
 							</td>
+							{#if showMonthly && monthlyData}
+								{#each monthColumns as col}
+									{@const mTotal = [...(monthlyData?.months.find(m => m.month === col.key)?.categories ?? [])]
+										.filter(c => !c.is_income && !c.is_reimbursable && c.tax_category !== COGS_CAT)
+										.reduce((s, c) => s + c.total, 0)}
+									<td class="amt-cell month-cell subtotal-month">
+										<strong>{mTotal > 0 ? formatAmount(mTotal) : '—'}</strong>
+									</td>
+								{/each}
+							{/if}
 						</tr>
 
 						<!-- Reimbursables (if any) -->
 						{#if reimbursableItems.length > 0}
 							<tr class="section-header-row">
-								<td colspan="2"><strong>Reimbursable (nets to $0)</strong></td>
+								<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}><strong>Reimbursable (nets to $0)</strong></td>
 							</tr>
 							{#each reimbursableItems as li}
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
 									<td class="amt-cell">{formatAmount(li.total)}</td>
+									{#if showMonthly && monthlyData}
+										{#each monthColumns as col}
+											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
+											<td class="amt-cell month-cell">{mAmt > 0 ? formatAmount(mAmt) : '—'}</td>
+										{/each}
+									{/if}
 								</tr>
 							{/each}
 						{/if}
@@ -719,6 +854,17 @@
 							<td class="amt-cell {amountClass(netProfit)}">
 								<strong>{formatAmount(netProfit)}</strong>
 							</td>
+							{#if showMonthly && monthlyData}
+								{#each monthColumns as col}
+									{@const mMonth = monthlyData?.months.find(m => m.month === col.key)}
+									{@const mIncome = (mMonth?.categories ?? []).filter(c => c.is_income).reduce((s, c) => s + c.total, 0)}
+									{@const mExpenses = (mMonth?.categories ?? []).filter(c => !c.is_income && !c.is_reimbursable).reduce((s, c) => s + c.total, 0)}
+									{@const mNet = mIncome - mExpenses}
+									<td class="amt-cell month-cell total-month {amountClass(mNet)}">
+										<strong>{mIncome > 0 || mExpenses > 0 ? formatAmount(mNet) : '—'}</strong>
+									</td>
+								{/each}
+							{/if}
 						</tr>
 					</tbody>
 				</table>
@@ -1229,6 +1375,76 @@
 		text-decoration: underline;
 	}
 
+	/* ── Monthly toggle button ────────────────────────────────────────────── */
+	.income-stmt-header {
+		display: flex;
+		align-items: baseline;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 12px;
+	}
+
+	.income-stmt-header .section-title {
+		margin-bottom: 0;
+	}
+
+	.btn-monthly-toggle {
+		font-family: var(--font);
+		font-size: .75rem;
+		font-weight: 500;
+		padding: 4px 10px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--surface);
+		color: var(--text-muted);
+		cursor: pointer;
+		white-space: nowrap;
+		transition: background .15s, color .15s, border-color .15s;
+	}
+
+	.btn-monthly-toggle:hover {
+		background: var(--gray-100);
+		color: var(--text);
+	}
+
+	.btn-monthly-toggle.active {
+		background: var(--blue-500);
+		color: #fff;
+		border-color: var(--blue-500);
+	}
+
+	/* ── Monthly columns ──────────────────────────────────────────────────── */
+	.monthly-expanded {
+		min-width: max-content;
+	}
+
+	.month-col {
+		width: 90px;
+		min-width: 80px;
+		font-weight: 400;
+		color: var(--text-muted);
+		font-size: .75rem;
+	}
+
+	.month-cell {
+		font-size: .8rem;
+		color: var(--text-muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.month-cell.income {
+		color: var(--green-700);
+	}
+
+	.subtotal-month {
+		color: var(--text);
+		border-top: 1px solid var(--gray-200);
+	}
+
+	.total-month {
+		color: var(--text);
+	}
+
 	/* ── Print ────────────────────────────────────────────────────────────── */
 	@media print {
 		.page-controls,
@@ -1237,7 +1453,8 @@
 		.inline-toggle .toggle-hint,
 		.page-footer-link,
 		.bluf-link,
-		.expense-bars-card {
+		.expense-bars-card,
+		.btn-monthly-toggle {
 			display: none !important;
 		}
 

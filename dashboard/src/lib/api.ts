@@ -489,6 +489,35 @@ export interface TaxSummary {
 	estimated_tax: EstimatedTax | null;
 }
 
+// ── Monthly breakdown types ───────────────────────────────────────────────────
+
+export interface MonthlyCategoryItem {
+	tax_category: string;
+	total: number;
+	is_income: boolean;
+	is_reimbursable: boolean;
+}
+
+export interface MonthlyBreakdownMonth {
+	month: string; // "YYYY-MM"
+	categories: MonthlyCategoryItem[];
+}
+
+export interface MonthlyBreakdown {
+	entity: string;
+	year: number;
+	months: MonthlyBreakdownMonth[];
+}
+
+export async function fetchMonthlyBreakdown(
+	entity: string,
+	year: number
+): Promise<MonthlyBreakdown> {
+	return request<MonthlyBreakdown>(
+		`/tax-summary/monthly?entity=${encodeURIComponent(entity)}&year=${year}`
+	);
+}
+
 export async function fetchTaxSummary(
 	entity: string,
 	year: number,

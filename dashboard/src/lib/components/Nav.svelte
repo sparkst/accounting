@@ -192,11 +192,11 @@
 					{/if}
 				</li>
 
-				<!-- Money dropdown: Invoices, Financials, Tax -->
+				<!-- Money dropdown: Invoices, Financials, Cash Flow, Tax -->
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/invoices', '/financials', '/tax'])}
+						class:nav-group-active={isGroupActive(['/invoices', '/financials', '/cashflow', '/tax'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'money'}
 						data-trigger="money"
@@ -244,6 +244,18 @@
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									Financials
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/cashflow"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/cashflow') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									Cash Flow
 								</a>
 							</li>
 							<li role="none">

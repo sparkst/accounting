@@ -986,10 +986,12 @@
 
 	.col-editable {
 		cursor: pointer;
-		transition: background .1s;
+		transition: background .1s, border-bottom-color .1s;
+		border-bottom: 1px solid transparent;
 	}
 	.col-editable:hover {
 		background: var(--gray-50);
+		border-bottom: 1px dashed var(--gray-400);
 	}
 
 	.row-desc {

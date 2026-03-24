@@ -7,7 +7,10 @@
 	let overdueCount = $state(0);
 	let darkMode = $state(false);
 
-	onMount(async () => {
+	// Which dropdown group is open: 'transactions' | 'money' | 'system' | null
+	let openGroup = $state<string | null>(null);
+
+	onMount(() => {
 		// Restore dark mode preference
 		const stored = localStorage.getItem('theme');
 		if (stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
@@ -15,23 +18,37 @@
 			document.documentElement.classList.add('dark');
 		}
 
-		try {
-			const health = await fetchHealth();
-			reviewCount = health.needs_review_count ?? 0;
-		} catch {
-			// health endpoint not critical for nav rendering
+		// Fetch badge counts (fire-and-forget; errors are non-fatal)
+		fetchHealth()
+			.then((health) => {
+				reviewCount = health.needs_review_count ?? 0;
+			})
+			.catch(() => {
+				// health endpoint not critical for nav rendering
+			});
+
+		fetchInvoices()
+			.then((allInvoices) => {
+				const today = new Date().toISOString().slice(0, 10);
+				overdueCount = allInvoices.items.filter(
+					(inv) =>
+						inv.status === 'overdue' ||
+						(inv.status === 'sent' && inv.due_date && inv.due_date < today)
+				).length;
+			})
+			.catch(() => {
+				// invoice endpoint not critical for nav rendering
+			});
+
+		// Close dropdown when clicking outside nav
+		function handleClickOutside(e: MouseEvent) {
+			const nav = document.querySelector('.nav-shell');
+			if (nav && !nav.contains(e.target as Node)) {
+				openGroup = null;
+			}
 		}
-		try {
-			const allInvoices = await fetchInvoices();
-			const today = new Date().toISOString().slice(0, 10);
-			overdueCount = allInvoices.items.filter(
-				(inv) =>
-					inv.status === 'overdue' ||
-					(inv.status === 'sent' && inv.due_date && inv.due_date < today)
-			).length;
-		} catch {
-			// invoice endpoint not critical for nav rendering
-		}
+		document.addEventListener('click', handleClickOutside);
+		return () => document.removeEventListener('click', handleClickOutside);
 	});
 
 	function toggleDark() {
@@ -45,6 +62,60 @@
 		if (href === '/') return path === '/';
 		return path.startsWith(href);
 	}
+
+	function isGroupActive(hrefs: string[]): boolean {
+		return hrefs.some((href) => isActive(href));
+	}
+
+	function toggleGroup(group: string) {
+		openGroup = openGroup === group ? null : group;
+	}
+
+	function closeGroup() {
+		openGroup = null;
+	}
+
+	// Keyboard handler for dropdown triggers
+	function handleTriggerKeydown(e: KeyboardEvent, group: string) {
+		if (e.key === 'Enter' || e.key === ' ') {
+			e.preventDefault();
+			toggleGroup(group);
+		} else if (e.key === 'ArrowDown') {
+			e.preventDefault();
+			openGroup = group;
+			// Focus first item after paint
+			requestAnimationFrame(() => {
+				const menu = document.querySelector<HTMLElement>(`[data-menu="${group}"]`);
+				const first = menu?.querySelector<HTMLElement>('[role="menuitem"]');
+				first?.focus();
+			});
+		} else if (e.key === 'Escape') {
+			closeGroup();
+		}
+	}
+
+	// Keyboard handler for menu items
+	function handleMenuKeydown(e: KeyboardEvent, group: string) {
+		const menu = document.querySelector<HTMLElement>(`[data-menu="${group}"]`);
+		if (!menu) return;
+		const items = Array.from(menu.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+		const idx = items.indexOf(e.target as HTMLElement);
+
+		if (e.key === 'ArrowDown') {
+			e.preventDefault();
+			items[(idx + 1) % items.length]?.focus();
+		} else if (e.key === 'ArrowUp') {
+			e.preventDefault();
+			items[(idx - 1 + items.length) % items.length]?.focus();
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			closeGroup();
+			// Return focus to trigger
+			document.querySelector<HTMLElement>(`[data-trigger="${group}"]`)?.focus();
+		} else if (e.key === 'Tab') {
+			closeGroup();
+		}
+	}
 </script>
 
 <header class="nav-shell">
@@ -56,91 +127,235 @@
 
 		<nav aria-label="Main navigation">
 			<ul class="nav-links">
+				<!-- Dashboard (top-level) -->
 				<li>
 					<a href="/" class="nav-link" aria-current={isActive('/') ? 'page' : undefined}>
 						Dashboard
 					</a>
 				</li>
-				<li>
-					<a href="/review" class="nav-link" aria-current={isActive('/review') ? 'page' : undefined}>
-						Review
+
+				<!-- Transactions dropdown: Register, Review -->
+				<li class="nav-group">
+					<button
+						class="nav-link nav-group-trigger"
+						class:nav-group-active={isGroupActive(['/register', '/review'])}
+						aria-haspopup="menu"
+						aria-expanded={openGroup === 'transactions'}
+						data-trigger="transactions"
+						onclick={() => toggleGroup('transactions')}
+						onkeydown={(e) => handleTriggerKeydown(e, 'transactions')}
+					>
+						Transactions
 						{#if reviewCount > 0}
 							<span class="nav-badge" aria-label="{reviewCount} items need review">
 								{reviewCount > 99 ? '99+' : reviewCount}
 							</span>
 						{/if}
-					</a>
+						<span class="nav-chevron" aria-hidden="true">
+							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+								<polyline points="2,3 5,7 8,3"/>
+							</svg>
+						</span>
+					</button>
+					{#if openGroup === 'transactions'}
+						<ul class="nav-dropdown" role="menu" data-menu="transactions" aria-label="Transactions">
+							<li role="none">
+								<a
+									href="/register"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/register') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'transactions')}
+								>
+									Register
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/review"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/review') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'transactions')}
+								>
+									Review
+									{#if reviewCount > 0}
+										<span class="nav-badge" aria-hidden="true">
+											{reviewCount > 99 ? '99+' : reviewCount}
+										</span>
+									{/if}
+								</a>
+							</li>
+						</ul>
+					{/if}
 				</li>
-				<li>
-					<a
-						href="/register"
-						class="nav-link"
-						aria-current={isActive('/register') ? 'page' : undefined}
+
+				<!-- Money dropdown: Invoices, Financials, Cash Flow, Tax -->
+				<li class="nav-group">
+					<button
+						class="nav-link nav-group-trigger"
+						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax'])}
+						aria-haspopup="menu"
+						aria-expanded={openGroup === 'money'}
+						data-trigger="money"
+						onclick={() => toggleGroup('money')}
+						onkeydown={(e) => handleTriggerKeydown(e, 'money')}
 					>
-						Register
-					</a>
-				</li>
-				<li>
-					<a
-						href="/invoices"
-						class="nav-link"
-						aria-current={isActive('/invoices') ? 'page' : undefined}
-					>
-						Invoices
+						Money
 						{#if overdueCount > 0}
-							<span
-								class="nav-badge nav-badge-red"
-								aria-label="{overdueCount} overdue invoices"
-							>
+							<span class="nav-badge nav-badge-red" aria-label="{overdueCount} overdue invoices">
 								{overdueCount > 99 ? '99+' : overdueCount}
 							</span>
 						{/if}
-					</a>
+						<span class="nav-chevron" aria-hidden="true">
+							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+								<polyline points="2,3 5,7 8,3"/>
+							</svg>
+						</span>
+					</button>
+					{#if openGroup === 'money'}
+						<ul class="nav-dropdown" role="menu" data-menu="money" aria-label="Money">
+							<li role="none">
+								<a
+									href="/invoices"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/invoices') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									Invoices
+									{#if overdueCount > 0}
+										<span class="nav-badge nav-badge-red" aria-hidden="true">
+											{overdueCount > 99 ? '99+' : overdueCount}
+										</span>
+									{/if}
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/ar-aging"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/ar-aging') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									AR Aging
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/financials"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/financials') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									Financials
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/cashflow"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/cashflow') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									Cash Flow
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/tax"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/tax') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									Tax
+								</a>
+							</li>
+						</ul>
+					{/if}
 				</li>
-				<li>
-					<a
-						href="/financials"
-						class="nav-link"
-						aria-current={isActive('/financials') ? 'page' : undefined}
+
+				<!-- System dropdown: Health, Rules, Reconciliation -->
+				<li class="nav-group">
+					<button
+						class="nav-link nav-group-trigger"
+						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation', '/monthly-close'])}
+						aria-haspopup="menu"
+						aria-expanded={openGroup === 'system'}
+						data-trigger="system"
+						onclick={() => toggleGroup('system')}
+						onkeydown={(e) => handleTriggerKeydown(e, 'system')}
 					>
-						Financials
-					</a>
-				</li>
-				<li>
-					<a
-						href="/tax"
-						class="nav-link"
-						aria-current={isActive('/tax') ? 'page' : undefined}
-					>
-						Tax
-					</a>
-				</li>
-				<li>
-					<a
-						href="/health"
-						class="nav-link"
-						aria-current={isActive('/health') ? 'page' : undefined}
-					>
-						Health
-					</a>
-				</li>
-				<li>
-					<a
-						href="/accounts"
-						class="nav-link"
-						aria-current={isActive('/accounts') ? 'page' : undefined}
-					>
-						Rules
-					</a>
-				</li>
-				<li>
-					<a
-						href="/reconciliation"
-						class="nav-link"
-						aria-current={isActive('/reconciliation') ? 'page' : undefined}
-					>
-						Reconciliation
-					</a>
+						System
+						<span class="nav-chevron" aria-hidden="true">
+							<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+								<polyline points="2,3 5,7 8,3"/>
+							</svg>
+						</span>
+					</button>
+					{#if openGroup === 'system'}
+						<ul class="nav-dropdown" role="menu" data-menu="system" aria-label="System">
+							<li role="none">
+								<a
+									href="/health"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/health') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Health
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/accounts"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/accounts') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Rules
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/reconciliation"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/reconciliation') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Reconciliation
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/monthly-close"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/monthly-close') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Monthly Close
+								</a>
+							</li>
+						</ul>
+					{/if}
 				</li>
 			</ul>
 		</nav>
@@ -227,6 +442,83 @@
 	}
 
 	.nav-link[aria-current='page'] {
+		color: var(--text);
+		background: var(--gray-200);
+	}
+
+	/* Dropdown trigger button resets */
+	.nav-group-trigger {
+		border: none;
+		background: transparent;
+		cursor: pointer;
+		font-family: inherit;
+	}
+
+	.nav-group-trigger[aria-expanded='true'] {
+		color: var(--text);
+		background: var(--gray-100);
+	}
+
+	.nav-group-active {
+		color: var(--text) !important;
+		background: var(--gray-200) !important;
+	}
+
+	/* Chevron rotates when open */
+	.nav-chevron {
+		display: inline-flex;
+		align-items: center;
+		opacity: 0.5;
+		transition: transform 0.15s;
+	}
+
+	.nav-group-trigger[aria-expanded='true'] .nav-chevron {
+		transform: rotate(180deg);
+	}
+
+	/* Dropdown group positioning */
+	.nav-group {
+		position: relative;
+	}
+
+	.nav-dropdown {
+		position: absolute;
+		top: calc(100% + 6px);
+		left: 0;
+		min-width: 160px;
+		background: var(--surface);
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+		box-shadow: var(--shadow);
+		list-style: none;
+		padding: 4px;
+		z-index: 200;
+	}
+
+	.nav-dropdown-item {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 7px 12px;
+		border-radius: var(--radius-sm);
+		text-decoration: none;
+		font-size: 0.875rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		transition:
+			color 0.12s,
+			background 0.12s;
+		width: 100%;
+	}
+
+	.nav-dropdown-item:hover,
+	.nav-dropdown-item:focus {
+		color: var(--text);
+		background: var(--gray-100);
+		outline: none;
+	}
+
+	.nav-dropdown-item[aria-current='page'] {
 		color: var(--text);
 		background: var(--gray-200);
 	}

@@ -9,6 +9,7 @@
 		type VendorRuleCreate
 	} from '$lib/api';
 	import { entityBadgeClass } from '$lib/categories';
+	import Toast from '$lib/components/Toast.svelte';
 
 	// ── Constants ────────────────────────────────────────────────────────────
 	const ENTITIES = ['sparkry', 'blackline', 'personal'] as const;
@@ -41,6 +42,15 @@
 	let editValue = $state('');
 	let savingCell = $state(false);
 
+	// Undo toast
+	interface UndoToast {
+		message: string;
+		ruleId: string;
+		field: string;
+		previousValue: string;
+	}
+	let undoToast = $state<UndoToast | null>(null);
+
 	// Add rule form
 	let showAddForm = $state(false);
 	let addForm = $state<VendorRuleCreate>({
@@ -59,6 +69,9 @@
 	let deleteTarget = $state<VendorRule | null>(null);
 	let deleteError = $state('');
 	let deleting = $state(false);
+	let dialogDeleteBtn = $state<HTMLButtonElement | null>(null);
+	let dialogCancelBtn = $state<HTMLButtonElement | null>(null);
+	let dialogTriggerBtn = $state<HTMLButtonElement | null>(null);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let totalPages = $derived(Math.ceil(total / PAGE_SIZE));
@@ -129,9 +142,25 @@
 
 	async function saveEdit() {
 		if (!editingCell) return;
+		const { ruleId, field } = editingCell;
+
+		// Capture previous value for undo
+		const rule = rules.find((r) => r.id === ruleId);
+		const previousValue = rule ? String((rule as unknown as Record<string, unknown>)[field] ?? '') : '';
+
+		// Skip if value didn't change
+		if (editValue === previousValue) {
+			cancelEdit();
+			return;
+		}
+
 		savingCell = true;
 		try {
-			await patchVendorRule(editingCell.ruleId, { [editingCell.field]: editValue });
+			await patchVendorRule(ruleId, { [field]: editValue });
+			const fieldLabel = field === 'vendor_pattern' ? 'pattern'
+				: field === 'tax_category' ? 'category'
+				: field;
+			undoToast = { message: `${fieldLabel} updated`, ruleId, field, previousValue };
 			editingCell = null;
 			editValue = '';
 			await load();
@@ -139,6 +168,18 @@
 			error = e instanceof Error ? e.message : 'Save failed';
 		} finally {
 			savingCell = false;
+		}
+	}
+
+	async function handleUndoEdit() {
+		if (!undoToast) return;
+		const { ruleId, field, previousValue } = undoToast;
+		undoToast = null;
+		try {
+			await patchVendorRule(ruleId, { [field]: previousValue });
+			await load();
+		} catch {
+			// undo failed silently
 		}
 	}
 
@@ -185,7 +226,8 @@
 	}
 
 	// ── Delete ────────────────────────────────────────────────────────────────
-	function confirmDelete(rule: VendorRule) {
+	function confirmDelete(rule: VendorRule, trigger: HTMLButtonElement) {
+		dialogTriggerBtn = trigger;
 		deleteTarget = rule;
 		deleteError = '';
 	}
@@ -196,7 +238,7 @@
 		deleteError = '';
 		try {
 			await deleteVendorRule(deleteTarget.id);
-			deleteTarget = null;
+			closeDialog();
 			await load();
 		} catch (e) {
 			deleteError = e instanceof Error ? e.message : 'Delete failed';
@@ -204,6 +246,63 @@
 			deleting = false;
 		}
 	}
+
+	function closeDialog() {
+		deleteTarget = null;
+		deleteError = '';
+		// Return focus to the button that opened the dialog
+		dialogTriggerBtn?.focus();
+		dialogTriggerBtn = null;
+	}
+
+	// ── Focus trap for delete dialog ──────────────────────────────────────────
+	$effect(() => {
+		if (!deleteTarget) return;
+
+		// Wait one microtask for the DOM to be present, then focus Cancel
+		const rafId = requestAnimationFrame(() => {
+			dialogCancelBtn?.focus();
+		});
+
+		function handleKeydown(e: KeyboardEvent) {
+			if (e.key === 'Escape') {
+				e.preventDefault();
+				closeDialog();
+				return;
+			}
+
+			if (e.key !== 'Tab') return;
+
+			const focusable = [dialogDeleteBtn, dialogCancelBtn].filter(
+				(el): el is HTMLButtonElement => el !== null && !el.disabled
+			);
+			if (focusable.length === 0) return;
+
+			const first = focusable[0];
+			const last = focusable[focusable.length - 1];
+			const active = document.activeElement;
+
+			if (e.shiftKey) {
+				// Shift+Tab from first → wrap to last
+				if (active === first) {
+					e.preventDefault();
+					last.focus();
+				}
+			} else {
+				// Tab from last → wrap to first
+				if (active === last) {
+					e.preventDefault();
+					first.focus();
+				}
+			}
+		}
+
+		document.addEventListener('keydown', handleKeydown);
+		return () => {
+			cancelAnimationFrame(rafId);
+			document.removeEventListener('keydown', handleKeydown);
+		};
+	});
 
 	// ── Formatting helpers ────────────────────────────────────────────────────
 	function entityLabel(e: string): string {
@@ -378,7 +477,7 @@
 												type="text"
 												bind:value={editValue}
 												onkeydown={onCellKeydown}
-												onblur={cancelEdit}
+												onblur={saveEdit}
 												autofocus
 											/>
 										{:else}
@@ -400,7 +499,7 @@
 												class="cell-select"
 												bind:value={editValue}
 												onkeydown={onCellKeydown}
-												onblur={cancelEdit}
+												onblur={saveEdit}
 												autofocus
 											>
 												{#each ENTITIES as e}
@@ -425,7 +524,7 @@
 												class="cell-select"
 												bind:value={editValue}
 												onkeydown={onCellKeydown}
-												onblur={cancelEdit}
+												onblur={saveEdit}
 												autofocus
 											>
 												{#each TAX_CATEGORIES as c}
@@ -472,7 +571,7 @@
 										<button
 											class="icon-btn delete-btn"
 											title="Delete rule"
-											onclick={() => confirmDelete(rule)}
+											onclick={(e) => confirmDelete(rule, e.currentTarget as HTMLButtonElement)}
 										>✕</button>
 									</td>
 								</tr>
@@ -544,11 +643,22 @@
 	</p>
 </div>
 
+{#if undoToast}
+	<Toast
+		message={undoToast.message}
+		type="success"
+		undoLabel="Undo"
+		duration={5000}
+		onundo={handleUndoEdit}
+		ondismiss={() => { undoToast = null; }}
+	/>
+{/if}
+
 <!-- ── Delete Confirmation Dialog ───────────────────────────────────────── -->
 {#if deleteTarget}
-	<div class="dialog-overlay" role="dialog" aria-modal="true">
+	<div class="dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
 		<div class="dialog-card card">
-			<h3 class="dialog-title">Delete vendor rule?</h3>
+			<h3 class="dialog-title" id="dialog-title">Delete vendor rule?</h3>
 			<p class="dialog-body">
 				Delete rule for <strong>{deleteTarget.vendor_pattern}</strong>?
 				This cannot be undone.
@@ -557,10 +667,19 @@
 				<p class="form-error">{deleteError}</p>
 			{/if}
 			<div class="dialog-actions">
-				<button class="btn btn-danger btn-sm" onclick={executeDelete} disabled={deleting}>
+				<button
+					bind:this={dialogDeleteBtn}
+					class="btn btn-danger btn-sm"
+					onclick={executeDelete}
+					disabled={deleting}
+				>
 					{deleting ? 'Deleting…' : 'Delete'}
 				</button>
-				<button class="btn btn-ghost btn-sm" onclick={() => { deleteTarget = null; deleteError = ''; }}>
+				<button
+					bind:this={dialogCancelBtn}
+					class="btn btn-ghost btn-sm"
+					onclick={closeDialog}
+				>
 					Cancel
 				</button>
 			</div>

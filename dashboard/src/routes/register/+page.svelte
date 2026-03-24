@@ -5,6 +5,7 @@
 	import type { TransactionFilters } from '$lib/api';
 	import TransactionCard from '$lib/components/TransactionCard.svelte';
 	import InsightPanel from '$lib/components/InsightPanel.svelte';
+	import Toast from '$lib/components/Toast.svelte';
 	import { DATE_PRESETS } from '$lib/datePresets';
 	import { fetchAggregations } from '$lib/api';
 	import type { AggregationData } from '$lib/api';
@@ -47,6 +48,15 @@
 	let editingCell = $state<{ id: string; field: string } | null>(null);
 	let editValue = $state('');
 	let editSaving = $state(false);
+
+	// Undo toast
+	interface UndoToast {
+		message: string;
+		id: string;
+		field: string;
+		previousValue: unknown;
+	}
+	let undoToast = $state<UndoToast | null>(null);
 
 	// Derived
 	let showReviewReason = $derived(statusFilter === 'rejected' || statusFilter.includes('rejected'));
@@ -251,6 +261,15 @@
 		if (!editingCell || editSaving) return;
 		const { id, field } = editingCell;
 
+		// Capture previous value for undo before patching
+		const tx = items.find((t: Transaction) => t.id === id);
+		let previousValue: unknown = null;
+		if (tx) {
+			if (field === 'entity') previousValue = tx.entity ?? null;
+			else if (field === 'tax_category') previousValue = tx.tax_category ?? null;
+			else if (field === 'amount') previousValue = tx.amount;
+		}
+
 		// Determine the update payload
 		let updates: Record<string, unknown> = {};
 		if (field === 'entity') {
@@ -266,11 +285,24 @@
 			updates.amount = parsed;
 		}
 
+		// Skip if value didn't change
+		const newValue = updates[field];
+		if (newValue === previousValue || String(newValue ?? '') === String(previousValue ?? '')) {
+			editingCell = null;
+			editValue = '';
+			return;
+		}
+
 		editSaving = true;
 		try {
 			await updateTransaction(id, updates);
 			editingCell = null;
 			editValue = '';
+
+			// Show undo toast
+			const fieldLabel = field === 'tax_category' ? 'category' : field;
+			undoToast = { message: `${fieldLabel} updated`, id, field, previousValue };
+
 			load(); // refresh data
 		} catch {
 			// on error, just cancel
@@ -282,6 +314,18 @@
 		editingCell = null;
 		editValue = '';
 		editSaving = false;
+	}
+
+	async function handleUndoEdit() {
+		if (!undoToast) return;
+		const { id, field, previousValue } = undoToast;
+		undoToast = null;
+		try {
+			await updateTransaction(id, { [field]: previousValue });
+			load();
+		} catch {
+			// undo failed silently
+		}
 	}
 
 	function handleEditKeydown(e: KeyboardEvent) {
@@ -335,6 +379,28 @@
 			e.preventDefault();
 			focusedRow = Math.max(focusedRow - 1, 0);
 			scrollToFocusedRow();
+		} else if (e.key === 'Enter') {
+			if (focusedRow >= 0 && focusedRow < items.length) {
+				e.preventDefault();
+				toggleRow(items[focusedRow].id);
+			}
+		} else if (e.key === 'Escape') {
+			if (expandedId) {
+				e.preventDefault();
+				expandedId = null;
+			}
+		} else if (e.key === 'y') {
+			if (focusedRow >= 0 && focusedRow < items.length) {
+				e.preventDefault();
+				const tx = items[focusedRow];
+				confirmTransaction(tx.id).then(() => load()).catch(() => {});
+			}
+		} else if (e.key === 'e') {
+			if (focusedRow >= 0 && focusedRow < items.length) {
+				e.preventDefault();
+				const tx = items[focusedRow];
+				startEdit(tx.id, 'tax_category', tx.tax_category ?? '');
+			}
 		}
 	}
 
@@ -380,6 +446,17 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+{#if undoToast}
+	<Toast
+		message={undoToast.message}
+		type="success"
+		undoLabel="Undo"
+		duration={5000}
+		onundo={handleUndoEdit}
+		ondismiss={() => { undoToast = null; }}
+	/>
+{/if}
 
 <div class="container page-shell">
 	<header class="page-header">
@@ -513,7 +590,12 @@
 	</div>
 
 	<div class="keyboard-hint">
-		<kbd>j</kbd><kbd>k</kbd> navigate rows &nbsp;·&nbsp; click cell to edit inline
+		<kbd>j</kbd><kbd>k</kbd> navigate &nbsp;·&nbsp;
+		<kbd>Enter</kbd> expand &nbsp;·&nbsp;
+		<kbd>y</kbd> confirm &nbsp;·&nbsp;
+		<kbd>e</kbd> edit category &nbsp;·&nbsp;
+		<kbd>Esc</kbd> collapse &nbsp;·&nbsp;
+		click cell to edit inline
 	</div>
 
 	{#if fetchError}
@@ -596,13 +678,21 @@
 						</thead>
 						<tbody>
 							{#each items as tx, rowIdx (tx.id)}
-								<!-- svelte-ignore a11y_click_events_have_key_events -->
 								<tr
 									class="row-{tx.status}"
 									class:row-expandable={true}
 									class:row-expanded={expandedId === tx.id}
 									class:register-row-focused={focusedRow === rowIdx}
+									role="row"
+									tabindex="0"
+									aria-expanded={expandedId === tx.id}
 									onclick={() => toggleRow(tx.id)}
+									onkeydown={(e) => {
+										if (e.key === 'Enter' || e.key === ' ') {
+											e.preventDefault();
+											toggleRow(tx.id);
+										}
+									}}
 								>
 									<td class="col-date">{formatDate(tx.date)}</td>
 									<td class="col-vendor">
@@ -931,10 +1021,12 @@
 
 	.col-editable {
 		cursor: pointer;
-		transition: background .1s;
+		transition: background .1s, border-bottom-color .1s;
+		border-bottom: 1px solid transparent;
 	}
 	.col-editable:hover {
 		background: var(--gray-50);
+		border-bottom: 1px dashed var(--gray-400);
 	}
 
 	.row-desc {
@@ -955,6 +1047,15 @@
 
 	.register-row-focused td {
 		background: color-mix(in srgb, var(--blue-500) 8%, var(--surface));
+	}
+
+	tr[role="row"]:focus {
+		outline: 2px solid var(--blue-500);
+		outline-offset: -2px;
+	}
+
+	tr[role="row"]:focus:not(:focus-visible) {
+		outline: none;
 	}
 
 	.expanded-row td {

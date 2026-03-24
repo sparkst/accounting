@@ -25,6 +25,7 @@ from src.utils.reconciliation import (
     RECON_LINK_NOTE_PREFIX,
     apply_manual_match,
     find_matches,
+    remove_manual_match,
 )
 
 # ---------------------------------------------------------------------------
@@ -384,3 +385,99 @@ def test_shopify_payout_matched_to_bank(session: Session) -> None:
     assert len(result.matched) == 1
     assert result.matched[0].payout.id == payout.id
     assert result.matched[0].bank.id == bank.id
+
+
+# ---------------------------------------------------------------------------
+# remove_manual_match (unlink)
+# ---------------------------------------------------------------------------
+
+
+def test_remove_manual_match_clears_both_notes(session: Session) -> None:
+    """remove_manual_match should strip the reconciled: note from both transactions."""
+    payout = _make_txn(session, source=Source.STRIPE, date="2026-09-01", amount=Decimal("400.00"))
+    bank = _make_txn(session, source=Source.BANK_CSV, date="2026-09-03", amount=Decimal("400.00"))
+
+    # Link first
+    apply_manual_match(session, payout.id, bank.id)
+    assert payout.notes == f"{RECON_LINK_NOTE_PREFIX}{bank.id}"
+    assert bank.notes == f"{RECON_LINK_NOTE_PREFIX}{payout.id}"
+
+    # Now unlink
+    txn_a, txn_b = remove_manual_match(session, payout.id, bank.id)
+
+    assert txn_a.notes is None
+    assert txn_b.notes is None
+
+
+def test_remove_manual_match_pair_returns_to_unmatched(session: Session) -> None:
+    """After unlinking, both transactions should appear as unmatched."""
+    payout = _make_txn(session, source=Source.STRIPE, date="2026-09-10", amount=Decimal("500.00"))
+    bank = _make_txn(session, source=Source.BANK_CSV, date="2026-09-12", amount=Decimal("500.00"))
+
+    apply_manual_match(session, payout.id, bank.id)
+    result_before = find_matches(session)
+    assert any(m.payout.id == payout.id for m in result_before.matched)
+
+    remove_manual_match(session, payout.id, bank.id)
+    result_after = find_matches(session)
+
+    # They may auto-rematch (amount/date qualify), but they must no longer
+    # be locked as a manual pair — verify they aren't "manually confirmed" (confidence=1.0)
+    # with no remaining recon note on both
+    session.refresh(payout)
+    session.refresh(bank)
+    assert payout.notes is None
+    assert bank.notes is None
+
+
+def test_remove_manual_match_preserves_other_notes(session: Session) -> None:
+    """Unlink must strip only the reconciled: segment, leaving other note content intact."""
+    payout = _make_txn(
+        session,
+        source=Source.STRIPE,
+        date="2026-09-20",
+        amount=Decimal("250.00"),
+        notes="some prior note",
+    )
+    bank = _make_txn(session, source=Source.BANK_CSV, date="2026-09-22", amount=Decimal("250.00"))
+
+    # Manually write combined notes (simulating a future scenario where other content exists)
+    payout.notes = f"some prior note {RECON_LINK_NOTE_PREFIX}{bank.id}"
+    session.commit()
+
+    # Perform unlink — should leave the non-recon portion
+    txn_a, txn_b = remove_manual_match(session, payout.id, bank.id)
+    assert txn_a.notes == "some prior note"
+    assert txn_b.notes is None
+
+
+def test_remove_manual_match_unknown_id_raises(session: Session) -> None:
+    """remove_manual_match should raise ValueError for unknown transaction IDs."""
+    payout = _make_txn(session, source=Source.STRIPE, date="2026-10-01", amount=Decimal("100.00"))
+
+    with pytest.raises(ValueError, match="not found"):
+        remove_manual_match(session, payout.id, "nonexistent-id")
+
+
+def test_remove_manual_match_not_linked_raises(session: Session) -> None:
+    """remove_manual_match should raise ValueError when transactions aren't linked."""
+    payout = _make_txn(session, source=Source.STRIPE, date="2026-10-05", amount=Decimal("150.00"))
+    bank = _make_txn(session, source=Source.BANK_CSV, date="2026-10-07", amount=Decimal("150.00"))
+
+    # Do NOT link — they have no recon notes
+    with pytest.raises(ValueError, match="not linked"):
+        remove_manual_match(session, payout.id, bank.id)
+
+
+def test_remove_manual_match_reverse_order_works(session: Session) -> None:
+    """Unlink should work regardless of which ID is passed as A or B."""
+    payout = _make_txn(session, source=Source.STRIPE, date="2026-10-10", amount=Decimal("300.00"))
+    bank = _make_txn(session, source=Source.BANK_CSV, date="2026-10-11", amount=Decimal("300.00"))
+
+    apply_manual_match(session, payout.id, bank.id)
+
+    # Pass bank first, payout second (reversed)
+    txn_b, txn_a = remove_manual_match(session, bank.id, payout.id)
+
+    assert txn_a.notes is None
+    assert txn_b.notes is None

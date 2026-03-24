@@ -172,9 +172,10 @@ def session() -> Generator[Session, None, None]:
 
 @pytest.fixture
 def adapter(monkeypatch: pytest.MonkeyPatch) -> StripeAdapter:
-    """StripeAdapter with fake API keys injected via environment."""
-    monkeypatch.setenv("STRIPE_API_KEY_SPARKRY", "sk_test_sparkry")
-    monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "sk_test_blackline")
+    """StripeAdapter with fake API key and connected account IDs via environment."""
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
+    monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_test_sparkry")
+    monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_test_blackline")
     return StripeAdapter()
 
 
@@ -291,17 +292,19 @@ class TestMapRefund:
 
 
 class TestStripeAdapterInit:
-    def test_missing_sparkry_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("STRIPE_API_KEY_SPARKRY", raising=False)
-        monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "sk_test_bl")
-        with pytest.raises(EnvironmentError, match="STRIPE_API_KEY_SPARKRY"):
+    def test_missing_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+        with pytest.raises(EnvironmentError, match="STRIPE_API_KEY"):
             StripeAdapter()
 
-    def test_missing_blackline_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("STRIPE_API_KEY_SPARKRY", "sk_test_sp")
-        monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
-        with pytest.raises(EnvironmentError, match="STRIPE_API_KEY_BLACKLINE"):
-            StripeAdapter()
+    def test_connected_accounts_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
+        monkeypatch.delenv("STRIPE_ACCOUNT_SPARKRY", raising=False)
+        monkeypatch.delenv("STRIPE_ACCOUNT_BLACKLINE", raising=False)
+        adapter = StripeAdapter()
+        assert adapter._api_key == "sk_test_platform"
+        assert adapter._account_sparkry is None
+        assert adapter._account_blackline is None
 
 
 class TestStripeAdapterRun:
@@ -542,7 +545,7 @@ class TestFetchAllRetry:
 
         call_count = {"n": 0}
 
-        def list_side_effect(params: Any) -> Any:
+        def list_side_effect(params: Any, **kwargs: Any) -> Any:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise stripe_lib.RateLimitError("Too many requests", http_status=429)
@@ -567,7 +570,7 @@ class TestFetchAllRetry:
 
         call_count = {"n": 0}
 
-        def list_side_effect(params: Any) -> Any:
+        def list_side_effect(params: Any, **kwargs: Any) -> Any:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise stripe_lib.APIConnectionError("Connection failed")
@@ -584,7 +587,7 @@ class TestFetchAllRetry:
         """After 3 RateLimitErrors _fetch_all raises RuntimeError (caller handles it)."""
         import stripe as stripe_lib
 
-        def always_fail(params: Any) -> Any:
+        def always_fail(params: Any, **kwargs: Any) -> Any:
             raise stripe_lib.RateLimitError("Too many requests", http_status=429)
 
         client = self._make_client("charges", always_fail)
@@ -599,7 +602,7 @@ class TestFetchAllRetry:
 
         call_count = {"n": 0}
 
-        def raise_auth(params: Any) -> Any:
+        def raise_auth(params: Any, **kwargs: Any) -> Any:
             call_count["n"] += 1
             raise stripe_lib.AuthenticationError(
                 "No such API key", http_status=401, code="api_key_invalid"
@@ -618,7 +621,7 @@ class TestFetchAllRetry:
 
         sleep_durations: list[float] = []
 
-        def always_fail(params: Any) -> Any:
+        def always_fail(params: Any, **kwargs: Any) -> Any:
             raise stripe_lib.RateLimitError("Too many requests", http_status=429)
 
         client = self._make_client("charges", always_fail)

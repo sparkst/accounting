@@ -50,6 +50,30 @@ export const CATEGORY_LABELS: Record<string, string> = Object.fromEntries(
 	ALL_CATEGORIES.map(c => [c.value, c.label])
 );
 
+/** Format amount with parenthetical negatives and tabular style.
+ *  Positive: $1,234.56  Negative: ($1,234.56)  Zero: $0.00 */
+export function formatAmount(amount: number): string {
+	const abs = Math.abs(amount);
+	const formatted = abs.toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+	if (amount < 0) return `(${formatted})`;
+	return formatted;
+}
+
+/** Returns CSS class for amount coloring */
+export function amountClass(amount: number): string {
+	if (amount > 0) return 'amount-positive tabular-nums';
+	if (amount < 0) return 'amount-negative tabular-nums';
+	return 'tabular-nums';
+}
+
+/** Returns entity badge CSS class */
+export function entityBadgeClass(entity: string): string {
+	const e = entity?.toLowerCase() ?? '';
+	if (e.includes('sparkry')) return 'entity-badge entity-sparkry';
+	if (e.includes('blackline')) return 'entity-badge entity-blackline';
+	return 'entity-badge entity-personal';
+}
+
 // Subcategories grouped by parent category for the TransactionCard detail editor.
 export const SUBCATEGORIES: Record<string, CategoryOption[]> = {
 	ADVERTISING: [

@@ -336,8 +336,8 @@ _SOURCE_CONFIG: dict[str, dict[str, Any]] = {
     "stripe": {
         "label": "Stripe",
         "mode": "automated",
-        "env_vars": ["STRIPE_API_KEY_SPARKRY", "STRIPE_API_KEY_BLACKLINE"],
-        "notes": "Requires Stripe API keys in .env for each entity.",
+        "env_vars": ["STRIPE_API_KEY"],
+        "notes": "Requires Stripe platform API key. Connected account IDs (STRIPE_ACCOUNT_SPARKRY, STRIPE_ACCOUNT_BLACKLINE) are optional.",
     },
     "shopify": {
         "label": "Shopify",

@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { fetchHealth, triggerSourceIngest, fetchSourceConfig } from '$lib/api';
 	import type { SourceConfigItem } from '$lib/api';
-	import type { HealthResponse, SourceFreshness, TaxDeadline, FailureLogEntry, LLMUsage } from '$lib/types';
+	import type { HealthResponse, SourceFreshness, FailureLogEntry, LLMUsage } from '$lib/types';
 
 	// ── State ─────────────────────────────────────────────────────────────────
 	let health: HealthResponse | null = $state(null);
@@ -64,27 +64,6 @@
 			minute: '2-digit',
 			hour12: true
 		});
-	}
-
-	function fmtDate(iso: string): string {
-		const d = new Date(iso + 'T00:00:00');
-		return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-	}
-
-	function deadlineUrgency(days: number): string {
-		if (days <= 7) return 'urgent';
-		if (days <= 30) return 'soon';
-		return 'upcoming';
-	}
-
-	function entityLabel(entity: string): string {
-		const map: Record<string, string> = {
-			sparkry: 'Sparkry AI',
-			blackline: 'BlackLine MTB',
-			personal: 'Personal',
-			all: 'All entities'
-		};
-		return map[entity] ?? entity;
 	}
 
 	// ── Load ─────────────────────────────────────────────────────────────────
@@ -153,7 +132,7 @@
 		<div>
 			<h1>Health Dashboard</h1>
 			<p class="page-subtitle">
-				Source freshness, classification accuracy, and upcoming tax deadlines
+				Source freshness, classification accuracy, and Claude API usage
 			</p>
 		</div>
 		<div class="page-header-actions">
@@ -188,7 +167,7 @@
 		{#if syncError}
 			<div class="sync-error-banner">
 				<span>{syncError}</span>
-				<button class="dismiss-btn" onclick={() => (syncError = '')}>✕</button>
+				<button class="dismiss-btn" aria-label="Dismiss error" onclick={() => (syncError = '')}>✕</button>
 			</div>
 		{/if}
 
@@ -204,6 +183,7 @@
 									class="freshness-dot"
 									style="background: {freshnessColor(sf.freshness_status)}"
 									title={freshnessLabel(sf.freshness_status)}
+									aria-label={freshnessLabel(sf.freshness_status)}
 								></span>
 								<span class="source-name">{sourceLabel(sf.source)}</span>
 							</div>
@@ -256,20 +236,22 @@
 							</div>
 						{/if}
 
-						<div class="source-actions">
-							<button
-								class="btn btn-ghost btn-sm"
-								disabled={syncingSource !== null}
-								onclick={() => syncSource(sf.source)}
-							>
-								{#if syncingSource === sf.source}
-									<span class="spinner" aria-hidden="true"></span>
-									Syncing…
-								{:else}
-									Re-sync
-								{/if}
-							</button>
-						</div>
+						{#if !sourceConfigFor(sf.source) || sourceConfigFor(sf.source)?.mode !== 'import_only'}
+							<div class="source-actions">
+								<button
+									class="btn btn-ghost btn-sm"
+									disabled={syncingSource !== null}
+									onclick={() => syncSource(sf.source)}
+								>
+									{#if syncingSource === sf.source}
+										<span class="spinner" aria-hidden="true"></span>
+										Syncing…
+									{:else}
+										Re-sync
+									{/if}
+								</button>
+							</div>
+						{/if}
 					</div>
 				{/each}
 			</div>
@@ -401,42 +383,7 @@
 			</div>
 		</section>
 
-		<!-- ── Tax Deadlines ────────────────────────────────────────────────── -->
-		<section class="dashboard-section">
-			<h2 class="section-title">Upcoming Tax Deadlines</h2>
-			{#if health.tax_deadlines.length === 0}
-				<div class="card empty-deadlines">
-					<p class="no-data">No deadlines in the next 180 days.</p>
-				</div>
-			{:else}
-				<div class="deadlines-list">
-					{#each health.tax_deadlines as deadline (deadline.label + deadline.due_date)}
-						{@const urgency = deadlineUrgency(deadline.days_until_due)}
-						<div class="card deadline-card deadline-{urgency}">
-							<div class="deadline-left">
-								<span class="deadline-dot deadline-dot-{urgency}"></span>
-								<div>
-									<p class="deadline-label">{deadline.label}</p>
-									<p class="deadline-entity">{entityLabel(deadline.entity)}</p>
-								</div>
-							</div>
-							<div class="deadline-right">
-								<p class="deadline-date">{fmtDate(deadline.due_date)}</p>
-								<p class="deadline-days deadline-days-{urgency}">
-									{deadline.days_until_due === 0
-										? 'Due today'
-										: deadline.days_until_due === 1
-											? 'Tomorrow'
-											: `${deadline.days_until_due} days`}
-								</p>
-							</div>
-						</div>
-					{/each}
-				</div>
-			{/if}
-		</section>
-
-		<!-- ── Failure Log ───────────────────────────────────────────────────── -->
+			<!-- ── Failure Log ───────────────────────────────────────────────────── -->
 		{#if health.failure_log.length > 0}
 			<section class="dashboard-section">
 				<h2 class="section-title">Recent Failures</h2>
@@ -481,6 +428,10 @@
 				</div>
 			</section>
 		{/if}
+
+		<p class="deadlines-link">
+			<a href="/">View upcoming deadlines on Dashboard &rarr;</a>
+		</p>
 
 	{/if}
 </div>
@@ -897,74 +848,20 @@
 		font-size: 0.875rem;
 	}
 
-	/* ── Tax deadlines ─────────────────────────────────────────────────────── */
-	.deadlines-list {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
+	/* ── Deadlines link ───────────────────────────────────────────────────── */
+	.deadlines-link {
+		margin-top: 24px;
+		font-size: 0.85rem;
 	}
 
-	.deadline-card {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		padding: 14px 18px;
+	.deadlines-link a {
+		color: var(--text-muted);
+		text-decoration: none;
 	}
 
-	.deadline-left {
-		display: flex;
-		align-items: flex-start;
-		gap: 12px;
-		min-width: 0;
-	}
-
-	.deadline-dot {
-		flex-shrink: 0;
-		width: 10px;
-		height: 10px;
-		border-radius: 50%;
-		margin-top: 4px;
-	}
-
-	.deadline-dot-urgent  { background: var(--red-500); }
-	.deadline-dot-soon    { background: var(--amber-500); }
-	.deadline-dot-upcoming { background: var(--green-500); }
-
-	.deadline-label {
-		font-size: 0.875rem;
-		font-weight: 500;
+	.deadlines-link a:hover {
 		color: var(--text);
-	}
-
-	.deadline-entity {
-		font-size: 0.75rem;
-		color: var(--text-muted);
-		margin-top: 2px;
-	}
-
-	.deadline-right {
-		text-align: right;
-		flex-shrink: 0;
-	}
-
-	.deadline-date {
-		font-size: 0.8rem;
-		color: var(--text-muted);
-	}
-
-	.deadline-days {
-		font-size: 0.875rem;
-		font-weight: 600;
-		margin-top: 2px;
-	}
-
-	.deadline-days-urgent  { color: var(--red-600); }
-	.deadline-days-soon    { color: var(--amber-600); }
-	.deadline-days-upcoming { color: var(--green-700); }
-
-	.empty-deadlines {
-		padding: 24px;
+		text-decoration: underline;
 	}
 
 	/* ── Failure table ─────────────────────────────────────────────────────── */

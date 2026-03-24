@@ -8,6 +8,7 @@
 		type VendorRule,
 		type VendorRuleCreate
 	} from '$lib/api';
+	import { entityBadgeClass } from '$lib/categories';
 
 	// ── Constants ────────────────────────────────────────────────────────────
 	const ENTITIES = ['sparkry', 'blackline', 'personal'] as const;
@@ -22,17 +23,6 @@
 	] as const;
 
 	const PAGE_SIZE = 25;
-
-	// Tax deadlines (static — based on design spec entity config)
-	const TAX_DEADLINES = [
-		{ label: 'WA B&O (Sparkry — Monthly)', entity: 'sparkry', due_date: '2026-04-25' },
-		{ label: 'WA B&O (Sparkry — Monthly)', entity: 'sparkry', due_date: '2026-05-25' },
-		{ label: 'WA B&O (BlackLine — Q1)', entity: 'blackline', due_date: '2026-04-30' },
-		{ label: 'Federal Estimated Tax Q1', entity: 'personal', due_date: '2026-04-15' },
-		{ label: 'Federal Estimated Tax Q2', entity: 'personal', due_date: '2026-06-15' },
-		{ label: 'Form 1065 (BlackLine)', entity: 'blackline', due_date: '2026-09-15' },
-		{ label: 'Schedule C / 1040 (Sparkry + Personal)', entity: 'personal', due_date: '2026-10-15' },
-	];
 
 	// ── State ─────────────────────────────────────────────────────────────────
 	let rules = $state<VendorRule[]>([]);
@@ -73,18 +63,6 @@
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let totalPages = $derived(Math.ceil(total / PAGE_SIZE));
 	let currentPage = $derived(Math.floor(offset / PAGE_SIZE) + 1);
-
-	let upcomingDeadlines = $derived.by(() => {
-		const today = new Date('2026-03-16'); // currentDate from memory
-		return TAX_DEADLINES
-			.map((d) => {
-				const due = new Date(d.due_date + 'T00:00:00');
-				const daysUntil = Math.round((due.getTime() - today.getTime()) / 86400000);
-				return { ...d, days_until_due: daysUntil };
-			})
-			.filter((d) => d.days_until_due >= 0)
-			.sort((a, b) => a.days_until_due - b.days_until_due);
-	});
 
 	// ── Debounced search ─────────────────────────────────────────────────────
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -247,12 +225,6 @@
 		return c.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (ch) => ch.toUpperCase());
 	}
 
-	function deadlineUrgency(days: number): 'urgent' | 'soon' | 'upcoming' {
-		if (days <= 7) return 'urgent';
-		if (days <= 30) return 'soon';
-		return 'upcoming';
-	}
-
 	function confidenceColor(c: number): string {
 		if (c >= 0.9) return 'var(--green-600)';
 		if (c >= 0.7) return 'var(--amber-600)';
@@ -269,7 +241,7 @@
 	<header class="page-header">
 		<div>
 			<h1>Accounts &amp; Memory</h1>
-			<p class="page-subtitle">Vendor classification rules, entity configuration, and tax deadlines</p>
+			<p class="page-subtitle">Vendor classification rules and entity configuration</p>
 		</div>
 	</header>
 
@@ -288,6 +260,7 @@
 				class="search-input"
 				type="search"
 				placeholder="Search vendor patterns…"
+				aria-label="Search vendor rules"
 				bind:value={searchInput}
 				oninput={onSearchInput}
 			/>
@@ -440,7 +413,7 @@
 												title="Click to edit"
 												onclick={() => startEdit(rule.id, 'entity', rule.entity)}
 											>
-												<span class="entity-pill entity-{rule.entity}">{entityLabel(rule.entity)}</span>
+												<span class={entityBadgeClass(rule.entity)}>{entityLabel(rule.entity)}</span>
 											</button>
 										{/if}
 									</td>
@@ -533,7 +506,7 @@
 	<section class="dashboard-section">
 		<h2 class="section-title">Entity Configuration</h2>
 		<div class="entity-grid">
-			<div class="card entity-card">
+			<div class="card entity-card entity-card-sparkry">
 				<div class="entity-header">
 					<span class="entity-pill entity-sparkry">Sparkry AI LLC</span>
 				</div>
@@ -543,7 +516,7 @@
 					<dt>Structure</dt><dd>Single-member LLC</dd>
 				</dl>
 			</div>
-			<div class="card entity-card">
+			<div class="card entity-card entity-card-blackline">
 				<div class="entity-header">
 					<span class="entity-pill entity-blackline">BlackLine MTB LLC</span>
 				</div>
@@ -553,7 +526,7 @@
 					<dt>Structure</dt><dd>Partnership (Travis 100%)</dd>
 				</dl>
 			</div>
-			<div class="card entity-card">
+			<div class="card entity-card entity-card-personal">
 				<div class="entity-header">
 					<span class="entity-pill entity-personal">Personal</span>
 				</div>
@@ -566,40 +539,9 @@
 		</div>
 	</section>
 
-	<!-- ── Tax Deadlines ─────────────────────────────────────────────────── -->
-	<section class="dashboard-section">
-		<h2 class="section-title">Upcoming Tax Deadlines</h2>
-		{#if upcomingDeadlines.length === 0}
-			<div class="card empty-card">
-				<p class="empty-msg">No upcoming deadlines.</p>
-			</div>
-		{:else}
-			<div class="deadlines-list">
-				{#each upcomingDeadlines as deadline (deadline.label + deadline.due_date)}
-					{@const urgency = deadlineUrgency(deadline.days_until_due)}
-					<div class="card deadline-card deadline-{urgency}">
-						<div class="deadline-left">
-							<span class="deadline-dot deadline-dot-{urgency}"></span>
-							<div>
-								<p class="deadline-label">{deadline.label}</p>
-								<p class="deadline-entity">{entityLabel(deadline.entity)}</p>
-							</div>
-						</div>
-						<div class="deadline-right">
-							<p class="deadline-date">{fmtDate(deadline.due_date)}</p>
-							<p class="deadline-days deadline-days-{urgency}">
-								{deadline.days_until_due === 0
-									? 'Due today'
-									: deadline.days_until_due === 1
-										? 'Tomorrow'
-										: `${deadline.days_until_due} days`}
-							</p>
-						</div>
-					</div>
-				{/each}
-			</div>
-		{/if}
-	</section>
+	<p class="deadlines-link">
+		<a href="/">View upcoming deadlines on Dashboard &rarr;</a>
+	</p>
 </div>
 
 <!-- ── Delete Confirmation Dialog ───────────────────────────────────────── -->
@@ -946,6 +888,10 @@
 		padding: 18px 20px;
 	}
 
+	.entity-card-sparkry  { border-top: 4px solid #1e40af; }
+	.entity-card-blackline { border-top: 4px solid #7c3aed; }
+	.entity-card-personal  { border-top: 4px solid #475569; }
+
 	.entity-header {
 		margin-bottom: 14px;
 	}
@@ -966,71 +912,21 @@
 		color: var(--text);
 	}
 
-	/* ── Tax deadlines ─────────────────────────────────────────────────────── */
-	.deadlines-list {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
+	/* ── Deadlines link ───────────────────────────────────────────────────── */
+	.deadlines-link {
+		margin-top: 8px;
+		font-size: 0.85rem;
 	}
 
-	.deadline-card {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		padding: 14px 18px;
+	.deadlines-link a {
+		color: var(--text-muted);
+		text-decoration: none;
 	}
 
-	.deadline-left {
-		display: flex;
-		align-items: flex-start;
-		gap: 12px;
-		min-width: 0;
-	}
-
-	.deadline-dot {
-		flex-shrink: 0;
-		width: 10px;
-		height: 10px;
-		border-radius: 50%;
-		margin-top: 4px;
-	}
-
-	.deadline-dot-urgent  { background: var(--red-500); }
-	.deadline-dot-soon    { background: var(--amber-500); }
-	.deadline-dot-upcoming { background: var(--green-500); }
-
-	.deadline-label {
-		font-size: 0.875rem;
-		font-weight: 500;
+	.deadlines-link a:hover {
 		color: var(--text);
+		text-decoration: underline;
 	}
-
-	.deadline-entity {
-		font-size: 0.75rem;
-		color: var(--text-muted);
-		margin-top: 2px;
-	}
-
-	.deadline-right {
-		text-align: right;
-		flex-shrink: 0;
-	}
-
-	.deadline-date {
-		font-size: 0.8rem;
-		color: var(--text-muted);
-	}
-
-	.deadline-days {
-		font-size: 0.875rem;
-		font-weight: 600;
-		margin-top: 2px;
-	}
-
-	.deadline-days-urgent  { color: var(--red-600); }
-	.deadline-days-soon    { color: var(--amber-600); }
-	.deadline-days-upcoming { color: var(--green-700); }
 
 	/* ── Buttons ───────────────────────────────────────────────────────────── */
 	.btn-sm {

@@ -8,7 +8,7 @@
 	import { DATE_PRESETS } from '$lib/datePresets';
 	import { fetchAggregations } from '$lib/api';
 	import type { AggregationData } from '$lib/api';
-	import { ALL_CATEGORIES } from '$lib/categories';
+	import { ALL_CATEGORIES, formatAmount, amountClass, entityBadgeClass } from '$lib/categories';
 
 	const PAGE_SIZES = [25, 50, 100, 200];
 	let pageSize = $state(50);
@@ -36,7 +36,7 @@
 	let expandedId = $state<string | null>(null);
 
 	// Keyboard navigation
-	let focusedRow = $state(0);
+	let focusedRow = $state(-1);
 
 	// Insight panel
 	let activeInsightCard = $state<'income' | 'expenses' | 'net' | null>(null);
@@ -135,15 +135,6 @@
 
 	function parseAmount(v: unknown): number {
 		return parseFloat(String(v)) || 0;
-	}
-
-	function formatCurrency(amount: number | string): string {
-		const n = typeof amount === 'string' ? parseFloat(amount) || 0 : amount;
-		return new Intl.NumberFormat('en-US', {
-			style: 'currency',
-			currency: 'USD',
-			minimumFractionDigits: 2
-		}).format(n);
 	}
 
 	function entityLabel(e: string | null): string {
@@ -416,7 +407,7 @@
 				aria-label="Income — click to view insights"
 			>
 				<span class="summary-label">Income</span>
-				<span class="summary-value amount-positive">{formatCurrency(incomeTotalAll)}</span>
+				<span class="summary-value {amountClass(incomeTotalAll)}">{formatAmount(incomeTotalAll)}</span>
 			</button>
 			<button
 				class="summary-card summary-card-btn"
@@ -426,7 +417,7 @@
 				aria-label="Expenses — click to view insights"
 			>
 				<span class="summary-label">Expenses</span>
-				<span class="summary-value amount-negative">{formatCurrency(expenseTotalAll)}</span>
+				<span class="summary-value {amountClass(expenseTotalAll)}">{formatAmount(expenseTotalAll)}</span>
 			</button>
 			<button
 				class="summary-card summary-card-btn"
@@ -436,8 +427,8 @@
 				aria-label="Net — click to view insights"
 			>
 				<span class="summary-label">Net</span>
-				<span class="summary-value" class:amount-positive={netAll >= 0} class:amount-negative={netAll < 0}>
-					{formatCurrency(netAll)}
+				<span class="summary-value {amountClass(netAll)}">
+					{formatAmount(netAll)}
 				</span>
 			</button>
 			<div class="summary-card">
@@ -573,6 +564,7 @@
 								</th>
 								<th
 									class="sortable col-amount"
+									style="text-align: right"
 									onclick={() => handleSort('amount')}
 									onkeydown={(e) => e.key === 'Enter' && handleSort('amount')}
 									role="columnheader"
@@ -598,7 +590,7 @@
 								>
 									Status{sortIndicator('status')}
 								</th>
-								<th class="col-running-total">Balance</th>
+								<th class="col-running-total" style="text-align: right">Balance</th>
 								{#if showReviewReason}<th class="col-review-reason">Review Reason</th>{/if}
 							</tr>
 						</thead>
@@ -652,8 +644,7 @@
 									<!-- Amount — inline editable -->
 									<td
 										class="col-amount col-editable"
-										class:amount-positive={parseAmount(tx.amount) > 0}
-										class:amount-negative={parseAmount(tx.amount) < 0}
+										style="text-align: right"
 										onclick={(e) => { e.stopPropagation(); startEdit(tx.id, 'amount', String(tx.amount || '')); }}
 									>
 										{#if editingCell?.id === tx.id && editingCell?.field === 'amount'}
@@ -668,7 +659,7 @@
 												autofocus
 											/>
 										{:else}
-											{tx.amount ? formatCurrency(parseAmount(tx.amount)) : '—'}
+											<span class={amountClass(parseAmount(tx.amount))}>{tx.amount ? formatAmount(parseAmount(tx.amount)) : '—'}</span>
 										{/if}
 									</td>
 
@@ -693,23 +684,23 @@
 												<option value="personal">Personal</option>
 											</select>
 										{:else}
-											{entityLabel(tx.entity)}
+											<span class={entityBadgeClass(tx.entity ?? '')}>{entityLabel(tx.entity)}</span>
 										{/if}
 									</td>
 
 									<td class="no-strike">
 										<span class="status-pill status-{tx.status}">
-											{tx.status.replace(/_/g, ' ')}
+											<span class="status-pill-icon status-icon-{tx.status}"></span>
+											{tx.status === 'auto_classified' ? 'auto' : tx.status.replace('_', ' ')}
 										</span>
 									</td>
 
 									<!-- Running total -->
 									<td
 										class="col-running-total col-amount"
-										class:amount-positive={runningTotals[rowIdx] >= 0}
-										class:amount-negative={runningTotals[rowIdx] < 0}
+										style="text-align: right"
 									>
-										{formatCurrency(runningTotals[rowIdx])}
+										<span class="{amountClass(runningTotals[rowIdx])} tabular-nums">{formatAmount(runningTotals[rowIdx])}</span>
 									</td>
 									{#if showReviewReason}<td class="review-reason" title={tx.review_reason}>{tx.review_reason ?? ''}</td>{/if}
 								</tr>
@@ -916,6 +907,8 @@
 
 	.table-wrapper {
 		overflow: hidden;
+		padding: 0;
+		border-top: none;
 	}
 
 	.table-scroll {
@@ -960,9 +953,8 @@
 		background: var(--gray-50);
 	}
 
-	.register-row-focused {
-		outline: 2px solid var(--blue-500);
-		outline-offset: -2px;
+	.register-row-focused td {
+		background: color-mix(in srgb, var(--blue-500) 8%, var(--surface));
 	}
 
 	.expanded-row td {

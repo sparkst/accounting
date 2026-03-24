@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { formatAmount, amountClass } from '$lib/categories';
 
 	// ── Types ─────────────────────────────────────────────────────────────────
 
@@ -70,6 +71,14 @@
 	);
 
 	let canLink = $derived(selectedA !== null && selectedB !== null && selectedA !== selectedB);
+
+	// Look up human-readable info for selected transactions
+	let selectedAInfo = $derived(
+		selectedA ? unmatched.payouts.find((t) => t.id === selectedA) : null
+	);
+	let selectedBInfo = $derived(
+		selectedB ? unmatched.banks.find((t) => t.id === selectedB) : null
+	);
 
 	// ── API helpers ───────────────────────────────────────────────────────────
 
@@ -171,7 +180,7 @@
 
 	function fmtAmount(amount: number | null): string {
 		if (amount === null) return '—';
-		return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(amount);
+		return formatAmount(amount);
 	}
 
 	function fmtDate(iso: string): string {
@@ -234,14 +243,14 @@
 	{#if error}
 		<div class="error-banner">
 			<span>{error}</span>
-			<button class="dismiss-btn" onclick={() => (error = '')}>✕</button>
+			<button class="dismiss-btn" aria-label="Dismiss error" onclick={() => (error = '')}>✕</button>
 		</div>
 	{/if}
 
 	{#if actionError}
 		<div class="error-banner">
 			<span>{actionError}</span>
-			<button class="dismiss-btn" onclick={() => (actionError = '')}>✕</button>
+			<button class="dismiss-btn" aria-label="Dismiss error" onclick={() => (actionError = '')}>✕</button>
 		</div>
 	{/if}
 
@@ -306,22 +315,34 @@
 		{/if}
 
 		<!-- ── Tabs ──────────────────────────────────────────────────────────── -->
-		<div class="tabs">
+		<div class="tabs" role="tablist" aria-label="Reconciliation views">
 			<button
 				class="tab-btn {activeTab === 'matched' ? 'tab-active' : ''}"
 				onclick={() => (activeTab = 'matched')}
+				role="tab"
+				aria-selected={activeTab === 'matched'}
+				aria-controls="tabpanel-matched"
+				id="tab-matched"
 			>
 				Matched ({matched.length})
 			</button>
 			<button
 				class="tab-btn {activeTab === 'unmatched' ? 'tab-active' : ''}"
 				onclick={() => (activeTab = 'unmatched')}
+				role="tab"
+				aria-selected={activeTab === 'unmatched'}
+				aria-controls="tabpanel-unmatched"
+				id="tab-unmatched"
 			>
 				Unmatched ({unmatched.payouts.length + unmatched.banks.length})
 			</button>
 			<button
 				class="tab-btn {activeTab === 'monthly' ? 'tab-active' : ''}"
 				onclick={() => (activeTab = 'monthly')}
+				role="tab"
+				aria-selected={activeTab === 'monthly'}
+				aria-controls="tabpanel-monthly"
+				id="tab-monthly"
 			>
 				Monthly totals ({summary.monthly_totals.length})
 			</button>
@@ -329,6 +350,7 @@
 
 		<!-- ── Matched pairs ─────────────────────────────────────────────────── -->
 		{#if activeTab === 'matched'}
+		<div id="tabpanel-matched" role="tabpanel" aria-labelledby="tab-matched">
 			{#if matched.length === 0}
 				<div class="card empty-state">
 					<p class="icon">⟷</p>
@@ -357,7 +379,7 @@
 										<span class="source-pill">{sourceLabel(pair.payout.source)}</span>
 									</td>
 									<td class="td-desc truncate">{pair.payout.description}</td>
-									<td class="num-col amount-positive">{fmtAmount(pair.payout.amount)}</td>
+									<td class="num-col {amountClass(pair.payout.amount ?? 0)}">{fmtAmount(pair.payout.amount)}</td>
 									<td class="td-date">{fmtDate(pair.bank.date)}</td>
 									<td class="num-col">
 										{#if pair.date_diff_days === 0}
@@ -384,10 +406,12 @@
 					</table>
 				</div>
 			{/if}
+		</div>
 		{/if}
 
 		<!-- ── Unmatched ─────────────────────────────────────────────────────── -->
 		{#if activeTab === 'unmatched'}
+		<div id="tabpanel-unmatched" role="tabpanel" aria-labelledby="tab-unmatched">
 			<div class="unmatched-layout">
 				<!-- Unmatched payouts -->
 				<section class="unmatched-section">
@@ -414,6 +438,10 @@
 										<tr
 											class="row-unmatched {selectedA === txn.id ? 'row-selected-a' : ''}"
 											onclick={() => toggleSelectA(txn.id)}
+											onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSelectA(txn.id); } }}
+											tabindex="0"
+											role="row"
+											aria-selected={selectedA === txn.id}
 										>
 											<td class="sel-col">
 												<input
@@ -428,7 +456,7 @@
 												<span class="source-pill">{sourceLabel(txn.source)}</span>
 											</td>
 											<td class="td-desc truncate">{txn.description}</td>
-											<td class="num-col amount-positive">{fmtAmount(txn.amount)}</td>
+											<td class="num-col {amountClass(txn.amount ?? 0)}">{fmtAmount(txn.amount)}</td>
 											<td class="td-card">{txn.payment_method ?? '—'}</td>
 										</tr>
 									{/each}
@@ -462,6 +490,10 @@
 										<tr
 											class="row-unmatched {selectedB === txn.id ? 'row-selected-b' : ''}"
 											onclick={() => toggleSelectB(txn.id)}
+											onkeydown={(e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSelectB(txn.id); } }}
+											tabindex="0"
+											role="row"
+											aria-selected={selectedB === txn.id}
 										>
 											<td class="sel-col">
 												<input
@@ -473,7 +505,7 @@
 											</td>
 											<td class="td-date">{fmtDate(txn.date)}</td>
 											<td class="td-desc truncate">{txn.description}</td>
-											<td class="num-col amount-positive">{fmtAmount(txn.amount)}</td>
+											<td class="num-col {amountClass(txn.amount ?? 0)}">{fmtAmount(txn.amount)}</td>
 											<td class="td-card">{txn.payment_method ?? '—'}</td>
 										</tr>
 									{/each}
@@ -490,7 +522,7 @@
 					<div class="link-bar-info">
 						{#if selectedA && selectedB}
 							<p class="link-ready">
-								Ready to link payout <code>{selectedA.slice(0, 8)}</code> with bank <code>{selectedB.slice(0, 8)}</code>
+								Link {sourceLabel(selectedAInfo?.source ?? 'payout')} <strong>{selectedAInfo?.description ?? 'payout'}</strong> ({fmtAmount(selectedAInfo?.amount ?? null)}, {selectedAInfo ? fmtDate(selectedAInfo.date) : ''}) with Bank deposit <strong>{selectedBInfo?.description ?? 'deposit'}</strong> ({fmtAmount(selectedBInfo?.amount ?? null)}, {selectedBInfo ? fmtDate(selectedBInfo.date) : ''})?
 							</p>
 						{:else if selectedA}
 							<p class="link-hint">Now select a bank deposit (B) to link with the selected payout.</p>
@@ -509,10 +541,12 @@
 					</button>
 				</div>
 			{/if}
+		</div>
 		{/if}
 
 		<!-- ── Monthly totals ────────────────────────────────────────────────── -->
 		{#if activeTab === 'monthly'}
+		<div id="tabpanel-monthly" role="tabpanel" aria-labelledby="tab-monthly">
 			{#if summary.monthly_totals.length === 0}
 				<div class="card empty-state">
 					<p class="icon">📅</p>
@@ -534,8 +568,8 @@
 							{#each summary.monthly_totals as m (m.month)}
 								<tr class="{m.flagged ? 'row-flagged' : ''}">
 									<td class="td-month">{fmtMonth(m.month)}</td>
-									<td class="num-col">{fmtAmount(m.payout_total)}</td>
-									<td class="num-col">{fmtAmount(m.bank_total)}</td>
+									<td class="num-col {amountClass(m.payout_total)}">{fmtAmount(m.payout_total)}</td>
+									<td class="num-col {amountClass(m.bank_total)}">{fmtAmount(m.bank_total)}</td>
 									<td class="num-col {m.flagged ? 'text-red' : 'text-muted'}">
 										{fmtAmount(m.discrepancy)}
 									</td>
@@ -552,6 +586,7 @@
 					</table>
 				</div>
 			{/if}
+		</div>
 		{/if}
 
 	{/if}

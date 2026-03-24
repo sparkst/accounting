@@ -11,8 +11,9 @@
 	<link rel="icon" href={favicon} />
 </svelte:head>
 
+<a href="#main" class="sr-only" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;">Skip to content</a>
 <Nav />
-<main class="main-content">
+<main id="main" class="main-content">
 	{@render children()}
 </main>
 

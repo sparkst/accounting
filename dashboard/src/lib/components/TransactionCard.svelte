@@ -2,7 +2,7 @@
 	import type { Transaction, Entity, TaxCategory, Direction, TransactionUpdate } from '$lib/types';
 	import { updateTransaction, confirmTransaction, extractReceipt, splitTransaction } from '$lib/api';
 	import type { SplitLineItem } from '$lib/api';
-	import { BUSINESS_CATEGORIES, PERSONAL_CATEGORIES, SUBCATEGORIES } from '$lib/categories';
+	import { BUSINESS_CATEGORIES, PERSONAL_CATEGORIES, SUBCATEGORIES, entityBadgeClass } from '$lib/categories';
 
 	interface Props {
 		transaction: Transaction;
@@ -466,6 +466,9 @@
 			<span class="tx-date">{formatDate(transaction.date)}</span>
 			<h3 class="tx-vendor truncate">
 				{transaction.vendor ?? transaction.description}
+				{#if entity}
+					<span class={entityBadgeClass(entity)}>{entity === 'sparkry' ? 'Sparkry' : entity === 'blackline' ? 'BlackLine' : 'Personal'}</span>
+				{/if}
 			</h3>
 			{#if transaction.vendor && transaction.description !== transaction.vendor}
 				<p class="tx-desc truncate">{transaction.description}</p>
@@ -1333,7 +1336,7 @@
 		border: 1px solid var(--border);
 		border-radius: var(--radius-sm);
 		overflow: hidden;
-		background: #fff;
+		background: var(--surface);
 	}
 
 	.attachment-image {
@@ -1485,7 +1488,7 @@
 		max-height: 520px;
 		border: none;
 		display: block;
-		background: #fff;
+		background: var(--surface);
 	}
 
 	.email-plain {

@@ -68,7 +68,7 @@ cd dashboard && npm install && npm run dev  # localhost:5173
 - **Amount validation**: split line items must sum to parent total
 - **Reconciliation vs dedup**: Stripe/Shopify payouts matching bank deposits are reconciliation pairs, not duplicates
 - **FastAPI binds to 127.0.0.1:8000** (localhost only)
-- **API keys in `.env`** (gitignored): `STRIPE_API_KEY_SPARKRY`, `STRIPE_API_KEY_BLACKLINE`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `ANTHROPIC_API_KEY`
+- **API keys in `.env`** (gitignored): `STRIPE_API_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `ANTHROPIC_API_KEY`
 
 ---
 

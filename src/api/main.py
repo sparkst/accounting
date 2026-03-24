@@ -14,9 +14,10 @@ import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.auth import require_api_key
 from src.api.routes.attachments import router as attachments_router
 from src.api.routes.csv_import import router as csv_import_router
 from src.api.routes.health import router as health_router
@@ -87,13 +88,18 @@ app.add_middleware(
 # Routers
 # ---------------------------------------------------------------------------
 
-app.include_router(attachments_router, prefix="/api")
-app.include_router(csv_import_router, prefix="/api")
+# Health is always public (no auth dependency) so monitoring tools can reach it.
 app.include_router(health_router, prefix="/api")
-app.include_router(transactions_router, prefix="/api")
-app.include_router(ingest_router, prefix="/api")
-app.include_router(invoices_router, prefix="/api")
-app.include_router(reconciliation_router, prefix="/api")
-app.include_router(tax_export_router, prefix="/api")
-app.include_router(tax_year_locks_router, prefix="/api")
-app.include_router(vendor_rules_router, prefix="/api")
+
+# All other routers require API key auth when API_KEY env var is set.
+_auth = [Depends(require_api_key)]
+
+app.include_router(attachments_router, prefix="/api", dependencies=_auth)
+app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
+app.include_router(transactions_router, prefix="/api", dependencies=_auth)
+app.include_router(ingest_router, prefix="/api", dependencies=_auth)
+app.include_router(invoices_router, prefix="/api", dependencies=_auth)
+app.include_router(reconciliation_router, prefix="/api", dependencies=_auth)
+app.include_router(tax_export_router, prefix="/api", dependencies=_auth)
+app.include_router(tax_year_locks_router, prefix="/api", dependencies=_auth)
+app.include_router(vendor_rules_router, prefix="/api", dependencies=_auth)

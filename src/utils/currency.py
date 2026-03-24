@@ -20,6 +20,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -33,14 +34,14 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CurrencyAmount:
     """A detected currency amount from text."""
-    amount: float
+    amount: Decimal
     currency_code: str  # ISO 4217
 
 
 @dataclass
 class ExchangeRateResult:
     """Result from an exchange rate lookup."""
-    rate: float
+    rate: Decimal
     date_used: str  # actual date used (may differ if weekend/holiday)
     source: str  # "frankfurter_api"
 
@@ -48,8 +49,8 @@ class ExchangeRateResult:
 @dataclass
 class ConversionResult:
     """Result of converting a foreign amount to USD."""
-    usd_amount: float
-    rate: float
+    usd_amount: Decimal
+    rate: Decimal
     date_used: str
     source: str
 
@@ -115,8 +116,8 @@ def detect_currency(text: str) -> list[CurrencyAmount]:
     def _add(pos: int, amount_str: str, code: str) -> None:
         raw = amount_str.replace(",", "")
         try:
-            amount = float(raw)
-        except ValueError:
+            amount = Decimal(raw)
+        except Exception:
             return
         if amount <= 0:
             return
@@ -189,7 +190,7 @@ def fetch_exchange_rate(
             return None
 
         result = ExchangeRateResult(
-            rate=float(rate),
+            rate=Decimal(str(rate)),
             date_used=data.get("date", date),
             source="frankfurter_api",
         )
@@ -202,7 +203,7 @@ def fetch_exchange_rate(
 
 
 def convert_to_usd(
-    amount: float,
+    amount: Decimal | float,
     currency_code: str,
     date: str = "latest",
 ) -> ConversionResult | None:
@@ -216,10 +217,12 @@ def convert_to_usd(
     Returns:
         ConversionResult on success, None if the API call fails.
     """
+    amount = Decimal(str(amount))
+
     if currency_code.upper() == "USD":
         return ConversionResult(
             usd_amount=amount,
-            rate=1.0,
+            rate=Decimal("1"),
             date_used=date,
             source="identity",
         )
@@ -228,7 +231,7 @@ def convert_to_usd(
     if rate_result is None:
         return None
 
-    usd_amount = round(amount * rate_result.rate, 2)
+    usd_amount = (amount * rate_result.rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return ConversionResult(
         usd_amount=usd_amount,
         rate=rate_result.rate,

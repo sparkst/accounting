@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Numeric, String, Text
+from sqlalchemy import CheckConstraint, DateTime, Float, ForeignKey, Numeric, String, Text  # Float kept for confidence/deductible_pct
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -37,6 +37,31 @@ class Transaction(Base):
     """
 
     __tablename__ = "transactions"
+
+    # ── CHECK constraints on enum columns ─────────────────────────────────────
+    _entity_values = "', '".join(e.value for e in Entity)
+    _status_values = "', '".join(s.value for s in TransactionStatus)
+    _direction_values = "', '".join(d.value for d in Direction)
+    _tax_category_values = "', '".join(c.value for c in TaxCategory)
+
+    __table_args__ = (
+        CheckConstraint(
+            f"entity IN ('{_entity_values}') OR entity IS NULL",
+            name="ck_transaction_entity",
+        ),
+        CheckConstraint(
+            f"status IN ('{_status_values}')",
+            name="ck_transaction_status",
+        ),
+        CheckConstraint(
+            f"direction IN ('{_direction_values}') OR direction IS NULL",
+            name="ck_transaction_direction",
+        ),
+        CheckConstraint(
+            f"tax_category IN ('{_tax_category_values}') OR tax_category IS NULL",
+            name="ck_transaction_tax_category",
+        ),
+    )
 
     # ── Identity ──────────────────────────────────────────────────────────────
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -91,14 +116,14 @@ class Transaction(Base):
         default=None,
         comment="ISO 4217 code (GBP, EUR, etc.) when original amount is non-USD. None means USD.",
     )
-    amount_foreign: Mapped[float | None] = mapped_column(
-        Float,
+    amount_foreign: Mapped[Any] = mapped_column(
+        Numeric(precision=18, scale=6, asdecimal=True),
         nullable=True,
         default=None,
         comment="Original amount in foreign currency (always positive, sign on amount field)",
     )
-    exchange_rate: Mapped[float | None] = mapped_column(
-        Float,
+    exchange_rate: Mapped[Any] = mapped_column(
+        Numeric(precision=18, scale=8, asdecimal=True),
         nullable=True,
         default=None,
         comment="Exchange rate used: foreign_amount * rate = USD amount",

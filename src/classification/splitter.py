@@ -15,7 +15,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from sqlalchemy.orm import Session
 
@@ -151,8 +151,12 @@ def validate_split_amounts(
         raise SplitValidationError("At least one line item is required.")
 
     child_total = sum(item.amount for item in line_items)
-    # Round both to 2dp before comparing.
-    if round(child_total, 2) != round(parent_amount, 2):
+    # Quantize both to 2dp before comparing (avoids float rounding errors).
+    _two_places = Decimal("0.01")
+    if (
+        child_total.quantize(_two_places, rounding=ROUND_HALF_UP)
+        != parent_amount.quantize(_two_places, rounding=ROUND_HALF_UP)
+    ):
         raise SplitValidationError(
             f"Line item amounts ({child_total}) must sum to parent total "
             f"({parent_amount}). Difference: {abs(child_total - parent_amount)}."

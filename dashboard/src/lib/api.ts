@@ -14,9 +14,22 @@ import type {
 
 const BASE = '/api';
 
+/**
+ * Read the API key from the Vite public env var VITE_API_KEY.
+ * In local dev this is typically unset (auth disabled on the server).
+ * Set VITE_API_KEY in dashboard/.env.local to match the server's API_KEY.
+ */
+function getApiKeyHeader(): Record<string, string> {
+	const key =
+		typeof import.meta !== 'undefined' && import.meta.env
+			? (import.meta.env.VITE_API_KEY as string | undefined)
+			: undefined;
+	return key ? { 'X-Api-Key': key } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json', ...init?.headers },
+		headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
 		...init
 	});
 	if (!res.ok) {
@@ -241,6 +254,7 @@ export async function uploadIcal(
 
 	const res = await fetch(`${BASE}/invoices/ical-upload${qs ? `?${qs}` : ''}`, {
 		method: 'POST',
+		headers: getApiKeyHeader(),
 		body: formData
 	});
 	if (!res.ok) {
@@ -373,7 +387,7 @@ export async function patchVendorRule(id: string, data: VendorRulePatch): Promis
 }
 
 export async function deleteVendorRule(id: string): Promise<void> {
-	const res = await fetch(`${BASE}/vendor-rules/${id}`, { method: 'DELETE' });
+	const res = await fetch(`${BASE}/vendor-rules/${id}`, { method: 'DELETE', headers: getApiKeyHeader() });
 	if (!res.ok && res.status !== 204) {
 		const text = await res.text().catch(() => res.statusText);
 		throw new Error(`API ${res.status}: ${text}`);
@@ -541,7 +555,7 @@ export async function downloadExport(
 	filename: string
 ): Promise<void> {
 	const url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
-	const res = await fetch(url);
+	const res = await fetch(url, { headers: getApiKeyHeader() });
 	if (!res.ok) {
 		const text = await res.text().catch(() => res.statusText);
 		throw new Error(`Export failed (${res.status}): ${text}`);
@@ -622,7 +636,7 @@ export async function fetchAggregations(params: {
 	if (params.entity) qs.set('entity', params.entity);
 	if (params.date_from) qs.set('date_from', params.date_from);
 	if (params.date_to) qs.set('date_to', params.date_to);
-	const res = await fetch(`${BASE}/transactions/aggregations?${qs}`);
+	const res = await fetch(`${BASE}/transactions/aggregations?${qs}`, { headers: getApiKeyHeader() });
 	if (!res.ok) throw new Error(`Aggregations failed: ${res.status}`);
 	return res.json();
 }

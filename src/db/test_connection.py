@@ -3,13 +3,17 @@
 REQ-ID: DB-007 (init_db creates all 5 tables; WAL mode enabled)
 """
 
+from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from sqlalchemy import inspect, text
 from sqlalchemy.orm import sessionmaker
 
 from src.db.connection import _build_engine, init_db
 from src.models.base import Base
+from src.models.transaction import Transaction
+from src.utils.dedup import compute_source_hash
 
 
 class TestInitDb:
@@ -71,3 +75,60 @@ class TestSessionFactory:
         with SessionCls() as s:
             result = s.execute(text("SELECT 1")).scalar()
         assert result == 1
+
+
+class TestPreventTransactionDelete:
+    """S1-007: DB-level trigger prevents DELETE on transactions."""
+
+    def test_delete_raises_abort(self, tmp_path: Path) -> None:
+        """Attempting to DELETE a transaction row raises an error."""
+        url = f"sqlite:///{tmp_path / 'accounting.db'}"
+        eng = _build_engine(url)
+        init_db(url)
+        SessionCls = sessionmaker(bind=eng)
+
+        with SessionCls() as s:
+            tx = Transaction(
+                source="bank_csv",
+                source_id="test-delete-trigger",
+                source_hash=compute_source_hash("bank_csv", "test-delete-trigger"),
+                date="2025-01-01",
+                description="Test transaction",
+                amount=Decimal("100.00"),
+                raw_data={},
+            )
+            s.add(tx)
+            s.commit()
+            tx_id = tx.id
+
+        # The trigger must fire and prevent the DELETE.
+        with SessionCls() as s:
+            with pytest.raises(Exception, match="cannot be deleted"):
+                s.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": tx_id})
+                s.commit()
+
+    def test_update_and_insert_still_work(self, tmp_path: Path) -> None:
+        """The trigger does not affect INSERT or UPDATE operations."""
+        url = f"sqlite:///{tmp_path / 'accounting.db'}"
+        eng = _build_engine(url)
+        init_db(url)
+        SessionCls = sessionmaker(bind=eng)
+
+        with SessionCls() as s:
+            tx = Transaction(
+                source="bank_csv",
+                source_id="test-no-side-effects",
+                source_hash=compute_source_hash("bank_csv", "test-no-side-effects"),
+                date="2025-01-01",
+                description="Original description",
+                amount=Decimal("50.00"),
+                raw_data={},
+            )
+            s.add(tx)
+            s.commit()
+
+            tx.description = "Updated description"
+            s.commit()
+
+            updated = s.query(Transaction).filter_by(id=tx.id).one()
+            assert updated.description == "Updated description"

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -21,8 +22,11 @@ import anthropic
 
 from src.classification.engine import ClassificationResult
 from src.models.enums import Direction, Entity, TaxCategory
+from src.models.llm_usage import LLMUsageLog, estimate_cost_for_model
 
 if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
     from src.models.transaction import Transaction
 
 logger = logging.getLogger(__name__)
@@ -86,6 +90,7 @@ def llm_classify(
     *,
     api_key: str | None = None,
     _client: anthropic.Anthropic | None = None,
+    _session: Session | None = None,
 ) -> ClassificationResult:
     """Classify *transaction* using Claude.
 
@@ -95,6 +100,11 @@ def llm_classify(
             ``ANTHROPIC_API_KEY`` environment variable.
         _client: Inject a pre-built (or mock) Anthropic client. When set,
             *api_key* is ignored. Intended for unit tests.
+        _session: Optional SQLAlchemy session. When provided, an
+            :class:`~src.models.llm_usage.LLMUsageLog` row is written after
+            every successful API call so the health dashboard can show real
+            cost data. The caller retains ownership of the session (commit /
+            rollback / close are not managed here).
 
     Returns:
         A :class:`ClassificationResult` with ``tier_used=3``. On API or parse
@@ -121,12 +131,23 @@ def llm_classify(
     )
 
     try:
+        t0 = time.monotonic()
         response = client.messages.create(
             model=_MODEL,
             max_tokens=_MAX_TOKENS,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        # ── Write LLM usage log ─────────────────────────────────────────────
+        _write_usage_log(
+            session=_session,
+            response=response,
+            duration_ms=duration_ms,
+            transaction_id=getattr(transaction, "id", None),
+        )
+
         first_block = response.content[0]
         # Accept TextBlock; other block types (ToolUseBlock, etc.) are unexpected.
         raw_text_val: str | None = getattr(first_block, "text", None)
@@ -145,6 +166,50 @@ def llm_classify(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _write_usage_log(
+    *,
+    session: Session | None,
+    response: Any,
+    duration_ms: int,
+    transaction_id: str | None,
+) -> None:
+    """Persist an :class:`LLMUsageLog` row for *response*.
+
+    Silently skips if *session* is ``None``. Any DB error is logged but not
+    re-raised — usage logging must never interrupt the classification pipeline.
+    """
+    if session is None:
+        return
+    try:
+        _raw_model = getattr(response, "model", _MODEL)
+        model_name: str = str(_raw_model) if isinstance(_raw_model, str) else _MODEL
+        usage = getattr(response, "usage", None)
+        input_tokens: int = int(getattr(usage, "input_tokens", 0))
+        output_tokens: int = int(getattr(usage, "output_tokens", 0))
+        cost = estimate_cost_for_model(model_name, input_tokens, output_tokens)
+
+        log_entry = LLMUsageLog(
+            model=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_estimate=cost,
+            duration_ms=duration_ms,
+            transaction_id=transaction_id,
+        )
+        session.add(log_entry)
+        session.flush()
+        logger.debug(
+            "LLMUsageLog written: model=%s in=%d out=%d cost=$%.6f duration=%dms",
+            model_name,
+            input_tokens,
+            output_tokens,
+            cost,
+            duration_ms,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to write LLMUsageLog: %s", exc)
 
 
 def _parse_response(raw_text: str) -> ClassificationResult:

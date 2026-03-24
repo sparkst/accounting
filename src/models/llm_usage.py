@@ -8,7 +8,20 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import Base
 
-# Cost per million tokens (Claude Sonnet pricing)
+# Cost per million tokens, keyed by model name prefix.
+# Haiku: $0.25/1M input, $1.25/1M output
+# Sonnet: $3/1M input, $15/1M output
+_PRICING: dict[str, tuple[float, float]] = {
+    "claude-3-5-haiku": (0.25, 1.25),
+    "claude-3-haiku": (0.25, 1.25),
+    "claude-3-5-sonnet": (3.0, 15.0),
+    "claude-3-sonnet": (3.0, 15.0),
+    "claude-3-opus": (15.0, 75.0),
+}
+# Fallback if model name doesn't match any prefix (use Sonnet pricing).
+_DEFAULT_PRICING: tuple[float, float] = (3.0, 15.0)
+
+# Legacy Sonnet pricing kept for the public helper used by tests.
 _INPUT_COST_PER_M = 3.0   # $3.00 / 1M input tokens
 _OUTPUT_COST_PER_M = 15.0  # $15.00 / 1M output tokens
 
@@ -27,6 +40,25 @@ def estimate_cost(input_tokens: int, output_tokens: int) -> float:
     Uses Claude Sonnet pricing: $3/1M input tokens, $15/1M output tokens.
     """
     return (input_tokens * _INPUT_COST_PER_M + output_tokens * _OUTPUT_COST_PER_M) / 1_000_000
+
+
+def estimate_cost_for_model(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Return estimated USD cost using per-model pricing.
+
+    Looks up pricing by matching *model* against known prefixes. Falls back to
+    Sonnet pricing for unknown models.
+
+    Pricing (per million tokens):
+    - Haiku:  $0.25 input / $1.25 output
+    - Sonnet: $3.00 input / $15.00 output
+    - Opus:   $15.00 input / $75.00 output
+    """
+    input_per_m, output_per_m = _DEFAULT_PRICING
+    for prefix, pricing in _PRICING.items():
+        if model.startswith(prefix):
+            input_per_m, output_per_m = pricing
+            break
+    return (input_tokens * input_per_m + output_tokens * output_per_m) / 1_000_000
 
 
 class LLMUsageLog(Base):
@@ -55,6 +87,14 @@ class LLMUsageLog(Base):
         String(64),
         nullable=False,
         comment="Claude model ID e.g. claude-3-5-haiku-20241022",
+    )
+
+    # ── Linked transaction (optional) ─────────────────────────────────────────
+    transaction_id: Mapped[str | None] = mapped_column(
+        String(36),
+        nullable=True,
+        index=True,
+        comment="UUID of the Transaction that triggered this API call, if known",
     )
 
     # ── Usage ─────────────────────────────────────────────────────────────────

@@ -112,3 +112,20 @@ def init_db(database_url: str | None = None) -> None:
         if result != "wal":
             conn.execute(text("PRAGMA journal_mode=WAL"))
             conn.commit()
+
+    # Enforce "never delete transactions" rule at the DB level.
+    # S1-007: A BEFORE DELETE trigger raises ABORT so no DELETE on the
+    # transactions table can succeed — callers must use status=rejected instead.
+    with target_engine.connect() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS prevent_transaction_delete
+                BEFORE DELETE ON transactions
+                BEGIN
+                    SELECT RAISE(ABORT, 'Transactions cannot be deleted. Use status=rejected instead.');
+                END;
+                """
+            )
+        )
+        conn.commit()

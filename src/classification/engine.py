@@ -99,7 +99,7 @@ def classify(
         return tier2
 
     # ── Tier 3: LLM classification ──────────────────────────────────────────
-    tier3 = _llm_mod.llm_classify(transaction, api_key=anthropic_api_key)
+    tier3 = _llm_mod.llm_classify(transaction, api_key=anthropic_api_key, _session=session)
     if tier3.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier3.tier_used = 3
         tier3.status = TransactionStatus.AUTO_CLASSIFIED

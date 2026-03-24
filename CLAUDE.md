@@ -28,6 +28,12 @@ mypy src/
 # Run a single test
 pytest src/adapters/test_gmail_n8n.py -v
 
+# Alembic migrations
+alembic current                                         # show current DB revision
+alembic upgrade head                                    # apply all pending migrations
+alembic revision --autogenerate -m "describe change"   # generate migration from model changes
+alembic downgrade -1                                    # roll back one migration
+
 # API server
 uvicorn src.api.main:app --reload --port 8000
 
@@ -99,3 +105,40 @@ data/                — SQLite DB, CSV drop zone (GITIGNORED)
 
 
 Tax categories, data source details, data model, and adapter specs are all in the design spec — read it when working on those areas.
+
+---
+
+## Amount Sign Convention
+
+**DB convention: expenses are negative, income is positive.**
+
+| Direction | DB amount | Example |
+|---|---|---|
+| `income` | positive | `+5000.00` (Stripe charge, invoice payment) |
+| `expense` | negative | `-238.03` (Gmail receipt, bank debit, Stripe refund) |
+| `reimbursable` | negative | `-500.00` (expense pending reimbursement) |
+| `transfer` | positive | `+4800.00` (Stripe payout — not P&L) |
+| bank credit | positive | `+3000.00` (bank CSV credit column) |
+| bank debit | negative | `-120.00` (bank CSV debit column) |
+
+### Adapter behavior
+
+- **Gmail (`gmail_n8n.py`)**: Always stores `signed_amount = -abs(amount)`. Amounts extracted from receipt bodies are always positive numbers (what was charged), so they are negated on store. Income classification is applied later by the classifier — the adapter itself treats every receipt as an expense.
+- **Stripe (`stripe_adapter.py`)**: Charges and payouts stored as positive (income/transfer). Refunds explicitly stored as `-abs(amount)` (negative = expense outflow).
+- **Bank CSV (`bank_csv.py`)**: Single signed-amount column passes through as-is (positive = credit/income, negative = debit/expense). Debit/credit split columns: debit → `-abs(debit_val)`, credit → `+abs(credit_val)`.
+
+### API sign-flipping
+
+- **`TransactionOut.fix_income_sign` (transactions.py line 116–127)**: At the response layer, if `direction == "income"` and `amount < 0`, the amount is flipped to `abs(amount)`. This corrects Gmail income transactions that were stored negative before classification set direction=income. The DB is NOT modified — only the JSON response.
+- **`income_total` / `expense_total` in list response (transactions.py line 477–494)**: Aggregation always uses `func.abs(amount)`, then `expense_total` is returned as `-raw_expense` (negative). Frontend receives a signed pair: positive income, negative expenses.
+- **Tax summary / export (`tax_export.py`)**: Uses `abs(amt) * deductible_pct` everywhere — sign is irrelevant to the calculation because direction is used to classify income vs expense, not the amount sign.
+
+### Frontend behavior
+
+- **`formatAmount(amount)` (categories.ts)**: Positive → `$X`, Negative → `(X)` (parenthetical). The `amountClass` helper colors positives green, negatives red.
+- **`TransactionCard`**: Displays `formatCurrency(transaction.amount)` verbatim (no sign flip). The API's `fix_income_sign` ensures income arrives positive. Expense editing stores negative on save: `amountSign === 'expense' ? -parsed : parsed`.
+- **Financials page**: Receives `gross_income` (positive), `total_expenses` (positive from API), `net_profit` from tax-summary endpoint. The `operatingExpenses` derived value calls `Math.abs(totalExpenses)` as a safety measure.
+
+### No bugs found
+
+The convention is consistent end-to-end. The one place that could cause confusion — Gmail income stored negative before classification — is correctly handled by `fix_income_sign` at the API response layer. Tax-summary aggregation is immune because it uses `abs()` throughout and relies on `direction` for income/expense categorisation.

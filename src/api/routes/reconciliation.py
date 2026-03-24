@@ -303,36 +303,3 @@ def unlink_match(
         transaction_b=_slim(txn_b),
         message=f"Unlinked {txn_a.id[:8]} ↔ {txn_b.id[:8]}",
     )
-
-
-@router.post("/unlink", response_model=UnlinkResult)
-def unlink_match(
-    body: UnlinkRequest,
-    db: Session = Depends(get_db),  # noqa: B008
-) -> UnlinkResult:
-    """Remove the reconciliation link between two matched transactions.
-
-    Strips the ``reconciled:<other_id>`` note from both transactions atomically.
-    Returns 404 if either transaction is not found or if they are not currently
-    linked to each other.
-
-    Args:
-        body: ``{ transaction_id_a, transaction_id_b }``
-
-    Returns:
-        Both updated transactions plus a confirmation message.
-    """
-    try:
-        txn_a, txn_b = remove_manual_match(db, body.transaction_id_a, body.transaction_id_b)
-        db.commit()
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Unlink match failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return UnlinkResult(
-        transaction_a=_slim(txn_a),
-        transaction_b=_slim(txn_b),
-        message=f"Unlinked {txn_a.id[:8]} ↔ {txn_b.id[:8]}",
-    )

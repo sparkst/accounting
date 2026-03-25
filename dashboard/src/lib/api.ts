@@ -186,6 +186,53 @@ export async function splitTransaction(id: string, lineItems: SplitLineItem[]): 
 	});
 }
 
+export interface UploadReceiptResult {
+	path: string;
+	filename: string;
+	attachments: string[];
+}
+
+export async function uploadReceipt(
+	transactionId: string,
+	file: File,
+	onProgress?: (pct: number) => void
+): Promise<UploadReceiptResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		const apiKey =
+			typeof import.meta !== 'undefined' && import.meta.env
+				? (import.meta.env.VITE_API_KEY as string | undefined)
+				: undefined;
+
+		xhr.open('POST', `${BASE}/transactions/${transactionId}/upload-receipt`);
+		if (apiKey) xhr.setRequestHeader('X-Api-Key', apiKey);
+
+		if (onProgress) {
+			xhr.upload.onprogress = (e) => {
+				if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+			};
+		}
+
+		xhr.onload = () => {
+			if (xhr.status >= 200 && xhr.status < 300) {
+				resolve(JSON.parse(xhr.responseText) as UploadReceiptResult);
+			} else {
+				let detail = xhr.statusText;
+				try {
+					detail = JSON.parse(xhr.responseText)?.detail ?? detail;
+				} catch { /* ignore */ }
+				reject(new Error(`Upload failed (${xhr.status}): ${detail}`));
+			}
+		};
+
+		xhr.onerror = () => reject(new Error('Network error during upload'));
+		xhr.send(formData);
+	});
+}
+
 export async function bulkConfirmTransactions(
 	ids: string[],
 	entity: string,
@@ -673,4 +720,111 @@ export async function fetchAggregations(params: {
 	const res = await fetch(`${BASE}/transactions/aggregations?${qs}`, { headers: getApiKeyHeader() });
 	if (!res.ok) throw new Error(`Aggregations failed: ${res.status}`);
 	return res.json();
+}
+
+// ── Import API ────────────────────────────────────────────────────────────────
+
+export interface BankCsvConfig {
+	bank_name: string;
+	label: string;
+	date_col: string;
+	amount_col: string;
+	description_col: string;
+	entity: string | null;
+}
+
+export interface BankCsvPreviewRow {
+	[key: string]: string;
+}
+
+export interface BankCsvPreview {
+	bank_name: string | null;
+	headers: string[];
+	sample_rows: BankCsvPreviewRow[];
+	row_count: number;
+	detected_config: BankCsvConfig | null;
+}
+
+export interface BankCsvCommitResult {
+	created: number;
+	skipped: number;
+	errors: string[];
+}
+
+export interface BrokerageCsvResult {
+	created: number;
+	skipped: number;
+	errors: string[];
+}
+
+/** Fetch saved bank CSV configs from the server. */
+export async function fetchBankCsvConfigs(): Promise<BankCsvConfig[]> {
+	return request<BankCsvConfig[]>('/import/bank-csv/configs');
+}
+
+/**
+ * Upload a bank CSV for preview. Returns detected headers, sample rows,
+ * and auto-detected config if the bank was recognized.
+ */
+export async function previewBankCsv(
+	file: File,
+	bankName?: string
+): Promise<BankCsvPreview> {
+	const formData = new FormData();
+	formData.append('file', file);
+	if (bankName) formData.append('bank_name', bankName);
+
+	const res = await fetch(`${BASE}/import/bank-csv/preview`, {
+		method: 'POST',
+		headers: getApiKeyHeader(),
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Preview failed (${res.status}): ${text}`);
+	}
+	return res.json() as Promise<BankCsvPreview>;
+}
+
+/**
+ * Commit a bank CSV import. Sends the file plus selected bank name,
+ * and returns counts of created/skipped/errors.
+ */
+export async function commitBankCsv(
+	file: File,
+	bankName: string
+): Promise<BankCsvCommitResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+	formData.append('bank_name', bankName);
+
+	const res = await fetch(`${BASE}/import/bank-csv/commit`, {
+		method: 'POST',
+		headers: getApiKeyHeader(),
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Import failed (${res.status}): ${text}`);
+	}
+	return res.json() as Promise<BankCsvCommitResult>;
+}
+
+/**
+ * Import a brokerage CSV. Returns counts of created/skipped/errors.
+ */
+export async function importBrokerageCsv(file: File): Promise<BrokerageCsvResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+
+	const res = await fetch(`${BASE}/import/brokerage-csv`, {
+		method: 'POST',
+		headers: getApiKeyHeader(),
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Import failed (${res.status}): ${text}`);
+	}
+	return res.json() as Promise<BrokerageCsvResult>;
 }

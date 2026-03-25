@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { Transaction, Entity, TaxCategory, Direction, TransactionUpdate } from '$lib/types';
-	import { updateTransaction, confirmTransaction, extractReceipt, splitTransaction } from '$lib/api';
+	import { updateTransaction, confirmTransaction, extractReceipt, splitTransaction, uploadReceipt } from '$lib/api';
 	import type { SplitLineItem } from '$lib/api';
 	import { BUSINESS_CATEGORIES, PERSONAL_CATEGORIES, SUBCATEGORIES, entityBadgeClass } from '$lib/categories';
 
@@ -37,6 +37,41 @@
 	let notes = $state(transaction.notes ?? '');
 	let extracting = $state(false);
 	let pdfViewPath = $state<string | null>(null);
+
+	// ── Receipt upload ────────────────────────────────────────────────────────
+	let uploadInput = $state<HTMLInputElement | null>(null);
+	let uploading = $state(false);
+	let uploadProgress = $state(0);
+	let uploadError = $state('');
+	let uploadSuccess = $state(false);
+
+	async function handleFileSelected(e: Event) {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+
+		uploading = true;
+		uploadProgress = 0;
+		uploadError = '';
+		uploadSuccess = false;
+
+		try {
+			const result = await uploadReceipt(transaction.id, file, (pct) => {
+				uploadProgress = pct;
+			});
+			// Reflect updated attachments on the card without a full reload
+			transaction = { ...transaction, attachments: result.attachments };
+			uploadSuccess = true;
+			// Show success briefly, then reset
+			setTimeout(() => { uploadSuccess = false; }, 2500);
+		} catch (err) {
+			uploadError = err instanceof Error ? err.message : 'Upload failed';
+		} finally {
+			uploading = false;
+			// Reset the file input so the same file can be re-selected if needed
+			input.value = '';
+		}
+	}
 
 	// ── Split panel ──────────────────────────────────────────────────────────
 	let splitOpen = $state(false);
@@ -641,6 +676,83 @@
 				{extracting ? 'Extracting…' : 'Extract'}
 			</button>
 		{/if}
+
+		<!-- Receipt upload -->
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div class="receipt-upload-wrap" onclick={(e) => e.stopPropagation()}>
+			{#if !transaction.attachments || transaction.attachments.length === 0}
+				<button
+					class="btn btn-ghost attach-btn"
+					type="button"
+					onclick={() => uploadInput?.click()}
+					disabled={uploading}
+					title="Attach a receipt (image or PDF)"
+				>
+					{#if uploading}
+						<span class="upload-spinner" aria-hidden="true"></span>
+						{uploadProgress > 0 ? `${uploadProgress}%` : 'Uploading…'}
+					{:else if uploadSuccess}
+						<span class="upload-tick">&#10003;</span> Attached
+					{:else}
+						<svg class="attach-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+							<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+						</svg>
+						Attach Receipt
+					{/if}
+				</button>
+			{:else}
+				<!-- Has attachments: show thumbnails + re-attach button -->
+				<div class="receipt-thumbs">
+					{#each (transaction.attachments ?? []) as path (path)}
+						{#if isImage(path)}
+							<a href={attachmentUrl(path)} target="_blank" rel="noopener" title={filenameFromPath(path)}>
+								<img
+									src={attachmentUrl(path)}
+									alt={filenameFromPath(path)}
+									class="receipt-thumb"
+									loading="lazy"
+								/>
+							</a>
+						{:else if isPdf(path)}
+							<a href={attachmentUrl(path)} target="_blank" rel="noopener" title={filenameFromPath(path)} class="receipt-thumb-pdf">
+								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+								<span class="thumb-pdf-name">{filenameFromPath(path)}</span>
+							</a>
+						{/if}
+					{/each}
+					<button
+						class="btn btn-ghost attach-btn attach-btn-small"
+						type="button"
+						onclick={() => uploadInput?.click()}
+						disabled={uploading}
+						title="Attach another receipt"
+					>
+						{#if uploading}
+							<span class="upload-spinner" aria-hidden="true"></span>
+							{uploadProgress > 0 ? `${uploadProgress}%` : '…'}
+						{:else if uploadSuccess}
+							<span class="upload-tick">&#10003;</span>
+						{:else}
+							+
+						{/if}
+					</button>
+				</div>
+			{/if}
+			{#if uploadError}
+				<p class="upload-error">{uploadError}</p>
+			{/if}
+			<input
+				bind:this={uploadInput}
+				type="file"
+				accept="image/*,application/pdf"
+				class="upload-file-input"
+				onchange={handleFileSelected}
+				aria-label="Upload receipt file"
+				tabindex="-1"
+			/>
+		</div>
+
 		<button
 			class="btn btn-primary confirm-btn"
 			type="button"
@@ -1502,5 +1614,113 @@
 		max-height: 400px;
 		overflow-y: auto;
 		margin: 0;
+	}
+
+	/* ── Receipt upload ───────────────────────────────────────────────────── */
+	.receipt-upload-wrap {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.upload-file-input {
+		display: none;
+	}
+
+	.attach-btn {
+		font-size: .78rem;
+		padding: 4px 10px;
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		color: var(--gray-600);
+		white-space: nowrap;
+	}
+
+	.attach-btn-small {
+		padding: 2px 7px;
+		font-size: .75rem;
+	}
+
+	.attach-icon {
+		flex-shrink: 0;
+	}
+
+	.upload-spinner {
+		display: inline-block;
+		width: 10px;
+		height: 10px;
+		border: 2px solid var(--gray-300);
+		border-top-color: var(--gray-600);
+		border-radius: 50%;
+		animation: spin .7s linear infinite;
+		flex-shrink: 0;
+	}
+
+	@keyframes spin {
+		to { transform: rotate(360deg); }
+	}
+
+	.upload-tick {
+		color: var(--green-600);
+		font-weight: 700;
+	}
+
+	.upload-error {
+		font-size: .72rem;
+		color: var(--red-600);
+		margin: 0;
+	}
+
+	.receipt-thumbs {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		flex-wrap: wrap;
+	}
+
+	.receipt-thumb {
+		width: 36px;
+		height: 36px;
+		object-fit: cover;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
+		display: block;
+		background: var(--gray-50);
+		cursor: pointer;
+		transition: opacity .12s;
+	}
+
+	.receipt-thumb:hover {
+		opacity: .8;
+	}
+
+	.receipt-thumb-pdf {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		font-size: .7rem;
+		font-family: var(--font-mono);
+		color: var(--gray-600);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		padding: 4px 7px;
+		background: var(--gray-50);
+		text-decoration: none;
+		max-width: 120px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.receipt-thumb-pdf:hover {
+		background: var(--gray-100);
+		color: var(--text);
+	}
+
+	.thumb-pdf-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 </style>

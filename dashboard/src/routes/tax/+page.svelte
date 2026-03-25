@@ -339,6 +339,86 @@
 	}
 
 	onMount(() => { load(); });
+
+	// ── S3-010: Home Office Deduction ─────────────────────────────────────────
+	type HomeOfficeMethod = 'simplified' | 'actual';
+	const HOME_OFFICE_SIMPLIFIED_RATE    = 5;   // $5 per sq ft (IRS simplified method)
+	const HOME_OFFICE_SIMPLIFIED_MAX_SQFT = 300; // IRS maximum for simplified method
+
+	let homeOfficeOpen     = $state(false);
+	let hoSqft             = $state('');
+	let hoMethod           = $state<HomeOfficeMethod>('simplified');
+	// Actual method: percentage of home used for business (for each expense type)
+	let hoRentPct          = $state('');
+	let hoUtilitiesPct     = $state('');
+	let hoInternetPct      = $state('');
+
+	interface HomeOfficeStorage {
+		sqft: string;
+		method: HomeOfficeMethod;
+		rentPct: string;
+		utilitiesPct: string;
+		internetPct: string;
+	}
+
+	function hoStorageKey(): string {
+		return `home-office-${selectedEntity}-${selectedYear}`;
+	}
+
+	function loadHomeOffice(): void {
+		if (typeof localStorage === 'undefined') return;
+		try {
+			const raw = localStorage.getItem(hoStorageKey());
+			if (!raw) return;
+			const data = JSON.parse(raw) as HomeOfficeStorage;
+			hoSqft         = data.sqft         ?? '';
+			hoMethod       = data.method       ?? 'simplified';
+			hoRentPct      = data.rentPct      ?? '';
+			hoUtilitiesPct = data.utilitiesPct ?? '';
+			hoInternetPct  = data.internetPct  ?? '';
+		} catch {
+			// ignore parse errors
+		}
+	}
+
+	function saveHomeOffice(): void {
+		if (typeof localStorage === 'undefined') return;
+		const data: HomeOfficeStorage = {
+			sqft:         hoSqft,
+			method:       hoMethod,
+			rentPct:      hoRentPct,
+			utilitiesPct: hoUtilitiesPct,
+			internetPct:  hoInternetPct,
+		};
+		localStorage.setItem(hoStorageKey(), JSON.stringify(data));
+	}
+
+	// Reload persisted inputs when entity or year changes
+	$effect(() => {
+		void selectedEntity;
+		void selectedYear;
+		loadHomeOffice();
+	});
+
+	// Persist on any input change
+	$effect(() => {
+		void hoSqft; void hoMethod; void hoRentPct; void hoUtilitiesPct; void hoInternetPct;
+		saveHomeOffice();
+	});
+
+	// Simplified method deduction (null if no valid sqft entered)
+	let hoSimplifiedDeduction = $derived.by((): number | null => {
+		const sqft = parseFloat(hoSqft);
+		if (isNaN(sqft) || sqft <= 0) return null;
+		const effective = Math.min(sqft, HOME_OFFICE_SIMPLIFIED_MAX_SQFT);
+		return effective * HOME_OFFICE_SIMPLIFIED_RATE;
+	});
+
+	// Parsed actual-method percentages (as decimals), or null if not entered
+	let hoActualRentPct      = $derived(parseFloat(hoRentPct)      || 0);
+	let hoActualUtilitiesPct = $derived(parseFloat(hoUtilitiesPct) || 0);
+	let hoActualInternetPct  = $derived(parseFloat(hoInternetPct)  || 0);
+	let hoActualAnyEntered   = $derived(hoRentPct !== '' || hoUtilitiesPct !== '' || hoInternetPct !== '');
 </script>
 
 <!-- ── Page ──────────────────────────────────────────────────────────────────── -->
@@ -1082,6 +1162,159 @@
 				</div>
 			</section>
 		{/if}
+
+		<!-- ── Home Office Deduction ──────────────────────────────────────────── -->
+		<section class="dashboard-section no-print" id="home-office">
+			<button
+				class="ho-toggle"
+				onclick={() => (homeOfficeOpen = !homeOfficeOpen)}
+				aria-expanded={homeOfficeOpen}
+			>
+				<span class="ho-toggle-text">Home Office Deduction</span>
+				<span class="chevron" class:chevron-open={homeOfficeOpen} aria-hidden="true">&#x25B8;</span>
+			</button>
+
+			{#if homeOfficeOpen}
+				<div class="card ho-card">
+					<!-- Method selector -->
+					<div class="ho-method-row">
+						<span class="ho-field-label">Method</span>
+						<div class="ho-method-tabs" role="group" aria-label="Deduction method">
+							<button
+								class="ho-method-tab"
+								class:ho-method-tab-active={hoMethod === 'simplified'}
+								onclick={() => (hoMethod = 'simplified')}
+								aria-pressed={hoMethod === 'simplified'}
+							>Simplified</button>
+							<button
+								class="ho-method-tab"
+								class:ho-method-tab-active={hoMethod === 'actual'}
+								onclick={() => (hoMethod = 'actual')}
+								aria-pressed={hoMethod === 'actual'}
+							>Actual</button>
+						</div>
+					</div>
+
+					<!-- Square footage (both methods) -->
+					<div class="ho-field-row">
+						<label class="ho-field-label" for="ho-sqft">Office sq ft</label>
+						<div class="ho-input-wrap">
+							<input
+								id="ho-sqft"
+								type="number"
+								min="1"
+								step="1"
+								class="ho-input"
+								bind:value={hoSqft}
+								placeholder="e.g. 100"
+								aria-describedby="ho-sqft-hint"
+							/>
+							<span class="ho-input-unit">sq ft</span>
+						</div>
+						{#if hoMethod === 'simplified'}
+							<p id="ho-sqft-hint" class="ho-hint">
+								IRS simplified method: ${HOME_OFFICE_SIMPLIFIED_RATE}/sq ft, up to {HOME_OFFICE_SIMPLIFIED_MAX_SQFT} sq ft max (${ HOME_OFFICE_SIMPLIFIED_RATE * HOME_OFFICE_SIMPLIFIED_MAX_SQFT } max deduction).
+							</p>
+						{:else}
+							<p id="ho-sqft-hint" class="ho-hint">
+								Used to calculate the business-use percentage of your home. Enter actual expense amounts below.
+							</p>
+						{/if}
+					</div>
+
+					{#if hoMethod === 'simplified'}
+						<!-- Simplified result -->
+						<div class="ho-result-row">
+							<span class="ho-result-label">Estimated Deduction</span>
+							{#if hoSimplifiedDeduction !== null}
+								<span class="ho-result-amount">
+									{fmtCurrency(hoSimplifiedDeduction)}
+									{#if parseFloat(hoSqft) > HOME_OFFICE_SIMPLIFIED_MAX_SQFT}
+										<span class="ho-result-note">(capped at {HOME_OFFICE_SIMPLIFIED_MAX_SQFT} sq ft)</span>
+									{/if}
+								</span>
+							{:else}
+								<span class="ho-result-placeholder">Enter sq ft above</span>
+							{/if}
+						</div>
+					{:else}
+						<!-- Actual method: percentage inputs -->
+						<div class="ho-field-row">
+							<label class="ho-field-label" for="ho-rent-pct">Rent / mortgage %</label>
+							<div class="ho-input-wrap">
+								<input
+									id="ho-rent-pct"
+									type="number"
+									min="0"
+									max="100"
+									step="0.1"
+									class="ho-input ho-input-sm"
+									bind:value={hoRentPct}
+									placeholder="0"
+								/>
+								<span class="ho-input-unit">%</span>
+							</div>
+						</div>
+						<div class="ho-field-row">
+							<label class="ho-field-label" for="ho-utilities-pct">Utilities %</label>
+							<div class="ho-input-wrap">
+								<input
+									id="ho-utilities-pct"
+									type="number"
+									min="0"
+									max="100"
+									step="0.1"
+									class="ho-input ho-input-sm"
+									bind:value={hoUtilitiesPct}
+									placeholder="0"
+								/>
+								<span class="ho-input-unit">%</span>
+							</div>
+						</div>
+						<div class="ho-field-row">
+							<label class="ho-field-label" for="ho-internet-pct">Internet %</label>
+							<div class="ho-input-wrap">
+								<input
+									id="ho-internet-pct"
+									type="number"
+									min="0"
+									max="100"
+									step="0.1"
+									class="ho-input ho-input-sm"
+									bind:value={hoInternetPct}
+									placeholder="0"
+								/>
+								<span class="ho-input-unit">%</span>
+							</div>
+						</div>
+
+						{#if hoActualAnyEntered}
+							<div class="ho-actual-summary">
+								<p class="ho-actual-heading">Apply these percentages to your actual annual expenses:</p>
+								<ul class="ho-actual-list">
+									{#if hoRentPct !== ''}
+										<li>Rent/mortgage: multiply annual total by <strong>{hoActualRentPct}%</strong></li>
+									{/if}
+									{#if hoUtilitiesPct !== ''}
+										<li>Utilities: multiply annual total by <strong>{hoActualUtilitiesPct}%</strong></li>
+									{/if}
+									{#if hoInternetPct !== ''}
+										<li>Internet: multiply annual total by <strong>{hoActualInternetPct}%</strong></li>
+									{/if}
+								</ul>
+								<p class="ho-hint">Sum the results for your Form 8829 / Schedule C line 30 deduction amount.</p>
+							</div>
+						{/if}
+					{/if}
+
+					<p class="ho-tip-note">
+						Tip: for this home office ({#if hoSqft}{hoSqft} sq ft{:else}?? sq ft{/if}), the simplified deduction is
+						{#if hoSimplifiedDeduction !== null}{fmtCurrency(hoSimplifiedDeduction)}{:else}—{/if}.
+						Compare with your actual expenses to choose the larger deduction.
+					</p>
+				</div>
+			{/if}
+		</section>
 
 		<!-- ── Export buttons ─────────────────────────────────────────────────── -->
 		<section class="dashboard-section no-print">
@@ -2031,6 +2264,203 @@
 	.pay-log-footer {
 		border-top: 1px solid var(--border);
 		padding: 12px 14px;
+	}
+
+	/* ── Home Office Deduction ───────────────────────────────────────────────── */
+	.ho-toggle {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		width: 100%;
+		padding: 10px 0;
+		background: none;
+		border: none;
+		border-bottom: 1px solid var(--border);
+		font-family: var(--font);
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: var(--text);
+		cursor: pointer;
+		text-align: left;
+		margin-bottom: 0;
+	}
+
+	.ho-toggle:hover {
+		color: var(--text);
+		opacity: 0.8;
+	}
+
+	.ho-toggle-text {
+		flex: 1;
+	}
+
+	.ho-card {
+		padding: 20px 24px;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		margin-top: 12px;
+	}
+
+	.ho-method-row {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+	}
+
+	.ho-method-tabs {
+		display: flex;
+		gap: 4px;
+	}
+
+	.ho-method-tab {
+		padding: 4px 14px;
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		font-family: var(--font);
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		cursor: pointer;
+		transition: color 0.12s, background 0.12s, border-color 0.12s;
+	}
+
+	.ho-method-tab:hover {
+		color: var(--text);
+		background: var(--gray-100);
+	}
+
+	.ho-method-tab-active {
+		color: var(--text);
+		background: var(--gray-200);
+		border-color: var(--gray-300);
+	}
+
+	.ho-field-row {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	.ho-field-label {
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--text-muted);
+	}
+
+	.ho-input-wrap {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.ho-input {
+		width: 120px;
+		padding: 6px 10px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		font-family: var(--font);
+		font-size: 0.875rem;
+		background: var(--surface);
+		color: var(--text);
+	}
+
+	.ho-input-sm {
+		width: 90px;
+	}
+
+	.ho-input:focus {
+		outline: none;
+		border-color: var(--blue-500);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-500) 15%, transparent);
+	}
+
+	.ho-input-unit {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+	}
+
+	.ho-hint {
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+
+	.ho-result-row {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		padding: 14px 16px;
+		background: var(--gray-50);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+	}
+
+	.ho-result-label {
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: var(--text-muted);
+		flex: 1;
+	}
+
+	.ho-result-amount {
+		font-size: 1.25rem;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+		color: var(--green-600);
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+	}
+
+	.ho-result-note {
+		font-size: 0.75rem;
+		font-weight: 400;
+		color: var(--text-muted);
+	}
+
+	.ho-result-placeholder {
+		font-size: 0.85rem;
+		color: var(--text-muted);
+		font-style: italic;
+	}
+
+	.ho-actual-summary {
+		padding: 14px 16px;
+		background: var(--gray-50);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.ho-actual-heading {
+		font-size: 0.82rem;
+		font-weight: 600;
+		color: var(--text);
+	}
+
+	.ho-actual-list {
+		list-style: disc;
+		padding-left: 18px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.ho-actual-list li {
+		font-size: 0.82rem;
+		color: var(--text-muted);
+	}
+
+	.ho-tip-note {
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		border-top: 1px solid var(--border);
+		padding-top: 12px;
+		line-height: 1.5;
 	}
 
 	/* ── Print ───────────────────────────────────────────────────────────────── */

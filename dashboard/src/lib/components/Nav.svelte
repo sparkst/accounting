@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { fetchHealth, fetchInvoices } from '$lib/api';
 
@@ -12,6 +13,39 @@
 
 	// Mobile nav open/closed
 	let mobileOpen = $state(false);
+
+	// Global search
+	let searchQuery = $state('');
+	let searchExpanded = $state(false); // mobile: expand search field
+	let searchDebounce: ReturnType<typeof setTimeout> | null = null;
+
+	function commitSearch(q: string) {
+		const trimmed = q.trim();
+		if (!trimmed) return;
+		goto(`/register?search=${encodeURIComponent(trimmed)}`);
+		searchQuery = '';
+		searchExpanded = false;
+	}
+
+	function handleSearchKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter') {
+			if (searchDebounce) clearTimeout(searchDebounce);
+			commitSearch(searchQuery);
+		} else if (e.key === 'Escape') {
+			searchQuery = '';
+			searchExpanded = false;
+			(e.target as HTMLElement).blur();
+		}
+	}
+
+	function handleSearchInput(e: Event) {
+		const val = (e.target as HTMLInputElement).value;
+		searchQuery = val;
+		if (searchDebounce) clearTimeout(searchDebounce);
+		searchDebounce = setTimeout(() => {
+			if (searchQuery.trim().length >= 2) commitSearch(searchQuery);
+		}, 300);
+	}
 
 	onMount(() => {
 		// Restore dark mode preference
@@ -226,7 +260,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax'])}
+						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax', '/bno-filing'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'money'}
 						data-trigger="money"
@@ -312,6 +346,18 @@
 									Tax
 								</a>
 							</li>
+							<li role="none">
+								<a
+									href="/bno-filing"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/bno-filing') ? 'page' : undefined}
+									onclick={closeMobileMenu}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									B&amp;O Filing
+								</a>
+							</li>
 						</ul>
 					{/if}
 				</li>
@@ -320,7 +366,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation', '/monthly-close'])}
+						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation', '/monthly-close', '/annual-close', '/import'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'system'}
 						data-trigger="system"
@@ -384,11 +430,66 @@
 									Monthly Close
 								</a>
 							</li>
+							<li role="none">
+								<a
+									href="/annual-close"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/annual-close') ? 'page' : undefined}
+									onclick={closeGroup}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Annual Close
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/import"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/import') ? 'page' : undefined}
+									onclick={closeMobileMenu}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Import
+								</a>
+							</li>
 						</ul>
 					{/if}
 				</li>
 			</ul>
 		</nav>
+
+		<!-- Global search (desktop: always visible; mobile: expandable icon) -->
+		<div class="search-wrap" class:search-expanded={searchExpanded}>
+			<!-- Mobile search icon trigger (hidden on desktop) -->
+			<button
+				class="search-icon-btn"
+				aria-label="Search transactions"
+				onclick={() => { searchExpanded = true; }}
+			>
+				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+				</svg>
+			</button>
+			<!-- The actual input -->
+			<div class="search-field" aria-hidden={!searchExpanded ? 'true' : undefined}>
+				<svg class="search-input-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+				</svg>
+				<input
+					type="search"
+					class="search-input"
+					placeholder="Search transactions…"
+					value={searchQuery}
+					oninput={handleSearchInput}
+					onkeydown={handleSearchKeydown}
+					onblur={() => { if (!searchQuery.trim()) searchExpanded = false; }}
+					tabindex={searchExpanded ? 0 : -1}
+					aria-label="Search transactions"
+				/>
+			</div>
+		</div>
 
 		<!-- Mobile hamburger button -->
 		<button
@@ -791,6 +892,103 @@
 
 		.mobile-close-row {
 			display: none !important;
+		}
+	}
+
+	/* ── Global search ───────────────────────────────────────────────────────── */
+
+	.search-wrap {
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+	}
+
+	/* Desktop: always show the field, hide the icon-only trigger */
+	.search-icon-btn {
+		display: none;
+	}
+
+	.search-field {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+
+	.search-input-icon {
+		position: absolute;
+		left: 8px;
+		color: var(--text-muted);
+		pointer-events: none;
+	}
+
+	.search-input {
+		width: 200px;
+		padding: 5px 10px 5px 28px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--gray-50);
+		color: var(--text);
+		font-size: 0.8rem;
+		font-family: inherit;
+		transition: border-color 0.12s, width 0.2s;
+	}
+
+	.search-input::placeholder {
+		color: var(--gray-400);
+	}
+
+	.search-input:focus {
+		outline: none;
+		border-color: var(--blue-500);
+		background: var(--surface);
+		width: 240px;
+	}
+
+	/* Hide webkit search clear button */
+	.search-input::-webkit-search-cancel-button {
+		-webkit-appearance: none;
+	}
+
+	/* Mobile: show icon-only trigger; collapse field unless expanded */
+	@media (max-width: 768px) {
+		.search-icon-btn {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			width: 32px;
+			height: 32px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: transparent;
+			color: var(--text-muted);
+			cursor: pointer;
+			transition: color 0.12s, background 0.12s;
+		}
+
+		.search-icon-btn:hover {
+			color: var(--text);
+			background: var(--gray-100);
+		}
+
+		.search-field {
+			display: none;
+		}
+
+		/* When expanded, hide the icon trigger and show the field */
+		.search-wrap.search-expanded .search-icon-btn {
+			display: none;
+		}
+
+		.search-wrap.search-expanded .search-field {
+			display: flex;
+		}
+
+		.search-wrap.search-expanded .search-input {
+			width: 160px;
+		}
+
+		.search-wrap.search-expanded .search-input:focus {
+			width: 200px;
 		}
 	}
 </style>

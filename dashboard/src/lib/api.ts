@@ -27,16 +27,43 @@ function getApiKeyHeader(): Record<string, string> {
 	return key ? { 'X-Api-Key': key } : {};
 }
 
+/**
+ * Per-endpoint AbortController map. Rapid consecutive calls to the same path
+ * (e.g. fast filter changes in Register) abort the previous in-flight request
+ * so a slow stale response cannot overwrite a fresher one.
+ */
+const _controllers = new Map<string, AbortController>();
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
-		...init
-	});
-	if (!res.ok) {
-		const text = await res.text().catch(() => res.statusText);
-		throw new Error(`API ${res.status}: ${text}`);
+	// Derive a stable key from the path (strip query string for grouping by endpoint).
+	const [pathKey] = path.split('?');
+
+	// Abort any in-flight request for the same endpoint.
+	const previous = _controllers.get(pathKey);
+	if (previous) {
+		previous.abort();
 	}
-	return res.json() as Promise<T>;
+
+	const controller = new AbortController();
+	_controllers.set(pathKey, controller);
+
+	try {
+		const res = await fetch(`${BASE}${path}`, {
+			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
+			...init,
+			signal: controller.signal
+		});
+		if (!res.ok) {
+			const text = await res.text().catch(() => res.statusText);
+			throw new Error(`API ${res.status}: ${text}`);
+		}
+		return res.json() as Promise<T>;
+	} finally {
+		// Clean up the map entry once the request settles (success, error, or abort).
+		if (_controllers.get(pathKey) === controller) {
+			_controllers.delete(pathKey);
+		}
+	}
 }
 
 export interface TransactionFilters {
@@ -489,6 +516,12 @@ export interface EstimatedTax {
 	warning?: string;
 }
 
+export interface Tax1099Entry {
+	payer: string;
+	type: string | null;
+	total: number;
+}
+
 export interface TaxSummary {
 	entity: string;
 	year: number;
@@ -501,6 +534,7 @@ export interface TaxSummary {
 	comparison: TaxYoyComparison | null;
 	tax_tips: TaxTip[];
 	estimated_tax: EstimatedTax | null;
+	income_1099_breakdown: Tax1099Entry[];
 }
 
 // ── Monthly breakdown types ───────────────────────────────────────────────────

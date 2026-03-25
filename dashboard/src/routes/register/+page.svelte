@@ -10,6 +10,7 @@
 	import { fetchAggregations } from '$lib/api';
 	import type { AggregationData } from '$lib/api';
 	import { ALL_CATEGORIES, formatAmount, amountClass, entityBadgeClass } from '$lib/categories';
+	import { selectedEntity as entityStore } from '$lib/stores/entity';
 
 	const PAGE_SIZES = [25, 50, 100, 200];
 	let pageSize = $state(50);
@@ -21,6 +22,8 @@
 	// Filters
 	let search = $state('');
 	let entityFilter = $state('');
+	// Persist entity filter changes back to the shared store (skip empty/"all" values)
+	$effect(() => { if (entityFilter && entityFilter !== 'all') entityStore.set(entityFilter); });
 	let statusFilter = $state('');
 	let showRejected = $state(false);
 	let dateFrom = $state('');
@@ -80,7 +83,13 @@
 	onMount(() => {
 		// Read URL search params to pre-populate filters
 		const params = new URLSearchParams(window.location.search);
-		if (params.get('entity')) entityFilter = params.get('entity')!;
+		if (params.get('entity')) {
+			entityFilter = params.get('entity')!;
+		} else {
+			// Fall back to persisted entity store (but don't force-filter to a specific entity by default)
+			const stored = $entityStore;
+			if (stored && stored !== '') entityFilter = stored;
+		}
 		if (params.get('status')) statusFilter = params.get('status')!;
 		if (params.get('dateFrom')) dateFrom = params.get('dateFrom')!;
 		if (params.get('dateTo')) dateTo = params.get('dateTo')!;

@@ -1,5 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { fetchHealth, fetchTaxSummary } from '$lib/api';
+	import type { HealthResponse, SourceFreshness } from '$lib/types';
+	import type { TaxSummary } from '$lib/api';
+	import { formatAmount } from '$lib/categories';
 
 	// ── Types ──────────────────────────────────────────────────────────────────
 	interface Step {
@@ -10,53 +14,9 @@
 		linkLabel: string;
 	}
 
-	// ── Constants ──────────────────────────────────────────────────────────────
-	const STEPS: Step[] = [
-		{
-			id: 'freshness',
-			title: 'Check Data Freshness',
-			description: 'Verify all data sources are up to date.',
-			href: '/health',
-			linkLabel: 'Open Health'
-		},
-		{
-			id: 'categorize',
-			title: 'Review Uncategorized',
-			description: 'Categorize all pending transactions.',
-			href: '/register?status=needs_review',
-			linkLabel: 'Open Register'
-		},
-		{
-			id: 'reconcile',
-			title: 'Reconcile',
-			description: 'Match payouts with bank deposits.',
-			href: '/reconciliation',
-			linkLabel: 'Open Reconciliation'
-		},
-		{
-			id: 'verify',
-			title: 'Verify P&L',
-			description: 'Review income statement for the month.',
-			href: '/financials',
-			linkLabel: 'Open Financials'
-		},
-		{
-			id: 'export',
-			title: 'Export for Filing',
-			description: 'Download tax exports if needed.',
-			href: '/tax',
-			linkLabel: 'Open Tax'
-		}
-	];
-
 	// ── Month helpers ──────────────────────────────────────────────────────────
 	function toMonthKey(year: number, month: number): string {
 		return `${year}-${String(month).padStart(2, '0')}`;
-	}
-
-	function parseMonthKey(key: string): { year: number; month: number } {
-		const [y, m] = key.split('-').map(Number);
-		return { year: y, month: m };
 	}
 
 	function monthLabel(year: number, month: number): string {
@@ -84,6 +44,11 @@
 	// Map of stepId → completed, persisted to localStorage per month
 	let checked = $state<Record<string, boolean>>({});
 
+	// API data
+	let health = $state<HealthResponse | null>(null);
+	let taxSummary = $state<TaxSummary | null>(null);
+	let apiLoading = $state(false);
+
 	// The localStorage key for the selected month
 	let storageKey = $derived(`close-${toMonthKey(selectedYear, selectedMonth)}`);
 
@@ -91,6 +56,73 @@
 	let isCurrentMonth = $derived(
 		selectedYear === now.getFullYear() && selectedMonth === now.getMonth() + 1
 	);
+
+	// ── Live step descriptions ─────────────────────────────────────────────────
+	let freshSources = $derived.by((): number => {
+		if (!health) return 0;
+		return health.source_freshness.filter(
+			(s: SourceFreshness) => s.freshness_status === 'green'
+		).length;
+	});
+
+	let totalSources = $derived.by((): number => {
+		if (!health) return 0;
+		return health.source_freshness.length;
+	});
+
+	let needsReview = $derived(health?.needs_review_count ?? 0);
+
+	let netProfit = $derived(taxSummary?.net_profit ?? null);
+
+	let readinessPct = $derived(taxSummary?.readiness.readiness_pct ?? null);
+
+	let STEPS = $derived.by((): Step[] => [
+		{
+			id: 'freshness',
+			title: 'Check Data Freshness',
+			description: health
+				? `${freshSources} of ${totalSources} sources up to date`
+				: 'Verify all data sources are up to date.',
+			href: '/health',
+			linkLabel: 'Open Health'
+		},
+		{
+			id: 'categorize',
+			title: 'Review Uncategorized',
+			description: health
+				? (needsReview === 0
+					? 'All transactions categorized.'
+					: `${needsReview} transaction${needsReview === 1 ? '' : 's'} need review`)
+				: 'Categorize all pending transactions.',
+			href: '/register?status=needs_review',
+			linkLabel: 'Open Register'
+		},
+		{
+			id: 'reconcile',
+			title: 'Reconcile',
+			description: 'Match payouts with bank deposits.',
+			href: '/reconciliation',
+			linkLabel: 'Open Reconciliation'
+		},
+		{
+			id: 'verify',
+			title: 'Verify P&L',
+			description: netProfit !== null
+				? `Net profit for ${selectedYear}: ${formatAmount(netProfit)}`
+				: 'Review income statement for the month.',
+			href: '/financials',
+			linkLabel: 'Open Financials'
+		},
+		{
+			id: 'export',
+			title: 'Export for Filing',
+			description: readinessPct !== null
+				? `${readinessPct}% of transactions confirmed`
+				: 'Download tax exports if needed.',
+			href: '/tax',
+			linkLabel: 'Open Tax'
+		}
+	]);
 
 	// Completed count
 	let completedCount = $derived(STEPS.filter((s) => checked[s.id]).length);
@@ -119,7 +151,7 @@
 		}
 	}
 
-	// Re-load state whenever the selected month changes
+	// Re-load checklist state whenever the selected month changes
 	$effect(() => {
 		const key = storageKey;
 		checked = loadState(key);
@@ -135,8 +167,26 @@
 		saveState(storageKey, snapshot);
 	});
 
+	// Reload tax summary when year changes
+	$effect(() => {
+		const year = selectedYear;
+		taxSummary = null;
+		fetchTaxSummary('sparkry', year).then(s => { taxSummary = s; }).catch(() => {});
+	});
+
 	onMount(() => {
 		checked = loadState(storageKey);
+		// Fetch live API data (best-effort — failures don't block the checklist)
+		apiLoading = true;
+		Promise.all([
+			fetchHealth().catch(() => null),
+			fetchTaxSummary('sparkry', selectedYear).catch(() => null)
+		]).then(([h, t]) => {
+			health = h;
+			taxSummary = t;
+		}).finally(() => {
+			apiLoading = false;
+		});
 	});
 
 	// ── Handlers ───────────────────────────────────────────────────────────────

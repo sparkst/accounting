@@ -2,6 +2,7 @@
 	import { fetchTaxSummary, fetchAggregations, fetchMonthlyBreakdown } from '$lib/api';
 	import type { TaxSummary, TaxLineItem, AggregationData, MonthlyBreakdown, MonthlyBreakdownMonth } from '$lib/api';
 	import { CATEGORY_LABELS, formatAmount, amountClass, entityBadgeClass } from '$lib/categories';
+	import { selectedEntity as entityStore } from '$lib/stores/entity';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
@@ -16,7 +17,12 @@
 	const COGS_CAT = 'COGS';
 
 	// ── State ─────────────────────────────────────────────────────────────────
-	let selectedEntity = $state<'sparkry' | 'blackline'>('sparkry');
+	// Seed from shared entity store; write back on change
+	const _initEntity = $entityStore;
+	let selectedEntity = $state<'sparkry' | 'blackline'>(
+		(_initEntity === 'sparkry' || _initEntity === 'blackline') ? _initEntity : 'sparkry'
+	);
+	$effect(() => { entityStore.set(selectedEntity); });
 	let selectedYear = $state(CURRENT_YEAR);
 	let compareMode = $state(false);
 	let loading = $state(false);

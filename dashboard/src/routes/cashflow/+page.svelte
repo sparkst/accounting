@@ -2,6 +2,7 @@
 	import { fetchTaxSummary } from '$lib/api';
 	import type { TaxLineItem } from '$lib/api';
 	import { CATEGORY_LABELS, formatAmount, amountClass } from '$lib/categories';
+	import { selectedEntity as entityStore } from '$lib/stores/entity';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
@@ -18,10 +19,10 @@
 	for (let y = 2024; y <= CURRENT_YEAR + 1; y++) YEARS.push(y);
 
 	// Categories that map to Investing activities (capital / asset related)
+	// Note: CAPITAL_CONTRIBUTION is Financing only — do not include here.
 	const INVESTING_CATEGORIES = new Set([
-		'CAPITAL_CONTRIBUTION',
 		'INVESTMENT_INCOME',
-		'CAR_AND_TRUCK',   // vehicle purchases
+		'CAR_AND_TRUCK',   // vehicle purchases / capital assets
 	]);
 
 	// Categories that map to Financing activities (owner draws, loans, transfers)
@@ -30,7 +31,15 @@
 	]);
 
 	// ── State ─────────────────────────────────────────────────────────────────
-	let selectedEntity = $state<EntityValue>('sparkry');
+	// Seed from shared entity store; write back on change (skip 'all' — not persisted)
+	const _initEntityCf = $entityStore;
+	const _validCfEntities = ['all', 'sparkry', 'blackline', 'personal'] as const;
+	let selectedEntity = $state<EntityValue>(
+		(_validCfEntities as readonly string[]).includes(_initEntityCf)
+			? (_initEntityCf as EntityValue)
+			: 'sparkry'
+	);
+	$effect(() => { if (selectedEntity !== 'all') entityStore.set(selectedEntity); });
 	let selectedYear   = $state(CURRENT_YEAR);
 	let loading        = $state(false);
 	let fetchError     = $state('');

@@ -13,9 +13,12 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from src.api.auth import require_api_key
 from src.api.routes.attachments import router as attachments_router
@@ -68,6 +71,62 @@ app = FastAPI(
     description="Cash-basis accounting API for Sparkry AI, BlackLine MTB, and Personal.",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Global exception handlers — prevent traceback leakage (S2-008, S2-009)
+# ---------------------------------------------------------------------------
+
+
+async def _global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch all unhandled exceptions; log with error_id, never expose traceback."""
+    error_id = uuid4().hex[:8]
+    logger.error("Unhandled error %s: %s", error_id, exc, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "error_id": error_id},
+    )
+
+
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Return clean field-level 422 errors without exposing internals."""
+    # Pydantic v2 may embed non-serializable objects (e.g. ValueError) in ctx.
+    # Stringify those before building the JSON response.
+    safe_errors = []
+    for err in exc.errors():
+        safe_err = {k: v for k, v in err.items() if k != "ctx"}
+        if "ctx" in err:
+            safe_err["ctx"] = {k: str(v) for k, v in err["ctx"].items()}
+        safe_errors.append(safe_err)
+    return JSONResponse(
+        status_code=422,
+        content={"error": "Validation error", "detail": safe_errors},
+    )
+
+
+async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Return the HTTP exception detail as JSON, ensuring no traceback leaks.
+
+    Preserves the {"detail": ...} format that clients and existing tests expect.
+    Non-serializable detail values are coerced to strings.
+    """
+    detail = (
+        exc.detail
+        if isinstance(exc.detail, (str, int, float, bool, list, dict, type(None)))
+        else str(exc.detail)
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": detail},
+    )
+
+
+app.add_exception_handler(Exception, _global_exception_handler)  # type: ignore[arg-type]
+app.add_exception_handler(RequestValidationError, _validation_exception_handler)  # type: ignore[arg-type]
+app.add_exception_handler(HTTPException, _http_exception_handler)  # type: ignore[arg-type]
+
 
 # ---------------------------------------------------------------------------
 # CORS — allow the SvelteKit dashboard running at localhost:5173

@@ -1,9 +1,13 @@
-"""Tests for Tier 3 LLM classifier — including LLMUsageLog persistence.
+"""Tests for Tier 3 LLM classifier — including LLMUsageLog persistence and circuit breaker.
 
 REQ-ID: LLM-USAGE-004  LLMUsageLog is written after every successful Claude API call.
 REQ-ID: LLM-USAGE-005  LLMUsageLog records correct model, tokens, cost, duration, and transaction_id.
 REQ-ID: LLM-USAGE-006  No LLMUsageLog row is written when _session is None (opt-in behaviour).
 REQ-ID: LLM-USAGE-007  estimate_cost_for_model returns correct amounts for Haiku vs Sonnet.
+REQ-ID: CB-001  After 3 consecutive API failures the circuit opens and calls return immediately.
+REQ-ID: CB-002  After 60 s the circuit goes half-open and the next call is attempted.
+REQ-ID: CB-003  A successful half-open call closes the circuit.
+REQ-ID: CB-004  A failed half-open call reopens the circuit.
 """
 
 from __future__ import annotations
@@ -18,7 +22,14 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from src.classification.llm_classifier import llm_classify
+import anthropic
+from src.classification.llm_classifier import (
+    _CB_FAILURE_THRESHOLD,
+    _CB_RECOVERY_TIMEOUT_S,
+    _circuit,
+    _reset_circuit_breaker,
+    llm_classify,
+)
 from src.db.connection import _configure_sqlite
 from src.models.base import Base
 from src.models.enums import Source
@@ -28,6 +39,14 @@ from src.models.transaction import Transaction
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_circuit() -> Generator[None, None, None]:
+    """Reset the module-level circuit breaker before every test."""
+    _reset_circuit_breaker()
+    yield
+    _reset_circuit_breaker()
 
 
 @pytest.fixture()
@@ -265,3 +284,136 @@ def test_usage_log_written_even_on_low_confidence(session: Session) -> None:
     assert result.confidence == pytest.approx(0.3)
     logs = session.query(LLMUsageLog).all()
     assert len(logs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker tests
+# REQ-ID: CB-001 through CB-004
+# ---------------------------------------------------------------------------
+
+
+def _make_failing_client() -> MagicMock:
+    """Return a mock client whose messages.create() always raises APIStatusError."""
+    client = MagicMock()
+    client.messages.create.side_effect = anthropic.APIStatusError(
+        message="Service unavailable",
+        response=MagicMock(status_code=503, headers={}),
+        body=None,
+    )
+    return client
+
+
+class TestCircuitBreaker:
+    def test_circuit_opens_after_threshold_failures(self) -> None:
+        """REQ-ID: CB-001 — After 3 consecutive failures the circuit opens."""
+        txn = _make_transaction()
+        client = _make_failing_client()
+
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            assert not _circuit.is_open, "Circuit opened too early"
+            llm_classify(txn, _client=client)
+
+        assert _circuit.is_open, "Circuit should be open after threshold failures"
+
+    def test_open_circuit_returns_fallback_immediately(self) -> None:
+        """REQ-ID: CB-001 — While open, calls return without hitting the API."""
+        txn = _make_transaction()
+        failing_client = _make_failing_client()
+
+        # Open the circuit
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            llm_classify(txn, _client=failing_client)
+
+        assert _circuit.is_open
+
+        # Subsequent calls must skip the API entirely
+        fast_client = MagicMock()
+        result = llm_classify(txn, _client=fast_client)
+
+        fast_client.messages.create.assert_not_called()
+        assert result.confidence == 0.0
+        assert result.reasoning == "Circuit breaker open"
+
+    def test_circuit_goes_half_open_after_timeout(self) -> None:
+        """REQ-ID: CB-002 — After recovery timeout, the next call is attempted."""
+        txn = _make_transaction()
+        failing_client = _make_failing_client()
+
+        # Open the circuit
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            llm_classify(txn, _client=failing_client)
+
+        assert _circuit.is_open
+
+        # Fast-forward past the recovery timeout
+        assert _circuit.opened_at is not None
+        _circuit.opened_at -= _CB_RECOVERY_TIMEOUT_S + 1.0
+
+        # Next call should be attempted (half-open)
+        good_client = _make_mock_client()
+        result = llm_classify(txn, _client=good_client)
+
+        good_client.messages.create.assert_called_once()
+        assert result.confidence > 0.0
+
+    def test_successful_half_open_call_closes_circuit(self) -> None:
+        """REQ-ID: CB-003 — Successful recovery call resets the circuit to closed."""
+        txn = _make_transaction()
+        failing_client = _make_failing_client()
+
+        # Open the circuit
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            llm_classify(txn, _client=failing_client)
+
+        # Fast-forward past recovery timeout
+        assert _circuit.opened_at is not None
+        _circuit.opened_at -= _CB_RECOVERY_TIMEOUT_S + 1.0
+
+        # Successful half-open call
+        good_client = _make_mock_client()
+        llm_classify(txn, _client=good_client)
+
+        assert not _circuit.is_open
+        assert _circuit.consecutive_failures == 0
+
+    def test_failed_half_open_call_reopens_circuit(self) -> None:
+        """REQ-ID: CB-004 — A failed recovery attempt reopens the circuit."""
+        txn = _make_transaction()
+        failing_client = _make_failing_client()
+
+        # Open the circuit
+        for _ in range(_CB_FAILURE_THRESHOLD):
+            llm_classify(txn, _client=failing_client)
+
+        assert _circuit.is_open
+
+        # Fast-forward so allow_attempt() returns True
+        assert _circuit.opened_at is not None
+        manipulated_time = _circuit.opened_at - (_CB_RECOVERY_TIMEOUT_S + 1.0)
+        _circuit.opened_at = manipulated_time
+
+        # Half-open attempt also fails — circuit should reopen with a fresh timestamp
+        llm_classify(txn, _client=failing_client)
+
+        assert _circuit.is_open
+        assert _circuit.opened_at is not None
+        # opened_at must have been refreshed to the current monotonic time
+        assert _circuit.opened_at > manipulated_time
+
+    def test_success_resets_failure_counter(self) -> None:
+        """A successful call resets the consecutive failure counter."""
+        txn = _make_transaction()
+        failing_client = _make_failing_client()
+        good_client = _make_mock_client()
+
+        # Accumulate failures short of the threshold
+        for _ in range(_CB_FAILURE_THRESHOLD - 1):
+            llm_classify(txn, _client=failing_client)
+
+        assert _circuit.consecutive_failures == _CB_FAILURE_THRESHOLD - 1
+        assert not _circuit.is_open
+
+        # Successful call resets
+        llm_classify(txn, _client=good_client)
+        assert _circuit.consecutive_failures == 0
+        assert not _circuit.is_open

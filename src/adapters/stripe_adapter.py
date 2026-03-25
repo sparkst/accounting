@@ -63,6 +63,9 @@ _BACKOFF_MAX = 30.0    # cap total sleep per attempt
 # Resource types to fetch per entity
 _RESOURCE_TYPES = ("charges", "payouts", "refunds")
 
+# DB commit frequency — reduces per-record fsync to per-batch
+BATCH_SIZE = 100
+
 
 # ---------------------------------------------------------------------------
 # Stripe object → raw dict
@@ -381,6 +384,7 @@ def _ingest_entity(
             continue  # Try next resource type rather than giving up on the entity
 
         mapper = mappers[resource]
+        pending = 0  # records staged since last commit
 
         for item in items:
             item_id = getattr(item, "id", repr(item))
@@ -403,17 +407,27 @@ def _ingest_entity(
                     result.records_skipped += 1
                     continue
 
-                session.add(tx)
-                session.commit()
+                # Savepoint: a flush failure rolls back only this record
+                with session.begin_nested():
+                    session.add(tx)
+
+                pending += 1
                 result.records_created += 1
                 logger.info(
                     "Ingested Stripe %s %s entity=%s amount=%s date=%s",
                     resource, item_id, entity_label, tx.amount, tx.date,
                 )
 
+                if pending >= BATCH_SIZE:
+                    session.commit()
+                    pending = 0
+
             except Exception as exc:
-                session.rollback()
                 result.record_error(f"stripe:{entity_label}:{resource}:{item_id}", exc)
+
+        # Commit remaining records in the last partial batch
+        if pending > 0:
+            session.commit()
 
 
 # ---------------------------------------------------------------------------

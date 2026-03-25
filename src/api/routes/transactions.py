@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func
 from collections.abc import Generator
 
@@ -151,8 +151,8 @@ class TransactionPatch(BaseModel):
     direction: str | None = None
     status: str | None = None
     notes: str | None = None
-    deductible_pct: float | None = None
-    amount: float | None = None
+    deductible_pct: float | None = Field(default=None, ge=0, le=1)
+    amount: float | None = Field(default=None, gt=-1_000_000, lt=1_000_000)
 
     @field_validator("entity")
     @classmethod

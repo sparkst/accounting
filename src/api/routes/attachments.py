@@ -112,9 +112,20 @@ async def upload_receipt(
     Saves the file to data/receipts/{transaction_id}/{filename} and appends
     the absolute path to the transaction's attachments JSON array.
 
+    transaction_id is validated as a UUID-safe string to prevent path traversal.
+
     Accepts: image/jpeg, image/png, image/gif, image/webp, image/heic, application/pdf
     Max size: 20 MB
     """
+    # Validate transaction_id to prevent path traversal
+    import re
+    if not re.match(r'^[a-f0-9\-]{8,36}$', transaction_id):
+        raise HTTPException(status_code=400, detail="Invalid transaction ID format")
+    # Resolve and verify path stays within receipts root
+    dest_dir_check = (_RECEIPTS_ROOT / transaction_id).resolve()
+    if not str(dest_dir_check).startswith(str(_RECEIPTS_ROOT.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid transaction ID")
+
     # Validate content type
     content_type = (file.content_type or "").lower().split(";")[0].strip()
     if content_type not in _ALLOWED_UPLOAD_MIME:

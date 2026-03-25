@@ -50,6 +50,12 @@
 		const file = input.files?.[0];
 		if (!file) return;
 
+		if (file.size > 20 * 1024 * 1024) {
+			uploadError = 'File must be under 20 MB';
+			input.value = '';
+			return;
+		}
+
 		uploading = true;
 		uploadProgress = 0;
 		uploadError = '';

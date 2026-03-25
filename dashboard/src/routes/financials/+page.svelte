@@ -7,7 +7,8 @@
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
 		{ value: 'sparkry', label: 'Sparkry AI LLC' },
-		{ value: 'blackline', label: 'BlackLine MTB LLC' }
+		{ value: 'blackline', label: 'BlackLine MTB LLC' },
+		{ value: 'personal', label: 'Personal' }
 	] as const;
 
 	const CURRENT_YEAR = new Date().getFullYear();

@@ -137,6 +137,7 @@
 	}
 
 	function resetYear() {
+		if (!confirm('Reset all steps for this period?')) return;
 		checked = {};
 	}
 </script>

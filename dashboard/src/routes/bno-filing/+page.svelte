@@ -78,14 +78,27 @@
 			: ''
 	);
 
-	/** Gross income from the tax summary (income categories only) */
-	let grossReceipts = $derived<number>(
-		summary
-			? summary.line_items
-				.filter((li) => li.is_income && !li.is_reimbursable)
-				.reduce((sum, li) => sum + li.total, 0)
-			: 0
+	/** Months included in the selected filing period */
+	let periodMonths = $derived<string[]>(
+		frequency === 'monthly'
+			? [selectedMonth]
+			: (QUARTERS.find((q) => q.value === selectedQuarter)?.months ?? [])
 	);
+
+	/** Gross income from bno_monthly for the selected period only */
+	let grossReceipts = $derived.by((): number => {
+		if (!summary) return 0;
+		const bnoMonthly = (summary as any)?.bno_monthly as Array<{month: string; income: number}> | undefined;
+		if (bnoMonthly && bnoMonthly.length > 0) {
+			return bnoMonthly
+				.filter((m) => periodMonths.includes(m.month.slice(5)))
+				.reduce((sum, m) => sum + m.income, 0);
+		}
+		// Fallback: filter line_items (full-year data, less accurate)
+		return summary.line_items
+			.filter((li) => li.is_income && !li.is_reimbursable)
+			.reduce((sum, li) => sum + li.total, 0);
+	});
 
 	let bnoTaxDue = $derived<number>(
 		Math.round(grossReceipts * BNO_RATE * 100) / 100

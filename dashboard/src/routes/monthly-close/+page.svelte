@@ -5,6 +5,28 @@
 	import type { TaxSummary } from '$lib/api';
 	import { formatAmount } from '$lib/categories';
 
+	// ── Entity selector ───────────────────────────────────────────────────────
+	const ENTITIES = [
+		{ value: 'sparkry', label: 'Sparkry AI LLC' },
+		{ value: 'blackline', label: 'BlackLine MTB LLC' },
+		{ value: 'personal', label: 'Personal' }
+	] as const;
+	type EntityValue = typeof ENTITIES[number]['value'];
+
+	function loadEntity(): EntityValue {
+		try {
+			const v = localStorage.getItem('monthly-close-entity');
+			if (v && ENTITIES.some((e) => e.value === v)) return v as EntityValue;
+		} catch { /* ignore */ }
+		return 'sparkry';
+	}
+
+	let selectedEntity = $state<EntityValue>(loadEntity());
+
+	$effect(() => {
+		try { localStorage.setItem('monthly-close-entity', selectedEntity); } catch { /* ignore */ }
+	});
+
 	// ── Types ──────────────────────────────────────────────────────────────────
 	interface Step {
 		id: string;
@@ -167,11 +189,12 @@
 		saveState(storageKey, snapshot);
 	});
 
-	// Reload tax summary when year changes
+	// Reload tax summary when year or entity changes
 	$effect(() => {
 		const year = selectedYear;
+		const entity = selectedEntity;
 		taxSummary = null;
-		fetchTaxSummary('sparkry', year).then(s => { taxSummary = s; }).catch(() => {});
+		fetchTaxSummary(entity, year).then(s => { taxSummary = s; }).catch(() => {});
 	});
 
 	onMount(() => {
@@ -180,7 +203,7 @@
 		apiLoading = true;
 		Promise.all([
 			fetchHealth().catch(() => null),
-			fetchTaxSummary('sparkry', selectedYear).catch(() => null)
+			fetchTaxSummary(selectedEntity, selectedYear).catch(() => null)
 		]).then(([h, t]) => {
 			health = h;
 			taxSummary = t;
@@ -208,6 +231,7 @@
 	}
 
 	function resetMonth() {
+		if (!confirm('Reset all steps for this period?')) return;
 		checked = {};
 	}
 </script>
@@ -220,6 +244,16 @@
 			<p class="page-subtitle">Step-by-step checklist to close out each month.</p>
 		</div>
 	</header>
+
+	<!-- ── Entity selector ────────────────────────────────────────────────── -->
+	<div class="entity-row card">
+		<label class="entity-label" for="close-entity">Entity</label>
+		<select id="close-entity" class="entity-select" bind:value={selectedEntity} aria-label="Select entity">
+			{#each ENTITIES as ent}
+				<option value={ent.value}>{ent.label}</option>
+			{/each}
+		</select>
+	</div>
 
 	<!-- ── Month selector ─────────────────────────────────────────────────── -->
 	<div class="month-nav card">
@@ -348,6 +382,27 @@
 		margin-top: 4px;
 		color: var(--text-muted);
 		font-size: 0.9rem;
+	}
+
+	/* ── Entity selector ──────────────────────────────────────────────────────── */
+	.entity-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 10px 16px;
+		margin-bottom: 12px;
+	}
+
+	.entity-label {
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--text-muted);
+		white-space: nowrap;
+	}
+
+	.entity-select {
+		flex: 1;
+		max-width: 240px;
 	}
 
 	/* ── Month navigator ─────────────────────────────────────────────────────── */

@@ -39,12 +39,7 @@
 	}
 
 	function handleSearchInput(e: Event) {
-		const val = (e.target as HTMLInputElement).value;
-		searchQuery = val;
-		if (searchDebounce) clearTimeout(searchDebounce);
-		searchDebounce = setTimeout(() => {
-			if (searchQuery.trim().length >= 2) commitSearch(searchQuery);
-		}, 300);
+		searchQuery = (e.target as HTMLInputElement).value;
 	}
 
 	onMount(() => {
@@ -436,7 +431,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/annual-close') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'system')}
 								>
 									Annual Close

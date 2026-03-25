@@ -219,27 +219,19 @@ def get_health(session: Session = Depends(get_db)) -> HealthResponse:  # noqa: B
             for sf in freshness_data
         ]
 
-        # ── Classification stats ───────────────────────────────────────────────
-        all_statuses: list[str] = [
-            row[0] for row in session.query(Transaction.status).all()
-        ]
-        total = len(all_statuses)
-
-        needs_review = sum(
-            1 for s in all_statuses if s == TransactionStatus.NEEDS_REVIEW.value
+        # ── Classification stats (SQL GROUP BY instead of Python loop) ────────
+        from sqlalchemy import func as sa_func
+        status_counts = dict(
+            session.query(Transaction.status, sa_func.count())
+            .group_by(Transaction.status)
+            .all()
         )
-        auto_classified = sum(
-            1 for s in all_statuses if s == TransactionStatus.AUTO_CLASSIFIED.value
-        )
-        confirmed = sum(
-            1 for s in all_statuses if s == TransactionStatus.CONFIRMED.value
-        )
-        split_parent = sum(
-            1 for s in all_statuses if s == TransactionStatus.SPLIT_PARENT.value
-        )
-        rejected = sum(
-            1 for s in all_statuses if s == TransactionStatus.REJECTED.value
-        )
+        total = sum(status_counts.values())
+        needs_review = status_counts.get(TransactionStatus.NEEDS_REVIEW.value, 0)
+        auto_classified = status_counts.get(TransactionStatus.AUTO_CLASSIFIED.value, 0)
+        confirmed = status_counts.get(TransactionStatus.CONFIRMED.value, 0)
+        split_parent = status_counts.get(TransactionStatus.SPLIT_PARENT.value, 0)
+        rejected = status_counts.get(TransactionStatus.REJECTED.value, 0)
 
         def _pct(count: int) -> float:
             return round(count / total * 100, 1) if total > 0 else 0.0

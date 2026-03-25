@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from collections.abc import Generator
 
@@ -92,8 +92,8 @@ class VendorRuleCreate(BaseModel):
     tax_category: str
     tax_subcategory: str | None = None
     direction: str
-    deductible_pct: float = 1.0
-    confidence: float = 1.0
+    deductible_pct: float = Field(default=1.0, ge=0, le=1)
+    confidence: float = Field(default=1.0, ge=0, le=1)
     source: str = VendorRuleSource.HUMAN.value
 
     def validate_enums(self) -> None:
@@ -113,8 +113,8 @@ class VendorRulePatch(BaseModel):
     tax_category: str | None = None
     tax_subcategory: str | None = None
     direction: str | None = None
-    deductible_pct: float | None = None
-    confidence: float | None = None
+    deductible_pct: float | None = Field(default=None, ge=0, le=1)
+    confidence: float | None = Field(default=None, ge=0, le=1)
 
     def validate_enums(self) -> None:
         if self.entity is not None:

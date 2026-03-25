@@ -2,11 +2,13 @@
 	import { fetchTaxSummary, fetchAggregations, fetchMonthlyBreakdown } from '$lib/api';
 	import type { TaxSummary, TaxLineItem, AggregationData, MonthlyBreakdown, MonthlyBreakdownMonth } from '$lib/api';
 	import { CATEGORY_LABELS, formatAmount, amountClass, entityBadgeClass } from '$lib/categories';
+	import { selectedEntity as entityStore } from '$lib/stores/entity';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
 		{ value: 'sparkry', label: 'Sparkry AI LLC' },
-		{ value: 'blackline', label: 'BlackLine MTB LLC' }
+		{ value: 'blackline', label: 'BlackLine MTB LLC' },
+		{ value: 'personal', label: 'Personal' }
 	] as const;
 
 	const CURRENT_YEAR = new Date().getFullYear();
@@ -16,7 +18,12 @@
 	const COGS_CAT = 'COGS';
 
 	// ── State ─────────────────────────────────────────────────────────────────
-	let selectedEntity = $state<'sparkry' | 'blackline'>('sparkry');
+	// Seed from shared entity store; write back on change
+	const _initEntity = $entityStore;
+	let selectedEntity = $state<'sparkry' | 'blackline'>(
+		(_initEntity === 'sparkry' || _initEntity === 'blackline') ? _initEntity : 'sparkry'
+	);
+	$effect(() => { entityStore.set(selectedEntity); });
 	let selectedYear = $state(CURRENT_YEAR);
 	let compareMode = $state(false);
 	let loading = $state(false);
@@ -41,6 +48,134 @@
 	let showMonthly = $state(false);
 	let monthlyData = $state<MonthlyBreakdown | null>(null);
 	let monthlyLoading = $state(false);
+
+	// ── S3-007: Budget ──────────────────────────────────────────────────────
+	// localStorage key: budget-{entity}-{year} → JSON object {[category]: amount}
+	type BudgetMap = Record<string, number>;
+
+	function budgetStorageKey(entity: string, year: number): string {
+		return `budget-${entity}-${year}`;
+	}
+
+	function loadBudget(entity: string, year: number): BudgetMap {
+		if (typeof localStorage === 'undefined') return {};
+		try {
+			return JSON.parse(localStorage.getItem(budgetStorageKey(entity, year)) ?? '{}') as BudgetMap;
+		} catch { return {}; }
+	}
+
+	function saveBudget(entity: string, year: number, map: BudgetMap): void {
+		if (typeof localStorage === 'undefined') return;
+		localStorage.setItem(budgetStorageKey(entity, year), JSON.stringify(map));
+	}
+
+	let budgetMap = $state<BudgetMap>({});
+	let showBudgetMode = $state(false);
+	// Draft edits per category while the inline form is open
+	let budgetDraft = $state<BudgetMap>({});
+
+	// Load budget from localStorage whenever entity/year changes
+	$effect(() => {
+		budgetMap = loadBudget(selectedEntity, selectedYear);
+		budgetDraft = { ...budgetMap };
+	});
+
+	function toggleBudgetMode(): void {
+		showBudgetMode = !showBudgetMode;
+		if (showBudgetMode) {
+			budgetDraft = { ...budgetMap };
+		}
+	}
+
+	function saveBudgetDraft(): void {
+		// Filter out zeros/empty entries
+		const cleaned: BudgetMap = {};
+		for (const [cat, val] of Object.entries(budgetDraft)) {
+			if (val && val > 0) cleaned[cat] = val;
+		}
+		budgetMap = cleaned;
+		saveBudget(selectedEntity, selectedYear, cleaned);
+		showBudgetMode = false;
+	}
+
+	function budgetVariance(cat: string, actual: number): number | null {
+		const b = budgetMap[cat];
+		if (!b) return null;
+		// actual is absolute (positive) expense amount; positive variance = over budget
+		return actual - b;
+	}
+
+	let hasBudgets = $derived(Object.keys(budgetMap).length > 0);
+
+	// ── S3-008: Client Profitability ────────────────────────────────────────
+	let incomeClients = $derived.by(() => {
+		const vendors = aggregations?.top_vendors.income ?? [];
+		if (vendors.length === 0) return [];
+		const totalExpAbs = Math.abs(totalExpenses);
+		const perClient = vendors.length > 0 ? totalExpAbs / vendors.length : 0;
+		return vendors.map(v => ({
+			client: v.vendor,
+			revenue: v.total,
+			allocatedExpenses: perClient,
+			profit: v.total - perClient,
+			marginPct: v.total > 0 ? ((v.total - perClient) / v.total) * 100 : 0
+		}));
+	});
+
+	// ── S3-009: Multi-year trends ───────────────────────────────────────────
+	let showTrends = $state(false);
+	let trendsLoading = $state(false);
+
+	interface YearTrend {
+		year: number;
+		revenue: number;
+		expenses: number;
+		netProfit: number;
+		marginPct: number;
+	}
+	let trendData = $state<YearTrend[]>([]);
+
+	async function loadTrends(): Promise<void> {
+		if (trendsLoading) return;
+		trendsLoading = true;
+		const years = [selectedYear - 2, selectedYear - 1, selectedYear];
+		try {
+			const results = await Promise.all(
+				years.map(y => fetchTaxSummary(selectedEntity, y).catch(() => null))
+			);
+			trendData = results
+				.map((s, i) => {
+					if (!s) return null;
+					const rev = s.gross_income;
+					const exp = Math.abs(s.total_expenses);
+					const net = s.net_profit;
+					const margin = rev > 0 ? (net / rev) * 100 : 0;
+					return { year: years[i], revenue: rev, expenses: exp, netProfit: net, marginPct: margin };
+				})
+				.filter((x): x is YearTrend => x !== null);
+		} catch {
+			// non-fatal
+		} finally {
+			trendsLoading = false;
+		}
+	}
+
+	function toggleTrends(): void {
+		showTrends = !showTrends;
+		if (showTrends && trendData.length === 0) {
+			void loadTrends();
+		}
+	}
+
+	// Reload trend data when entity/year changes if trends section is open
+	$effect(() => {
+		void selectedEntity;
+		void selectedYear;
+		trendData = [];
+		if (showTrends) {
+			void loadTrends();
+		}
+	});
 
 	// ── Derived: single entity ───────────────────────────────────────────────
 	let incomeItems = $derived.by((): TaxLineItem[] =>
@@ -669,19 +804,54 @@
 				<h2 class="section-title">
 					Income Statement — {entityLabel(selectedEntity)}, {selectedYear}
 				</h2>
-				<button
-					class="btn-monthly-toggle {showMonthly ? 'active' : ''}"
-					onclick={toggleMonthly}
-					aria-pressed={showMonthly}
-					title={showMonthly ? 'Collapse monthly columns' : 'Expand monthly columns'}
-				>
-					{#if monthlyLoading}
-						Loading…
-					{:else}
-						{showMonthly ? 'Hide months' : 'By month'}
-					{/if}
-				</button>
+				<div class="income-stmt-actions">
+					<button
+						class="btn-monthly-toggle {showBudgetMode ? 'active' : ''}"
+						onclick={toggleBudgetMode}
+						aria-pressed={showBudgetMode}
+						title="Set category budgets"
+					>
+						{showBudgetMode ? 'Cancel' : (hasBudgets ? 'Edit Budget' : 'Set Budget')}
+					</button>
+					<button
+						class="btn-monthly-toggle {showMonthly ? 'active' : ''}"
+						onclick={toggleMonthly}
+						aria-pressed={showMonthly}
+						title={showMonthly ? 'Collapse monthly columns' : 'Expand monthly columns'}
+					>
+						{#if monthlyLoading}
+							Loading…
+						{:else}
+							{showMonthly ? 'Hide months' : 'By month'}
+						{/if}
+					</button>
+				</div>
 			</div>
+
+			{#if showBudgetMode}
+				<div class="card budget-form-card">
+					<p class="budget-form-title">Set annual budget per expense category</p>
+					<div class="budget-form-grid">
+						{#each expenseItems as li}
+							<label class="budget-form-row">
+								<span class="budget-form-label">{catLabel(li.tax_category)}</span>
+								<input
+									type="number"
+									min="0"
+									step="100"
+									class="budget-input"
+									placeholder="e.g. 5000"
+									bind:value={budgetDraft[li.tax_category]}
+								/>
+							</label>
+						{/each}
+					</div>
+					<div class="budget-form-footer">
+						<button class="btn btn-primary" onclick={saveBudgetDraft}>Save Budget</button>
+						<button class="btn btn-ghost" onclick={toggleBudgetMode}>Cancel</button>
+					</div>
+				</div>
+			{/if}
 
 			<div class="card table-card">
 				<table class="data-table financial-table {showMonthly ? 'monthly-expanded' : ''}">
@@ -689,6 +859,10 @@
 						<tr>
 							<th class="cat-col">Category</th>
 							<th class="amt-col">YTD</th>
+							{#if hasBudgets && !showMonthly}
+								<th class="amt-col">Budget</th>
+								<th class="amt-col">Variance</th>
+							{/if}
 							{#if showMonthly && monthlyData}
 								{#each monthColumns as col}
 									<th class="amt-col month-col">{col.label}</th>
@@ -699,7 +873,7 @@
 					<tbody>
 						<!-- Revenue -->
 						<tr class="section-header-row">
-							<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}>
+							<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : hasBudgets && !showMonthly ? 4 : 2}>
 								<button class="inline-toggle" onclick={() => showIncomeDetail = !showIncomeDetail} aria-expanded={showIncomeDetail}>
 									<strong>Revenue</strong>
 									<span class="toggle-hint" aria-hidden="true">{showIncomeDetail ? '−' : '+'}</span>
@@ -711,6 +885,10 @@
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
 									<td class="amt-cell {amountClass(li.total)}">{formatAmount(li.total)}</td>
+									{#if hasBudgets && !showMonthly}
+										<td class="amt-cell budget-cell">—</td>
+										<td class="amt-cell budget-cell">—</td>
+									{/if}
 									{#if showMonthly && monthlyData}
 										{#each monthColumns as col}
 											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
@@ -725,6 +903,10 @@
 							<td class="amt-cell {amountClass(grossIncome)}">
 								<strong>{formatAmount(grossIncome)}</strong>
 							</td>
+							{#if hasBudgets && !showMonthly}
+								<td class="amt-cell budget-cell">—</td>
+								<td class="amt-cell budget-cell">—</td>
+							{/if}
 							{#if showMonthly && monthlyData}
 								{#each monthColumns as col}
 									{@const mTotal = [...(monthlyData?.months.find(m => m.month === col.key)?.categories ?? [])]
@@ -740,7 +922,7 @@
 						<!-- COGS -->
 						{#if cogsItems.length > 0}
 							<tr class="section-header-row">
-								<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}><strong>Cost of Goods Sold</strong></td>
+								<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : hasBudgets && !showMonthly ? 4 : 2}><strong>Cost of Goods Sold</strong></td>
 							</tr>
 							{#each cogsItems as li}
 								<tr>
@@ -775,7 +957,7 @@
 
 						<!-- Operating Expenses -->
 						<tr class="section-header-row">
-							<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}>
+							<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : hasBudgets && !showMonthly ? 4 : 2}>
 								<button class="inline-toggle" onclick={() => showExpenseDetail = !showExpenseDetail} aria-expanded={showExpenseDetail}>
 									<strong>Operating Expenses</strong>
 									<span class="toggle-hint" aria-hidden="true">{showExpenseDetail ? '−' : '+'}</span>
@@ -784,9 +966,15 @@
 						</tr>
 						{#if showExpenseDetail}
 							{#each expenseItems as li}
+								{@const actual = Math.abs(li.total)}
+								{@const variance = budgetVariance(li.tax_category, actual)}
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
-									<td class="amt-cell">{formatAmount(Math.abs(li.total))}</td>
+									<td class="amt-cell">{formatAmount(actual)}</td>
+									{#if hasBudgets && !showMonthly}
+										<td class="amt-cell budget-cell">{budgetMap[li.tax_category] ? formatAmount(budgetMap[li.tax_category]) : '—'}</td>
+										<td class="amt-cell {variance !== null ? (variance > 0 ? 'budget-over' : 'budget-under') : ''}">{variance !== null ? (variance > 0 ? '+' : '') + formatAmount(variance) : '—'}</td>
+									{/if}
 									{#if showMonthly && monthlyData}
 										{#each monthColumns as col}
 											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
@@ -798,9 +986,15 @@
 						{:else}
 							<!-- Show top 5 when collapsed -->
 							{#each topExpenses as li}
+								{@const actual = Math.abs(li.total)}
+								{@const variance = budgetVariance(li.tax_category, actual)}
 								<tr>
 									<td class="indent-1">{catLabel(li.tax_category)}</td>
-									<td class="amt-cell">{formatAmount(Math.abs(li.total))}</td>
+									<td class="amt-cell">{formatAmount(actual)}</td>
+									{#if hasBudgets && !showMonthly}
+										<td class="amt-cell budget-cell">{budgetMap[li.tax_category] ? formatAmount(budgetMap[li.tax_category]) : '—'}</td>
+										<td class="amt-cell {variance !== null ? (variance > 0 ? 'budget-over' : 'budget-under') : ''}">{variance !== null ? (variance > 0 ? '+' : '') + formatAmount(variance) : '—'}</td>
+									{/if}
 									{#if showMonthly && monthlyData}
 										{#each monthColumns as col}
 											{@const mAmt = monthlyByCategory.get(li.tax_category)?.get(col.key) ?? 0}
@@ -811,7 +1005,7 @@
 							{/each}
 							{#if expenseItems.length > 5}
 								<tr>
-									<td class="indent-1" colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}>
+									<td class="indent-1" colspan={showMonthly && monthlyData ? 2 + monthColumns.length : hasBudgets && !showMonthly ? 4 : 2}>
 										<button class="inline-toggle text-muted" onclick={() => showExpenseDetail = true}>
 											+{expenseItems.length - 5} more categories
 										</button>
@@ -824,6 +1018,14 @@
 							<td class="amt-cell">
 								<strong>{formatAmount(operatingExpenses)}</strong>
 							</td>
+							{#if hasBudgets && !showMonthly}
+								{@const totalBudget = expenseItems.reduce((s, li) => s + (budgetMap[li.tax_category] ?? 0), 0)}
+								{@const totalVariance = totalBudget > 0 ? operatingExpenses - totalBudget : null}
+								<td class="amt-cell budget-cell"><strong>{totalBudget > 0 ? formatAmount(totalBudget) : '—'}</strong></td>
+								<td class="amt-cell {totalVariance !== null ? (totalVariance > 0 ? 'budget-over' : 'budget-under') : ''}">
+									<strong>{totalVariance !== null ? (totalVariance > 0 ? '+' : '') + formatAmount(totalVariance) : '—'}</strong>
+								</td>
+							{/if}
 							{#if showMonthly && monthlyData}
 								{#each monthColumns as col}
 									{@const mTotal = [...(monthlyData?.months.find(m => m.month === col.key)?.categories ?? [])]
@@ -839,7 +1041,7 @@
 						<!-- Reimbursables (if any) -->
 						{#if reimbursableItems.length > 0}
 							<tr class="section-header-row">
-								<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : 2}><strong>Reimbursable (nets to $0)</strong></td>
+								<td colspan={showMonthly && monthlyData ? 2 + monthColumns.length : hasBudgets && !showMonthly ? 4 : 2}><strong>Reimbursable (nets to $0)</strong></td>
 							</tr>
 							{#each reimbursableItems as li}
 								<tr>
@@ -861,6 +1063,10 @@
 							<td class="amt-cell {amountClass(netProfit)}">
 								<strong>{formatAmount(netProfit)}</strong>
 							</td>
+							{#if hasBudgets && !showMonthly}
+								<td class="amt-cell budget-cell">—</td>
+								<td class="amt-cell budget-cell">—</td>
+							{/if}
 							{#if showMonthly && monthlyData}
 								{#each monthColumns as col}
 									{@const mMonth = monthlyData?.months.find(m => m.month === col.key)}
@@ -930,6 +1136,91 @@
 				</div>
 			</section>
 		{/if}
+
+		<!-- ── S3-008: Client Profitability ──────────────────────────────────── -->
+		{#if incomeClients.length > 0}
+			<section class="dashboard-section">
+				<h2 class="section-title">Client Profitability (v1 Estimate)</h2>
+				<div class="card table-card">
+					<table class="data-table">
+						<thead>
+							<tr>
+								<th>Client</th>
+								<th class="amt-col">Revenue</th>
+								<th class="amt-col">Allocated Expenses</th>
+								<th class="amt-col">Profit</th>
+								<th class="pct-col">Margin %</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each incomeClients as c}
+								<tr>
+									<td>{c.client}</td>
+									<td class="amt-cell {amountClass(c.revenue)}">{formatAmount(c.revenue)}</td>
+									<td class="amt-cell">{formatAmount(c.allocatedExpenses)}</td>
+									<td class="amt-cell {amountClass(c.profit)}">{formatAmount(c.profit)}</td>
+									<td class="pct-cell {c.marginPct >= 0 ? 'pct-up' : 'pct-down'}">{c.marginPct.toFixed(1)}%</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+					<p class="profitability-note">Overhead allocated equally across {incomeClients.length} client{incomeClients.length !== 1 ? 's' : ''}. v1 approximation — not full cost accounting.</p>
+				</div>
+			</section>
+		{/if}
+
+		<!-- ── S3-009: Multi-year Trends ─────────────────────────────────────── -->
+		<section class="dashboard-section">
+			<button class="section-toggle" onclick={toggleTrends} aria-expanded={showTrends} aria-controls="trends-panel">
+				<h2 class="section-title">Multi-Year Trends</h2>
+				<span class="toggle-icon" aria-hidden="true">{showTrends ? '−' : '+'}</span>
+			</button>
+			{#if showTrends}
+				<div id="trends-panel">
+					{#if trendsLoading}
+						<div class="card" style="padding: 20px; color: var(--text-muted); font-size: .875rem;">Loading trend data…</div>
+					{:else if trendData.length > 0}
+						<div class="card table-card">
+							<table class="data-table">
+								<thead>
+									<tr>
+										<th>Year</th>
+										<th class="amt-col">Revenue</th>
+										<th class="pct-col">Rev YoY</th>
+										<th class="amt-col">Expenses</th>
+										<th class="amt-col">Net Profit</th>
+										<th class="pct-col">Margin %</th>
+										<th class="pct-col">Profit YoY</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each trendData as row, i}
+										{@const prev = i > 0 ? trendData[i - 1] : null}
+										{@const revGrowth = prev && prev.revenue > 0 ? ((row.revenue - prev.revenue) / prev.revenue) * 100 : null}
+										{@const profitGrowth = prev && prev.netProfit !== 0 ? ((row.netProfit - prev.netProfit) / Math.abs(prev.netProfit)) * 100 : null}
+										<tr class={row.year === selectedYear ? 'trends-current-year' : ''}>
+											<td><strong>{row.year}</strong>{#if row.year === selectedYear}&nbsp;<span class="trend-current-badge">YTD</span>{/if}</td>
+											<td class="amt-cell {amountClass(row.revenue)}">{formatAmount(row.revenue)}</td>
+											<td class="pct-cell {revGrowth !== null ? pctBadge(revGrowth) : ''}">
+												{#if revGrowth !== null}{revGrowth > 0 ? '+' : ''}{revGrowth.toFixed(1)}%{:else}—{/if}
+											</td>
+											<td class="amt-cell">{formatAmount(row.expenses)}</td>
+											<td class="amt-cell {amountClass(row.netProfit)}">{formatAmount(row.netProfit)}</td>
+											<td class="pct-cell {pctBadge(row.marginPct)}">{row.marginPct.toFixed(1)}%</td>
+											<td class="pct-cell {profitGrowth !== null ? pctBadge(profitGrowth) : ''}">
+												{#if profitGrowth !== null}{profitGrowth > 0 ? '+' : ''}{profitGrowth.toFixed(1)}%{:else}—{/if}
+											</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					{:else}
+						<p class="no-data-note" style="margin-top: 8px;">No trend data available.</p>
+					{/if}
+				</div>
+			{/if}
+		</section>
 
 		<!-- Warnings/Anomalies -->
 		{#if aggregations && aggregations.concentration_warnings.length > 0}
@@ -1450,6 +1741,109 @@
 
 	.total-month {
 		color: var(--text);
+	}
+
+	/* ── S3-007: Budget columns ───────────────────────────────────────────── */
+	.budget-cell {
+		color: var(--text-muted);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.budget-over {
+		color: var(--red-700);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.budget-under {
+		color: var(--green-700);
+		font-variant-numeric: tabular-nums;
+	}
+
+	.budget-form-card {
+		padding: 20px;
+		margin-bottom: 16px;
+	}
+
+	.budget-form-title {
+		font-size: .8rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: .04em;
+		margin-bottom: 14px;
+	}
+
+	.budget-form-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+		gap: 10px;
+		margin-bottom: 16px;
+	}
+
+	.budget-form-row {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		font-size: .85rem;
+	}
+
+	.budget-form-label {
+		flex: 1;
+		color: var(--text);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.budget-input {
+		width: 110px;
+		font-family: var(--font);
+		font-size: .85rem;
+		padding: 4px 8px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--surface);
+		color: var(--text);
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+	}
+
+	.budget-form-footer {
+		display: flex;
+		gap: 10px;
+	}
+
+	.income-stmt-actions {
+		display: flex;
+		gap: 8px;
+		align-items: center;
+	}
+
+	/* ── S3-008: Profitability note ────────────────────────────────────────── */
+	.profitability-note {
+		font-size: .75rem;
+		color: var(--text-muted);
+		font-style: italic;
+		margin-top: 12px;
+		padding-top: 10px;
+		border-top: 1px solid var(--gray-100);
+	}
+
+	/* ── S3-009: Trends ────────────────────────────────────────────────────── */
+	.trends-current-year {
+		background: var(--gray-50);
+	}
+
+	.trend-current-badge {
+		font-size: .65rem;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: .04em;
+		color: var(--blue-500);
+		background: color-mix(in srgb, var(--blue-500) 12%, transparent);
+		padding: 1px 5px;
+		border-radius: 999px;
+		vertical-align: middle;
 	}
 
 	/* ── Print ────────────────────────────────────────────────────────────── */

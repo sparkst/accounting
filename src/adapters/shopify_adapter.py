@@ -75,6 +75,7 @@ _MAX_RETRIES = 3              # transient-error retry limit
 _BACKOFF_BASE_S = 1.0         # base backoff for exponential jitter
 _BACKOFF_MAX_S = 30.0         # cap on backoff duration
 _PAGE_LIMIT = 250             # Shopify max page size
+BATCH_SIZE = 100              # DB commit frequency — reduces per-record fsync overhead
 
 # Link header pattern: <url>; rel="next"
 _LINK_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
@@ -337,15 +338,22 @@ class ShopifyAdapter(BaseAdapter):
             "Content-Type": "application/json",
         }
 
+        # Shared pending counter — committed every BATCH_SIZE records
+        pending: list[int] = [0]
+
         try:
             with httpx.Client(headers=headers, timeout=30.0) as client:
-                self._ingest_orders(client, session, result)
-                self._ingest_payouts(client, session, result)
+                self._ingest_orders(client, session, result, pending)
+                self._ingest_payouts(client, session, result, pending)
         except ShopifyAuthError:
             result.status = IngestionStatus.FAILURE
             result.errors.append(("auth", "Authentication failed (401/403)"))
             self._write_ingestion_log(session, result)
             raise
+
+        # Commit any remaining records in the last partial batch
+        if pending[0] > 0:
+            session.commit()
 
         self._write_ingestion_log(session, result)
         return result
@@ -359,6 +367,7 @@ class ShopifyAdapter(BaseAdapter):
         client: httpx.Client,
         session: Session,
         result: AdapterResult,
+        pending: list[int],
     ) -> None:
         """Fetch all orders (paginated) and insert new Transaction rows."""
         url = (
@@ -376,7 +385,7 @@ class ShopifyAdapter(BaseAdapter):
             for order in orders:
                 order_id = str(order.get("id", "unknown"))
                 try:
-                    self._insert_if_new(_parse_order(order), session, result)
+                    self._insert_if_new(_parse_order(order), session, result, pending)
                 except Exception as exc:
                     result.record_error(f"order_{order_id}", exc)
 
@@ -385,7 +394,7 @@ class ShopifyAdapter(BaseAdapter):
                     refund_id = str(refund.get("id", "unknown"))
                     try:
                         self._insert_if_new(
-                            _parse_refund(refund, order), session, result
+                            _parse_refund(refund, order), session, result, pending
                         )
                     except Exception as exc:
                         result.record_error(f"refund_{refund_id}", exc)
@@ -399,6 +408,7 @@ class ShopifyAdapter(BaseAdapter):
         client: httpx.Client,
         session: Session,
         result: AdapterResult,
+        pending: list[int],
     ) -> None:
         """Fetch all Shopify Payments payouts (paginated) and insert Transaction rows."""
         url = (
@@ -416,7 +426,7 @@ class ShopifyAdapter(BaseAdapter):
             for payout in payouts:
                 payout_id = str(payout.get("id", "unknown"))
                 try:
-                    self._insert_if_new(_parse_payout(payout), session, result)
+                    self._insert_if_new(_parse_payout(payout), session, result, pending)
                 except Exception as exc:
                     result.record_error(f"payout_{payout_id}", exc)
 
@@ -429,12 +439,13 @@ class ShopifyAdapter(BaseAdapter):
         fields: dict[str, Any],
         session: Session,
         result: AdapterResult,
+        pending: list[int],
     ) -> None:
         """Insert a Transaction if source_hash is not already present.
 
         On dedup hit: increments ``records_skipped`` and ``records_processed``.
-        On new record: inserts + commits, increments ``records_created``
-        and ``records_processed``.
+        On new record: stages the row within a savepoint (per-record isolation),
+        increments counters, and commits every BATCH_SIZE rows.
         """
         source_hash = fields["source_hash"]
         existing = (
@@ -463,9 +474,12 @@ class ShopifyAdapter(BaseAdapter):
             confidence=fields["confidence"],
             raw_data=fields["raw_data"],
         )
-        session.add(tx)
-        session.commit()
 
+        # Savepoint ensures a flush failure rolls back only this record
+        with session.begin_nested():
+            session.add(tx)
+
+        pending[0] += 1
         result.records_created += 1
         result.records_processed += 1
         logger.info(
@@ -474,6 +488,10 @@ class ShopifyAdapter(BaseAdapter):
             fields["date"],
             fields["amount"],
         )
+
+        if pending[0] >= BATCH_SIZE:
+            session.commit()
+            pending[0] = 0
 
     # ------------------------------------------------------------------
     # HTTP helpers

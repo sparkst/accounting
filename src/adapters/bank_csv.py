@@ -482,6 +482,10 @@ class BankCsvAdapter(BaseAdapter):
             except Exception as exc:
                 result.record_error(f"{self._filename}:row{row.row_number}", exc)
 
+        # Commit any remaining records from the batch
+        if result.records_created > 0:
+            session.commit()
+
         return result
 
     def _process_row(
@@ -491,8 +495,13 @@ class BankCsvAdapter(BaseAdapter):
         result: AdapterResult,
     ) -> None:
         """Insert a single row as a Transaction (skipped in dry_run mode)."""
-        # Build a stable source_id from filename + row number + date + amount.
-        source_id = f"{self._filename}:{row.row_number}:{row.date}:{row.amount}"
+        # Build a stable source_id from filename + transaction content (date,
+        # amount, description) rather than row position so that re-exporting
+        # the same bank statement with a different sort order produces identical
+        # hashes and is correctly deduplicated.  S1-008.
+        normalized_desc = (row.description or "").strip().lower()
+        normalized_amount = str(row.amount) if row.amount is not None else ""
+        source_id = f"{self._filename}:{row.date}:{normalized_amount}:{normalized_desc}"
         source_hash = compute_source_hash(self.source, source_id)
 
         # Check for existing transaction with same source_hash.
@@ -540,9 +549,17 @@ class BankCsvAdapter(BaseAdapter):
         )
 
         if not self._dry_run:
-            session.add(tx)
-            session.commit()
-            result.records_created += 1
+            try:
+                session.begin_nested()  # savepoint for per-record isolation
+                session.add(tx)
+                session.flush()
+                result.records_created += 1
+                # Batch commit every 100 records (final commit in run() after loop)
+                if result.records_created % 100 == 0:
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
             logger.info(
                 "BankCsvAdapter ingested row %d: %s %s %s",
                 row.row_number,

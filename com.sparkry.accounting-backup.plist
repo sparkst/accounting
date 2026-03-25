@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+  <!-- Label must match the filename (without .plist) -->
+  <key>Label</key>
+  <string>com.sparkry.accounting-backup</string>
+
+  <!-- Absolute path to the backup script -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/travis/SGDrive/dev/accounting/scripts/backup.sh</string>
+  </array>
+
+  <!-- Run daily at 02:00 local time -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <!-- Log output -->
+  <key>StandardOutPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.accounting-backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.accounting-backup.error.log</string>
+
+  <!-- Keep job registered across reboots -->
+  <key>RunAtLoad</key>
+  <false/>
+
+</dict>
+</plist>

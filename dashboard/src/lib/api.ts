@@ -14,16 +14,70 @@ import type {
 
 const BASE = '/api';
 
+/**
+ * Read the API key from the Vite public env var VITE_API_KEY.
+ * In local dev this is typically unset (auth disabled on the server).
+ * Set VITE_API_KEY in dashboard/.env.local to match the server's API_KEY.
+ */
+function getApiKeyHeader(): Record<string, string> {
+	const key =
+		typeof import.meta !== 'undefined' && import.meta.env
+			? (import.meta.env.VITE_API_KEY as string | undefined)
+			: undefined;
+	return key ? { 'X-Api-Key': key } : {};
+}
+
+/**
+ * Per-endpoint AbortController map. Rapid consecutive calls to the same path
+ * (e.g. fast filter changes in Register) abort the previous in-flight request
+ * so a slow stale response cannot overwrite a fresher one.
+ */
+const _controllers = new Map<string, AbortController>();
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	const res = await fetch(`${BASE}${path}`, {
-		headers: { 'Content-Type': 'application/json', ...init?.headers },
-		...init
-	});
-	if (!res.ok) {
-		const text = await res.text().catch(() => res.statusText);
-		throw new Error(`API ${res.status}: ${text}`);
+	// Only abort previous requests for GET (safe/idempotent). POST/PATCH/DELETE
+	// mutations should not be cancelled — the server may have already committed.
+	const method = (init?.method ?? 'GET').toUpperCase();
+	const [pathKey] = path.split('?');
+	let controller: AbortController | undefined;
+
+	if (method === 'GET') {
+		const previous = _controllers.get(pathKey);
+		if (previous) {
+			previous.abort();
+		}
+		controller = new AbortController();
+		_controllers.set(pathKey, controller);
 	}
-	return res.json() as Promise<T>;
+
+	try {
+		const res = await fetch(`${BASE}${path}`, {
+			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
+			...init,
+			...(controller ? { signal: controller.signal } : {})
+		});
+		if (!res.ok) {
+			const text = await res.text().catch(() => res.statusText);
+			throw new Error(`API ${res.status}: ${text}`);
+		}
+		return res.json() as Promise<T>;
+	} finally {
+		if (controller && _controllers.get(pathKey) === controller) {
+			_controllers.delete(pathKey);
+		}
+	}
+}
+
+/** Build a query string from a filters object, omitting undefined/empty values. */
+function toQueryString(filters: object): string {
+	const params = new URLSearchParams();
+	for (const [key, val] of Object.entries(filters)) {
+		if (val !== undefined && val !== '') {
+			params.set(key, String(val));
+		}
+	}
+	const qs = params.toString();
+	return qs ? `?${qs}` : '';
 }
 
 export interface TransactionFilters {
@@ -39,14 +93,7 @@ export interface TransactionFilters {
 }
 
 export async function fetchTransactions(filters: TransactionFilters = {}): Promise<TransactionList> {
-	const params = new URLSearchParams();
-	for (const [key, val] of Object.entries(filters)) {
-		if (val !== undefined && val !== '') {
-			params.set(key, String(val));
-		}
-	}
-	const qs = params.toString();
-	return request<TransactionList>(`/transactions${qs ? `?${qs}` : ''}`);
+	return request<TransactionList>(`/transactions${toQueryString(filters)}`);
 }
 
 export async function fetchReviewQueue(status?: string): Promise<Transaction[]> {
@@ -146,6 +193,53 @@ export async function splitTransaction(id: string, lineItems: SplitLineItem[]): 
 	});
 }
 
+export interface UploadReceiptResult {
+	path: string;
+	filename: string;
+	attachments: string[];
+}
+
+export async function uploadReceipt(
+	transactionId: string,
+	file: File,
+	onProgress?: (pct: number) => void
+): Promise<UploadReceiptResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		const apiKey =
+			typeof import.meta !== 'undefined' && import.meta.env
+				? (import.meta.env.VITE_API_KEY as string | undefined)
+				: undefined;
+
+		xhr.open('POST', `${BASE}/transactions/${transactionId}/upload-receipt`);
+		if (apiKey) xhr.setRequestHeader('X-Api-Key', apiKey);
+
+		if (onProgress) {
+			xhr.upload.onprogress = (e) => {
+				if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+			};
+		}
+
+		xhr.onload = () => {
+			if (xhr.status >= 200 && xhr.status < 300) {
+				resolve(JSON.parse(xhr.responseText) as UploadReceiptResult);
+			} else {
+				let detail = xhr.statusText;
+				try {
+					detail = JSON.parse(xhr.responseText)?.detail ?? detail;
+				} catch { /* ignore */ }
+				reject(new Error(`Upload failed (${xhr.status}): ${detail}`));
+			}
+		};
+
+		xhr.onerror = () => reject(new Error('Network error during upload'));
+		xhr.send(formData);
+	});
+}
+
 export async function bulkConfirmTransactions(
 	ids: string[],
 	entity: string,
@@ -170,14 +264,7 @@ export interface InvoiceFilters {
 }
 
 export async function fetchInvoices(filters: InvoiceFilters = {}): Promise<InvoiceListResponse> {
-	const params = new URLSearchParams();
-	for (const [key, val] of Object.entries(filters)) {
-		if (val !== undefined && val !== '') {
-			params.set(key, String(val));
-		}
-	}
-	const qs = params.toString();
-	return request<InvoiceListResponse>(`/invoices${qs ? `?${qs}` : ''}`);
+	return request<InvoiceListResponse>(`/invoices${toQueryString(filters)}`);
 }
 
 export async function fetchInvoice(id: string): Promise<Invoice> {
@@ -241,6 +328,7 @@ export async function uploadIcal(
 
 	const res = await fetch(`${BASE}/invoices/ical-upload${qs ? `?${qs}` : ''}`, {
 		method: 'POST',
+		headers: getApiKeyHeader(),
 		body: formData
 	});
 	if (!res.ok) {
@@ -344,14 +432,7 @@ export interface VendorRulePatch {
 export async function fetchVendorRules(
 	filters: VendorRuleFilters = {}
 ): Promise<VendorRuleListResponse> {
-	const params = new URLSearchParams();
-	for (const [key, val] of Object.entries(filters)) {
-		if (val !== undefined && val !== '') {
-			params.set(key, String(val));
-		}
-	}
-	const qs = params.toString();
-	return request<VendorRuleListResponse>(`/vendor-rules${qs ? `?${qs}` : ''}`);
+	return request<VendorRuleListResponse>(`/vendor-rules${toQueryString(filters)}`);
 }
 
 export async function fetchVendorRule(id: string): Promise<VendorRuleWithMatches> {
@@ -373,7 +454,7 @@ export async function patchVendorRule(id: string, data: VendorRulePatch): Promis
 }
 
 export async function deleteVendorRule(id: string): Promise<void> {
-	const res = await fetch(`${BASE}/vendor-rules/${id}`, { method: 'DELETE' });
+	const res = await fetch(`${BASE}/vendor-rules/${id}`, { method: 'DELETE', headers: getApiKeyHeader() });
 	if (!res.ok && res.status !== 204) {
 		const text = await res.text().catch(() => res.statusText);
 		throw new Error(`API ${res.status}: ${text}`);
@@ -475,6 +556,12 @@ export interface EstimatedTax {
 	warning?: string;
 }
 
+export interface Tax1099Entry {
+	payer: string;
+	type: string | null;
+	total: number;
+}
+
 export interface TaxSummary {
 	entity: string;
 	year: number;
@@ -487,6 +574,7 @@ export interface TaxSummary {
 	comparison: TaxYoyComparison | null;
 	tax_tips: TaxTip[];
 	estimated_tax: EstimatedTax | null;
+	income_1099_breakdown: Tax1099Entry[];
 }
 
 // ── Monthly breakdown types ───────────────────────────────────────────────────
@@ -541,7 +629,7 @@ export async function downloadExport(
 	filename: string
 ): Promise<void> {
 	const url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
-	const res = await fetch(url);
+	const res = await fetch(url, { headers: getApiKeyHeader() });
 	if (!res.ok) {
 		const text = await res.text().catch(() => res.statusText);
 		throw new Error(`Export failed (${res.status}): ${text}`);
@@ -622,7 +710,114 @@ export async function fetchAggregations(params: {
 	if (params.entity) qs.set('entity', params.entity);
 	if (params.date_from) qs.set('date_from', params.date_from);
 	if (params.date_to) qs.set('date_to', params.date_to);
-	const res = await fetch(`${BASE}/transactions/aggregations?${qs}`);
+	const res = await fetch(`${BASE}/transactions/aggregations?${qs}`, { headers: getApiKeyHeader() });
 	if (!res.ok) throw new Error(`Aggregations failed: ${res.status}`);
 	return res.json();
+}
+
+// ── Import API ────────────────────────────────────────────────────────────────
+
+export interface BankCsvConfig {
+	bank_name: string;
+	label: string;
+	date_col: string;
+	amount_col: string;
+	description_col: string;
+	entity: string | null;
+}
+
+export interface BankCsvPreviewRow {
+	[key: string]: string;
+}
+
+export interface BankCsvPreview {
+	bank_name: string | null;
+	headers: string[];
+	sample_rows: BankCsvPreviewRow[];
+	row_count: number;
+	detected_config: BankCsvConfig | null;
+}
+
+export interface BankCsvCommitResult {
+	created: number;
+	skipped: number;
+	errors: string[];
+}
+
+export interface BrokerageCsvResult {
+	created: number;
+	skipped: number;
+	errors: string[];
+}
+
+/** Fetch saved bank CSV configs from the server. */
+export async function fetchBankCsvConfigs(): Promise<BankCsvConfig[]> {
+	return request<BankCsvConfig[]>('/import/bank-csv/configs');
+}
+
+/**
+ * Upload a bank CSV for preview. Returns detected headers, sample rows,
+ * and auto-detected config if the bank was recognized.
+ */
+export async function previewBankCsv(
+	file: File,
+	bankName?: string
+): Promise<BankCsvPreview> {
+	const formData = new FormData();
+	formData.append('file', file);
+	if (bankName) formData.append('bank_name', bankName);
+
+	const res = await fetch(`${BASE}/import/bank-csv/preview`, {
+		method: 'POST',
+		headers: getApiKeyHeader(),
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Preview failed (${res.status}): ${text}`);
+	}
+	return res.json() as Promise<BankCsvPreview>;
+}
+
+/**
+ * Commit a bank CSV import. Sends the file plus selected bank name,
+ * and returns counts of created/skipped/errors.
+ */
+export async function commitBankCsv(
+	file: File,
+	bankName: string
+): Promise<BankCsvCommitResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+	formData.append('bank_name', bankName);
+
+	const res = await fetch(`${BASE}/import/bank-csv/commit`, {
+		method: 'POST',
+		headers: getApiKeyHeader(),
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Import failed (${res.status}): ${text}`);
+	}
+	return res.json() as Promise<BankCsvCommitResult>;
+}
+
+/**
+ * Import a brokerage CSV. Returns counts of created/skipped/errors.
+ */
+export async function importBrokerageCsv(file: File): Promise<BrokerageCsvResult> {
+	const formData = new FormData();
+	formData.append('file', file);
+
+	const res = await fetch(`${BASE}/import/brokerage-csv`, {
+		method: 'POST',
+		headers: getApiKeyHeader(),
+		body: formData
+	});
+	if (!res.ok) {
+		const text = await res.text().catch(() => res.statusText);
+		throw new Error(`Import failed (${res.status}): ${text}`);
+	}
+	return res.json() as Promise<BrokerageCsvResult>;
 }

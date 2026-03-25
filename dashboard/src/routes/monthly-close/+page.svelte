@@ -1,5 +1,31 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { fetchHealth, fetchTaxSummary } from '$lib/api';
+	import type { HealthResponse, SourceFreshness } from '$lib/types';
+	import type { TaxSummary } from '$lib/api';
+	import { formatAmount } from '$lib/categories';
+
+	// ── Entity selector ───────────────────────────────────────────────────────
+	const ENTITIES = [
+		{ value: 'sparkry', label: 'Sparkry AI LLC' },
+		{ value: 'blackline', label: 'BlackLine MTB LLC' },
+		{ value: 'personal', label: 'Personal' }
+	] as const;
+	type EntityValue = typeof ENTITIES[number]['value'];
+
+	function loadEntity(): EntityValue {
+		try {
+			const v = localStorage.getItem('monthly-close-entity');
+			if (v && ENTITIES.some((e) => e.value === v)) return v as EntityValue;
+		} catch { /* ignore */ }
+		return 'sparkry';
+	}
+
+	let selectedEntity = $state<EntityValue>(loadEntity());
+
+	$effect(() => {
+		try { localStorage.setItem('monthly-close-entity', selectedEntity); } catch { /* ignore */ }
+	});
 
 	// ── Types ──────────────────────────────────────────────────────────────────
 	interface Step {
@@ -10,53 +36,9 @@
 		linkLabel: string;
 	}
 
-	// ── Constants ──────────────────────────────────────────────────────────────
-	const STEPS: Step[] = [
-		{
-			id: 'freshness',
-			title: 'Check Data Freshness',
-			description: 'Verify all data sources are up to date.',
-			href: '/health',
-			linkLabel: 'Open Health'
-		},
-		{
-			id: 'categorize',
-			title: 'Review Uncategorized',
-			description: 'Categorize all pending transactions.',
-			href: '/register?status=needs_review',
-			linkLabel: 'Open Register'
-		},
-		{
-			id: 'reconcile',
-			title: 'Reconcile',
-			description: 'Match payouts with bank deposits.',
-			href: '/reconciliation',
-			linkLabel: 'Open Reconciliation'
-		},
-		{
-			id: 'verify',
-			title: 'Verify P&L',
-			description: 'Review income statement for the month.',
-			href: '/financials',
-			linkLabel: 'Open Financials'
-		},
-		{
-			id: 'export',
-			title: 'Export for Filing',
-			description: 'Download tax exports if needed.',
-			href: '/tax',
-			linkLabel: 'Open Tax'
-		}
-	];
-
 	// ── Month helpers ──────────────────────────────────────────────────────────
 	function toMonthKey(year: number, month: number): string {
 		return `${year}-${String(month).padStart(2, '0')}`;
-	}
-
-	function parseMonthKey(key: string): { year: number; month: number } {
-		const [y, m] = key.split('-').map(Number);
-		return { year: y, month: m };
 	}
 
 	function monthLabel(year: number, month: number): string {
@@ -84,6 +66,11 @@
 	// Map of stepId → completed, persisted to localStorage per month
 	let checked = $state<Record<string, boolean>>({});
 
+	// API data
+	let health = $state<HealthResponse | null>(null);
+	let taxSummary = $state<TaxSummary | null>(null);
+	let apiLoading = $state(false);
+
 	// The localStorage key for the selected month
 	let storageKey = $derived(`close-${toMonthKey(selectedYear, selectedMonth)}`);
 
@@ -91,6 +78,73 @@
 	let isCurrentMonth = $derived(
 		selectedYear === now.getFullYear() && selectedMonth === now.getMonth() + 1
 	);
+
+	// ── Live step descriptions ─────────────────────────────────────────────────
+	let freshSources = $derived.by((): number => {
+		if (!health) return 0;
+		return health.source_freshness.filter(
+			(s: SourceFreshness) => s.freshness_status === 'green'
+		).length;
+	});
+
+	let totalSources = $derived.by((): number => {
+		if (!health) return 0;
+		return health.source_freshness.length;
+	});
+
+	let needsReview = $derived(health?.needs_review_count ?? 0);
+
+	let netProfit = $derived(taxSummary?.net_profit ?? null);
+
+	let readinessPct = $derived(taxSummary?.readiness.readiness_pct ?? null);
+
+	let STEPS = $derived.by((): Step[] => [
+		{
+			id: 'freshness',
+			title: 'Check Data Freshness',
+			description: health
+				? `${freshSources} of ${totalSources} sources up to date`
+				: 'Verify all data sources are up to date.',
+			href: '/health',
+			linkLabel: 'Open Health'
+		},
+		{
+			id: 'categorize',
+			title: 'Review Uncategorized',
+			description: health
+				? (needsReview === 0
+					? 'All transactions categorized.'
+					: `${needsReview} transaction${needsReview === 1 ? '' : 's'} need review`)
+				: 'Categorize all pending transactions.',
+			href: '/register?status=needs_review',
+			linkLabel: 'Open Register'
+		},
+		{
+			id: 'reconcile',
+			title: 'Reconcile',
+			description: 'Match payouts with bank deposits.',
+			href: '/reconciliation',
+			linkLabel: 'Open Reconciliation'
+		},
+		{
+			id: 'verify',
+			title: 'Verify P&L',
+			description: netProfit !== null
+				? `Net profit for ${selectedYear}: ${formatAmount(netProfit)}`
+				: 'Review income statement for the month.',
+			href: '/financials',
+			linkLabel: 'Open Financials'
+		},
+		{
+			id: 'export',
+			title: 'Export for Filing',
+			description: readinessPct !== null
+				? `${readinessPct}% of transactions confirmed`
+				: 'Download tax exports if needed.',
+			href: '/tax',
+			linkLabel: 'Open Tax'
+		}
+	]);
 
 	// Completed count
 	let completedCount = $derived(STEPS.filter((s) => checked[s.id]).length);
@@ -119,7 +173,7 @@
 		}
 	}
 
-	// Re-load state whenever the selected month changes
+	// Re-load checklist state whenever the selected month changes
 	$effect(() => {
 		const key = storageKey;
 		checked = loadState(key);
@@ -135,8 +189,27 @@
 		saveState(storageKey, snapshot);
 	});
 
+	// Reload tax summary when year or entity changes
+	$effect(() => {
+		const year = selectedYear;
+		const entity = selectedEntity;
+		taxSummary = null;
+		fetchTaxSummary(entity, year).then(s => { taxSummary = s; }).catch(() => {});
+	});
+
 	onMount(() => {
 		checked = loadState(storageKey);
+		// Fetch live API data (best-effort — failures don't block the checklist)
+		apiLoading = true;
+		Promise.all([
+			fetchHealth().catch(() => null),
+			fetchTaxSummary(selectedEntity, selectedYear).catch(() => null)
+		]).then(([h, t]) => {
+			health = h;
+			taxSummary = t;
+		}).finally(() => {
+			apiLoading = false;
+		});
 	});
 
 	// ── Handlers ───────────────────────────────────────────────────────────────
@@ -158,6 +231,7 @@
 	}
 
 	function resetMonth() {
+		if (!confirm('Reset all steps for this period?')) return;
 		checked = {};
 	}
 </script>
@@ -170,6 +244,16 @@
 			<p class="page-subtitle">Step-by-step checklist to close out each month.</p>
 		</div>
 	</header>
+
+	<!-- ── Entity selector ────────────────────────────────────────────────── -->
+	<div class="entity-row card">
+		<label class="entity-label" for="close-entity">Entity</label>
+		<select id="close-entity" class="entity-select" bind:value={selectedEntity} aria-label="Select entity">
+			{#each ENTITIES as ent}
+				<option value={ent.value}>{ent.label}</option>
+			{/each}
+		</select>
+	</div>
 
 	<!-- ── Month selector ─────────────────────────────────────────────────── -->
 	<div class="month-nav card">
@@ -298,6 +382,27 @@
 		margin-top: 4px;
 		color: var(--text-muted);
 		font-size: 0.9rem;
+	}
+
+	/* ── Entity selector ──────────────────────────────────────────────────────── */
+	.entity-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 10px 16px;
+		margin-bottom: 12px;
+	}
+
+	.entity-label {
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--text-muted);
+		white-space: nowrap;
+	}
+
+	.entity-select {
+		flex: 1;
+		max-width: 240px;
 	}
 
 	/* ── Month navigator ─────────────────────────────────────────────────────── */

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { fetchHealth, fetchInvoices } from '$lib/api';
 
@@ -9,6 +10,37 @@
 
 	// Which dropdown group is open: 'transactions' | 'money' | 'system' | null
 	let openGroup = $state<string | null>(null);
+
+	// Mobile nav open/closed
+	let mobileOpen = $state(false);
+
+	// Global search
+	let searchQuery = $state('');
+	let searchExpanded = $state(false); // mobile: expand search field
+	let searchDebounce: ReturnType<typeof setTimeout> | null = null;
+
+	function commitSearch(q: string) {
+		const trimmed = q.trim();
+		if (!trimmed) return;
+		goto(`/register?search=${encodeURIComponent(trimmed)}`);
+		searchQuery = '';
+		searchExpanded = false;
+	}
+
+	function handleSearchKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter') {
+			if (searchDebounce) clearTimeout(searchDebounce);
+			commitSearch(searchQuery);
+		} else if (e.key === 'Escape') {
+			searchQuery = '';
+			searchExpanded = false;
+			(e.target as HTMLElement).blur();
+		}
+	}
+
+	function handleSearchInput(e: Event) {
+		searchQuery = (e.target as HTMLInputElement).value;
+	}
 
 	onMount(() => {
 		// Restore dark mode preference
@@ -48,7 +80,19 @@
 			}
 		}
 		document.addEventListener('click', handleClickOutside);
-		return () => document.removeEventListener('click', handleClickOutside);
+
+		// Close mobile menu on Escape
+		function handleGlobalKeydown(e: KeyboardEvent) {
+			if (e.key === 'Escape' && mobileOpen) {
+				mobileOpen = false;
+			}
+		}
+		document.addEventListener('keydown', handleGlobalKeydown);
+
+		return () => {
+			document.removeEventListener('click', handleClickOutside);
+			document.removeEventListener('keydown', handleGlobalKeydown);
+		};
 	});
 
 	function toggleDark() {
@@ -72,6 +116,11 @@
 	}
 
 	function closeGroup() {
+		openGroup = null;
+	}
+
+	function closeMobileMenu() {
+		mobileOpen = false;
 		openGroup = null;
 	}
 
@@ -126,10 +175,20 @@
 		</a>
 
 		<nav aria-label="Main navigation">
-			<ul class="nav-links">
+			<ul class="nav-links" class:mobile-open={mobileOpen}>
+				<!-- Mobile close button (inside panel) -->
+				<li class="mobile-close-row" aria-hidden="true">
+					<button class="mobile-close-btn" onclick={closeMobileMenu} tabindex={mobileOpen ? 0 : -1} aria-label="Close menu">
+						<svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+							<line x1="3" y1="3" x2="15" y2="15"/>
+							<line x1="15" y1="3" x2="3" y2="15"/>
+						</svg>
+					</button>
+				</li>
+
 				<!-- Dashboard (top-level) -->
 				<li>
-					<a href="/" class="nav-link" aria-current={isActive('/') ? 'page' : undefined}>
+					<a href="/" class="nav-link" aria-current={isActive('/') ? 'page' : undefined} onclick={closeMobileMenu}>
 						Dashboard
 					</a>
 				</li>
@@ -165,7 +224,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/register') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'transactions')}
 								>
 									Register
@@ -177,7 +236,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/review') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'transactions')}
 								>
 									Review
@@ -196,7 +255,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax'])}
+						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax', '/bno-filing'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'money'}
 						data-trigger="money"
@@ -223,7 +282,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/invoices') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									Invoices
@@ -240,7 +299,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/ar-aging') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									AR Aging
@@ -252,7 +311,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/financials') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									Financials
@@ -264,7 +323,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/cashflow') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									Cash Flow
@@ -276,10 +335,22 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/tax') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									Tax
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/bno-filing"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/bno-filing') ? 'page' : undefined}
+									onclick={closeMobileMenu}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									B&amp;O Filing
 								</a>
 							</li>
 						</ul>
@@ -290,7 +361,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation', '/monthly-close'])}
+						class:nav-group-active={isGroupActive(['/health', '/accounts', '/reconciliation', '/monthly-close', '/annual-close', '/import'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'system'}
 						data-trigger="system"
@@ -312,7 +383,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/health') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'system')}
 								>
 									Health
@@ -324,7 +395,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/accounts') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'system')}
 								>
 									Rules
@@ -336,7 +407,7 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/reconciliation') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'system')}
 								>
 									Reconciliation
@@ -348,10 +419,34 @@
 									class="nav-dropdown-item"
 									role="menuitem"
 									aria-current={isActive('/monthly-close') ? 'page' : undefined}
-									onclick={closeGroup}
+									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'system')}
 								>
 									Monthly Close
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/annual-close"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/annual-close') ? 'page' : undefined}
+									onclick={closeMobileMenu}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Annual Close
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/import"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/import') ? 'page' : undefined}
+									onclick={closeMobileMenu}
+									onkeydown={(e) => handleMenuKeydown(e, 'system')}
+								>
+									Import
 								</a>
 							</li>
 						</ul>
@@ -359,6 +454,61 @@
 				</li>
 			</ul>
 		</nav>
+
+		<!-- Global search (desktop: always visible; mobile: expandable icon) -->
+		<div class="search-wrap" class:search-expanded={searchExpanded}>
+			<!-- Mobile search icon trigger (hidden on desktop) -->
+			<button
+				class="search-icon-btn"
+				aria-label="Search transactions"
+				onclick={() => { searchExpanded = true; }}
+			>
+				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+				</svg>
+			</button>
+			<!-- The actual input -->
+			<div class="search-field" aria-hidden={!searchExpanded ? 'true' : undefined}>
+				<svg class="search-input-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+				</svg>
+				<input
+					type="search"
+					class="search-input"
+					placeholder="Search transactions…"
+					value={searchQuery}
+					oninput={handleSearchInput}
+					onkeydown={handleSearchKeydown}
+					onblur={() => { if (!searchQuery.trim()) searchExpanded = false; }}
+					tabindex={searchExpanded ? 0 : -1}
+					aria-label="Search transactions"
+				/>
+			</div>
+		</div>
+
+		<!-- Mobile hamburger button -->
+		<button
+			class="hamburger"
+			onclick={() => (mobileOpen = !mobileOpen)}
+			aria-label={mobileOpen ? 'Close navigation menu' : 'Open navigation menu'}
+			aria-expanded={mobileOpen}
+			aria-controls="mobile-nav-panel"
+		>
+			{#if mobileOpen}
+				<!-- X icon when open -->
+				<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+					<line x1="4" y1="4" x2="16" y2="16"/>
+					<line x1="16" y1="4" x2="4" y2="16"/>
+				</svg>
+			{:else}
+				<!-- Hamburger icon -->
+				<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+					<line x1="3" y1="5" x2="17" y2="5"/>
+					<line x1="3" y1="10" x2="17" y2="10"/>
+					<line x1="3" y1="15" x2="17" y2="15"/>
+				</svg>
+			{/if}
+		</button>
 
 		<button
 			class="dark-toggle"
@@ -373,6 +523,15 @@
 			{/if}
 		</button>
 	</div>
+
+	<!-- Mobile overlay backdrop -->
+	{#if mobileOpen}
+		<div
+			class="mobile-backdrop"
+			aria-hidden="true"
+			onclick={closeMobileMenu}
+		></div>
+	{/if}
 </header>
 
 <style>
@@ -560,5 +719,271 @@
 	.dark-toggle:hover {
 		color: var(--text);
 		background: var(--gray-100);
+	}
+
+	/* ── Hamburger button (desktop: hidden) ──────────────────────── */
+	.hamburger {
+		display: none;
+		align-items: center;
+		justify-content: center;
+		width: 36px;
+		height: 36px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: transparent;
+		color: var(--text-muted);
+		cursor: pointer;
+		flex-shrink: 0;
+		transition: color 0.12s, background 0.12s;
+		/* Place between brand and dark-toggle in source order, but
+		   visually we want it at the far right before dark-toggle.
+		   The flex order on .nav-inner handles this naturally. */
+	}
+
+	.hamburger:hover {
+		color: var(--text);
+		background: var(--gray-100);
+	}
+
+	/* Mobile-only close row inside the panel */
+	.mobile-close-row {
+		display: none;
+	}
+
+	/* Mobile overlay backdrop */
+	.mobile-backdrop {
+		display: none;
+	}
+
+	/* ── Mobile backdrop ─────────────────────────────────────────── */
+	@media (max-width: 768px) {
+		.mobile-backdrop {
+			display: block;
+			position: fixed;
+			inset: 0;
+			z-index: 98;
+			background: rgba(0, 0, 0, 0.35);
+			animation: backdrop-in 0.2s ease;
+		}
+	}
+
+	@keyframes backdrop-in {
+		from { opacity: 0; }
+		to   { opacity: 1; }
+	}
+
+	/* ── Mobile layout ───────────────────────────────────────────── */
+	@media (max-width: 768px) {
+		.nav-inner {
+			gap: 12px;
+		}
+
+		/* Push hamburger to the right automatically */
+		nav {
+			flex: 0; /* don't consume space when links are hidden */
+		}
+
+		.hamburger {
+			display: flex;
+			margin-left: auto; /* push to right side before dark-toggle */
+		}
+
+		/* Desktop nav hidden by default on mobile */
+		.nav-links {
+			display: none;
+		}
+
+		/* Slide-out panel when open */
+		.nav-links.mobile-open {
+			display: flex;
+			flex-direction: column;
+			gap: 2px;
+
+			/* Full-height panel anchored to the right */
+			position: fixed;
+			top: 0;
+			right: 0;
+			bottom: 0;
+			width: min(280px, 85vw);
+			z-index: 99;
+
+			background: var(--surface);
+			border-left: 1px solid var(--border);
+			box-shadow: -4px 0 24px rgba(0, 0, 0, 0.12);
+			padding: 12px;
+			overflow-y: auto;
+
+			animation: panel-in 0.22s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+		}
+
+		@keyframes panel-in {
+			from { transform: translateX(100%); opacity: 0.6; }
+			to   { transform: translateX(0);    opacity: 1; }
+		}
+
+		/* Show the in-panel close button row */
+		.mobile-close-row {
+			display: flex;
+			justify-content: flex-end;
+			margin-bottom: 8px;
+		}
+
+		.mobile-close-btn {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			width: 32px;
+			height: 32px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: transparent;
+			color: var(--text-muted);
+			cursor: pointer;
+			transition: color 0.12s, background 0.12s;
+		}
+
+		.mobile-close-btn:hover {
+			color: var(--text);
+			background: var(--gray-100);
+		}
+
+		/* Full-width nav links inside panel */
+		.nav-link {
+			width: 100%;
+			padding: 10px 14px;
+			font-size: 0.95rem;
+		}
+
+		/* Dropdowns are static (no absolute positioning) on mobile */
+		.nav-group {
+			position: static;
+		}
+
+		.nav-dropdown {
+			position: static;
+			box-shadow: none;
+			border: none;
+			border-radius: 0;
+			padding: 0 0 4px 12px; /* indent under trigger */
+			background: transparent;
+			min-width: unset;
+		}
+
+		.nav-dropdown-item {
+			width: 100%;
+			padding: 8px 14px;
+			font-size: 0.9rem;
+		}
+	}
+
+	@media (min-width: 769px) {
+		.hamburger {
+			display: none;
+		}
+
+		.nav-links {
+			display: flex !important; /* always visible on desktop */
+		}
+
+		.mobile-close-row {
+			display: none !important;
+		}
+	}
+
+	/* ── Global search ───────────────────────────────────────────────────────── */
+
+	.search-wrap {
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+	}
+
+	/* Desktop: always show the field, hide the icon-only trigger */
+	.search-icon-btn {
+		display: none;
+	}
+
+	.search-field {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+
+	.search-input-icon {
+		position: absolute;
+		left: 8px;
+		color: var(--text-muted);
+		pointer-events: none;
+	}
+
+	.search-input {
+		width: 200px;
+		padding: 5px 10px 5px 28px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		background: var(--gray-50);
+		color: var(--text);
+		font-size: 0.8rem;
+		font-family: inherit;
+		transition: border-color 0.12s, width 0.2s;
+	}
+
+	.search-input::placeholder {
+		color: var(--gray-400);
+	}
+
+	.search-input:focus {
+		outline: none;
+		border-color: var(--blue-500);
+		background: var(--surface);
+		width: 240px;
+	}
+
+	/* Hide webkit search clear button */
+	.search-input::-webkit-search-cancel-button {
+		-webkit-appearance: none;
+	}
+
+	/* Mobile: show icon-only trigger; collapse field unless expanded */
+	@media (max-width: 768px) {
+		.search-icon-btn {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			width: 32px;
+			height: 32px;
+			border: 1px solid var(--border);
+			border-radius: var(--radius-sm);
+			background: transparent;
+			color: var(--text-muted);
+			cursor: pointer;
+			transition: color 0.12s, background 0.12s;
+		}
+
+		.search-icon-btn:hover {
+			color: var(--text);
+			background: var(--gray-100);
+		}
+
+		.search-field {
+			display: none;
+		}
+
+		/* When expanded, hide the icon trigger and show the field */
+		.search-wrap.search-expanded .search-icon-btn {
+			display: none;
+		}
+
+		.search-wrap.search-expanded .search-field {
+			display: flex;
+		}
+
+		.search-wrap.search-expanded .search-input {
+			width: 160px;
+		}
+
+		.search-wrap.search-expanded .search-input:focus {
+			width: 200px;
+		}
 	}
 </style>

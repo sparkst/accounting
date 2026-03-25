@@ -261,15 +261,15 @@ def run_reclassify() -> ReclassifySummary:
       3. Run the classification engine on every ``needs_review`` transaction.
       4. Return counts and errors.
     """
-    session = SessionLocal()
+    session = None
     try:
+        session = SessionLocal()
         result = reclassify_all(
             session,
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
             seed_rules=True,
         )
     except Exception:
-        session.close()
         return ReclassifySummary(
             vendor_updated=0,
             classified=0,
@@ -277,7 +277,8 @@ def run_reclassify() -> ReclassifySummary:
             errors=[f"[reclassify] Fatal error: {traceback.format_exc()}"],
         )
     finally:
-        session.close()
+        if session:
+            session.close()
 
     return ReclassifySummary(
         vendor_updated=result.vendor_updated,

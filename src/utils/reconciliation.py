@@ -150,7 +150,18 @@ def _load_bank_deposits(session: Session) -> list[Transaction]:
 
 def _already_reconciled(txn: Transaction) -> bool:
     """Return True if this transaction has been manually reconciled."""
-    return bool(txn.notes and txn.notes.startswith(RECON_LINK_NOTE_PREFIX))
+    return bool(txn.notes and RECON_LINK_NOTE_PREFIX in txn.notes)
+
+
+def _extract_recon_link(notes: str | None) -> str | None:
+    """Extract the linked transaction ID from notes containing a reconciled: marker."""
+    if not notes:
+        return None
+    for line in notes.split("\n"):
+        line = line.strip()
+        if line.startswith(RECON_LINK_NOTE_PREFIX):
+            return line[len(RECON_LINK_NOTE_PREFIX):]
+    return None
 
 
 def find_matches(
@@ -190,7 +201,7 @@ def find_matches(
     for p in payouts:
         if _already_reconciled(p):
             # Extract linked bank ID from notes field
-            linked_id = p.notes.split(":", 1)[1] if p.notes else None
+            linked_id = _extract_recon_link(p.notes)
             if linked_id:
                 reconciled_payout_ids.add(p.id)
         else:
@@ -198,7 +209,7 @@ def find_matches(
 
     for b in banks:
         if _already_reconciled(b):
-            linked_id = b.notes.split(":", 1)[1] if b.notes else None
+            linked_id = _extract_recon_link(b.notes)
             if linked_id:
                 reconciled_bank_ids.add(b.id)
         else:
@@ -210,7 +221,7 @@ def find_matches(
     # For manual pairs, find the payout-bank relationship
     for p in payouts:
         if p.id in reconciled_payout_ids and p.notes:
-            linked_bank_id = p.notes.split(":", 1)[1]
+            linked_bank_id = _extract_recon_link(p.notes)
             linked_bank = next((b for b in banks if b.id == linked_bank_id), None)
             if linked_bank:
                 d_diff = abs((_parse_date(p.date) - _parse_date(linked_bank.date)).days)
@@ -363,12 +374,28 @@ def apply_manual_match(
     if txn_b is None:
         raise ValueError(f"Transaction not found: {transaction_id_b}")
 
-    txn_a.notes = f"{RECON_LINK_NOTE_PREFIX}{txn_b.id}"
-    txn_b.notes = f"{RECON_LINK_NOTE_PREFIX}{txn_a.id}"
+    # Append recon link to notes (preserve existing content)
+    old_notes_a = txn_a.notes
+    old_notes_b = txn_b.notes
+    recon_a = f"{RECON_LINK_NOTE_PREFIX}{txn_b.id}"
+    recon_b = f"{RECON_LINK_NOTE_PREFIX}{txn_a.id}"
+    txn_a.notes = f"{old_notes_a}\n{recon_a}" if old_notes_a else recon_a
+    txn_b.notes = f"{old_notes_b}\n{recon_b}" if old_notes_b else recon_b
 
     # If the original transaction has foreign currency and the match is a
     # CC statement, update the USD amount to the actual amount charged.
     _update_foreign_currency_from_statement(session, txn_a, txn_b)
+
+    # Audit trail for reconciliation match
+    from src.models.audit_event import AuditEvent
+    for txn, old_notes in [(txn_a, old_notes_a), (txn_b, old_notes_b)]:
+        session.add(AuditEvent(
+            transaction_id=txn.id,
+            field_changed="reconciliation_link",
+            old_value=old_notes,
+            new_value=txn.notes,
+            changed_by="human",
+        ))
 
     session.flush()
     return txn_a, txn_b
@@ -425,8 +452,21 @@ def remove_manual_match(
         cleaned = notes.replace(link_to_remove, "").strip()
         return cleaned if cleaned else None
 
+    old_notes_a = txn_a.notes
+    old_notes_b = txn_b.notes
     txn_a.notes = _strip_recon_note(txn_a.notes, a_link)
     txn_b.notes = _strip_recon_note(txn_b.notes, b_link)
+
+    # Audit trail for reconciliation unlink
+    from src.models.audit_event import AuditEvent
+    for txn, old_notes in [(txn_a, old_notes_a), (txn_b, old_notes_b)]:
+        session.add(AuditEvent(
+            transaction_id=txn.id,
+            field_changed="reconciliation_link",
+            old_value=old_notes,
+            new_value=txn.notes,
+            changed_by="human",
+        ))
 
     session.flush()
     return txn_a, txn_b
@@ -468,7 +508,7 @@ def _update_foreign_currency_from_statement(
     statement_amount = abs(Decimal(str(statement_txn.amount)))
     original_sign = -1 if (foreign_txn.amount is not None and float(foreign_txn.amount) < 0) else 1
     foreign_txn.amount = original_sign * statement_amount
-    foreign_txn.exchange_rate = float(statement_amount) / foreign_txn.amount_foreign
+    foreign_txn.exchange_rate = statement_amount / Decimal(str(foreign_txn.amount_foreign))
     foreign_txn.exchange_rate_source = "credit_card_statement"
 
     # Log audit events

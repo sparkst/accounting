@@ -656,3 +656,65 @@ class TestEncodingVariants:
         result = parse_csv_bytes(csv_latin1, config)
         assert len(result.rows) == 1
         assert "Caf" in result.rows[0].description
+
+
+# ---------------------------------------------------------------------------
+# Tests — S1-008: source_hash is stable across different row orderings
+# ---------------------------------------------------------------------------
+
+
+class TestSourceHashStability:
+    """S1-008: Dedup hash is based on content, not row position."""
+
+    def test_same_transactions_different_order_same_hashes(self, session):
+        """Two CSVs with the same transactions in different row order produce
+        identical source_hashes, so the second import is fully skipped."""
+        csv_v1 = b"""Date,Description,Amount,Balance
+01/05/2025,Amazon.com,-45.99,1000.00
+01/08/2025,Direct Deposit,2500.00,3500.00
+01/10/2025,Whole Foods,-67.23,3432.77
+"""
+        csv_v2 = b"""Date,Description,Amount,Balance
+01/10/2025,Whole Foods,-67.23,3432.77
+01/05/2025,Amazon.com,-45.99,1000.00
+01/08/2025,Direct Deposit,2500.00,3500.00
+"""
+        config = BankCsvConfig(
+            bank_name="test_stability",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+            balance_column="Balance",
+        )
+
+        # First import — all 3 rows inserted.
+        adapter1 = BankCsvAdapter(csv_v1, config, filename="statement.csv", dry_run=False)
+        result1 = adapter1.run(session)
+        assert result1.records_created == 3
+
+        # Second import with different row order — all 3 rows skipped as duplicates.
+        adapter2 = BankCsvAdapter(csv_v2, config, filename="statement.csv", dry_run=False)
+        result2 = adapter2.run(session)
+        assert result2.records_created == 0
+        assert result2.records_skipped == 3
+
+    def test_different_description_produces_different_hash(self, session):
+        """Transactions that differ only in description get distinct hashes."""
+        csv_a = b"Date,Description,Amount\n01/05/2025,Vendor A,100.00\n"
+        csv_b = b"Date,Description,Amount\n01/05/2025,Vendor B,100.00\n"
+        config = BankCsvConfig(
+            bank_name="test_distinct",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+
+        adapter_a = BankCsvAdapter(csv_a, config, filename="stmt.csv", dry_run=False)
+        result_a = adapter_a.run(session)
+        assert result_a.records_created == 1
+
+        adapter_b = BankCsvAdapter(csv_b, config, filename="stmt.csv", dry_run=False)
+        result_b = adapter_b.run(session)
+        assert result_b.records_created == 1  # distinct description → distinct hash

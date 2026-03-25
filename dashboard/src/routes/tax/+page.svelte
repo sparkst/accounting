@@ -1,8 +1,18 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { fetchTaxSummary, downloadExport } from '$lib/api';
-	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip, EstimatedTax } from '$lib/api';
+	import type { TaxSummary, TaxLineItem, TaxYoyDelta, TaxTip, EstimatedTax, Tax1099Entry } from '$lib/api';
 	import { CATEGORY_LABELS, formatAmount, amountClass } from '$lib/categories';
+	import { selectedEntity as entityStore } from '$lib/stores/entity';
+
+	// ── Estimated tax payment log types ───────────────────────────────────────
+	interface EstPaymentRecord {
+		id: string;
+		quarter: string;         // e.g. "Q1 2026"
+		amount: number;
+		date: string;            // ISO date string
+		type: 'federal' | 'state';
+	}
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 	const ENTITIES = [
@@ -20,7 +30,15 @@
 
 
 	// ── State ─────────────────────────────────────────────────────────────────
-	let selectedEntity   = $state<'sparkry' | 'blackline' | 'personal'>('sparkry');
+	// Seed from shared entity store; write back on change
+	const _initEntityTax = $entityStore;
+	const _validTaxEntities = ['sparkry', 'blackline', 'personal'] as const;
+	let selectedEntity = $state<'sparkry' | 'blackline' | 'personal'>(
+		(_validTaxEntities as readonly string[]).includes(_initEntityTax)
+			? (_initEntityTax as 'sparkry' | 'blackline' | 'personal')
+			: 'sparkry'
+	);
+	$effect(() => { entityStore.set(selectedEntity); });
 	let selectedYear     = $state(CURRENT_YEAR);
 	let summary          = $state<TaxSummary | null>(null);
 	let loading          = $state(false);
@@ -31,6 +49,77 @@
 	let showDismissed    = $state(false);
 	let insightsOpen     = $state(false);
 	let bnoExpanded      = $state(false);
+
+	// ── S3-002: 1099 Tracking ─────────────────────────────────────────────────
+	let breakdown1099 = $derived<Tax1099Entry[]>(summary?.income_1099_breakdown ?? []);
+
+	// ── S3-003: Estimated tax payment log ─────────────────────────────────────
+	let estPayments = $state<EstPaymentRecord[]>([]);
+	let showPaymentForm = $state(false);
+	let paymentFormQuarter = $state('');
+	let paymentFormAmount = $state('');
+	let paymentFormDate = $state('');
+	let paymentFormType = $state<'federal' | 'state'>('federal');
+
+	function estPaymentStorageKey(): string {
+		return `est-payments-${selectedEntity}-${selectedYear}`;
+	}
+
+	function loadEstPayments(): void {
+		if (typeof localStorage === 'undefined') return;
+		try {
+			const raw = localStorage.getItem(estPaymentStorageKey());
+			estPayments = raw ? (JSON.parse(raw) as EstPaymentRecord[]) : [];
+		} catch {
+			estPayments = [];
+		}
+	}
+
+	function saveEstPayments(records: EstPaymentRecord[]): void {
+		if (typeof localStorage === 'undefined') return;
+		localStorage.setItem(estPaymentStorageKey(), JSON.stringify(records));
+	}
+
+	function openPaymentForm(quarter?: string): void {
+		paymentFormQuarter = quarter ?? '';
+		paymentFormAmount = '';
+		paymentFormDate = new Date().toISOString().slice(0, 10);
+		paymentFormType = 'federal';
+		showPaymentForm = true;
+	}
+
+	function cancelPaymentForm(): void {
+		showPaymentForm = false;
+	}
+
+	function submitPaymentForm(): void {
+		const amt = parseFloat(paymentFormAmount);
+		if (!paymentFormQuarter || isNaN(amt) || amt <= 0 || !paymentFormDate) return;
+		const record: EstPaymentRecord = {
+			id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+			quarter: paymentFormQuarter,
+			amount: amt,
+			date: paymentFormDate,
+			type: paymentFormType,
+		};
+		const updated = [...estPayments, record];
+		saveEstPayments(updated);
+		estPayments = updated;
+		showPaymentForm = false;
+	}
+
+	function deleteEstPayment(id: string): void {
+		const updated = estPayments.filter(p => p.id !== id);
+		saveEstPayments(updated);
+		estPayments = updated;
+	}
+
+	/** Sum of recorded payments for a given quarter label (e.g. "Q1 2026"). */
+	function quarterPaidTotal(quarterLabel: string): number {
+		return estPayments
+			.filter(p => p.quarter === quarterLabel)
+			.reduce((sum, p) => sum + p.amount, 0);
+	}
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let compareYear = $derived(selectedYear - 1);
@@ -221,6 +310,7 @@
 		loading = true;
 		fetchError = '';
 		summary = null;
+		loadEstPayments();
 		try {
 			const cy = compareEnabled ? compareYear : undefined;
 			summary = await fetchTaxSummary(selectedEntity, selectedYear, cy);
@@ -249,6 +339,86 @@
 	}
 
 	onMount(() => { load(); });
+
+	// ── S3-010: Home Office Deduction ─────────────────────────────────────────
+	type HomeOfficeMethod = 'simplified' | 'actual';
+	const HOME_OFFICE_SIMPLIFIED_RATE    = 5;   // $5 per sq ft (IRS simplified method)
+	const HOME_OFFICE_SIMPLIFIED_MAX_SQFT = 300; // IRS maximum for simplified method
+
+	let homeOfficeOpen     = $state(false);
+	let hoSqft             = $state('');
+	let hoMethod           = $state<HomeOfficeMethod>('simplified');
+	// Actual method: percentage of home used for business (for each expense type)
+	let hoRentPct          = $state('');
+	let hoUtilitiesPct     = $state('');
+	let hoInternetPct      = $state('');
+
+	interface HomeOfficeStorage {
+		sqft: string;
+		method: HomeOfficeMethod;
+		rentPct: string;
+		utilitiesPct: string;
+		internetPct: string;
+	}
+
+	function hoStorageKey(): string {
+		return `home-office-${selectedEntity}-${selectedYear}`;
+	}
+
+	function loadHomeOffice(): void {
+		if (typeof localStorage === 'undefined') return;
+		try {
+			const raw = localStorage.getItem(hoStorageKey());
+			if (!raw) return;
+			const data = JSON.parse(raw) as HomeOfficeStorage;
+			hoSqft         = data.sqft         ?? '';
+			hoMethod       = data.method       ?? 'simplified';
+			hoRentPct      = data.rentPct      ?? '';
+			hoUtilitiesPct = data.utilitiesPct ?? '';
+			hoInternetPct  = data.internetPct  ?? '';
+		} catch {
+			// ignore parse errors
+		}
+	}
+
+	function saveHomeOffice(): void {
+		if (typeof localStorage === 'undefined') return;
+		const data: HomeOfficeStorage = {
+			sqft:         hoSqft,
+			method:       hoMethod,
+			rentPct:      hoRentPct,
+			utilitiesPct: hoUtilitiesPct,
+			internetPct:  hoInternetPct,
+		};
+		localStorage.setItem(hoStorageKey(), JSON.stringify(data));
+	}
+
+	// Reload persisted inputs when entity or year changes
+	$effect(() => {
+		void selectedEntity;
+		void selectedYear;
+		loadHomeOffice();
+	});
+
+	// Persist on any input change
+	$effect(() => {
+		void hoSqft; void hoMethod; void hoRentPct; void hoUtilitiesPct; void hoInternetPct;
+		saveHomeOffice();
+	});
+
+	// Simplified method deduction (null if no valid sqft entered)
+	let hoSimplifiedDeduction = $derived.by((): number | null => {
+		const sqft = parseFloat(hoSqft);
+		if (isNaN(sqft) || sqft <= 0) return null;
+		const effective = Math.min(sqft, HOME_OFFICE_SIMPLIFIED_MAX_SQFT);
+		return effective * HOME_OFFICE_SIMPLIFIED_RATE;
+	});
+
+	// Parsed actual-method percentages (as decimals), or null if not entered
+	let hoActualRentPct      = $derived(parseFloat(hoRentPct)      || 0);
+	let hoActualUtilitiesPct = $derived(parseFloat(hoUtilitiesPct) || 0);
+	let hoActualInternetPct  = $derived(parseFloat(hoInternetPct)  || 0);
+	let hoActualAnyEntered   = $derived(hoRentPct !== '' || hoUtilitiesPct !== '' || hoInternetPct !== '');
 </script>
 
 <!-- ── Page ──────────────────────────────────────────────────────────────────── -->
@@ -383,7 +553,11 @@
 		{#if summary.warnings.length > 0}
 			{#each summary.warnings as w (w.warning)}
 				<div class="alert-banner alert-warning">
-					{w.warning}
+					{#if w.warning.includes('1099 documentation gap')}
+						{w.warning} <a href="#tracking-1099" class="warning-link">View 1099 Tracking →</a>
+					{:else}
+						{w.warning}
+					{/if}
 				</div>
 			{/each}
 		{/if}
@@ -787,6 +961,360 @@
 				</div>
 			</section>
 		{/if}
+
+		<!-- ── 1099 Tracking ─────────────────────────────────────────────────── -->
+		<section class="dashboard-section" id="tracking-1099">
+			<h2 class="section-title">1099 Tracking</h2>
+			<div class="card table-card">
+				{#if breakdown1099.length === 0}
+					<p class="no-data table-empty">
+						No income tagged to a 1099 payer for {selectedEntity} in {selectedYear}.
+						Tag income transactions with a payer in the Register.
+					</p>
+				{:else}
+					<table class="data-table tracking-1099-table">
+						<thead>
+							<tr>
+								<th>Payer Name</th>
+								<th>1099 Type</th>
+								<th class="th-right">Total Amount</th>
+								<th class="th-right"># Transactions</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each breakdown1099 as entry (entry.payer)}
+								<tr>
+									<td class="td-category">{entry.payer}</td>
+									<td class="td-1099-type">{entry.type ?? '—'}</td>
+									<td class="td-amount amount-positive">{fmtCurrency(entry.total)}</td>
+									<td class="td-amount td-tx-count">—</td>
+								</tr>
+							{/each}
+						</tbody>
+						<tfoot>
+							<tr>
+								<td colspan="2" class="subtotal-label">Total Tagged</td>
+								<td class="td-amount subtotal-val">
+									{fmtCurrency(breakdown1099.reduce((s, e) => s + e.total, 0))}
+								</td>
+								<td></td>
+							</tr>
+						</tfoot>
+					</table>
+				{/if}
+			</div>
+		</section>
+
+		<!-- ── Estimated Tax Payment Log ──────────────────────────────────────── -->
+		{#if estimatedTax}
+			<section class="dashboard-section no-print">
+				<h2 class="section-title">Estimated Tax Payment Log</h2>
+				<div class="card est-log-card">
+					<table class="data-table est-table">
+						<thead>
+							<tr>
+								<th>Quarter</th>
+								<th class="th-right">Projected</th>
+								<th class="th-right">Paid (Recorded)</th>
+								<th>Date Paid</th>
+								<th>Type</th>
+								<th class="th-right">Remaining</th>
+								<th class="no-print"></th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each estimatedTax.quarters as q (q.quarter)}
+								{@const qLabel = `${q.quarter} ${selectedYear}`}
+								{@const payments = estPayments.filter(p => p.quarter === qLabel)}
+								{@const totalPaid = payments.reduce((s, p) => s + p.amount, 0)}
+								{@const remaining = Math.max(0, q.projected_amount - totalPaid)}
+								<tr class="est-log-quarter-row">
+									<td class="td-period" rowspan={payments.length > 0 ? payments.length + 1 : 1}>
+										{q.quarter} <span class="est-log-year">{selectedYear}</span>
+									</td>
+									<td class="td-amount" rowspan={payments.length > 0 ? payments.length + 1 : 1}>
+										{fmtCurrency(q.projected_amount)}
+									</td>
+									{#if payments.length === 0}
+										<td class="td-amount no-data">—</td>
+										<td class="no-data">—</td>
+										<td></td>
+										<td class="td-amount">{fmtCurrency(q.projected_amount)}</td>
+										<td class="no-print">
+											<button
+												class="btn-record-payment"
+												onclick={() => openPaymentForm(qLabel)}
+											>Record</button>
+										</td>
+									{/if}
+								</tr>
+								{#each payments as payment, pi (payment.id)}
+									<tr>
+										<td class="td-amount amount-positive">{fmtCurrency(payment.amount)}</td>
+										<td class="td-date">{payment.date}</td>
+										<td>
+											<span class="pay-type-badge pay-type-{payment.type}">{payment.type}</span>
+										</td>
+										{#if pi === 0}
+											<td class="td-amount" rowspan={payments.length}>
+												{#if remaining > 0}
+													{fmtCurrency(remaining)}
+												{:else}
+													<span class="no-data">—</span>
+												{/if}
+											</td>
+										{/if}
+										<td class="no-print">
+											{#if pi === 0}
+												<button
+													class="btn-record-payment"
+													onclick={() => openPaymentForm(qLabel)}
+												>+ Add</button>
+											{/if}
+											<button
+												class="btn-delete-payment"
+												onclick={() => deleteEstPayment(payment.id)}
+												aria-label="Delete payment"
+												title="Remove this payment"
+											>✕</button>
+										</td>
+									</tr>
+								{/each}
+							{/each}
+						</tbody>
+						<tfoot>
+							<tr>
+								<td>Total</td>
+								<td class="td-amount">{fmtCurrency(estimatedTax.total_annual)}</td>
+								<td class="td-amount">
+									{fmtCurrency(estPayments.reduce((s, p) => s + p.amount, 0))}
+								</td>
+								<td colspan="2"></td>
+								<td class="td-amount">
+									{#if estimatedTax.total_annual - estPayments.reduce((s, p) => s + p.amount, 0) > 0}
+										{fmtCurrency(estimatedTax.total_annual - estPayments.reduce((s, p) => s + p.amount, 0))}
+									{:else}
+										<span class="no-data">—</span>
+									{/if}
+								</td>
+								<td class="no-print"></td>
+							</tr>
+						</tfoot>
+					</table>
+
+					<!-- ── Record Payment inline form ────────────────────────────── -->
+					{#if showPaymentForm}
+						<div class="pay-form-wrap">
+							<h3 class="pay-form-title">Record Estimated Tax Payment</h3>
+							<div class="pay-form-row">
+								<label class="pay-form-label" for="pay-quarter">Quarter</label>
+								<select
+									id="pay-quarter"
+									class="pay-form-input"
+									bind:value={paymentFormQuarter}
+								>
+									<option value="">— select —</option>
+									{#each estimatedTax.quarters as q (q.quarter)}
+										<option value="{q.quarter} {selectedYear}">{q.quarter} {selectedYear}</option>
+									{/each}
+								</select>
+							</div>
+							<div class="pay-form-row">
+								<label class="pay-form-label" for="pay-amount">Amount ($)</label>
+								<input
+									id="pay-amount"
+									type="number"
+									min="0"
+									step="0.01"
+									class="pay-form-input"
+									bind:value={paymentFormAmount}
+									placeholder="0.00"
+								/>
+							</div>
+							<div class="pay-form-row">
+								<label class="pay-form-label" for="pay-date">Date Paid</label>
+								<input
+									id="pay-date"
+									type="date"
+									class="pay-form-input"
+									bind:value={paymentFormDate}
+								/>
+							</div>
+							<div class="pay-form-row">
+								<label class="pay-form-label" for="pay-type">Type</label>
+								<select id="pay-type" class="pay-form-input" bind:value={paymentFormType}>
+									<option value="federal">Federal</option>
+									<option value="state">State (WA)</option>
+								</select>
+							</div>
+							<div class="pay-form-actions">
+								<button class="btn btn-primary" onclick={submitPaymentForm}>Save Payment</button>
+								<button class="btn btn-ghost" onclick={cancelPaymentForm}>Cancel</button>
+							</div>
+						</div>
+					{:else}
+						<div class="pay-log-footer">
+							<button class="btn btn-ghost" onclick={() => openPaymentForm()}>
+								+ Record Payment
+							</button>
+						</div>
+					{/if}
+				</div>
+			</section>
+		{/if}
+
+		<!-- ── Home Office Deduction ──────────────────────────────────────────── -->
+		<section class="dashboard-section no-print" id="home-office">
+			<button
+				class="ho-toggle"
+				onclick={() => (homeOfficeOpen = !homeOfficeOpen)}
+				aria-expanded={homeOfficeOpen}
+			>
+				<span class="ho-toggle-text">Home Office Deduction</span>
+				<span class="chevron" class:chevron-open={homeOfficeOpen} aria-hidden="true">&#x25B8;</span>
+			</button>
+
+			{#if homeOfficeOpen}
+				<div class="card ho-card">
+					<!-- Method selector -->
+					<div class="ho-method-row">
+						<span class="ho-field-label">Method</span>
+						<div class="ho-method-tabs" role="group" aria-label="Deduction method">
+							<button
+								class="ho-method-tab"
+								class:ho-method-tab-active={hoMethod === 'simplified'}
+								onclick={() => (hoMethod = 'simplified')}
+								aria-pressed={hoMethod === 'simplified'}
+							>Simplified</button>
+							<button
+								class="ho-method-tab"
+								class:ho-method-tab-active={hoMethod === 'actual'}
+								onclick={() => (hoMethod = 'actual')}
+								aria-pressed={hoMethod === 'actual'}
+							>Actual</button>
+						</div>
+					</div>
+
+					<!-- Square footage (both methods) -->
+					<div class="ho-field-row">
+						<label class="ho-field-label" for="ho-sqft">Office sq ft</label>
+						<div class="ho-input-wrap">
+							<input
+								id="ho-sqft"
+								type="number"
+								min="1"
+								step="1"
+								class="ho-input"
+								bind:value={hoSqft}
+								placeholder="e.g. 100"
+								aria-describedby="ho-sqft-hint"
+							/>
+							<span class="ho-input-unit">sq ft</span>
+						</div>
+						{#if hoMethod === 'simplified'}
+							<p id="ho-sqft-hint" class="ho-hint">
+								IRS simplified method: ${HOME_OFFICE_SIMPLIFIED_RATE}/sq ft, up to {HOME_OFFICE_SIMPLIFIED_MAX_SQFT} sq ft max (${ HOME_OFFICE_SIMPLIFIED_RATE * HOME_OFFICE_SIMPLIFIED_MAX_SQFT } max deduction).
+							</p>
+						{:else}
+							<p id="ho-sqft-hint" class="ho-hint">
+								Used to calculate the business-use percentage of your home. Enter actual expense amounts below.
+							</p>
+						{/if}
+					</div>
+
+					{#if hoMethod === 'simplified'}
+						<!-- Simplified result -->
+						<div class="ho-result-row">
+							<span class="ho-result-label">Estimated Deduction</span>
+							{#if hoSimplifiedDeduction !== null}
+								<span class="ho-result-amount">
+									{fmtCurrency(hoSimplifiedDeduction)}
+									{#if parseFloat(hoSqft) > HOME_OFFICE_SIMPLIFIED_MAX_SQFT}
+										<span class="ho-result-note">(capped at {HOME_OFFICE_SIMPLIFIED_MAX_SQFT} sq ft)</span>
+									{/if}
+								</span>
+							{:else}
+								<span class="ho-result-placeholder">Enter sq ft above</span>
+							{/if}
+						</div>
+					{:else}
+						<!-- Actual method: percentage inputs -->
+						<div class="ho-field-row">
+							<label class="ho-field-label" for="ho-rent-pct">Rent / mortgage %</label>
+							<div class="ho-input-wrap">
+								<input
+									id="ho-rent-pct"
+									type="number"
+									min="0"
+									max="100"
+									step="0.1"
+									class="ho-input ho-input-sm"
+									bind:value={hoRentPct}
+									placeholder="0"
+								/>
+								<span class="ho-input-unit">%</span>
+							</div>
+						</div>
+						<div class="ho-field-row">
+							<label class="ho-field-label" for="ho-utilities-pct">Utilities %</label>
+							<div class="ho-input-wrap">
+								<input
+									id="ho-utilities-pct"
+									type="number"
+									min="0"
+									max="100"
+									step="0.1"
+									class="ho-input ho-input-sm"
+									bind:value={hoUtilitiesPct}
+									placeholder="0"
+								/>
+								<span class="ho-input-unit">%</span>
+							</div>
+						</div>
+						<div class="ho-field-row">
+							<label class="ho-field-label" for="ho-internet-pct">Internet %</label>
+							<div class="ho-input-wrap">
+								<input
+									id="ho-internet-pct"
+									type="number"
+									min="0"
+									max="100"
+									step="0.1"
+									class="ho-input ho-input-sm"
+									bind:value={hoInternetPct}
+									placeholder="0"
+								/>
+								<span class="ho-input-unit">%</span>
+							</div>
+						</div>
+
+						{#if hoActualAnyEntered}
+							<div class="ho-actual-summary">
+								<p class="ho-actual-heading">Apply these percentages to your actual annual expenses:</p>
+								<ul class="ho-actual-list">
+									{#if hoRentPct !== ''}
+										<li>Rent/mortgage: multiply annual total by <strong>{hoActualRentPct}%</strong></li>
+									{/if}
+									{#if hoUtilitiesPct !== ''}
+										<li>Utilities: multiply annual total by <strong>{hoActualUtilitiesPct}%</strong></li>
+									{/if}
+									{#if hoInternetPct !== ''}
+										<li>Internet: multiply annual total by <strong>{hoActualInternetPct}%</strong></li>
+									{/if}
+								</ul>
+								<p class="ho-hint">Sum the results for your Form 8829 / Schedule C line 30 deduction amount.</p>
+							</div>
+						{/if}
+					{/if}
+
+					<p class="ho-tip-note">
+						Tip: for this home office ({#if hoSqft}{hoSqft} sq ft{:else}?? sq ft{/if}), the simplified deduction is
+						{#if hoSimplifiedDeduction !== null}{fmtCurrency(hoSimplifiedDeduction)}{:else}—{/if}.
+						Compare with your actual expenses to choose the larger deduction.
+					</p>
+				</div>
+			{/if}
+		</section>
 
 		<!-- ── Export buttons ─────────────────────────────────────────────────── -->
 		<section class="dashboard-section no-print">
@@ -1578,6 +2106,361 @@
 
 	.bno-toggle-link:hover {
 		text-decoration: underline;
+	}
+
+	/* ── Warning link (inside alert banners) ────────────────────────────────── */
+	.warning-link {
+		color: inherit;
+		font-weight: 600;
+		text-underline-offset: 2px;
+	}
+
+	/* ── 1099 Tracking table ─────────────────────────────────────────────────── */
+	.tracking-1099-table {
+		max-width: 720px;
+	}
+
+	.td-1099-type {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+	}
+
+	.td-tx-count {
+		color: var(--text-muted);
+		font-size: 0.875rem;
+	}
+
+	/* ── Estimated tax payment log ───────────────────────────────────────────── */
+	.est-log-card {
+		padding: 0;
+		overflow-x: auto;
+	}
+
+	.est-log-quarter-row td {
+		vertical-align: top;
+	}
+
+	.est-log-year {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+		font-weight: 400;
+	}
+
+	.td-date {
+		font-size: 0.875rem;
+		white-space: nowrap;
+		color: var(--text-muted);
+	}
+
+	.pay-type-badge {
+		font-size: 0.7rem;
+		font-weight: 600;
+		padding: 2px 8px;
+		border-radius: 999px;
+		white-space: nowrap;
+		text-transform: uppercase;
+	}
+
+	.pay-type-federal {
+		background: var(--blue-100, #dbeafe);
+		color: var(--blue-700, #1d4ed8);
+	}
+
+	.pay-type-state {
+		background: var(--green-100);
+		color: var(--green-700);
+	}
+
+	.btn-record-payment {
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		font-family: var(--font);
+		font-size: 0.75rem;
+		font-weight: 500;
+		color: var(--blue-600);
+		cursor: pointer;
+		padding: 3px 10px;
+		white-space: nowrap;
+		transition: background 0.1s, border-color 0.1s;
+	}
+
+	.btn-record-payment:hover {
+		background: var(--blue-50, #eff6ff);
+		border-color: var(--blue-300, #93c5fd);
+	}
+
+	.btn-delete-payment {
+		background: none;
+		border: none;
+		cursor: pointer;
+		color: var(--text-muted);
+		font-size: 0.8rem;
+		padding: 2px 4px;
+		border-radius: 2px;
+		line-height: 1;
+		transition: color 0.1s;
+	}
+
+	.btn-delete-payment:hover {
+		color: var(--red-600);
+	}
+
+	/* ── Record payment inline form ──────────────────────────────────────────── */
+	.pay-form-wrap {
+		border-top: 1px solid var(--border);
+		padding: 20px 22px;
+		display: flex;
+		flex-direction: column;
+		gap: 14px;
+		background: var(--gray-50);
+	}
+
+	.pay-form-title {
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: var(--text);
+		margin: 0;
+	}
+
+	.pay-form-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+	}
+
+	.pay-form-label {
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		width: 90px;
+		flex-shrink: 0;
+	}
+
+	.pay-form-input {
+		font-family: var(--font);
+		font-size: 0.875rem;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		padding: 6px 10px;
+		background: var(--surface);
+		color: var(--text);
+		min-width: 160px;
+		max-width: 260px;
+	}
+
+	.pay-form-input:focus {
+		outline: none;
+		border-color: var(--blue-500, #3b82f6);
+		box-shadow: 0 0 0 2px var(--blue-100, #dbeafe);
+	}
+
+	.pay-form-actions {
+		display: flex;
+		gap: 10px;
+		margin-top: 4px;
+	}
+
+	.pay-log-footer {
+		border-top: 1px solid var(--border);
+		padding: 12px 14px;
+	}
+
+	/* ── Home Office Deduction ───────────────────────────────────────────────── */
+	.ho-toggle {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		width: 100%;
+		padding: 10px 0;
+		background: none;
+		border: none;
+		border-bottom: 1px solid var(--border);
+		font-family: var(--font);
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: var(--text);
+		cursor: pointer;
+		text-align: left;
+		margin-bottom: 0;
+	}
+
+	.ho-toggle:hover {
+		color: var(--text);
+		opacity: 0.8;
+	}
+
+	.ho-toggle-text {
+		flex: 1;
+	}
+
+	.ho-card {
+		padding: 20px 24px;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		margin-top: 12px;
+	}
+
+	.ho-method-row {
+		display: flex;
+		align-items: center;
+		gap: 16px;
+	}
+
+	.ho-method-tabs {
+		display: flex;
+		gap: 4px;
+	}
+
+	.ho-method-tab {
+		padding: 4px 14px;
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		font-family: var(--font);
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--text-muted);
+		cursor: pointer;
+		transition: color 0.12s, background 0.12s, border-color 0.12s;
+	}
+
+	.ho-method-tab:hover {
+		color: var(--text);
+		background: var(--gray-100);
+	}
+
+	.ho-method-tab-active {
+		color: var(--text);
+		background: var(--gray-200);
+		border-color: var(--gray-300);
+	}
+
+	.ho-field-row {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+	}
+
+	.ho-field-label {
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--text-muted);
+	}
+
+	.ho-input-wrap {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.ho-input {
+		width: 120px;
+		padding: 6px 10px;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		font-family: var(--font);
+		font-size: 0.875rem;
+		background: var(--surface);
+		color: var(--text);
+	}
+
+	.ho-input-sm {
+		width: 90px;
+	}
+
+	.ho-input:focus {
+		outline: none;
+		border-color: var(--blue-500);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue-500) 15%, transparent);
+	}
+
+	.ho-input-unit {
+		font-size: 0.8rem;
+		color: var(--text-muted);
+	}
+
+	.ho-hint {
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+
+	.ho-result-row {
+		display: flex;
+		align-items: baseline;
+		gap: 12px;
+		padding: 14px 16px;
+		background: var(--gray-50);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+	}
+
+	.ho-result-label {
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: var(--text-muted);
+		flex: 1;
+	}
+
+	.ho-result-amount {
+		font-size: 1.25rem;
+		font-weight: 700;
+		font-variant-numeric: tabular-nums;
+		color: var(--green-600);
+		display: flex;
+		align-items: baseline;
+		gap: 6px;
+	}
+
+	.ho-result-note {
+		font-size: 0.75rem;
+		font-weight: 400;
+		color: var(--text-muted);
+	}
+
+	.ho-result-placeholder {
+		font-size: 0.85rem;
+		color: var(--text-muted);
+		font-style: italic;
+	}
+
+	.ho-actual-summary {
+		padding: 14px 16px;
+		background: var(--gray-50);
+		border: 1px solid var(--border);
+		border-radius: var(--radius-sm);
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+
+	.ho-actual-heading {
+		font-size: 0.82rem;
+		font-weight: 600;
+		color: var(--text);
+	}
+
+	.ho-actual-list {
+		list-style: disc;
+		padding-left: 18px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.ho-actual-list li {
+		font-size: 0.82rem;
+		color: var(--text-muted);
+	}
+
+	.ho-tip-note {
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		border-top: 1px solid var(--border);
+		padding-top: 12px;
+		line-height: 1.5;
 	}
 
 	/* ── Print ───────────────────────────────────────────────────────────────── */

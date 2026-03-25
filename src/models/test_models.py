@@ -8,7 +8,8 @@ from collections.abc import Generator
 from datetime import datetime
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, event, inspect
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.models.audit_event import AuditEvent
@@ -436,3 +437,113 @@ class TestSchemaIntrospection:
             "last_matched", "created_at",
         }
         assert required.issubset(cols), f"Missing columns: {required - cols}"
+
+
+# ── CHECK constraints on enum columns ─────────────────────────────────────────
+
+class TestCheckConstraints:
+    """REQ-ID: DB-007 — DB-level CHECK constraints reject invalid enum values.
+
+    Uses a dedicated engine with enforce_constraints=True so SQLite actually
+    enforces CHECK constraints (they are compiled into the schema but SQLite
+    does not enforce them by default without PRAGMA enforce_fk / check_constraints).
+    """
+
+    @pytest.fixture
+    def constrained_session(self) -> Generator[Session, None, None]:
+        """Fresh in-memory DB with CHECK constraints enforced."""
+        engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+        )
+
+        # Enable CHECK constraint enforcement for every new connection.
+        @event.listens_for(engine, "connect")
+        def _set_pragmas(dbapi_conn: object, _record: object) -> None:
+            cursor = dbapi_conn.cursor()  # type: ignore[union-attr]
+            cursor.execute("PRAGMA enforce_constraints = ON")
+            cursor.close()
+
+        Base.metadata.create_all(engine)
+        SessionCls = sessionmaker(bind=engine)
+        s = SessionCls()
+        yield s
+        s.close()
+        engine.dispose()
+
+    def _minimal_tx(self, suffix: str = "") -> Transaction:
+        return Transaction(
+            source=Source.BANK_CSV.value,
+            source_hash=f"check_test_{suffix}_" + "x" * 44,
+            date="2026-01-01",
+            description="Test",
+            amount=decimal.Decimal("-10.00"),
+            raw_data={},
+        )
+
+    def test_invalid_entity_raises_integrity_error(
+        self, constrained_session: Session
+    ) -> None:
+        """Inserting a bogus entity value must raise IntegrityError."""
+        tx = self._minimal_tx("entity")
+        tx.entity = "not_a_real_entity"
+        constrained_session.add(tx)
+        with pytest.raises(IntegrityError):
+            constrained_session.commit()
+        constrained_session.rollback()
+
+    def test_invalid_status_raises_integrity_error(
+        self, constrained_session: Session
+    ) -> None:
+        tx = self._minimal_tx("status")
+        tx.status = "bogus_status"
+        constrained_session.add(tx)
+        with pytest.raises(IntegrityError):
+            constrained_session.commit()
+        constrained_session.rollback()
+
+    def test_invalid_direction_raises_integrity_error(
+        self, constrained_session: Session
+    ) -> None:
+        tx = self._minimal_tx("direction")
+        tx.direction = "sideways"
+        constrained_session.add(tx)
+        with pytest.raises(IntegrityError):
+            constrained_session.commit()
+        constrained_session.rollback()
+
+    def test_invalid_tax_category_raises_integrity_error(
+        self, constrained_session: Session
+    ) -> None:
+        tx = self._minimal_tx("tax_cat")
+        tx.tax_category = "FAKE_CATEGORY"
+        constrained_session.add(tx)
+        with pytest.raises(IntegrityError):
+            constrained_session.commit()
+        constrained_session.rollback()
+
+    def test_null_nullable_enum_columns_allowed(
+        self, constrained_session: Session
+    ) -> None:
+        """NULL is explicitly allowed for entity, direction, tax_category."""
+        tx = self._minimal_tx("null_ok")
+        tx.entity = None
+        tx.direction = None
+        tx.tax_category = None
+        constrained_session.add(tx)
+        constrained_session.commit()  # must not raise
+        fetched = constrained_session.get(Transaction, tx.id)
+        assert fetched is not None
+        assert fetched.entity is None
+
+    def test_valid_enum_values_accepted(
+        self, constrained_session: Session
+    ) -> None:
+        """A fully classified transaction with valid enum values must persist."""
+        tx = self._minimal_tx("valid")
+        tx.entity = Entity.SPARKRY.value
+        tx.status = TransactionStatus.CONFIRMED.value
+        tx.direction = Direction.EXPENSE.value
+        tx.tax_category = TaxCategory.SUPPLIES.value
+        constrained_session.add(tx)
+        constrained_session.commit()  # must not raise

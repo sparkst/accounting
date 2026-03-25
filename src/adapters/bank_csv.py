@@ -549,11 +549,17 @@ class BankCsvAdapter(BaseAdapter):
         )
 
         if not self._dry_run:
-            session.add(tx)
-            result.records_created += 1
-            # Batch commit every 100 records (committed in run() after loop)
-            if result.records_created % 100 == 0:
-                session.commit()
+            try:
+                session.begin_nested()  # savepoint for per-record isolation
+                session.add(tx)
+                session.flush()
+                result.records_created += 1
+                # Batch commit every 100 records (final commit in run() after loop)
+                if result.records_created % 100 == 0:
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
             logger.info(
                 "BankCsvAdapter ingested row %d: %s %s %s",
                 row.row_number,

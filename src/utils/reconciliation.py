@@ -363,12 +363,28 @@ def apply_manual_match(
     if txn_b is None:
         raise ValueError(f"Transaction not found: {transaction_id_b}")
 
-    txn_a.notes = f"{RECON_LINK_NOTE_PREFIX}{txn_b.id}"
-    txn_b.notes = f"{RECON_LINK_NOTE_PREFIX}{txn_a.id}"
+    # Append recon link to notes (preserve existing content)
+    old_notes_a = txn_a.notes
+    old_notes_b = txn_b.notes
+    recon_a = f"{RECON_LINK_NOTE_PREFIX}{txn_b.id}"
+    recon_b = f"{RECON_LINK_NOTE_PREFIX}{txn_a.id}"
+    txn_a.notes = f"{old_notes_a}\n{recon_a}" if old_notes_a else recon_a
+    txn_b.notes = f"{old_notes_b}\n{recon_b}" if old_notes_b else recon_b
 
     # If the original transaction has foreign currency and the match is a
     # CC statement, update the USD amount to the actual amount charged.
     _update_foreign_currency_from_statement(session, txn_a, txn_b)
+
+    # Audit trail for reconciliation match
+    from src.models.audit_event import AuditEvent
+    for txn, old_notes in [(txn_a, old_notes_a), (txn_b, old_notes_b)]:
+        session.add(AuditEvent(
+            transaction_id=txn.id,
+            field_changed="reconciliation_link",
+            old_value=old_notes,
+            new_value=txn.notes,
+            changed_by="human",
+        ))
 
     session.flush()
     return txn_a, txn_b
@@ -425,8 +441,21 @@ def remove_manual_match(
         cleaned = notes.replace(link_to_remove, "").strip()
         return cleaned if cleaned else None
 
+    old_notes_a = txn_a.notes
+    old_notes_b = txn_b.notes
     txn_a.notes = _strip_recon_note(txn_a.notes, a_link)
     txn_b.notes = _strip_recon_note(txn_b.notes, b_link)
+
+    # Audit trail for reconciliation unlink
+    from src.models.audit_event import AuditEvent
+    for txn, old_notes in [(txn_a, old_notes_a), (txn_b, old_notes_b)]:
+        session.add(AuditEvent(
+            transaction_id=txn.id,
+            field_changed="reconciliation_link",
+            old_value=old_notes,
+            new_value=txn.notes,
+            changed_by="human",
+        ))
 
     session.flush()
     return txn_a, txn_b

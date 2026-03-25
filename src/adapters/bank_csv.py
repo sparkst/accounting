@@ -482,6 +482,10 @@ class BankCsvAdapter(BaseAdapter):
             except Exception as exc:
                 result.record_error(f"{self._filename}:row{row.row_number}", exc)
 
+        # Commit any remaining records from the batch
+        if result.records_created > 0:
+            session.commit()
+
         return result
 
     def _process_row(
@@ -546,8 +550,10 @@ class BankCsvAdapter(BaseAdapter):
 
         if not self._dry_run:
             session.add(tx)
-            session.commit()
             result.records_created += 1
+            # Batch commit every 100 records (committed in run() after loop)
+            if result.records_created % 100 == 0:
+                session.commit()
             logger.info(
                 "BankCsvAdapter ingested row %d: %s %s %s",
                 row.row_number,

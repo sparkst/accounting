@@ -150,7 +150,18 @@ def _load_bank_deposits(session: Session) -> list[Transaction]:
 
 def _already_reconciled(txn: Transaction) -> bool:
     """Return True if this transaction has been manually reconciled."""
-    return bool(txn.notes and txn.notes.startswith(RECON_LINK_NOTE_PREFIX))
+    return bool(txn.notes and RECON_LINK_NOTE_PREFIX in txn.notes)
+
+
+def _extract_recon_link(notes: str | None) -> str | None:
+    """Extract the linked transaction ID from notes containing a reconciled: marker."""
+    if not notes:
+        return None
+    for line in notes.split("\n"):
+        line = line.strip()
+        if line.startswith(RECON_LINK_NOTE_PREFIX):
+            return line[len(RECON_LINK_NOTE_PREFIX):]
+    return None
 
 
 def find_matches(
@@ -190,7 +201,7 @@ def find_matches(
     for p in payouts:
         if _already_reconciled(p):
             # Extract linked bank ID from notes field
-            linked_id = p.notes.split(":", 1)[1] if p.notes else None
+            linked_id = _extract_recon_link(p.notes)
             if linked_id:
                 reconciled_payout_ids.add(p.id)
         else:
@@ -198,7 +209,7 @@ def find_matches(
 
     for b in banks:
         if _already_reconciled(b):
-            linked_id = b.notes.split(":", 1)[1] if b.notes else None
+            linked_id = _extract_recon_link(b.notes)
             if linked_id:
                 reconciled_bank_ids.add(b.id)
         else:
@@ -210,7 +221,7 @@ def find_matches(
     # For manual pairs, find the payout-bank relationship
     for p in payouts:
         if p.id in reconciled_payout_ids and p.notes:
-            linked_bank_id = p.notes.split(":", 1)[1]
+            linked_bank_id = _extract_recon_link(p.notes)
             linked_bank = next((b for b in banks if b.id == linked_bank_id), None)
             if linked_bank:
                 d_diff = abs((_parse_date(p.date) - _parse_date(linked_bank.date)).days)
@@ -497,7 +508,7 @@ def _update_foreign_currency_from_statement(
     statement_amount = abs(Decimal(str(statement_txn.amount)))
     original_sign = -1 if (foreign_txn.amount is not None and float(foreign_txn.amount) < 0) else 1
     foreign_txn.amount = original_sign * statement_amount
-    foreign_txn.exchange_rate = float(statement_amount) / foreign_txn.amount_foreign
+    foreign_txn.exchange_rate = statement_amount / Decimal(str(foreign_txn.amount_foreign))
     foreign_txn.exchange_rate_source = "credit_card_statement"
 
     # Log audit events

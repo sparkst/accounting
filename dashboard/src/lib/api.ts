@@ -35,23 +35,26 @@ function getApiKeyHeader(): Record<string, string> {
 const _controllers = new Map<string, AbortController>();
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	// Derive a stable key from the path (strip query string for grouping by endpoint).
+	// Only abort previous requests for GET (safe/idempotent). POST/PATCH/DELETE
+	// mutations should not be cancelled — the server may have already committed.
+	const method = (init?.method ?? 'GET').toUpperCase();
 	const [pathKey] = path.split('?');
+	let controller: AbortController | undefined;
 
-	// Abort any in-flight request for the same endpoint.
-	const previous = _controllers.get(pathKey);
-	if (previous) {
-		previous.abort();
+	if (method === 'GET') {
+		const previous = _controllers.get(pathKey);
+		if (previous) {
+			previous.abort();
+		}
+		controller = new AbortController();
+		_controllers.set(pathKey, controller);
 	}
-
-	const controller = new AbortController();
-	_controllers.set(pathKey, controller);
 
 	try {
 		const res = await fetch(`${BASE}${path}`, {
 			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
 			...init,
-			signal: controller.signal
+			...(controller ? { signal: controller.signal } : {})
 		});
 		if (!res.ok) {
 			const text = await res.text().catch(() => res.statusText);
@@ -59,11 +62,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		}
 		return res.json() as Promise<T>;
 	} finally {
-		// Clean up the map entry once the request settles (success, error, or abort).
-		if (_controllers.get(pathKey) === controller) {
+		if (controller && _controllers.get(pathKey) === controller) {
 			_controllers.delete(pathKey);
 		}
 	}
+}
+
+/** Build a query string from a filters object, omitting undefined/empty values. */
+function toQueryString(filters: object): string {
+	const params = new URLSearchParams();
+	for (const [key, val] of Object.entries(filters)) {
+		if (val !== undefined && val !== '') {
+			params.set(key, String(val));
+		}
+	}
+	const qs = params.toString();
+	return qs ? `?${qs}` : '';
 }
 
 export interface TransactionFilters {
@@ -79,14 +93,7 @@ export interface TransactionFilters {
 }
 
 export async function fetchTransactions(filters: TransactionFilters = {}): Promise<TransactionList> {
-	const params = new URLSearchParams();
-	for (const [key, val] of Object.entries(filters)) {
-		if (val !== undefined && val !== '') {
-			params.set(key, String(val));
-		}
-	}
-	const qs = params.toString();
-	return request<TransactionList>(`/transactions${qs ? `?${qs}` : ''}`);
+	return request<TransactionList>(`/transactions${toQueryString(filters)}`);
 }
 
 export async function fetchReviewQueue(status?: string): Promise<Transaction[]> {
@@ -257,14 +264,7 @@ export interface InvoiceFilters {
 }
 
 export async function fetchInvoices(filters: InvoiceFilters = {}): Promise<InvoiceListResponse> {
-	const params = new URLSearchParams();
-	for (const [key, val] of Object.entries(filters)) {
-		if (val !== undefined && val !== '') {
-			params.set(key, String(val));
-		}
-	}
-	const qs = params.toString();
-	return request<InvoiceListResponse>(`/invoices${qs ? `?${qs}` : ''}`);
+	return request<InvoiceListResponse>(`/invoices${toQueryString(filters)}`);
 }
 
 export async function fetchInvoice(id: string): Promise<Invoice> {
@@ -432,14 +432,7 @@ export interface VendorRulePatch {
 export async function fetchVendorRules(
 	filters: VendorRuleFilters = {}
 ): Promise<VendorRuleListResponse> {
-	const params = new URLSearchParams();
-	for (const [key, val] of Object.entries(filters)) {
-		if (val !== undefined && val !== '') {
-			params.set(key, String(val));
-		}
-	}
-	const qs = params.toString();
-	return request<VendorRuleListResponse>(`/vendor-rules${qs ? `?${qs}` : ''}`);
+	return request<VendorRuleListResponse>(`/vendor-rules${toQueryString(filters)}`);
 }
 
 export async function fetchVendorRule(id: string): Promise<VendorRuleWithMatches> {

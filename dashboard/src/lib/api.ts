@@ -35,19 +35,20 @@ function getApiKeyHeader(): Record<string, string> {
 const _controllers = new Map<string, AbortController>();
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	// Only abort previous requests for GET (safe/idempotent). POST/PATCH/DELETE
-	// mutations should not be cancelled — the server may have already committed.
+	// Abort previous in-flight GET to the SAME full path (including query params).
+	// This prevents stale filter responses in Register without interfering with
+	// concurrent calls to the same endpoint with different params (e.g. Dashboard
+	// calls /transactions twice with different filters via Promise.all).
 	const method = (init?.method ?? 'GET').toUpperCase();
-	const [pathKey] = path.split('?');
 	let controller: AbortController | undefined;
 
 	if (method === 'GET') {
-		const previous = _controllers.get(pathKey);
+		const previous = _controllers.get(path);
 		if (previous) {
 			previous.abort();
 		}
 		controller = new AbortController();
-		_controllers.set(pathKey, controller);
+		_controllers.set(path, controller);
 	}
 
 	try {
@@ -62,8 +63,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		}
 		return res.json() as Promise<T>;
 	} finally {
-		if (controller && _controllers.get(pathKey) === controller) {
-			_controllers.delete(pathKey);
+		if (controller && _controllers.get(path) === controller) {
+			_controllers.delete(path);
 		}
 	}
 }

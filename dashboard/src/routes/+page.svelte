@@ -136,6 +136,8 @@
 				return s === 'sent' || s === 'overdue' || (s === 'sent' && inv.due_date && inv.due_date < today);
 			});
 		} catch (e) {
+			// Ignore AbortError from rapid navigation / concurrent requests
+			if (e instanceof DOMException && e.name === 'AbortError') return;
 			fetchError = e instanceof Error ? e.message : 'Failed to load dashboard data';
 		} finally {
 			loading = false;

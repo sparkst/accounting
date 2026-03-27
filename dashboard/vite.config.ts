@@ -10,5 +10,8 @@ export default defineConfig({
 				changeOrigin: true
 			}
 		}
+	},
+	preview: {
+		allowedHosts: ['macbook.ancon-cliff.ts.net']
 	}
 });

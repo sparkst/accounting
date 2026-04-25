@@ -325,11 +325,6 @@ kbd {
 	background: var(--surface);
 	white-space: nowrap;
 }
-.data-table thead th {
-	position: sticky;
-	top: var(--nav-height);
-	z-index: 10;
-}
 .data-table th.sortable {
 	cursor: pointer;
 	user-select: none;

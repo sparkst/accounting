@@ -33,10 +33,11 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
-from src.invoicing.email_sender import send_invoice_email
+from src.invoicing.email_sender import _validate_email, send_invoice_email
 from src.invoicing.generator import generate_calendar_invoice as _gen_calendar
 from src.invoicing.generator import generate_flat_invoice as _gen_flat
 from src.invoicing.payment_link import create_payment_link
+from src.invoicing.pdf_renderer import render_html as _render_html
 from src.invoicing.pdf_renderer import render_pdf
 from src.models.enums import (
     INVOICE_STATUS_TRANSITIONS,
@@ -107,10 +108,11 @@ def _create_invoice_audit_event(
     separate connection with FK checks disabled (PRAGMA foreign_keys
     cannot be toggled mid-transaction in SQLite).
     """
-    from sqlalchemy import text
+    from sqlalchemy import Engine, text
 
-    bound_engine = session.get_bind()
-    with bound_engine.connect() as conn:
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    with bind.connect() as conn:
         conn.execute(text("PRAGMA foreign_keys=OFF"))
         conn.execute(
             text(
@@ -128,6 +130,7 @@ def _create_invoice_audit_event(
                 "at": _now().isoformat(),
             },
         )
+        conn.execute(text("PRAGMA foreign_keys=ON"))
         conn.commit()
 
 
@@ -719,8 +722,6 @@ def send_invoice(
     Creates a Stripe payment link (or reuses existing), generates PDF,
     sends email via Resend. Transitions status to 'sent'.
     """
-    from src.invoicing.email_sender import _validate_email
-
     inv: Invoice | None = session.get(Invoice, invoice_id)
     if inv is None:
         raise HTTPException(status_code=404, detail="Invoice not found")
@@ -729,22 +730,19 @@ def send_invoice(
     if customer is None:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    # Validate status
     if inv.status in (InvoiceStatus.PAID.value, InvoiceStatus.VOID.value):
         raise HTTPException(
             status_code=422,
             detail=f"Cannot send invoice in '{inv.status}' status.",
         )
 
-    # Validate total
     if inv.total is None or inv.total <= 0:
         raise HTTPException(
             status_code=422,
             detail="Invoice total must be positive.",
         )
 
-    # Resolve and validate email
-    to_email = body.to_email or (customer.contact_email if customer else None)
+    to_email = body.to_email or customer.contact_email
     if not to_email:
         raise HTTPException(
             status_code=422,
@@ -755,7 +753,6 @@ def send_invoice(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # Step 1: Generate PDF
     line_items = (
         session.query(InvoiceLineItem)
         .filter(InvoiceLineItem.invoice_id == invoice_id)
@@ -765,7 +762,6 @@ def send_invoice(
 
     pdf_bytes = render_pdf(inv, line_items, customer)
 
-    # Step 2: Create/reuse Stripe payment link and persist immediately
     freshly_created = not inv.payment_link_id
     try:
         link_result = create_payment_link(inv)
@@ -781,7 +777,6 @@ def send_invoice(
     session.commit()
     session.refresh(inv)
 
-    # Step 3: Send email
     try:
         send_invoice_email(
             invoice=inv,
@@ -802,7 +797,6 @@ def send_invoice(
             detail=f"Payment link created but email failed: {exc}",
         ) from exc
 
-    # Step 4: Persist send state and transition status
     old_sent_to = inv.sent_to
     inv.sent_at = _now()
     inv.sent_to = to_email
@@ -1039,7 +1033,6 @@ def get_invoice_html(
         .all()
     )
 
-    from src.invoicing.pdf_renderer import render_html as _render_html
     html = _render_html(inv, line_items, customer)
     return HTMLResponse(content=html)
 

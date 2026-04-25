@@ -1,8 +1,4 @@
-"""Create Stripe payment links for invoices.
-
-Idempotent: if the invoice already has a payment link, the existing one is returned.
-Uses Decimal arithmetic for cent conversion to avoid float rounding errors.
-"""
+"""Create Stripe payment links for invoices."""
 
 import os
 from dataclasses import dataclass
@@ -18,8 +14,11 @@ class PaymentLinkResult:
 
 
 def create_payment_link(invoice) -> PaymentLinkResult:
-    """Create a Stripe payment link for an invoice, or reuse existing one."""
-    # Idempotent: reuse if already created
+    """Create a Stripe payment link for an invoice, or reuse existing one.
+
+    Idempotent: returns the existing link if one is already attached.
+    Uses Decimal arithmetic for cent conversion to avoid float rounding.
+    """
     if invoice.payment_link_url and invoice.payment_link_id:
         return PaymentLinkResult(url=invoice.payment_link_url, link_id=invoice.payment_link_id)
 

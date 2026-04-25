@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
 	import type { Invoice, Customer } from '$lib/types';
 	import {
 		fetchInvoices,
@@ -595,7 +594,7 @@
 
 														{#if expandedInvoice.sent_at}
 															<p class="send-sent-info">
-																Sent to {expandedInvoice.sent_to} on {expandedInvoice.sent_at ? new Date(expandedInvoice.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '--'}
+																Sent to {expandedInvoice.sent_to} on {new Date(expandedInvoice.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
 															</p>
 														{/if}
 

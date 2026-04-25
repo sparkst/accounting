@@ -1406,6 +1406,7 @@ class TestSendInvoice:
 
         db_session.expire_all()
         inv_after = db_session.get(Invoice, inv.id)
+        assert inv_after is not None
         assert inv_after.status == InvoiceStatus.DRAFT.value
         assert inv_after.sent_at is None
         assert inv_after.sent_to is None

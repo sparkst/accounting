@@ -8,10 +8,9 @@ Uses mock objects for Invoice, Customer, and InvoiceLineItem to avoid DB depende
 
 from __future__ import annotations
 
-import base64
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -23,7 +22,7 @@ from src.invoicing.email_sender import send_invoice_email
 
 
 @pytest.fixture()
-def invoice():
+def invoice() -> SimpleNamespace:
     return SimpleNamespace(
         id="inv-001",
         invoice_number="202604-001",
@@ -36,7 +35,7 @@ def invoice():
 
 
 @pytest.fixture()
-def customer():
+def customer() -> SimpleNamespace:
     return SimpleNamespace(
         name="Acme Corp",
         contact_name="Jane Doe",
@@ -45,7 +44,7 @@ def customer():
 
 
 @pytest.fixture()
-def line_items():
+def line_items() -> list[SimpleNamespace]:
     return [
         SimpleNamespace(
             description="AI Engineering Coaching — Apr 7",
@@ -65,12 +64,12 @@ def line_items():
 
 
 @pytest.fixture()
-def pdf_bytes():
+def pdf_bytes() -> bytes:
     return b"%PDF-1.4 fake pdf content here"
 
 
 @pytest.fixture()
-def payment_link_url():
+def payment_link_url() -> str:
     return "https://buy.stripe.com/test_abc123"
 
 
@@ -86,7 +85,7 @@ class TestSendInvoiceEmail:
 
     def test_happy_path(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """send_invoice_email calls resend.Emails.send and returns the message ID."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -104,7 +103,7 @@ class TestSendInvoiceEmail:
 
     def test_from_address(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """From address is 'Sparkry AI LLC <orders@sparkry.ai>'."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -122,7 +121,7 @@ class TestSendInvoiceEmail:
 
     def test_subject_format(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """Subject line follows 'Invoice {number} from Sparkry AI LLC' format."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -140,7 +139,7 @@ class TestSendInvoiceEmail:
 
     def test_html_contains_payment_link(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """HTML body contains the payment link URL in an anchor tag."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -160,7 +159,7 @@ class TestSendInvoiceEmail:
 
     def test_html_contains_summary(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """HTML body contains invoice amount, service period, and due date."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -182,7 +181,7 @@ class TestSendInvoiceEmail:
 
     def test_pdf_attachment(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """Attachments include PDF with correct filename and inline logo."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -206,7 +205,7 @@ class TestSendInvoiceEmail:
 
     def test_plain_text_fallback(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """The send params include a 'text' key with a plain text version."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
@@ -231,7 +230,7 @@ class TestSendInvoiceEmail:
 
     def test_invalid_email_no_at(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """Email without @ symbol raises ValueError before calling Resend."""
         with pytest.raises(ValueError, match="[Ii]nvalid email"):
             send_invoice_email(
@@ -247,7 +246,7 @@ class TestSendInvoiceEmail:
 
     def test_invalid_email_no_tld(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """Email without a TLD raises ValueError before calling Resend."""
         with pytest.raises(ValueError, match="[Ii]nvalid email"):
             send_invoice_email(
@@ -263,7 +262,7 @@ class TestSendInvoiceEmail:
 
     def test_invalid_email_with_newline(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """Email containing newline characters is rejected."""
         with pytest.raises(ValueError, match="[Ii]nvalid email"):
             send_invoice_email(
@@ -279,7 +278,7 @@ class TestSendInvoiceEmail:
 
     def test_resend_error(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
-    ):
+    ) -> None:
         """When resend.Emails.send raises an exception, it propagates."""
         mock_resend.Emails.send.side_effect = RuntimeError("Resend API down")
 

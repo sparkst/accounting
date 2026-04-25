@@ -9,7 +9,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
 import stripe as stripe_lib
 
 from src.invoicing.payment_link import PaymentLinkResult, create_payment_link

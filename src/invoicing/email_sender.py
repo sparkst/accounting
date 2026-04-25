@@ -1,18 +1,8 @@
 """Invoice email sender using Resend.
 
-Builds an HTML email with inline CSS (no <style> tags — email clients strip
+Builds an HTML email with inline CSS (no <style> tags -- email clients strip
 them) and table-based layout for Outlook compatibility.  Attaches the invoice
 PDF and includes a plain-text fallback.
-
-Usage:
-    message_id = send_invoice_email(
-        invoice=invoice,
-        line_items=line_items,
-        customer=customer,
-        pdf_bytes=pdf_bytes,
-        payment_link_url="https://buy.stripe.com/...",
-        to_email="client@example.com",
-    )
 """
 
 from __future__ import annotations
@@ -31,8 +21,10 @@ _LOGO_PATH = Path(__file__).parent / "assets" / "sparkry-logo.png"
 
 FROM_ADDRESS = "Sparkry AI LLC <travis@sparkry.ai>"
 
-# RFC-5321 header injection prevention + basic format check.
-# Must be user@domain.tld with no CR/LF characters.
+_FONT_STACK = (
+    "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+)
+
 _EMAIL_RE = re.compile(
     r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+"
     r"@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"
@@ -41,22 +33,12 @@ _EMAIL_RE = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
-# Email validation
-# ---------------------------------------------------------------------------
-
-
 def _validate_email(email: str) -> None:
     """Raise ValueError if *email* is not a valid user@domain.tld address."""
     if "\r" in email or "\n" in email:
         raise ValueError(f"Invalid email address (contains forbidden characters): {email!r}")
     if not _EMAIL_RE.match(email):
         raise ValueError(f"Invalid email address: {email!r}")
-
-
-# ---------------------------------------------------------------------------
-# Formatting helpers
-# ---------------------------------------------------------------------------
 
 
 def _format_currency(amount: Decimal | float | int) -> str:
@@ -69,11 +51,6 @@ def _format_date(d: str | date) -> str:
     if isinstance(d, str):
         d = date.fromisoformat(d)
     return d.strftime("%m/%d/%Y")
-
-
-# ---------------------------------------------------------------------------
-# HTML builder
-# ---------------------------------------------------------------------------
 
 
 def _build_html(
@@ -89,16 +66,18 @@ def _build_html(
     safe_link = _html.escape(payment_link_url)
     greeting = f"Hi {safe_name}," if customer.contact_name else "Hello,"
 
-    # Line items rows
+    f = _FONT_STACK
+
     li_rows = ""
     for item in line_items:
         safe_desc = _html.escape(str(item.description))
+        safe_qty = _html.escape(str(item.quantity))
         li_rows += (
             f'<tr style="border-bottom: 1px solid #eeeeee;">'
-            f'<td style="padding: 8px 12px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #333333;">{safe_desc}</td>'
-            f'<td style="padding: 8px 12px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #333333; text-align: center;">{item.quantity}</td>'
-            f'<td style="padding: 8px 12px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #333333; text-align: right;">{_format_currency(item.unit_price)}</td>'
-            f'<td style="padding: 8px 12px; font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #333333; text-align: right;">{_format_currency(item.total_price)}</td>'
+            f'<td style="padding: 8px 12px; font-family: {f}; font-size: 14px; color: #333333;">{safe_desc}</td>'
+            f'<td style="padding: 8px 12px; font-family: {f}; font-size: 14px; color: #333333; text-align: center;">{safe_qty}</td>'
+            f'<td style="padding: 8px 12px; font-family: {f}; font-size: 14px; color: #333333; text-align: right;">{_format_currency(item.unit_price)}</td>'
+            f'<td style="padding: 8px 12px; font-family: {f}; font-size: 14px; color: #333333; text-align: right;">{_format_currency(item.total_price)}</td>'
             f"</tr>"
         )
 
@@ -124,7 +103,7 @@ def _build_html(
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
 <tr>
 <td><img src="cid:sparkry-logo" alt="Sparkry AI LLC" width="160" style="display: block; height: auto;"></td>
-<td align="right" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #86868b;">Invoice {safe_number}</td>
+<td align="right" style="font-family: {f}; font-size: 14px; color: #86868b;">Invoice {safe_number}</td>
 </tr>
 </table>
 </td>
@@ -132,12 +111,12 @@ def _build_html(
 
 <!-- Greeting -->
 <tr>
-<td style="padding: 32px 32px 16px 32px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 16px; color: #1d1d1f;">
+<td style="padding: 32px 32px 16px 32px; font-family: {f}; font-size: 16px; color: #1d1d1f;">
 {greeting}
 </td>
 </tr>
 <tr>
-<td style="padding: 0 32px 24px 32px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #333333; line-height: 1.5;">
+<td style="padding: 0 32px 24px 32px; font-family: {f}; font-size: 14px; color: #333333; line-height: 1.5;">
 Please find attached invoice <strong>{safe_number}</strong> for your review.
 </td>
 </tr>
@@ -150,20 +129,20 @@ Please find attached invoice <strong>{safe_number}</strong> for your review.
 <td style="padding: 16px 20px;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
 <tr>
-<td style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; color: #86868b;">Invoice Number</td>
-<td align="right" style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #1d1d1f; font-weight: 500;">{safe_number}</td>
+<td style="padding: 4px 0; font-family: {f}; font-size: 13px; color: #86868b;">Invoice Number</td>
+<td align="right" style="padding: 4px 0; font-family: {f}; font-size: 14px; color: #1d1d1f; font-weight: 500;">{safe_number}</td>
 </tr>
 <tr>
-<td style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; color: #86868b;">Amount Due</td>
-<td align="right" style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #1d1d1f; font-weight: 600;">{amount_str}</td>
+<td style="padding: 4px 0; font-family: {f}; font-size: 13px; color: #86868b;">Amount Due</td>
+<td align="right" style="padding: 4px 0; font-family: {f}; font-size: 14px; color: #1d1d1f; font-weight: 600;">{amount_str}</td>
 </tr>
 <tr>
-<td style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; color: #86868b;">Service Period</td>
-<td align="right" style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #1d1d1f;">{_format_date(invoice.service_period_start)} to {_format_date(invoice.service_period_end)}</td>
+<td style="padding: 4px 0; font-family: {f}; font-size: 13px; color: #86868b;">Service Period</td>
+<td align="right" style="padding: 4px 0; font-family: {f}; font-size: 14px; color: #1d1d1f;">{_format_date(invoice.service_period_start)} to {_format_date(invoice.service_period_end)}</td>
 </tr>
 <tr>
-<td style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 13px; color: #86868b;">Due Date</td>
-<td align="right" style="padding: 4px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; color: #1d1d1f; font-weight: 500;">{_format_date(invoice.due_date)}</td>
+<td style="padding: 4px 0; font-family: {f}; font-size: 13px; color: #86868b;">Due Date</td>
+<td align="right" style="padding: 4px 0; font-family: {f}; font-size: 14px; color: #1d1d1f; font-weight: 500;">{_format_date(invoice.due_date)}</td>
 </tr>
 </table>
 </td>
@@ -177,15 +156,15 @@ Please find attached invoice <strong>{safe_number}</strong> for your review.
 <td style="padding: 0 32px 24px 32px;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="border: 1px solid #e5e5e5; border-radius: 6px; border-collapse: collapse;">
 <tr style="background-color: #f5f5f7;">
-<td style="padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px;">Description</td>
-<td style="padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; text-align: center;">Qty</td>
-<td style="padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; text-align: right;">Rate</td>
-<td style="padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; text-align: right;">Amount</td>
+<td style="padding: 10px 12px; font-family: {f}; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px;">Description</td>
+<td style="padding: 10px 12px; font-family: {f}; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; text-align: center;">Qty</td>
+<td style="padding: 10px 12px; font-family: {f}; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; text-align: right;">Rate</td>
+<td style="padding: 10px 12px; font-family: {f}; font-size: 12px; font-weight: 600; color: #86868b; text-transform: uppercase; letter-spacing: 0.5px; text-align: right;">Amount</td>
 </tr>
 {li_rows}
 <tr style="background-color: #f5f5f7;">
-<td colspan="3" style="padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; color: #1d1d1f; text-align: right;">Total</td>
-<td style="padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; color: #1d1d1f; text-align: right;">{amount_str}</td>
+<td colspan="3" style="padding: 10px 12px; font-family: {f}; font-size: 14px; font-weight: 600; color: #1d1d1f; text-align: right;">Total</td>
+<td style="padding: 10px 12px; font-family: {f}; font-size: 14px; font-weight: 600; color: #1d1d1f; text-align: right;">{amount_str}</td>
 </tr>
 </table>
 </td>
@@ -197,7 +176,7 @@ Please find attached invoice <strong>{safe_number}</strong> for your review.
 <table role="presentation" cellpadding="0" cellspacing="0" border="0">
 <tr>
 <td align="center" style="background-color: #0071e3; border-radius: 8px;">
-<a href="{safe_link}" target="_blank" style="display: inline-block; padding: 14px 32px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 16px; font-weight: 500; color: #ffffff; text-decoration: none;">Pay Invoice</a>
+<a href="{safe_link}" target="_blank" style="display: inline-block; padding: 14px 32px; font-family: {f}; font-size: 16px; font-weight: 500; color: #ffffff; text-decoration: none;">Pay Invoice</a>
 </td>
 </tr>
 </table>
@@ -209,7 +188,7 @@ Please find attached invoice <strong>{safe_number}</strong> for your review.
 <td style="padding: 20px 32px; background-color: #f5f5f7; border-top: 1px solid #e5e5e5;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
 <tr>
-<td style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; color: #86868b; line-height: 1.5;">
+<td style="font-family: {f}; font-size: 12px; color: #86868b; line-height: 1.5;">
 Sparkry AI LLC<br>
 travis@sparkry.com<br>
 <br>
@@ -230,11 +209,6 @@ A PDF copy of this invoice is attached for your records.
 </html>"""
 
     return html
-
-
-# ---------------------------------------------------------------------------
-# Plain-text builder
-# ---------------------------------------------------------------------------
 
 
 def _build_plain_text(
@@ -284,11 +258,6 @@ def _build_plain_text(
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-
 def send_invoice_email(
     invoice: Any,
     line_items: list[Any],
@@ -297,24 +266,7 @@ def send_invoice_email(
     payment_link_url: str,
     to_email: str,
 ) -> str:
-    """Send an invoice email via Resend and return the message ID.
-
-    Args:
-        invoice: Invoice model object (needs invoice_number, total,
-                 service_period_start/end, due_date, submitted_date).
-        line_items: List of InvoiceLineItem objects.
-        customer: Customer model object (needs name, contact_name, contact_email).
-        pdf_bytes: Raw PDF bytes to attach.
-        payment_link_url: Stripe payment link URL for the "Pay Invoice" button.
-        to_email: Recipient email address.
-
-    Returns:
-        Resend message ID string.
-
-    Raises:
-        ValueError: If to_email is not a valid email address.
-        Exception: Re-raises any Resend API errors.
-    """
+    """Send an invoice email via Resend and return the Resend message ID."""
     resend.api_key = os.environ.get("RESEND_API_KEY", "")
     if not resend.api_key:
         raise ValueError("RESEND_API_KEY is not configured")

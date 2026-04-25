@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import type { Customer, CalendarSession, Invoice } from '$lib/types';
 	import {
@@ -389,7 +388,7 @@
 
 					{#if generatedInvoice.sent_at}
 						<p class="send-sent-info">
-							Sent to {generatedInvoice.sent_to} on {generatedInvoice.sent_at ? new Date(generatedInvoice.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '--'}
+							Sent to {generatedInvoice.sent_to} on {new Date(generatedInvoice.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
 						</p>
 					{/if}
 
@@ -418,9 +417,9 @@
 									</button>
 								</div>
 							{/if}
-								<button class="btn btn-ghost btn-sm" onclick={() => { sendSuccess = false; showSendConfirm = false; }}>
-									Resend to a different address
-								</button>
+							<button class="btn btn-ghost btn-sm" onclick={() => { sendSuccess = false; showSendConfirm = false; }}>
+								Resend to a different address
+							</button>
 						</div>
 					{:else}
 						<div class="send-form">

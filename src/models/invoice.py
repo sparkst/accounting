@@ -324,6 +324,28 @@ class Invoice(Base):
         comment="Per-step checkbox state for SAP Ariba submission (persisted between sessions)",
     )
 
+    # ── Payment link / send tracking ──────────────────────────────────────────
+    payment_link_url: Mapped[str | None] = mapped_column(
+        String(512),
+        nullable=True,
+        comment="Stripe payment link URL for online payment",
+    )
+    payment_link_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Stripe payment link ID (for deactivation on void)",
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        comment="When the invoice email was last sent",
+    )
+    sent_to: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="Email address the invoice was sent to",
+    )
+
     # ── PDF / document ─────────────────────────────────────────────────────────
     pdf_path: Mapped[str | None] = mapped_column(
         String(512),

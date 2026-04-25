@@ -272,6 +272,25 @@ def parse_ical(
         result.warnings.append(f"Failed to parse iCal data: {exc}")
         return result
 
+    # First pass: collect RECURRENCE-ID dates by UID.
+    # Modified instances override RRULE-generated occurrences at those dates.
+    recurrence_overrides: dict[str, set[date]] = {}
+    for component in cal.walk():
+        if component.name != "VEVENT":
+            continue
+        rid = component.get("RECURRENCE-ID")
+        if rid is None:
+            continue
+        uid = str(component.get("UID", ""))
+        rid_dt = _extract_dt(rid)
+        if rid_dt is not None:
+            if rid_dt.tzinfo is None:
+                tz_id = getattr(rid, "params", {}).get("TZID")
+                tz = _resolve_tz(tz_id, result.warnings)
+                rid_dt = rid_dt.replace(tzinfo=tz)
+            rid_date = _to_pacific(rid_dt).date()
+            recurrence_overrides.setdefault(uid, set()).add(rid_date)
+
     seen_keys: set[tuple[str, str, str]] = set()
 
     for component in cal.walk():
@@ -315,16 +334,22 @@ def parse_ical(
         summary = str(component.get("SUMMARY", "")).strip()
         uid = str(component.get("UID", ""))
 
+        # ── RECURRENCE-ID handling ───────────────────────────────────────────
+        has_recurrence_id = component.get("RECURRENCE-ID") is not None
+
         # ── EXDATE ────────────────────────────────────────────────────────────
         exdates = _exdates_for_event(component)
 
         # ── RRULE expansion vs. single occurrence ─────────────────────────────
         has_rrule = component.get("RRULE") is not None
+        uid_overrides = recurrence_overrides.get(uid, set())
 
         if has_rrule:
             occurrences = _expand_rrule(
                 component, dtstart, start_date, end_date, result.warnings
             )
+        elif has_recurrence_id:
+            occurrences = [dtstart]
         else:
             occurrences = [dtstart]
 
@@ -342,6 +367,10 @@ def parse_ical(
 
             # Skip if EXDATE
             if occ_date in exdates:
+                continue
+
+            # Skip RRULE occurrences overridden by a modified instance
+            if has_rrule and occ_date in uid_overrides:
                 continue
 
             # Filter by date range

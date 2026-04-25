@@ -9,8 +9,10 @@
 		generateCalendarInvoice,
 		uploadIcal,
 		fetchInvoice,
+		patchInvoice,
 		getInvoicePdfUrl,
-		getInvoiceHtmlUrl
+		getInvoiceHtmlUrl,
+		sendInvoice
 	} from '$lib/api';
 	import Toast from '$lib/components/Toast.svelte';
 
@@ -31,6 +33,7 @@
 
 	// Calendar state
 	let calendarStep = $state(1); // 1=upload, 2=pick sessions, 3=review
+	let billingMonth = $state('');
 	let icalFile = $state<File | null>(null);
 	let icalParsing = $state(false);
 	let matchedSessions = $state<Array<CalendarSession & { selected: boolean; alreadyBilled?: string }>>([]);
@@ -42,6 +45,14 @@
 	// Calendar step 3
 	let calInvoiceProject = $state('');
 	let calInvoiceNotes = $state('');
+
+	// Send state
+	let sendEmail = $state('');
+	let sending = $state(false);
+	let sendSuccess = $state(false);
+	let sendError = $state('');
+	let showSendConfirm = $state(false);
+	let linkCopied = $state(false);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let selectedCustomer = $derived(
@@ -104,6 +115,21 @@
 		return `${y}-${String(m).padStart(2, '0')}`;
 	}
 
+	function previousMonth(): string {
+		const now = new Date();
+		const y = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+		const m = now.getMonth() === 0 ? 12 : now.getMonth();
+		return `${y}-${String(m).padStart(2, '0')}`;
+	}
+
+	function monthDateRange(ym: string): { start: string; end: string } {
+		const [y, m] = ym.split('-').map(Number);
+		const start = `${y}-${String(m).padStart(2, '0')}-01`;
+		const lastDay = new Date(y, m, 0).getDate();
+		const end = `${y}-${String(m).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
+		return { start, end };
+	}
+
 	function toggleSapStep(index: number) {
 		sapChecklist = { ...sapChecklist, [String(index)]: !sapChecklist[String(index)] };
 	}
@@ -135,6 +161,10 @@
 		try {
 			const inv = await generateFlatInvoice(selectedCustomerId, flatMonth);
 			generatedInvoice = await fetchInvoice(inv.id);
+			sendEmail = selectedCustomer?.contact_email ?? '';
+			sendSuccess = false;
+			sendError = '';
+			showSendConfirm = false;
 			addToast(`Generated invoice ${inv.invoice_number}`, 'success');
 			// Initialize SAP checklist
 			sapChecklist = {};
@@ -171,7 +201,8 @@
 		if (!icalFile || !selectedCustomerId) return;
 		icalParsing = true;
 		try {
-			const result = await uploadIcal(icalFile, selectedCustomerId);
+			const { start, end } = monthDateRange(billingMonth);
+			const result = await uploadIcal(icalFile, selectedCustomerId, start, end);
 			matchedSessions = result.matched_sessions.map(s => ({
 				...s,
 				selected: true,
@@ -209,6 +240,10 @@
 			}));
 			const inv = await generateCalendarInvoice(selectedCustomerId, sessions);
 			generatedInvoice = await fetchInvoice(inv.id);
+			sendEmail = selectedCustomer?.contact_email ?? '';
+			sendSuccess = false;
+			sendError = '';
+			showSendConfirm = false;
 			addToast(`Generated invoice ${inv.invoice_number}`, 'success');
 		} catch (e) {
 			addToast(e instanceof Error ? e.message : 'Generation failed', 'error');
@@ -252,7 +287,7 @@
 		<div class="card generated-card">
 			<div class="generated-header">
 				<h2>Invoice Generated</h2>
-				<span class="status-pill status-draft">draft</span>
+				<span class="status-pill status-{generatedInvoice.status}">{generatedInvoice.status}</span>
 			</div>
 
 			<div class="generated-meta">
@@ -276,6 +311,34 @@
 						<span class="meta-value">{generatedInvoice.po_number}</span>
 					</div>
 				{/if}
+				<div class="meta-item">
+					<label for="submitted-date" class="meta-label">Submitted Date</label>
+					<input
+						id="submitted-date"
+						type="date"
+						value={generatedInvoice.submitted_date ?? ''}
+						class="form-input form-input-sm"
+						onchange={async (e) => {
+							const val = (e.target as HTMLInputElement).value;
+							await patchInvoice(generatedInvoice!.id, { submitted_date: val });
+							generatedInvoice = await fetchInvoice(generatedInvoice!.id);
+						}}
+					/>
+				</div>
+				<div class="meta-item">
+					<label for="due-date" class="meta-label">Due Date</label>
+					<input
+						id="due-date"
+						type="date"
+						value={generatedInvoice.due_date ?? ''}
+						class="form-input form-input-sm"
+						onchange={async (e) => {
+							const val = (e.target as HTMLInputElement).value;
+							await patchInvoice(generatedInvoice!.id, { due_date: val });
+							generatedInvoice = await fetchInvoice(generatedInvoice!.id);
+						}}
+					/>
+				</div>
 			</div>
 
 			{#if generatedInvoice.line_items && generatedInvoice.line_items.length > 0}
@@ -316,6 +379,115 @@
 				</a>
 				<a href="/invoices" class="btn btn-primary">View All Invoices</a>
 			</div>
+
+			<!-- Send Invoice section -->
+			{#if generatedInvoice.status !== 'paid' && generatedInvoice.status !== 'void' && !generatedInvoice.po_number}
+				<div class="send-section card">
+					<h3 class="send-title">
+						{generatedInvoice.sent_at ? 'Resend Invoice' : 'Send Invoice'}
+					</h3>
+
+					{#if generatedInvoice.sent_at}
+						<p class="send-sent-info">
+							Sent to {generatedInvoice.sent_to} on {generatedInvoice.sent_at ? new Date(generatedInvoice.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : '--'}
+						</p>
+					{/if}
+
+					{#if sendSuccess}
+						<div class="send-success">
+							<p>Invoice sent to {generatedInvoice.sent_to}</p>
+							{#if generatedInvoice.payment_link_url}
+								<div class="payment-link-row">
+									<span class="payment-link-label">Payment link:</span>
+									<a href={generatedInvoice.payment_link_url} target="_blank" rel="noopener" class="payment-link-url">
+										{generatedInvoice.payment_link_url}
+									</a>
+									<button
+										class="btn btn-ghost btn-sm"
+										onclick={async () => {
+											try {
+												await navigator.clipboard.writeText(generatedInvoice!.payment_link_url!);
+												linkCopied = true;
+												setTimeout(() => linkCopied = false, 2000);
+											} catch {
+												/* clipboard unavailable */
+											}
+										}}
+									>
+										{linkCopied ? 'Copied!' : 'Copy'}
+									</button>
+								</div>
+							{/if}
+								<button class="btn btn-ghost btn-sm" onclick={() => { sendSuccess = false; showSendConfirm = false; }}>
+									Resend to a different address
+								</button>
+						</div>
+					{:else}
+						<div class="send-form">
+							<div class="send-email-row">
+								<label for="send-email" class="meta-label">Recipient Email</label>
+								<input
+									id="send-email"
+									type="email"
+									bind:value={sendEmail}
+									placeholder={selectedCustomer?.contact_email || 'Enter email address'}
+									class="form-input"
+									disabled={sending}
+								/>
+								{#if !sendEmail && !selectedCustomer?.contact_email}
+									<span class="send-helper">No contact email on file — enter a recipient address</span>
+								{/if}
+							</div>
+
+							{#if sendError}
+								<p class="error-msg">{sendError}</p>
+							{/if}
+
+							{#if showSendConfirm}
+								<div class="send-confirm">
+									<p>Send invoice for {fmtCurrency(generatedInvoice.total)} to <strong>{sendEmail || selectedCustomer?.contact_email}</strong>?</p>
+									<div class="send-confirm-actions">
+										<button
+											class="btn btn-primary"
+											disabled={sending}
+											onclick={async () => {
+												sending = true;
+												sendError = '';
+												try {
+													const emailToSend = sendEmail || selectedCustomer?.contact_email || undefined;
+													const result = await sendInvoice(generatedInvoice!.id, emailToSend);
+													generatedInvoice = result.invoice;
+													sendSuccess = true;
+													showSendConfirm = false;
+													addToast(result.message, 'success');
+												} catch (err) {
+													sendError = err instanceof Error ? err.message : 'Send failed';
+													addToast(sendError, 'error');
+												} finally {
+													sending = false;
+												}
+											}}
+										>
+											{sending ? 'Sending...' : 'Yes, Send'}
+										</button>
+										<button class="btn btn-ghost" onclick={() => showSendConfirm = false} disabled={sending}>
+											Cancel
+										</button>
+									</div>
+								</div>
+							{:else}
+								<button
+									class="btn btn-primary"
+									disabled={sending || (!sendEmail && !selectedCustomer?.contact_email)}
+									onclick={() => showSendConfirm = true}
+								>
+									{generatedInvoice.sent_at ? 'Resend Invoice' : 'Send Invoice'}
+								</button>
+							{/if}
+						</div>
+					{/if}
+				</div>
+			{/if}
 
 			<!-- SAP Ariba instructions for flat-rate (Cardinal Health) -->
 			{#if generatedInvoice.po_number && selectedCustomer?.billing_model === 'flat_rate'}
@@ -375,6 +547,7 @@
 							matchedSessions = [];
 							unmatchedEvents = [];
 							generatedInvoice = null;
+							billingMonth = previousMonth();
 							if (customer.default_rate) sessionRate = parseFloat(customer.default_rate);
 							calInvoiceProject = customer.name;
 						}}
@@ -454,6 +627,18 @@
 					<!-- Step 1: Upload .ics -->
 					<div class="card flow-card">
 						<h2 class="flow-title">Upload Calendar File</h2>
+
+						<div class="form-field" style="margin-bottom: 16px;">
+							<label for="billing-month" class="form-label">Billing Month</label>
+							<input
+								id="billing-month"
+								type="month"
+								bind:value={billingMonth}
+								class="form-input"
+								style="max-width: 200px;"
+							/>
+						</div>
+
 						<div
 							class="drop-zone"
 							class:drop-zone-active={icalFile !== null}
@@ -784,6 +969,12 @@
 		background: var(--surface);
 		border: 1px solid var(--border);
 		border-radius: var(--radius-sm);
+	}
+
+	.form-input-sm {
+		padding: 4px 8px;
+		font-size: .8rem;
+		max-width: 160px;
 	}
 
 	.form-input:focus {
@@ -1159,5 +1350,108 @@
 
 	@keyframes spin {
 		to { transform: rotate(360deg); }
+	}
+
+	/* ── Send Invoice section ──────────────────────────────────────── */
+	.send-section {
+		margin-top: 16px;
+		padding: 20px;
+		border: 1px solid var(--gray-200);
+	}
+
+	.send-title {
+		font-size: 1rem;
+		font-weight: 600;
+		margin-bottom: 12px;
+	}
+
+	.send-sent-info {
+		font-size: .85rem;
+		color: var(--gray-500);
+		margin-bottom: 12px;
+	}
+
+	.send-form {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.send-email-row {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.send-helper {
+		font-size: .8rem;
+		color: var(--gray-400);
+	}
+
+	.send-confirm {
+		background: var(--gray-50);
+		border: 1px solid var(--gray-200);
+		border-radius: 8px;
+		padding: 16px;
+	}
+
+	.send-confirm p {
+		margin-bottom: 12px;
+	}
+
+	.send-confirm-actions {
+		display: flex;
+		gap: 8px;
+	}
+
+	.send-success {
+		background: #f0fdf4;
+		border: 1px solid #bbf7d0;
+		border-radius: 8px;
+		padding: 16px;
+	}
+
+	.send-success p {
+		color: #166534;
+		font-weight: 500;
+		margin-bottom: 8px;
+	}
+
+	.payment-link-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+
+	.payment-link-label {
+		font-size: .85rem;
+		color: var(--gray-500);
+	}
+
+	.payment-link-url {
+		font-size: .85rem;
+		color: var(--link-color, #2563eb);
+		word-break: break-all;
+	}
+
+	.status-sent {
+		background: #dbeafe;
+		color: #1e40af;
+	}
+
+	.status-overdue {
+		background: #fee2e2;
+		color: #991b1b;
+	}
+
+	.status-paid {
+		background: #dcfce7;
+		color: #166534;
+	}
+
+	.status-void {
+		background: #f3f4f6;
+		color: #6b7280;
 	}
 </style>

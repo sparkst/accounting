@@ -212,6 +212,10 @@ export interface Invoice {
 	late_fee_pct: number;
 	po_number: string | null;
 	payment_transaction_id: string | null;
+	payment_link_url: string | null;
+	payment_link_id: string | null;
+	sent_at: string | null;
+	sent_to: string | null;
 	sap_instructions: Record<string, unknown> | null;
 	sap_checklist_state: Record<string, unknown> | null;
 	pdf_path: string | null;

@@ -239,31 +239,11 @@ def generate_calendar_invoice(
     # Auto-increment invoice number
     invoice_number = _next_calendar_invoice_number(db, first_date.year, first_date.month)
 
-    # Calculate total hours and subtotal for section header
-    total_hours = sum(
-        getattr(s, "duration_hours", 0.0) for s in billable_sessions
-    )
-
     invoice_id = _new_uuid()
     subtotal = decimal.Decimal("0.00")
     line_items: list[InvoiceLineItem] = []
 
-    # sort_order=0: section header line item
-    header_desc = f"{customer.name} - {total_hours:g} Hours"
-    header_li = InvoiceLineItem(
-        id=_new_uuid(),
-        invoice_id=invoice_id,
-        description=header_desc,
-        quantity=decimal.Decimal(str(total_hours)),
-        unit_price=effective_rate,
-        total_price=decimal.Decimal("0.00"),  # Header is display-only, $0
-        date=None,
-        sort_order=0,
-    )
-    db.add(header_li)
-    line_items.append(header_li)
-
-    # sort_order=1+: one line item per session, sorted chronologically
+    # One line item per session, sorted chronologically
     sorted_sessions = sorted(billable_sessions, key=lambda s: (getattr(s, "date", ""), getattr(s, "start_time", "") if hasattr(s, "start_time") else ""))
     for i, sess in enumerate(sorted_sessions):
         sess_date = getattr(sess, "date", "")
@@ -279,19 +259,29 @@ def generate_calendar_invoice(
             unit_price=effective_rate,
             total_price=total_price,
             date=sess_date,
-            sort_order=i + 1,
+            sort_order=i,
         )
         db.add(li)
         line_items.append(li)
         subtotal += total_price
 
     # Create invoice
+    today = date.today()
+    terms_days = 14
+    if customer.payment_terms:
+        try:
+            terms_days = int("".join(c for c in customer.payment_terms if c.isdigit()))
+        except ValueError:
+            pass
+
     invoice = Invoice(
         id=invoice_id,
         invoice_number=invoice_number,
         customer_id=customer.id,
         entity=Entity.SPARKRY.value,
         project=customer.name,
+        submitted_date=today.isoformat(),
+        due_date=(today + timedelta(days=terms_days)).isoformat(),
         service_period_start=first_date_str,
         service_period_end=last_date_str,
         subtotal=subtotal,
@@ -385,12 +375,22 @@ def generate_flat_invoice(
 
     invoice_id = _new_uuid()
 
+    today = date.today()
+    flat_terms_days = 14
+    if customer.payment_terms:
+        try:
+            flat_terms_days = int("".join(c for c in customer.payment_terms if c.isdigit()))
+        except ValueError:
+            pass
+
     invoice = Invoice(
         id=invoice_id,
         invoice_number=invoice_number,
         customer_id=customer.id,
         entity=Entity.SPARKRY.value,
         project=project_name,
+        submitted_date=today.isoformat(),
+        due_date=(today + timedelta(days=flat_terms_days)).isoformat(),
         service_period_start=first_biz.isoformat(),
         service_period_end=last_biz.isoformat(),
         subtotal=subtotal,

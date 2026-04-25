@@ -27,6 +27,7 @@ from src.api.routes.health import router as health_router
 from src.api.routes.ingest import router as ingest_router
 from src.api.routes.invoices import router as invoices_router
 from src.api.routes.reconciliation import router as reconciliation_router
+from src.api.routes.tax_documents import router as tax_documents_router
 from src.api.routes.tax_export import router as tax_export_router
 from src.api.routes.tax_year_locks import router as tax_year_locks_router
 from src.api.routes.transactions import router as transactions_router
@@ -159,6 +160,7 @@ app.include_router(transactions_router, prefix="/api", dependencies=_auth)
 app.include_router(ingest_router, prefix="/api", dependencies=_auth)
 app.include_router(invoices_router, prefix="/api", dependencies=_auth)
 app.include_router(reconciliation_router, prefix="/api", dependencies=_auth)
+app.include_router(tax_documents_router, prefix="/api", dependencies=_auth)
 app.include_router(tax_export_router, prefix="/api", dependencies=_auth)
 app.include_router(tax_year_locks_router, prefix="/api", dependencies=_auth)
 app.include_router(vendor_rules_router, prefix="/api", dependencies=_auth)

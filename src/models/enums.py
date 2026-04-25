@@ -227,3 +227,24 @@ INVOICE_STATUS_TRANSITIONS: dict[str, set[str]] = {
     InvoiceStatus.OVERDUE: {InvoiceStatus.PAID, InvoiceStatus.VOID},
     InvoiceStatus.VOID: set(),  # terminal
 }
+
+
+class TaxFormType(enum.StrEnum):
+    """IRS form types for received tax documents."""
+
+    FORM_1099_NEC = "1099-NEC"
+    FORM_1099_INT = "1099-INT"
+    FORM_1099_DIV = "1099-DIV"
+    FORM_1099_B = "1099-B"
+    FORM_1099_K = "1099-K"
+    FORM_K1 = "K-1"
+    FORM_1098 = "1098"
+    PROPERTY_TAX = "PROPERTY_TAX"
+    OTHER = "OTHER"
+
+
+class TaxDocumentStatus(enum.StrEnum):
+    """Lifecycle status of a tax document record."""
+
+    ACTIVE = "active"
+    INACTIVE = "inactive"  # soft delete

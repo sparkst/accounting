@@ -55,6 +55,8 @@ _LIGHT_GREY: tuple[int, int, int] = (229, 231, 235)
 _SECTION_BG: tuple[int, int, int] = (249, 250, 251)
 _WHITE: tuple[int, int, int] = (255, 255, 255)
 
+_LOGO_PATH = Path(__file__).parent / "assets" / "sparkry-logo.png"
+
 # ---------------------------------------------------------------------------
 # Page geometry
 # ---------------------------------------------------------------------------
@@ -319,18 +321,15 @@ class _InvoicePDF(FPDF):
         self.set_fill_color(*_ORANGE)
         self.rect(0, 0, _PAGE_W, 8, style="F")
 
-        # Address block starts at y=14
-        self.set_xy(_MARGIN_L, 14)
-        self.set_font("Helvetica", style="B", size=12)
-        self.set_text_color(*_BLACK)
-        self.cell(
-            0, 6, "Sparkry LLC",
-            new_x=XPos.LMARGIN, new_y=YPos.NEXT,
-        )
+        # Logo (1738x762 = 2.28:1 ratio, rendered at ~40mm wide)
+        logo_w, logo_h = 40, 17.5
+        self.image(str(_LOGO_PATH), x=_MARGIN_L, y=12, w=logo_w, h=logo_h)
 
+        # Address block starts below logo
+        addr_y = 12 + logo_h + 2
         self.set_font("Helvetica", size=9)
         self.set_text_color(*_DARK_GREY)
-        self.set_x(_MARGIN_L)
+        self.set_xy(_MARGIN_L, addr_y)
         self.cell(0, 5, "24517 SE 43rd Pl", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         self.set_x(_MARGIN_L)
         self.cell(0, 5, "Sammamish, WA 98029", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -365,7 +364,7 @@ def _do_render_pdf(
     pdf.add_page()
 
     # ── "Invoice" title  ────────────────────────────────────────────────────
-    pdf.set_xy(_MARGIN_L, 46)
+    pdf.set_xy(_MARGIN_L, 50)
     pdf.set_font("Helvetica", style="B", size=22)
     pdf.set_text_color(*_BLACK)
     pdf.cell(0, 10, "Invoice", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -375,7 +374,7 @@ def _do_render_pdf(
     pdf.set_font("Helvetica", size=9)
     pdf.set_text_color(*_MID_GREY)
     submitted_text = f"Submitted on:  {_fmt_date(inv.submitted_date)}"
-    pdf.cell(0, 6, submitted_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 6, _pdf_text(submitted_text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ── Meta grid  ──────────────────────────────────────────────────────────
     col_w = _CONTENT_W / 3

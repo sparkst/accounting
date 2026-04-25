@@ -21,19 +21,24 @@ import calendar
 import contextlib
 import decimal
 import logging
+import os
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import stripe as _stripe
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
+from src.invoicing.email_sender import _validate_email, send_invoice_email
 from src.invoicing.generator import generate_calendar_invoice as _gen_calendar
 from src.invoicing.generator import generate_flat_invoice as _gen_flat
-from src.models.audit_event import AuditEvent
+from src.invoicing.payment_link import create_payment_link
+from src.invoicing.pdf_renderer import render_html as _render_html
+from src.invoicing.pdf_renderer import render_pdf
 from src.models.enums import (
     INVOICE_STATUS_TRANSITIONS,
     BillingModel,
@@ -99,28 +104,34 @@ def _create_invoice_audit_event(
     """Create an AuditEvent for an invoice status/field change.
 
     Reuses the AuditEvent model. Since transaction_id has a FK to
-    transactions and invoice IDs are not in that table, we temporarily
-    disable FK enforcement for the insert. The PRAGMA must be issued
-    before any implicit transaction starts on this connection, so we
-    commit any pending work first.
+    transactions and invoice IDs are not in that table, we use a
+    separate connection with FK checks disabled (PRAGMA foreign_keys
+    cannot be toggled mid-transaction in SQLite).
     """
-    from sqlalchemy import text
+    from sqlalchemy import Engine, text
 
-    # Flush pending work so we start clean, then disable FK for this insert
-    session.flush()
-    session.execute(text("PRAGMA foreign_keys=OFF"))
-    event = AuditEvent(
-        id=_new_uuid(),
-        transaction_id=invoice_id,
-        field_changed=field,
-        old_value=old_value,
-        new_value=new_value,
-        changed_by=ConfirmedBy.HUMAN.value,
-        changed_at=_now(),
-    )
-    session.add(event)
-    session.flush()
-    session.execute(text("PRAGMA foreign_keys=ON"))
+    bind = session.get_bind()
+    assert isinstance(bind, Engine)
+    with bind.connect() as conn:
+        conn.execute(text("PRAGMA foreign_keys=OFF"))
+        conn.execute(
+            text(
+                "INSERT INTO audit_events (id, transaction_id, field_changed, "
+                "old_value, new_value, changed_by, changed_at) "
+                "VALUES (:id, :tid, :field, :old, :new, :by, :at)"
+            ),
+            {
+                "id": _new_uuid(),
+                "tid": invoice_id,
+                "field": field,
+                "old": old_value,
+                "new": new_value,
+                "by": ConfirmedBy.HUMAN.value,
+                "at": _now().isoformat(),
+            },
+        )
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +182,10 @@ class InvoiceOut(BaseModel):
     late_fee_pct: float = 0.0
     po_number: str | None = None
     payment_transaction_id: str | None = None
+    payment_link_url: str | None = None
+    payment_link_id: str | None = None
+    sent_at: datetime | None = None
+    sent_to: str | None = None
     sap_instructions: Any | None = None
     sap_checklist_state: Any | None = None
     pdf_path: str | None = None
@@ -356,6 +371,15 @@ class ARAgingItem(BaseModel):
     days_outstanding: int
     expected_payment_date: str | None
     is_overdue: bool
+
+
+class SendInvoiceRequest(BaseModel):
+    to_email: str | None = None
+
+
+class SendInvoiceResponse(BaseModel):
+    invoice: InvoiceOut
+    message: str
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +680,13 @@ def transition_invoice_status(
                 "payment_transaction_id", old_payment_id, None,
             )
 
+    # Deactivate Stripe payment link when voiding
+    if new_status == InvoiceStatus.VOID.value and inv.payment_link_id:
+        try:
+            _stripe_deactivate_link(inv.payment_link_id)
+        except Exception:
+            logger.warning("Failed to deactivate payment link %s", inv.payment_link_id)
+
     inv.updated_at = _now()
 
     # Audit event for status change
@@ -668,6 +699,128 @@ def transition_invoice_status(
 
     data = _enrich_with_aging(inv)
     return InvoiceOut.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# Invoice send
+# ---------------------------------------------------------------------------
+
+
+def _stripe_deactivate_link(payment_link_id: str) -> None:
+    _stripe.api_key = os.environ.get("STRIPE_RESTRICTED_KEY", "")
+    _stripe.PaymentLink.modify(payment_link_id, active=False)
+
+
+@router.post("/invoices/{invoice_id}/send", response_model=SendInvoiceResponse)
+def send_invoice(
+    invoice_id: str,
+    body: SendInvoiceRequest,
+    session: Session = Depends(get_db),  # noqa: B008
+) -> SendInvoiceResponse:
+    """Send an invoice via email with a Stripe payment link.
+
+    Creates a Stripe payment link (or reuses existing), generates PDF,
+    sends email via Resend. Transitions status to 'sent'.
+    """
+    inv: Invoice | None = session.get(Invoice, invoice_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Invoice not found")
+
+    customer: Customer | None = session.get(Customer, inv.customer_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    if inv.status in (InvoiceStatus.PAID.value, InvoiceStatus.VOID.value):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cannot send invoice in '{inv.status}' status.",
+        )
+
+    if inv.total is None or inv.total <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Invoice total must be positive.",
+        )
+
+    to_email = body.to_email or customer.contact_email
+    if not to_email:
+        raise HTTPException(
+            status_code=422,
+            detail="No recipient email. Provide to_email or set customer contact_email.",
+        )
+    try:
+        _validate_email(to_email)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    line_items = (
+        session.query(InvoiceLineItem)
+        .filter(InvoiceLineItem.invoice_id == invoice_id)
+        .order_by(InvoiceLineItem.sort_order)
+        .all()
+    )
+
+    pdf_bytes = render_pdf(inv, line_items, customer)
+
+    freshly_created = not inv.payment_link_id
+    try:
+        link_result = create_payment_link(inv)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to create payment link: {exc}",
+        ) from exc
+
+    inv.payment_link_url = link_result.url
+    inv.payment_link_id = link_result.link_id
+    inv.updated_at = _now()
+    session.commit()
+    session.refresh(inv)
+
+    try:
+        send_invoice_email(
+            invoice=inv,
+            line_items=line_items,
+            customer=customer,
+            pdf_bytes=pdf_bytes,
+            payment_link_url=link_result.url,
+            to_email=to_email,
+        )
+    except Exception as exc:
+        if freshly_created:
+            try:
+                _stripe_deactivate_link(link_result.link_id)
+            except Exception:
+                logger.warning("Failed to deactivate payment link after email failure")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Payment link created but email failed: {exc}",
+        ) from exc
+
+    old_sent_to = inv.sent_to
+    inv.sent_at = _now()
+    inv.sent_to = to_email
+    inv.updated_at = _now()
+
+    old_status = inv.status
+    if inv.status == InvoiceStatus.DRAFT.value:
+        inv.status = InvoiceStatus.SENT.value
+        _create_invoice_audit_event(
+            session, invoice_id, "status", old_status, InvoiceStatus.SENT.value,
+        )
+
+    _create_invoice_audit_event(
+        session, invoice_id, "sent_to", old_sent_to, to_email,
+    )
+
+    session.commit()
+    session.refresh(inv)
+
+    data = _enrich_with_aging(inv)
+    return SendInvoiceResponse(
+        invoice=InvoiceOut.model_validate(data),
+        message=f"Invoice sent to {to_email}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -806,9 +959,18 @@ async def ical_upload(
 
     result = parse_ical(content, customer, sd, ed)
 
-    # Convert dataclass result to dict
+    # Convert dataclass result to dict, renaming duration_hours → hours
     return {
-        "matched_sessions": result.matched_sessions,
+        "matched_sessions": [
+            {
+                "date": s.date,
+                "start_time": s.start_time,
+                "description": s.description,
+                "hours": s.duration_hours,
+                "event_uid": s.event_uid,
+            }
+            for s in result.matched_sessions
+        ],
         "unmatched_events": result.unmatched_events,
         "warnings": result.warnings if hasattr(result, "warnings") else [],
     }
@@ -840,7 +1002,6 @@ def get_invoice_pdf(
         .all()
     )
 
-    from src.invoicing.pdf_renderer import render_pdf
     pdf_bytes = render_pdf(inv, line_items, customer)
 
     filename = f"invoice-{inv.invoice_number}.pdf"
@@ -872,8 +1033,7 @@ def get_invoice_html(
         .all()
     )
 
-    from src.invoicing.pdf_renderer import render_html
-    html = render_html(inv, line_items, customer)
+    html = _render_html(inv, line_items, customer)
     return HTMLResponse(content=html)
 
 

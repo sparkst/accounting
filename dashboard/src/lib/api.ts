@@ -339,6 +339,23 @@ export async function uploadIcal(
 	return res.json() as Promise<ICalUploadResult>;
 }
 
+export interface SendInvoiceResponse {
+	invoice: Invoice;
+	message: string;
+}
+
+export async function sendInvoice(
+	invoiceId: string,
+	toEmail?: string
+): Promise<SendInvoiceResponse> {
+	const body: Record<string, string> = {};
+	if (toEmail) body.to_email = toEmail;
+	return request<SendInvoiceResponse>(`/invoices/${invoiceId}/send`, {
+		method: 'POST',
+		body: JSON.stringify(body)
+	});
+}
+
 export function getInvoicePdfUrl(id: string): string {
 	return `${BASE}/invoices/${id}/pdf`;
 }

@@ -527,12 +527,11 @@ class TestGenerateCalendar:
         assert data["status"] == "draft"
         assert float(data["total"]) == 250.0  # 1*100 + 1.5*100
         assert data["invoice_number"].startswith("202603-")
-        # 1 section header (sort_order=0) + 2 session line items = 3 total
-        assert len(data["line_items"]) == 3
-        # Header is first item
-        header = data["line_items"][0]
-        assert header["sort_order"] == 0
-        assert header["date"] is None
+        assert len(data["line_items"]) == 2
+        first = data["line_items"][0]
+        assert first["sort_order"] == 0
+        assert first["description"] == "Coaching session 1"
+        assert first["date"] == "2026-03-05"
 
     def test_generate_calendar_double_billing_guard(self, client: TestClient, db_session: Session) -> None:
         """INV-TEST-010: Double-billing guard on generate-calendar."""
@@ -1235,7 +1234,264 @@ class TestARAgingReport:
         assert len(items) == 2
         # Oldest (most days outstanding) should be first
         assert items[0]["invoice_number"] == "OLD01"
-        assert items[1]["invoice_number"] == "NEW01"
+
+
+# ---------------------------------------------------------------------------
+# Invoice send flow
+# ---------------------------------------------------------------------------
+
+
+class TestSendInvoice:
+    """INV-TEST-018: POST /api/invoices/{id}/send"""
+
+    def test_send_happy_path(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session, name="Fascinate")
+        cust.contact_email = "ben@benthole.com"
+        db_session.commit()
+
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND001",
+            subtotal="500.00",
+            submitted_date="2026-04-24",
+            due_date="2026-05-15",
+        )
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link,
+            patch("src.api.routes.invoices.send_invoice_email") as mock_email,
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/test_123",
+                link_id="plink_test_123",
+            )
+
+            r = client.post(f"/api/invoices/{inv.id}/send", json={})
+            assert r.status_code == 200
+            data = r.json()
+            assert data["message"] == "Invoice sent to ben@benthole.com"
+            assert data["invoice"]["status"] == "sent"
+            assert data["invoice"]["payment_link_url"] == "https://buy.stripe.com/test_123"
+            assert data["invoice"]["payment_link_id"] == "plink_test_123"
+            assert data["invoice"]["sent_to"] == "ben@benthole.com"
+            assert data["invoice"]["sent_at"] is not None
+
+            mock_link.assert_called_once()
+            mock_email.assert_called_once()
+
+    def test_send_with_email_override(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        cust.contact_email = "default@example.com"
+        db_session.commit()
+
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND002",
+            subtotal="1000.00",
+        )
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link,
+            patch("src.api.routes.invoices.send_invoice_email"),
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link.return_value = PaymentLinkResult(url="https://buy.stripe.com/x", link_id="plink_x")
+
+            r = client.post(
+                f"/api/invoices/{inv.id}/send",
+                json={"to_email": "override@example.com"},
+            )
+            assert r.status_code == 200
+            assert r.json()["invoice"]["sent_to"] == "override@example.com"
+
+    def test_send_rejects_paid_invoice(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND003",
+            status=InvoiceStatus.PAID.value,
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/send", json={"to_email": "x@x.com"})
+        assert r.status_code == 422
+        assert "paid" in r.json()["detail"].lower()
+
+    def test_send_rejects_void_invoice(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND004",
+            status=InvoiceStatus.VOID.value,
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/send", json={"to_email": "x@x.com"})
+        assert r.status_code == 422
+
+    def test_send_rejects_zero_total(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND005",
+            subtotal="0.00",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/send", json={"to_email": "x@x.com"})
+        assert r.status_code == 422
+        assert "positive" in r.json()["detail"].lower()
+
+    def test_send_requires_email(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND006",
+            subtotal="100.00",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/send", json={})
+        assert r.status_code == 422
+        assert "email" in r.json()["detail"].lower()
+
+    def test_send_validates_email_format(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND007",
+            subtotal="100.00",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/send", json={"to_email": "not-an-email"})
+        assert r.status_code == 422
+        assert "email" in r.json()["detail"].lower()
+
+    def test_send_rejects_newline_in_email(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND008",
+            subtotal="100.00",
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/send", json={"to_email": "x@x.com\r\nBcc: evil@evil.com"})
+        assert r.status_code == 422
+        assert "invalid email" in r.json()["detail"].lower()
+
+    def test_send_email_failure_returns_502(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        cust.contact_email = "ben@benthole.com"
+        db_session.commit()
+
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND009",
+            subtotal="500.00",
+        )
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link,
+            patch("src.api.routes.invoices.send_invoice_email", side_effect=Exception("Resend down")),
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+            patch("src.api.routes.invoices._stripe_deactivate_link") as mock_deactivate,
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link.return_value = PaymentLinkResult(url="https://buy.stripe.com/y", link_id="plink_y")
+
+            r = client.post(f"/api/invoices/{inv.id}/send", json={})
+            assert r.status_code == 502
+            assert "email failed" in r.json()["detail"].lower()
+
+            mock_deactivate.assert_called_once_with("plink_y")
+
+        db_session.expire_all()
+        inv_after = db_session.get(Invoice, inv.id)
+        assert inv_after is not None
+        assert inv_after.status == InvoiceStatus.DRAFT.value
+        assert inv_after.sent_at is None
+        assert inv_after.sent_to is None
+        # Payment link is persisted even on email failure (crash safety)
+        assert inv_after.payment_link_url == "https://buy.stripe.com/y"
+        assert inv_after.payment_link_id == "plink_y"
+
+    def test_send_creates_audit_event(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        cust.contact_email = "ben@benthole.com"
+        db_session.commit()
+
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND010",
+            subtotal="500.00",
+        )
+        inv_id = inv.id
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link,
+            patch("src.api.routes.invoices.send_invoice_email"),
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link.return_value = PaymentLinkResult(url="https://buy.stripe.com/z", link_id="plink_z")
+
+            client.post(f"/api/invoices/{inv_id}/send", json={})
+
+        verify = _TestSession()
+        try:
+            events = verify.query(AuditEvent).filter(
+                AuditEvent.transaction_id == inv_id,
+            ).all()
+            fields = {e.field_changed for e in events}
+            assert "status" in fields
+            assert "sent_to" in fields
+        finally:
+            verify.close()
+
+    def test_send_resend_reuses_payment_link(self, client: TestClient, db_session: Session) -> None:
+        """Re-sending a sent invoice reuses existing payment link."""
+        cust = _make_customer(db_session)
+        cust.contact_email = "ben@benthole.com"
+        db_session.commit()
+
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND011",
+            status=InvoiceStatus.SENT.value,
+            subtotal="500.00",
+        )
+        inv.payment_link_url = "https://buy.stripe.com/existing"
+        inv.payment_link_id = "plink_existing"
+        db_session.commit()
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link,
+            patch("src.api.routes.invoices.send_invoice_email"),
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/existing",
+                link_id="plink_existing",
+            )
+
+            r = client.post(
+                f"/api/invoices/{inv.id}/send",
+                json={"to_email": "new@example.com"},
+            )
+            assert r.status_code == 200
+            assert r.json()["invoice"]["sent_to"] == "new@example.com"
+            assert r.json()["invoice"]["payment_link_url"] == "https://buy.stripe.com/existing"
+
+            passed_inv = mock_link.call_args[0][0]
+            assert passed_inv.payment_link_id == "plink_existing"
+
+    def test_send_invoice_not_found(self, client: TestClient) -> None:
+        r = client.post(f"/api/invoices/{uuid.uuid4()}/send", json={"to_email": "x@x.com"})
+        assert r.status_code == 404
+
+
+class TestARAgingEdgeCases:
+    """Additional AR aging edge case tests."""
 
     def test_outstanding_includes_overdue_status(self, client: TestClient, db_session: Session) -> None:
         """Invoices stored with 'overdue' status appear in the outstanding report."""

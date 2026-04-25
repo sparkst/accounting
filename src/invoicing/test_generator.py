@@ -214,7 +214,8 @@ class TestGenerateCalendarInvoice:
         assert inv1.invoice_number == "202603-001"
         assert inv2.invoice_number == "202603-002"
 
-    def test_section_header_line_item_at_sort_order_zero(self, db: Session, hourly_customer: Customer):
+    def test_no_header_line_item(self, db: Session, hourly_customer: Customer):
+        """Section headers are rendered by the PDF/HTML layer, not stored as line items."""
         sessions = _sessions(
             ("2026-03-05", "Sync A", 1.0),
             ("2026-03-12", "Sync B", 2.0),
@@ -229,29 +230,9 @@ class TestGenerateCalendarInvoice:
             .order_by(InvoiceLineItem.sort_order)
             .all()
         )
-        header = line_items[0]
-        assert header.sort_order == 0
-        assert header.date is None
-        assert "3" in header.description  # "3 Hours" — 1+2 hours total
-        assert header.total_price == decimal.Decimal("0.00")
-
-    def test_section_header_description_contains_hours(self, db: Session, hourly_customer: Customer):
-        sessions = _sessions(
-            ("2026-03-05", "Sync", 1.5),
-            ("2026-03-12", "Sync 2", 0.5),
-        )
-        invoice = generate_calendar_invoice(db, hourly_customer, sessions)
-        db.commit()
-        assert invoice is not None
-
-        items = (
-            db.query(InvoiceLineItem)
-            .filter(InvoiceLineItem.invoice_id == invoice.id)
-            .order_by(InvoiceLineItem.sort_order)
-            .all()
-        )
-        header = items[0]
-        assert "2" in header.description  # 1.5 + 0.5 = 2 hours
+        assert len(line_items) == 2
+        assert line_items[0].description == "Sync A"
+        assert line_items[0].sort_order == 0
 
     def test_one_line_item_per_session(self, db: Session, hourly_customer: Customer):
         sessions = _sessions(
@@ -269,8 +250,7 @@ class TestGenerateCalendarInvoice:
             .order_by(InvoiceLineItem.sort_order)
             .all()
         )
-        # 1 header + 3 session items
-        assert len(line_items) == 4
+        assert len(line_items) == 3
 
     def test_subtotal_correctly_summed(self, db: Session, hourly_customer: Customer):
         # 1.0 hr @ $100 + 2.0 hrs @ $100 = $300

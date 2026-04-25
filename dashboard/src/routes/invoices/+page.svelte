@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
 	import type { Invoice, Customer } from '$lib/types';
 	import {
 		fetchInvoices,
@@ -10,7 +9,8 @@
 		transitionInvoiceStatus,
 		getInvoicePdfUrl,
 		getInvoiceHtmlUrl,
-		patchInvoice
+		patchInvoice,
+		sendInvoice
 	} from '$lib/api';
 	import { formatAmount, amountClass } from '$lib/categories';
 	import Toast from '$lib/components/Toast.svelte';
@@ -36,6 +36,14 @@
 	// Mark Sent / Mark Paid confirmation
 	let sentConfirmId = $state<string | null>(null);
 	let paidConfirmId = $state<string | null>(null);
+
+	// Send Invoice state
+	let sendEmail = $state('');
+	let sending = $state(false);
+	let sendError = $state('');
+	let sendSuccess = $state(false);
+	let showSendConfirm = $state(false);
+	let linkCopied = $state(false);
 
 	// ── Derived ───────────────────────────────────────────────────────────────
 	let filteredInvoices = $derived(
@@ -173,9 +181,21 @@
 		}
 		expandedId = inv.id;
 		expandLoading = true;
+		// Reset send state for new expansion
+		sendEmail = '';
+		sending = false;
+		sendError = '';
+		sendSuccess = false;
+		showSendConfirm = false;
+		linkCopied = false;
 		try {
 			expandedInvoice = await fetchInvoice(inv.id);
 			initSapChecklist(expandedInvoice);
+			// Pre-fill send email from customer contact
+			const cust = customerById(expandedInvoice.customer_id);
+			if (cust?.contact_email) {
+				sendEmail = cust.contact_email;
+			}
 		} catch (e) {
 			addToast('Failed to load invoice detail', 'error');
 			expandedId = null;
@@ -564,6 +584,116 @@
 														{/if}
 													{/if}
 												</div>
+
+												<!-- Send Invoice section -->
+												{#if expandedInvoice.status !== 'paid' && expandedInvoice.status !== 'void' && !expandedInvoice.po_number}
+													<div class="send-section card">
+														<h3 class="send-title">
+															{expandedInvoice.sent_at ? 'Resend Invoice' : 'Send Invoice'}
+														</h3>
+
+														{#if expandedInvoice.sent_at}
+															<p class="send-sent-info">
+																Sent to {expandedInvoice.sent_to} on {new Date(expandedInvoice.sent_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+															</p>
+														{/if}
+
+														{#if sendSuccess}
+															<div class="send-success">
+																<p>Invoice sent to {expandedInvoice.sent_to}</p>
+																{#if expandedInvoice.payment_link_url}
+																	<div class="payment-link-row">
+																		<span class="payment-link-label">Payment link:</span>
+																		<a href={expandedInvoice.payment_link_url} target="_blank" rel="noopener" class="payment-link-url">
+																			{expandedInvoice.payment_link_url}
+																		</a>
+																		<button
+																			class="btn btn-ghost btn-sm"
+																			onclick={async () => {
+																				try {
+																					await navigator.clipboard.writeText(expandedInvoice!.payment_link_url!);
+																					linkCopied = true;
+																					setTimeout(() => linkCopied = false, 2000);
+																				} catch {
+																					/* clipboard unavailable */
+																				}
+																			}}
+																		>
+																			{linkCopied ? 'Copied!' : 'Copy'}
+																		</button>
+																	</div>
+																{/if}
+																<button class="btn btn-ghost btn-sm" onclick={() => { sendSuccess = false; showSendConfirm = false; }}>
+																	Resend to a different address
+																</button>
+															</div>
+														{:else}
+															<div class="send-form">
+																<div class="send-email-row">
+																	<label for="send-email-list" class="meta-label">Recipient Email</label>
+																	<input
+																		id="send-email-list"
+																		type="email"
+																		bind:value={sendEmail}
+																		placeholder={customerById(expandedInvoice.customer_id)?.contact_email || 'Enter email address'}
+																		class="form-input"
+																		disabled={sending}
+																	/>
+																	{#if !sendEmail && !customerById(expandedInvoice.customer_id)?.contact_email}
+																		<span class="send-helper">No contact email on file -- enter a recipient address</span>
+																	{/if}
+																</div>
+
+																{#if sendError}
+																	<p class="error-msg">{sendError}</p>
+																{/if}
+
+																{#if showSendConfirm}
+																	<div class="send-confirm">
+																		<p>Send invoice for {fmtCurrencyAmount(expandedInvoice.total)} to <strong>{sendEmail || customerById(expandedInvoice.customer_id)?.contact_email}</strong>?</p>
+																		<div class="send-confirm-actions">
+																			<button
+																				class="btn btn-primary"
+																				disabled={sending}
+																				onclick={async () => {
+																					sending = true;
+																					sendError = '';
+																					try {
+																						const emailToSend = sendEmail || customerById(expandedInvoice!.customer_id)?.contact_email || undefined;
+																						const result = await sendInvoice(expandedInvoice!.id, emailToSend);
+																						expandedInvoice = result.invoice;
+																						sendSuccess = true;
+																						showSendConfirm = false;
+																						addToast(result.message, 'success');
+																						await load();
+																					} catch (err) {
+																						sendError = err instanceof Error ? err.message : 'Send failed';
+																						addToast(sendError, 'error');
+																					} finally {
+																						sending = false;
+																					}
+																				}}
+																			>
+																				{sending ? 'Sending...' : 'Yes, Send'}
+																			</button>
+																			<button class="btn btn-ghost" onclick={() => showSendConfirm = false} disabled={sending}>
+																				Cancel
+																			</button>
+																		</div>
+																	</div>
+																{:else}
+																	<button
+																		class="btn btn-primary"
+																		disabled={sending || (!sendEmail && !customerById(expandedInvoice.customer_id)?.contact_email)}
+																		onclick={() => showSendConfirm = true}
+																	>
+																		{expandedInvoice.sent_at ? 'Resend Invoice' : 'Send Invoice'}
+																	</button>
+																{/if}
+															</div>
+														{/if}
+													</div>
+												{/if}
 
 												<!-- SAP Ariba instructions for Cardinal Health -->
 												{#if expandedInvoice.po_number && customerById(expandedInvoice.customer_id)?.billing_model === 'flat_rate'}
@@ -1031,5 +1161,88 @@
 
 	@keyframes spin {
 		to { transform: rotate(360deg); }
+	}
+
+	/* ── Send Invoice ──────────────────────────────────────────────────── */
+	.send-section {
+		margin-top: 0;
+		padding: 20px;
+		border: 1px solid var(--gray-200);
+	}
+
+	.send-title {
+		font-size: 1rem;
+		font-weight: 600;
+		margin-bottom: 12px;
+	}
+
+	.send-sent-info {
+		font-size: .85rem;
+		color: var(--gray-500);
+		margin-bottom: 12px;
+	}
+
+	.send-form {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.send-email-row {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.send-helper {
+		font-size: .8rem;
+		color: var(--gray-400);
+	}
+
+	.send-confirm {
+		background: var(--gray-50);
+		border: 1px solid var(--gray-200);
+		border-radius: 8px;
+		padding: 16px;
+	}
+
+	.send-confirm p {
+		margin-bottom: 12px;
+	}
+
+	.send-confirm-actions {
+		display: flex;
+		gap: 8px;
+	}
+
+	.send-success {
+		background: #f0fdf4;
+		border: 1px solid #bbf7d0;
+		border-radius: 8px;
+		padding: 16px;
+	}
+
+	.send-success p {
+		color: #166534;
+		font-weight: 500;
+		margin-bottom: 8px;
+	}
+
+	.payment-link-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		flex-wrap: wrap;
+	}
+
+	.payment-link-label {
+		font-size: .85rem;
+		color: var(--gray-500);
+	}
+
+	.payment-link-url {
+		font-size: .85rem;
+		color: var(--link-color, #2563eb);
+		word-break: break-all;
 	}
 </style>

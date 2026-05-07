@@ -12,7 +12,6 @@ import os
 import sqlite3
 from pathlib import Path
 
-from dotenv import load_dotenv
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -21,6 +20,12 @@ from src.models.audit_event import AuditEvent  # noqa: F401
 # Import all models so their tables are registered on Base.metadata before
 # init_db() calls create_all().
 from src.models.base import Base
+from src.models.history import (  # noqa: F401
+    AccountBalanceSnapshot,
+    CostBasisLot,
+    ExpectedAccount,
+    HistoricalPrice,
+)
 from src.models.ingested_file import IngestedFile  # noqa: F401
 from src.models.ingestion_log import IngestionLog  # noqa: F401
 from src.models.invoice import Customer, Invoice, InvoiceLineItem  # noqa: F401
@@ -28,8 +33,6 @@ from src.models.llm_usage import LLMUsageLog  # noqa: F401
 from src.models.tax_year_lock import TaxYearLock  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
-
-load_dotenv()
 
 _DEFAULT_DB_PATH = "data/accounting.db"
 

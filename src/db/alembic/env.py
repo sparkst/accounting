@@ -8,9 +8,8 @@ src/db/connection.py) so the same override mechanism works for tests.
 import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config, pool
-
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 
 # ---------------------------------------------------------------------------
 # Import all models so their tables are registered on Base.metadata before
@@ -18,6 +17,18 @@ from alembic import context
 # ---------------------------------------------------------------------------
 from src.models.audit_event import AuditEvent  # noqa: F401
 from src.models.base import Base
+from src.models.brokerage import (  # noqa: F401
+    Account,
+    BrokerageTransaction,
+    PositionSnapshot,
+    RealizedGainLoss,
+)
+from src.models.history import (  # noqa: F401
+    AccountBalanceSnapshot,
+    CostBasisLot,
+    ExpectedAccount,
+    HistoricalPrice,
+)
 from src.models.ingested_file import IngestedFile  # noqa: F401
 from src.models.ingestion_log import IngestionLog  # noqa: F401
 from src.models.invoice import Customer, Invoice, InvoiceLineItem  # noqa: F401

@@ -47,6 +47,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.db.connection import SessionLocal
 from src.models.brokerage import Account
+from src.models.enums import AccountType, Broker, Entity
 from src.models.history import ExpectedAccount
 
 if TYPE_CHECKING:
@@ -76,6 +77,22 @@ _SKIP_NAMES: frozenset[str] = frozenset(
         "Annual",
     )
 )
+
+
+# expected_account.institution → Broker enum value. Used by the confirm
+# walkthrough when an active row has no resolved Account row — the seeder
+# offers to create one against the matched broker. Phase 4 added the four
+# non-broker institutions (FT, NW Mutual, F&G, GSK).
+_INSTITUTION_TO_BROKER: dict[str, Broker] = {
+    "Vanguard": Broker.VANGUARD,
+    "E*TRADE": Broker.ETRADE,
+    "Charles Schwab": Broker.SCHWAB,
+    "Fidelity Investments": Broker.FIDELITY,
+    "Franklin Templeton": Broker.FRANKLIN_TEMPLETON,
+    "Northwestern Mutual Investment Services": Broker.NW_MUTUAL,
+    "F&G Life": Broker.FG_ANNUITY,
+    "GSK": Broker.GSK_PENSION,
+}
 
 
 # Best-guess institution per XLSX label. Falls back to the label itself.
@@ -378,6 +395,48 @@ def seed(
 # ── Interactive confirm ──────────────────────────────────────────────────────
 
 
+def _offer_account_creation(
+    row: ExpectedAccount,
+    session: Session,
+    input_fn: Callable[[str], str],
+    output_fn: Callable[[str], None],
+) -> bool:
+    """Prompt the operator to create an ``Account`` row for ``row``.
+
+    Returns True if an Account was created and linked; False if the operator
+    declined or the institution has no Broker mapping.
+    """
+    broker = _INSTITUTION_TO_BROKER.get(row.institution)
+    if broker is None:
+        return False
+    prompt = (
+        f"  No live Account row for this expected_account.\n"
+        f"  Create one as broker={broker.value}? "
+        f"Enter account_number (blank to skip): "
+    )
+    try:
+        account_number = input_fn(prompt).strip()
+    except EOFError:
+        return False
+    if not account_number:
+        return False
+    new_account = Account(
+        broker=broker.value,
+        account_number=account_number,
+        account_name=row.account_name[:128],
+        account_type=AccountType.OTHER.value,
+        entity=Entity.PERSONAL.value,
+    )
+    session.add(new_account)
+    session.flush()
+    row.resolved_account_id = new_account.id
+    output_fn(
+        f"  Created Account(broker={broker.value},"
+        f" number={account_number}); linked.\n"
+    )
+    return True
+
+
 def confirm_interactive(
     session: Session,
     *,
@@ -388,8 +447,14 @@ def confirm_interactive(
 
     Response codes: ``a`` → active, ``c`` → closed, ``s`` (or anything else)
     → skip (leave as ``unconfirmed``).
+
+    For rows marked ``a`` whose ``resolved_account_id`` is None and whose
+    ``institution`` maps to a known ``Broker``, the operator is additionally
+    prompted to create the missing ``Account`` row.
     """
-    counts: dict[str, int] = {"active": 0, "closed": 0, "skipped": 0}
+    counts: dict[str, int] = {
+        "active": 0, "closed": 0, "skipped": 0, "accounts_created": 0,
+    }
     rows = (
         session.query(ExpectedAccount)
         .filter(ExpectedAccount.status == "unconfirmed")
@@ -413,6 +478,10 @@ def confirm_interactive(
         if answer == "a":
             row.status = "active"
             counts["active"] += 1
+            if row.resolved_account_id is None and _offer_account_creation(
+                row, session, input_fn, output_fn
+            ):
+                counts["accounts_created"] += 1
         elif answer == "c":
             row.status = "closed"
             counts["closed"] += 1
@@ -422,7 +491,8 @@ def confirm_interactive(
     session.commit()
     output_fn(
         f"Confirmed: {counts['active']} active, {counts['closed']} closed, "
-        f"{counts['skipped']} skipped."
+        f"{counts['skipped']} skipped, "
+        f"{counts['accounts_created']} accounts created."
     )
     return counts
 

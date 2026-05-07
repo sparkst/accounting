@@ -6,19 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-This is a greenfield project. The design spec and requirements exist but no source code has been written yet. Start by reading the design spec and requirements before implementing.
+Production system deployed locally via launchd + Caddy reverse proxy, accessible at `https://macbook.ancon-cliff.ts.net`. All core features implemented: transaction ingestion, classification, invoicing, tax exports, reconciliation, and dashboard.
 
 **Design spec:** `docs/superpowers/specs/2026-03-15-accounting-system-design.md`
-**Requirements:** `requirements/current.md` (24 REQ-IDs)
+**Requirements:** `requirements/current.md` (≈40 REQ-IDs)
+
+Most recent shipped scope: brokerage Phase 3 — net-worth-over-time chart with date/dollar axes, S&P 500 buy-and-hold overlay, per-holding pages, account tags with three-state filter chips, missing-accounts panel, XLSX historical import.
 
 ---
 
 ## Development Commands
 
 ```bash
-# Python environment
+# Python environment (deps live in pyproject.toml)
 python -m venv .venv && source .venv/bin/activate
-pip install fastapi uvicorn stripe shopify-python anthropic sqlalchemy aiosqlite ruff mypy pytest
+pip install -e ".[dev]"
+
+# Secrets (Doppler — never use .env files)
+doppler setup --project accounting --config dev    # first-time setup
+doppler run -- uvicorn src.api.main:app --reload --port 8000   # dev server with secrets
+doppler run -- pytest                              # tests with secrets
 
 # Quality gates (run before committing)
 pytest
@@ -34,11 +41,53 @@ alembic upgrade head                                    # apply all pending migr
 alembic revision --autogenerate -m "describe change"   # generate migration from model changes
 alembic downgrade -1                                    # roll back one migration
 
-# API server
-uvicorn src.api.main:app --reload --port 8000
-
-# Dashboard
+# Dashboard (dev)
 cd dashboard && npm install && npm run dev  # localhost:5173
+
+# Dashboard (production build — required for launchd service)
+cd dashboard && npm run build
+
+# Brokerage Phase 3 importers (all DRY-RUN by default; pass --apply to write)
+python -m src.adapters.xlsx_savings_plan import-balances --file <xlsx>   # historical balance snapshots
+python -m src.adapters.xlsx_savings_plan import-prices   --file <xlsx>   # XLSX price seed
+python -m src.adapters.xlsx_savings_plan import-lots     --file <xlsx>   # TD/SB cost-basis lots
+python -m scripts.backfill_historical_prices --years 10                  # yfinance EOD backfill
+python -m scripts.seed_expected_accounts seed --file <xlsx>              # expected_account seed
+python -m scripts.seed_expected_accounts confirm                         # interactive active/closed walkthrough; offers Account creation for unmapped institutions
+python -m scripts.seed_account_tags                                      # default tag rules per account
+
+# Brokerage Phase 4 per-institution adapters (DRY-RUN default; --apply to write)
+# Migration p4ext1enum0xt must be applied first (extends Broker + AccountType enums).
+python -m src.adapters.vanguard_csv    import-positions --file <csv>     # Vanguard OFX-style CSV (brokerage 6-col + 529 5-col)
+python -m src.adapters.fg_pdf          import          --file <pdf>      # F&G annuity annual/portal PDF
+python -m src.adapters.nw_mutual_xlsx  import          --file <xlsx>     # NW Mutual whole-life policies
+python -m src.adapters.gsk_pdf         import          --file <pdf>      # GSK cash-balance pension PDF
+python -m src.adapters.ft_pdf          import-statements --dir <path>    # Franklin Templeton year-end statements
+```
+
+### Optional: SQLite MCP for ad-hoc inspection
+
+For interactive inspection during debugging, register a SQLite MCP and let Claude query without writing throwaway scripts.
+
+**Important — the existing PreToolUse mutation guard in `.claude/settings.json` only matches `Bash` tool calls. It does NOT intercept MCP tool invocations.** Off-the-shelf SQLite MCPs (e.g., `mcp-server-sqlite-npx`, the official reference server) expose `write_query` alongside `read_query` with no `--read-only` flag, so pointing one at the live DB lets the model mutate it.
+
+The safe pattern is to point the MCP at a **snapshot copy**, not the live DB:
+
+```bash
+# From the repo root. Use sqlite3 .backup (NOT plain cp) so WAL pages are flushed
+# and the snapshot is internally consistent — a plain cp on a WAL-mode DB drops
+# unflushed transactions silently.
+sqlite3 data/accounting.db ".backup data/accounting.snapshot.db"
+ls -la data/accounting.db data/accounting.snapshot.db   # confirm freshness
+claude mcp add sqlite -s local -- npx -y mcp-server-sqlite-npx@0.8.0 "$(pwd)/data/accounting.snapshot.db"
+claude mcp list                                  # verify it loaded
+```
+
+The package version is pinned so a future supply-chain change doesn't silently alter behavior. Refresh the snapshot whenever you need newer data (re-run the `sqlite3 ... .backup` command). The whole `data/` tree is gitignored, so the snapshot is too. Remove when done:
+
+```bash
+claude mcp remove sqlite
+rm data/accounting.snapshot.db
 ```
 
 ---
@@ -50,6 +99,12 @@ cd dashboard && npm install && npm run dev  # localhost:5173
 - **Adapters** (`src/adapters/`): One per data source. Each normalizes to a common Transaction schema. Per-record error isolation — one bad record never halts a batch.
 - **Classification** (`src/classification/`): Tier 1 vendor rules (instant) → Tier 2 pattern matching → Tier 3 Claude API. Items below 0.7 confidence route to `needs_review`.
 - **Learning loop**: Every human interaction (confirm, edit, correct) creates/updates a VendorRule. The system suggests aggressively; humans confirm.
+- **Invoicing** (`src/invoicing/`): Invoice generation (calendar-based + flat-rate), PDF rendering (WeasyPrint), email delivery (Resend), Stripe payment link creation. Double-billing guards on both invoice types.
+- **Tax Documents** (`src/tax_docs/`): Tax document intake and processing.
+- **Brokerage** (`src/adapters/{schwab,fidelity,etrade,vanguard}_csv.py`, `src/models/brokerage.py`, `src/api/routes/brokerage.py`): Broker statement CSV ingestion with position snapshots; surfaced in dashboard at `/brokerage`.
+- **Brokerage history** (`src/models/history.py`): Phase 3 schema sitting alongside the live brokerage tables — `HistoricalPrice` (yfinance daily EOD), `AccountBalanceSnapshot` (XLSX historical aggregates), `ExpectedAccount` (manually-curated coverage list driving the missing-accounts panel), `CostBasisLot` (lot-level historical data), `AccountTag` (free-text tags for filter chips). Endpoints under `/api/brokerage/`: `networth-history`, `networth-history-benchmark`, `holdings/{symbol}/history`, `missing-accounts`, `PUT /accounts/{id}/tags`.
+- **Reports** (`src/reports/`): Weekly P&L generator, run via launchd (`com.sparkry.weekly-pl-report.plist`).
+- **Utilities** (`src/utils/`): Reconciliation engine and shared helpers.
 - **Dashboard** (`dashboard/`): SvelteKit frontend calling FastAPI backend. Apple design principles. Keyboard-first (y=confirm, e=edit, s=split, d=duplicate, j/k=navigate).
 
 ---
@@ -74,21 +129,36 @@ cd dashboard && npm install && npm run dev  # localhost:5173
 - **Amount validation**: split line items must sum to parent total
 - **Reconciliation vs dedup**: Stripe/Shopify payouts matching bank deposits are reconciliation pairs, not duplicates
 - **FastAPI binds to 127.0.0.1:8000** (localhost only)
-- **API keys in `.env`** (gitignored): `STRIPE_API_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `ANTHROPIC_API_KEY`
+- **Secrets managed via Doppler** — never use `.env` files. Keys: `STRIPE_API_KEY`, `STRIPE_RESTRICTED_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `STRIPE_ACCOUNT_TRAVIS_PERSONAL`, `RESEND_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `N8N_WEBHOOK_SECRET`, `API_KEY`
 
 ---
 
-## File Layout (Planned)
+## Critical Patterns
+
+- **Float → Decimal**: always `Decimal(str(value))`, never `Decimal(value)` on a float — preserves the user-facing precision. Apply at the JSON/CSV/DataFrame boundary in adapters.
+- **Per-row savepoint for batch ingest**: wrap the per-row insert in `with session.begin_nested():` so an `IntegrityError` rolls back only that row. Outer `session.commit()` once at end. See `src/adapters/xlsx_savings_plan.py` for the canonical pattern.
+- **Hash payload quantization**: dedup hashes (`source_row_hash`) must `Decimal.quantize()` numeric components before stringifying — otherwise `Decimal('10.50')` and `Decimal('10.5')` collide-or-not based on string format and break re-import idempotency.
+- **DRY-RUN default for scripts**: every importer/seeder defaults to `dry_run=True` (or `--apply` opt-in on the CLI). Programmatic callers must explicitly opt in to writing.
+- **Per-record error isolation**: one bad row never halts a batch. Catch per-row, append to `result.errors`, log, continue. Test it explicitly.
+
+---
+
+## File Layout
 
 ```
 requirements/        — PRD with REQ-IDs
 src/adapters/        — One adapter per data source (tests co-located as test_*.py)
 src/classification/  — 3-tier classification engine
-src/models/          — SQLAlchemy models (Transaction, VendorRule, IngestionLog, etc.)
+src/models/          — SQLAlchemy models (Transaction, VendorRule, Invoice, etc.)
 src/db/              — Schema, Alembic migrations, connection
 src/api/             — FastAPI routes for dashboard
-src/export/          — Tax export formatters (FreeTaxUSA, TaxAct, B&O)
-dashboard/           — SvelteKit frontend
+src/invoicing/       — Invoice generation, PDF rendering, email, payment links
+src/tax_docs/        — Tax document intake and processing
+src/utils/           — Reconciliation engine and shared helpers
+src/export/          — Tax export formatters (FreeTaxUSA, B&O)
+src/reports/         — Weekly P&L report generator
+scripts/             — Operational scripts (backup, deduction-scan, auto-confirm, ingest-brokerage)
+dashboard/           — SvelteKit frontend (built with vite, served via vite preview)
 data/                — SQLite DB, CSV drop zone (GITIGNORED)
 ```
 
@@ -102,9 +172,35 @@ data/                — SQLite DB, CSV drop zone (GITIGNORED)
 - Test classification with known transaction fixtures
 - Test dedup with intentional duplicate scenarios
 - Test export formats against expected CSV structure
+- For multi-phase work (greenfield features, schema changes), use `/qpipeline thorough` — it enforces ideate → plan → execute → review-loop (to convergence) → verify → demo. Review-loops must run to actual zero P0+P1 across all 4 lenses (security, financial-correctness, code-quality, test-coverage), not be cut short.
 
 
 Tax categories, data source details, data model, and adapter specs are all in the design spec — read it when working on those areas.
+
+---
+
+## Local Deployment
+
+Five launchd services behind a Caddy reverse proxy over Tailscale. API plist uses `doppler run --` to inject secrets at runtime.
+
+| Service | Plist | Port | What |
+|---------|-------|------|------|
+| API | `com.sparkry.accounting-api.plist` | 8000 | FastAPI via `doppler run -- uvicorn` |
+| Dashboard | `com.sparkry.accounting-dashboard.plist` | 5173 | SvelteKit via `vite preview` (requires `npm run build` first) |
+| Caddy | `com.sparkry.caddy-accounting.plist` | 443 | HTTPS reverse proxy |
+| Backup | `com.sparkry.accounting-backup.plist` | — | Periodic SQLite backup (`scripts/backup.sh`) |
+| Weekly P&L | `com.sparkry.weekly-pl-report.plist` | — | Monday P&L email (`scripts/weekly-pl-report.py`) |
+
+```bash
+# Restart a service after code changes
+launchctl unload com.sparkry.accounting-api.plist && launchctl load com.sparkry.accounting-api.plist
+
+# Dashboard changes require rebuild before restart
+cd dashboard && npm run build
+launchctl unload com.sparkry.accounting-dashboard.plist && launchctl load com.sparkry.accounting-dashboard.plist
+```
+
+Access via `https://macbook.ancon-cliff.ts.net` (Tailscale). Caddy routes `/api/*` → API, everything else → dashboard.
 
 ---
 
@@ -129,9 +225,9 @@ Tax categories, data source details, data model, and adapter specs are all in th
 
 ### API sign-flipping
 
-- **`TransactionOut.fix_income_sign` (transactions.py line 116–127)**: At the response layer, if `direction == "income"` and `amount < 0`, the amount is flipped to `abs(amount)`. This corrects Gmail income transactions that were stored negative before classification set direction=income. The DB is NOT modified — only the JSON response.
-- **`income_total` / `expense_total` in list response (transactions.py line 477–494)**: Aggregation always uses `func.abs(amount)`, then `expense_total` is returned as `-raw_expense` (negative). Frontend receives a signed pair: positive income, negative expenses.
-- **Tax summary / export (`tax_export.py`)**: Uses `abs(amt) * deductible_pct` everywhere — sign is irrelevant to the calculation because direction is used to classify income vs expense, not the amount sign.
+- **`TransactionOut.fix_income_sign`**: At the response layer, if `direction == "income"` and `amount < 0`, the amount is flipped to `abs(amount)`. This corrects Gmail income transactions that were stored negative before classification set direction=income. The DB is NOT modified — only the JSON response.
+- **`income_total` / `expense_total` in list response**: Aggregation always uses `func.abs(amount)`, then `expense_total` is returned as `-raw_expense` (negative). Frontend receives a signed pair: positive income, negative expenses.
+- **Tax summary / export**: Uses `abs(amt) * deductible_pct` everywhere — sign is irrelevant to the calculation because direction is used to classify income vs expense, not the amount sign.
 
 ### Frontend behavior
 
@@ -139,6 +235,4 @@ Tax categories, data source details, data model, and adapter specs are all in th
 - **`TransactionCard`**: Displays `formatCurrency(transaction.amount)` verbatim (no sign flip). The API's `fix_income_sign` ensures income arrives positive. Expense editing stores negative on save: `amountSign === 'expense' ? -parsed : parsed`.
 - **Financials page**: Receives `gross_income` (positive), `total_expenses` (positive from API), `net_profit` from tax-summary endpoint. The `operatingExpenses` derived value calls `Math.abs(totalExpenses)` as a safety measure.
 
-### No bugs found
-
-The convention is consistent end-to-end. The one place that could cause confusion — Gmail income stored negative before classification — is correctly handled by `fix_income_sign` at the API response layer. Tax-summary aggregation is immune because it uses `abs()` throughout and relies on `direction` for income/expense categorisation.
+The convention is consistent end-to-end. Gmail income stored negative before classification is correctly handled by `fix_income_sign` at the API response layer.

@@ -246,6 +246,8 @@ class TestConfirmInteractive:
         session.add_all([e1, e2, e3])
         session.commit()
 
+        # When marked active, institution "A" is not in the broker mapping →
+        # no Account creation prompt fires, so all 3 inputs map to status only.
         responses = iter(["a", "c", "s"])
         outputs: list[str] = []
         counts = seeder.confirm_interactive(
@@ -253,7 +255,9 @@ class TestConfirmInteractive:
             input_fn=lambda _prompt: next(responses),
             output_fn=outputs.append,
         )
-        assert counts == {"active": 1, "closed": 1, "skipped": 1}
+        assert counts == {
+            "active": 1, "closed": 1, "skipped": 1, "accounts_created": 0,
+        }
 
         statuses = {
             row.account_name: row.status
@@ -268,5 +272,74 @@ class TestConfirmInteractive:
             input_fn=lambda _p: "a",
             output_fn=outputs.append,
         )
-        assert counts == {"active": 0, "closed": 0, "skipped": 0}
+        assert counts == {
+            "active": 0, "closed": 0, "skipped": 0, "accounts_created": 0,
+        }
         assert any("No unconfirmed" in s for s in outputs)
+
+    def test_active_with_unmapped_institution_offers_account_creation(
+        self, session: Session
+    ) -> None:
+        """Phase-4 institutions (FT, NW Mutual, F&G, GSK) trigger account-create prompt."""
+        from src.models.brokerage import Account
+
+        e = ExpectedAccount(
+            institution="Franklin Templeton",
+            account_name="Templeton Growth Fund",
+            last_4="8291",
+            source="manual",
+            status="unconfirmed",
+        )
+        session.add(e)
+        session.commit()
+
+        responses = iter(["a", "8291"])
+        outputs: list[str] = []
+        counts = seeder.confirm_interactive(
+            session,
+            input_fn=lambda _p: next(responses),
+            output_fn=outputs.append,
+        )
+        assert counts["active"] == 1
+        assert counts["accounts_created"] == 1
+
+        # Account row exists with the right broker.
+        accts = (
+            session.query(Account)
+            .filter(Account.broker == "franklin_templeton")
+            .all()
+        )
+        assert len(accts) == 1
+        assert accts[0].account_number == "8291"
+
+        # ExpectedAccount is linked.
+        e_reloaded = session.query(ExpectedAccount).one()
+        assert e_reloaded.resolved_account_id == accts[0].id
+
+    def test_active_with_blank_account_number_skips_creation(
+        self, session: Session
+    ) -> None:
+        """Operator declining the account-create prompt leaves Account un-made."""
+        from src.models.brokerage import Account
+
+        e = ExpectedAccount(
+            institution="GSK",
+            account_name="Cash Balance Pension",
+            source="manual",
+            status="unconfirmed",
+        )
+        session.add(e)
+        session.commit()
+
+        responses = iter(["a", ""])  # active, then blank account_number
+        counts = seeder.confirm_interactive(
+            session,
+            input_fn=lambda _p: next(responses),
+            output_fn=lambda _o: None,
+        )
+        assert counts["active"] == 1
+        assert counts["accounts_created"] == 0
+        assert (
+            session.query(Account).filter(Account.broker == "gsk_pension").count()
+            == 0
+        )

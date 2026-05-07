@@ -28,7 +28,7 @@ import logging
 import re
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -39,10 +39,10 @@ from sqlalchemy.orm import Session
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
+from src.adapters._shared.result import BaseImportResult
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +76,16 @@ _DATE_FORMAT = "%b %d, %Y"
 
 
 @dataclass
-class ImportResult:
+class ImportResult(BaseImportResult):
     """Summary of an import run.
 
-    ``parsed`` and ``would_insert`` are populated in dry-run; ``imported``,
-    ``dup_skipped``, ``matched`` are populated on apply. ``errors`` collects
-    per-record failure strings (PDF parse, missing Account, etc.).
+    Inherits shared fields (``imported``, ``matched``, ``unmatched``,
+    ``dup_skipped``, ``errors``, ``warnings``, ``distinct_accounts``) from
+    :class:`~src.adapters._shared.result.BaseImportResult` and adds two
+    adapter-specific fields:
+
+    * ``parsed``: PDFs whose closing-balance regex matched.
+    * ``would_insert``: snapshot rows that *would* be written on apply (dry-run).
     """
 
     parsed: int = 0
@@ -89,21 +93,6 @@ class ImportResult:
 
     would_insert: int = 0
     """Snapshot rows that *would* be written on apply (dry-run only)."""
-
-    imported: int = 0
-    """Newly inserted snapshot rows."""
-
-    matched: int = 0
-    """Rows whose Account row was found and FK populated."""
-
-    dup_skipped: int = 0
-    """Rows skipped because an equivalent snapshot already exists."""
-
-    errors: list[str] = field(default_factory=list)
-    """Per-record error strings."""
-
-    warnings: list[str] = field(default_factory=list)
-    """Non-fatal per-record warning strings."""
 
 
 # ── Pure parsing ─────────────────────────────────────────────────────────────
@@ -190,6 +179,7 @@ def import_pdf(
     snap_as_of = as_of if as_of is not None else extracted_as_of
 
     result.parsed = 1
+    result.distinct_accounts = [GSK_ACCOUNT_NUMBER]
 
     if dry_run:
         result.would_insert = 1

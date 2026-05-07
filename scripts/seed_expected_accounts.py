@@ -217,7 +217,7 @@ def _institution_for_xlsx_name(name: str) -> str:
 
 def _read_xlsx_account_names(file_path: str) -> list[str]:
     """Re-enumerate distinct non-aggregate account names from the workbook."""
-    wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+    wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True, keep_links=False)
     if XLSX_SHEET_NAME not in wb.sheetnames:
         raise ValueError(
             f"Workbook is missing required sheet: {XLSX_SHEET_NAME!r}"

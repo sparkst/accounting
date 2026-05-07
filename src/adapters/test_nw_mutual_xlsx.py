@@ -10,10 +10,12 @@ Uses an in-memory SQLite engine with FK enforcement, mirroring
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Generator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import openpyxl
 import pytest
@@ -21,6 +23,8 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
 from src.adapters.nw_mutual_xlsx import (
+    ADAPTER_NAME,
+    NW_MUTUAL_BROKER,
     SOURCE_TAG,
     ImportResult,
     import_balances,
@@ -123,7 +127,7 @@ def _seed_accounts(session: Session, policies: list[str]) -> dict[str, str]:
     ids: dict[str, str] = {}
     for policy in policies:
         acct = Account(
-            broker="nw_mutual",
+            broker=NW_MUTUAL_BROKER,
             account_number=policy,
             account_type="other",
             entity="personal",
@@ -222,8 +226,10 @@ def test_apply_writes_three_snapshots(session: Session, fixture_xlsx: Path) -> N
     # IngestionLog written.
     logs = session.query(IngestionLog).all()
     assert len(logs) == 1
-    # FIX-T: assert source and records_processed on the log.
-    assert logs[0].source == SOURCE_TAG
+    # Assert the adapter writes using ADAPTER_NAME (not SOURCE_TAG) as the
+    # log source — they happen to be equal today but ADAPTER_NAME is the
+    # canonical constant for ingestion_log.source.
+    assert logs[0].source == ADAPTER_NAME
     assert logs[0].records_processed == 3
 
 
@@ -321,3 +327,73 @@ def test_per_row_error_isolation_does_not_break_batch(
     # The other 3 valid rows should be imported.
     assert result.imported == 3, f"expected 3 imported, got: {result.imported}"
     assert session.query(AccountBalanceSnapshot).count() == 3
+
+
+# ── FIX-3: error strings must not contain insured name (PII) ────────────────
+
+
+def _build_pii_test_workbook(path: Path) -> None:
+    """Workbook with a single policy row owned by 'TestSubject McTester'.
+
+    Used to verify that per-row exception strings in result.errors do not
+    contain the insured name — preventing PII leakage into IngestionLog.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Life Insurance"
+
+    headers = [
+        "Insured", "Account Number", "Net Death Benefit", "Annualized Premium",
+        "Last Annual Dividend", "Loans", "Net Accumulated Value",
+    ]
+    for col_idx, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=col_idx, value=h)
+
+    # One valid-looking row with a distinctive insured name.
+    ws.cell(row=2, column=1, value="TestSubject McTester")
+    ws.cell(row=2, column=2, value="99990001")
+    ws.cell(row=2, column=3, value="$100,000.00")
+    ws.cell(row=2, column=4, value="$500.00")
+    ws.cell(row=2, column=5, value="$50.00")
+    ws.cell(row=2, column=6, value="$0.00")
+    ws.cell(row=2, column=7, value="$12,345.00")
+
+    wb.save(path)
+
+
+def test_error_string_does_not_contain_insured_name(
+    tmp_path: Path, session: Session
+) -> None:
+    """FIX-3: when a row insert raises, result.errors must NOT contain the
+    insured name — PII must not flow into IngestionLog.error_detail."""
+    xlsx = tmp_path / "pii_test.xlsx"
+    _build_pii_test_workbook(xlsx)
+
+    # Seed the matching Account row so account lookup succeeds.
+    acct = Account(
+        broker=NW_MUTUAL_BROKER,
+        account_number="99990001",
+        account_type="other",
+        entity="personal",
+    )
+    session.add(acct)
+    session.commit()
+
+    # Patch begin_nested to raise a RuntimeError so the per-row except branch fires.
+    @contextlib.contextmanager
+    def _failing_begin_nested():  # type: ignore[no-untyped-def]
+        raise RuntimeError("injected failure for PII test")
+        yield  # pragma: no cover — generator protocol requires a yield
+
+    with patch.object(session, "begin_nested", _failing_begin_nested):
+        result = import_balances(xlsx, dry_run=False, session=session,
+                                 as_of=date(2026, 5, 7))
+
+    # A per-row error must have been recorded.
+    assert len(result.errors) >= 1, f"expected at least 1 error, got: {result.errors}"
+    # The insured name must NOT appear in any error string.
+    for err in result.errors:
+        assert "TestSubject McTester" not in err, (
+            f"PII (insured name) found in error string: {err!r}"
+        )

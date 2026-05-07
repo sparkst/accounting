@@ -24,7 +24,7 @@ import logging
 import re
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -36,10 +36,10 @@ from sqlalchemy.orm import Session
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
+from src.adapters._shared.result import BaseImportResult
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -71,29 +71,19 @@ _PORTFOLIO_OVERVIEW_RE: Final[re.Pattern[str]] = re.compile(
 
 
 @dataclass
-class ImportResult:
-    """Summary of a statement-import run."""
+class ImportResult(BaseImportResult):
+    """Summary of a statement-import run.
 
-    imported: int = 0
-    """Newly inserted ``AccountBalanceSnapshot`` rows."""
+    Inherits shared fields (``imported``, ``matched``, ``unmatched``,
+    ``dup_skipped``, ``errors``, ``warnings``, ``distinct_accounts``) from
+    :class:`~src.adapters._shared.result.BaseImportResult` and adds one
+    adapter-specific field:
 
-    matched: int = 0
-    """Rows whose ``account_id`` resolved (always == imported on success)."""
-
-    dup_skipped: int = 0
-    """Rows skipped because an equivalent snapshot already exists."""
-
-    errors: list[str] = field(default_factory=list)
-    """Per-file error strings (``filename: message``)."""
-
-    warnings: list[str] = field(default_factory=list)
-    """Non-fatal per-file warning strings."""
+    * ``files_seen``: number of ``*.pdf`` files walked (informational).
+    """
 
     files_seen: int = 0
     """Number of ``*.pdf`` files walked (informational)."""
-
-    distinct_accounts: list[str] = field(default_factory=list)
-    """Distinct account identifiers observed."""
 
 
 # ── Public extraction helpers ────────────────────────────────────────────────

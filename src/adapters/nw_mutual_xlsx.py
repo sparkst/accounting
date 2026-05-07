@@ -29,7 +29,7 @@ import hashlib
 import logging
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -41,10 +41,10 @@ from sqlalchemy.orm import Session
 
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
+from src.adapters._shared.result import BaseImportResult
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +68,19 @@ _NA_MARKERS = frozenset({"N/A", "n/a", "NA", "na", "--", "-"})
 
 
 @dataclass
-class ImportResult:
-    """Summary of an import run."""
+class ImportResult(BaseImportResult):
+    """Summary of an import run.
+
+    Inherits shared fields (``imported``, ``matched``, ``unmatched``,
+    ``dup_skipped``, ``errors``, ``warnings``, ``distinct_accounts``) from
+    :class:`~src.adapters._shared.result.BaseImportResult` and adds one
+    adapter-specific field:
+
+    * ``parsed``: total policy rows read from the workbook.
+    """
 
     parsed: int = 0
     """Total policy rows parsed from the workbook."""
-
-    imported: int = 0
-    """Newly inserted snapshot rows (apply mode only)."""
-
-    matched: int = 0
-    """Rows whose account_id resolved to a live Account."""
-
-    dup_skipped: int = 0
-    """Rows skipped because an equivalent snapshot already exists."""
-
-    errors: list[str] = field(default_factory=list)
-    """Per-row error strings (genuine failures — not N/A skips)."""
-
-    warnings: list[str] = field(default_factory=list)
-    """Per-row warning strings (expected non-fatal skips, e.g. N/A rows)."""
-
-    distinct_accounts: list[str] = field(default_factory=list)
-    """Distinct policy numbers observed."""
 
 
 # ── Parsing ──────────────────────────────────────────────────────────────────
@@ -256,7 +246,10 @@ def import_balances(
         insured = row["insured"]
         balance: Decimal = row["net_accum_value"]
         raw_account_name = f"NW Mutual {insured} {policy_number}".strip()
-        record_label = f"{raw_account_name}@{as_of.isoformat()}"
+        # Use only the policy number (not the insured name) in the label so
+        # that per-row exception strings in result.errors do not leak PII into
+        # IngestionLog.error_detail → /api/health.
+        record_label = f"policy {policy_number}@{as_of.isoformat()}"
         row_hash = _row_hash(policy_number, as_of, balance)
 
         # Idempotency check by the dedup hash.
@@ -316,19 +309,16 @@ def import_balances(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    # Include warnings in error_detail for visibility, but only errors fail.
-    detail_parts: list[str] = []
-    if result.warnings:
-        detail_parts.append("warnings:\n" + "\n".join(result.warnings))
-    if result.errors:
-        detail_parts.append("errors:\n" + "\n".join(result.errors))
+    # error_detail includes ONLY errors (not warnings) so PII-free error strings
+    # are not exposed via /api/health. Warnings are still surfaced via
+    # _print_summary and via the ImportResult returned to the caller.
     write_ingestion_log(
         session,
         source=ADAPTER_NAME,
         records_processed=result.imported + result.dup_skipped,
         records_failed=len(result.errors),
         status=status,
-        error_detail="\n".join(detail_parts) or None,
+        error_detail="\n".join(result.errors) or None,
     )
     return result
 

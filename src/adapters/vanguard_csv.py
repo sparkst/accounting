@@ -44,7 +44,7 @@ import hashlib
 import logging
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from io import StringIO
@@ -60,9 +60,9 @@ from src.adapters._shared.money import (
     quantize_balance,
     quantize_shares,
 )
+from src.adapters._shared.result import BaseImportResult
 from src.models.brokerage import Account, PositionSnapshot
 from src.models.enums import Broker, IngestionStatus
-from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -89,11 +89,13 @@ _K529_HEADER_PREFIX = "Fund Account Number,Fund Name"
 
 
 @dataclass
-class ImportResult:
+class ImportResult(BaseImportResult):
     """Summary of an import run.
 
-    Mirrors ``xlsx_savings_plan.ImportResult`` field-for-field for the shared
-    fields, and adds two adapter-specific fields:
+    Inherits shared fields (``imported``, ``matched``, ``unmatched``,
+    ``dup_skipped``, ``errors``, ``warnings``, ``distinct_accounts``) from
+    :class:`~src.adapters._shared.result.BaseImportResult` and adds two
+    adapter-specific fields:
 
     * ``parsed``: positions-block rows successfully parsed (regardless of
       dry_run / mapping errors — a measure of file shape).
@@ -101,32 +103,11 @@ class ImportResult:
       counts but does not write these.
     """
 
-    imported: int = 0
-    """Newly inserted PositionSnapshot rows."""
-
-    matched: int = 0
-    """Rows whose account_id resolved to a live Account."""
-
-    unmatched: int = 0
-    """Rows that parsed but could not be matched to an Account."""
-
     parsed: int = 0
     """Position-block rows successfully parsed (independent of dry_run)."""
 
     transactions_seen: int = 0
     """Transactions-block rows observed; not written in Phase 4."""
-
-    dup_skipped: int = 0
-    """Rows skipped because an equivalent snapshot already exists."""
-
-    errors: list[str] = field(default_factory=list)
-    """Per-row error strings (record_label: message)."""
-
-    warnings: list[str] = field(default_factory=list)
-    """Non-fatal per-row warning strings."""
-
-    distinct_accounts: list[str] = field(default_factory=list)
-    """Distinct ``account_number`` values observed in the positions block."""
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -216,12 +197,17 @@ def _row_hash(
     (``Decimal('10.5')`` vs ``'10.50'``) doesn't change the hash and break
     re-import idempotency.
     """
+    # price uses quantize_balance (2 decimals) rather than quantize_shares so
+    # that trailing-zero CSV variants of the same per-share price (e.g.
+    # "659.35" vs "659.350") land on the same hash bucket and re-import
+    # is idempotent.  Storage precision is determined by the DB column
+    # (Numeric(18, 8)), not by the hash payload.
     payload = "|".join(
         (
             account_number,
             symbol or "-",
             str(quantize_shares(shares)),
-            str(quantize_shares(price)),
+            str(quantize_balance(price)),
             str(quantize_balance(market_value)),
             as_of.isoformat(),
         )
@@ -417,6 +403,7 @@ def import_positions(
         account_id = account_id_by_number.get(parsed.account_number)
         if account_id is None:
             # Already recorded as an error above — don't double-log.
+            result.unmatched += 1
             continue
 
         record_label = (
@@ -482,7 +469,7 @@ def import_positions(
     write_ingestion_log(
         session,
         source=ADAPTER_NAME,
-        records_processed=result.imported + result.dup_skipped,
+        records_processed=result.imported + result.dup_skipped + result.unmatched,
         records_failed=len(result.errors),
         status=status,
         error_detail=_format_log_detail(result),

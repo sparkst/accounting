@@ -69,7 +69,7 @@ def session() -> Generator[Session, None, None]:
 def seeded_account(session: Session) -> Account:
     """Account row matching the FT statement contract."""
     acct = Account(
-        broker="franklin_templeton",
+        broker=FT_BROKER,
         account_number="8291",
         account_name="Templeton Growth Fund",
         account_type="other",

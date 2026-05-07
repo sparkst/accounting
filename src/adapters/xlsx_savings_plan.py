@@ -249,7 +249,7 @@ def import_account_balances(
 
     # We don't use read_only=True: it leaves max_row/max_column lazy (None until
     # the sheet is iterated), which complicates indexed access by (row, col).
-    wb = openpyxl.load_workbook(file_path, data_only=True)
+    wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
     if SHEET_NAME not in wb.sheetnames:
         result.errors.append(f"workbook missing sheet '{SHEET_NAME}'")
         if session is not None and not dry_run:
@@ -409,7 +409,7 @@ def import_historical_prices(
     """
     result = ImportResult()
 
-    wb = openpyxl.load_workbook(file_path, data_only=True)
+    wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
     if PRICES_SHEET_NAME not in wb.sheetnames:
         result.errors.append(f"workbook missing sheet '{PRICES_SHEET_NAME}'")
         if session is not None and not dry_run:
@@ -696,7 +696,7 @@ def import_cost_basis_lots(
     """
     result = ImportResult()
 
-    wb = openpyxl.load_workbook(file_path, data_only=True)
+    wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
 
     found_any = False
     if TD_LOTS_SHEET_NAME in wb.sheetnames:

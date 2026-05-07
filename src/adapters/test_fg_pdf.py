@@ -391,3 +391,40 @@ def test_import_pdf_unmapped_contract_inline(session: Session, tmp_path: Path) -
     assert result.imported == 0
     assert any("MZ999999" in e for e in result.errors), result.errors
     assert session.query(AccountBalanceSnapshot).count() == 0
+
+
+def test_import_pdf_annual_apply_writes_snapshot(
+    session: Session, tmp_path: Path
+) -> None:
+    """FIX-11: annual flavor apply path — patches pdftotext, seeds Account, asserts snapshot."""
+    # Seed the Account row the adapter will look up.
+    acct = Account(
+        broker=BROKER,
+        account_number="MZ152585",
+        account_type="other",
+        entity="personal",
+    )
+    session.add(acct)
+    session.commit()
+
+    pdf = tmp_path / "annual.pdf"
+    pdf.write_bytes(b"placeholder")
+
+    with patch("src.adapters.fg_pdf.pdftotext_layout", return_value=ANNUAL_TEXT_FIXTURE):
+        result = import_pdf(pdf, dry_run=False, session=session)
+
+    assert result.imported == 1
+    assert result.errors == []
+    snaps = session.query(AccountBalanceSnapshot).all()
+    assert len(snaps) == 1
+    snap = snaps[0]
+    assert snap.account_id == acct.id
+    # Annual fixture has "Total Account Value as of 05/01/2026 $660,218.55" (last match).
+    assert snap.as_of == date(2026, 5, 1)
+    assert snap.balance == Decimal("660218.55")
+    assert snap.source == SOURCE_TAG
+
+    # IngestionLog written.
+    logs = session.query(IngestionLog).all()
+    assert len(logs) == 1
+    assert logs[0].source == ADAPTER_NAME

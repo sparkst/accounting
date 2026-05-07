@@ -344,6 +344,43 @@ class TestConfirmInteractive:
             == 0
         )
 
+    def test_active_with_gsk_institution_offers_account_creation(
+        self, session: Session
+    ) -> None:
+        """FIX-4: GSK institution maps to broker=gsk_pension; positive creation path."""
+        from src.models.brokerage import Account
+
+        e = ExpectedAccount(
+            institution="GSK",
+            account_name="Cash Balance Pension Plan",
+            source="manual",
+            status="unconfirmed",
+        )
+        session.add(e)
+        session.commit()
+
+        responses = iter(["a", "GSK_PENSION"])  # active, supply account_number
+        outputs: list[str] = []
+        counts = seeder.confirm_interactive(
+            session,
+            input_fn=lambda _p: next(responses),
+            output_fn=outputs.append,
+        )
+        assert counts["accounts_created"] == 1
+
+        # An Account row must exist with the correct broker and account_number.
+        accts = (
+            session.query(Account)
+            .filter(Account.broker == "gsk_pension")
+            .all()
+        )
+        assert len(accts) == 1
+        assert accts[0].account_number == "GSK_PENSION"
+
+        # The ExpectedAccount must be linked to the newly created Account.
+        e_reloaded = session.query(ExpectedAccount).one()
+        assert e_reloaded.resolved_account_id == accts[0].id
+
     def test_active_with_nw_mutual_institution_offers_account_creation(
         self, session: Session
     ) -> None:

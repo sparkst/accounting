@@ -391,6 +391,28 @@ def test_real_529_dry_run(session: Session) -> None:
     assert result.transactions_seen > 0
 
 
+def test_all_unmapped_accounts_records_processed_equals_parsed(
+    session: Session, tmp_path: Path
+) -> None:
+    """FIX-2: when every position row is unmapped, records_processed must equal
+    the number of parsed position rows (not zero), so the audit log is truthful."""
+    # Do NOT seed any Account rows — all 3 parsed positions are unmapped.
+    csv = _write(tmp_path, "OfxDownload.csv", INLINE_BROKERAGE)
+
+    result = import_positions(csv, dry_run=False, session=session,
+                              as_of=date(2026, 5, 1))
+
+    # All 3 rows parsed successfully but none matched an Account.
+    assert result.parsed == 3
+    assert result.imported == 0
+    assert result.dup_skipped == 0
+    assert result.unmatched == 3
+
+    # IngestionLog records_processed must include the unmatched rows.
+    log = session.execute(select(IngestionLog)).scalar_one()
+    assert log.records_processed == 3
+
+
 # ── Constants / contract checks ──────────────────────────────────────────────
 
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 
 @dataclass
-class ImportResult:
+class BaseImportResult:
     """Canonical summary of a Phase-4 adapter import run.
 
     Adapters that need extra fields should subclass and add them.

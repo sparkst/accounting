@@ -32,7 +32,7 @@ import logging
 import re
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -44,10 +44,10 @@ from sqlalchemy.orm import Session
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
+from src.adapters._shared.result import BaseImportResult
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -68,33 +68,14 @@ BROKER = Broker.FG_ANNUITY.value
 
 
 @dataclass
-class ImportResult:
+class ImportResult(BaseImportResult):
     """Summary of a single PDF import run.
 
-    Mirrors :class:`src.adapters.xlsx_savings_plan.ImportResult` so consumers
-    can treat any Phase-4 adapter result uniformly.
+    Inherits shared fields (``imported``, ``matched``, ``unmatched``,
+    ``dup_skipped``, ``errors``, ``warnings``, ``distinct_accounts``) from
+    :class:`~src.adapters._shared.result.BaseImportResult`. No
+    adapter-specific extra fields are required for F&G.
     """
-
-    imported: int = 0
-    """Newly inserted snapshot rows (max 1 for this adapter)."""
-
-    matched: int = 0
-    """Rows whose account_id resolved to a live Account."""
-
-    unmatched: int = 0
-    """Rows that parsed but could not be matched to an Account."""
-
-    dup_skipped: int = 0
-    """Rows skipped because an equivalent snapshot already exists."""
-
-    errors: list[str] = field(default_factory=list)
-    """Per-record error strings."""
-
-    warnings: list[str] = field(default_factory=list)
-    """Non-fatal per-record warning strings."""
-
-    distinct_accounts: list[str] = field(default_factory=list)
-    """Distinct contract numbers observed."""
 
 
 # ── Regexes ──────────────────────────────────────────────────────────────────

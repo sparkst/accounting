@@ -1,0 +1,224 @@
+"""Backfill historical EOD prices from yfinance into the historical_price table.
+
+Discovers symbols from existing position_snapshot and brokerage_transaction
+rows, adds benchmark symbols (SPY, VTI, QQQ, BND), and fetches up to 10 years
+of daily closes via the yfinance adapter. Idempotent on (symbol, trade_date)
+PK — already-existing rows are skipped.
+
+DRY-RUN by default. Use --apply to write.
+
+Usage:
+    python -m scripts.backfill_historical_prices                    # dry-run, all symbols
+    python -m scripts.backfill_historical_prices --apply            # write
+    python -m scripts.backfill_historical_prices --symbols SPY VTI  # subset
+    python -m scripts.backfill_historical_prices --years 5 --apply  # last 5 years only
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from collections.abc import Iterable
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from sqlalchemy import select  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+from src.adapters.yfinance_prices import HistoricalPriceRow, fetch_eod  # noqa: E402
+from src.db.connection import SessionLocal  # noqa: E402
+from src.models.brokerage import BrokerageTransaction, PositionSnapshot  # noqa: E402
+from src.models.history import HistoricalPrice  # noqa: E402
+from src.models.ingestion_log import IngestionLog  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+BENCHMARK_SYMBOLS: tuple[str, ...] = ("SPY", "VTI", "QQQ", "BND")
+
+
+def discover_symbols(session: Session) -> set[str]:
+    """Distinct non-null symbols across position_snapshot and brokerage_transaction.
+
+    Excludes obviously-non-tradable values (cash sleeves with empty symbol,
+    'TOTAL' rows, 'Generated %' adapter-bug rows).
+    """
+    symbols: set[str] = set()
+    for sym in session.execute(select(PositionSnapshot.symbol).distinct()).scalars():
+        if sym and sym.strip() and not sym.startswith("Generated") and sym.upper() != "TOTAL":
+            symbols.add(sym.strip().upper())
+    for sym in session.execute(select(BrokerageTransaction.symbol).distinct()).scalars():
+        if sym and sym.strip():
+            symbols.add(sym.strip().upper())
+    return symbols
+
+
+def _existing_dates_for_symbol(session: Session, symbol: str) -> set[date]:
+    rows = session.execute(
+        select(HistoricalPrice.trade_date).where(HistoricalPrice.symbol == symbol)
+    ).scalars()
+    return set(rows)
+
+
+def _persist_rows(
+    session: Session, rows: Iterable[HistoricalPriceRow]
+) -> tuple[int, int]:
+    """Insert HistoricalPrice rows, skipping PK conflicts. Returns (inserted, skipped)."""
+    inserted = 0
+    skipped = 0
+    for row in rows:
+        existing = session.get(HistoricalPrice, (row["symbol"], row["trade_date"]))
+        if existing is not None:
+            skipped += 1
+            continue
+        try:
+            session.add(
+                HistoricalPrice(
+                    symbol=row["symbol"],
+                    trade_date=row["trade_date"],
+                    close=row["close"],
+                    open=row["open"],
+                    high=row["high"],
+                    low=row["low"],
+                    volume=row["volume"],
+                    source="yfinance",
+                )
+            )
+            session.flush()
+            inserted += 1
+        except IntegrityError:
+            session.rollback()
+            skipped += 1
+    return inserted, skipped
+
+
+def backfill(
+    session: Session,
+    symbols: list[str],
+    start: date,
+    end: date,
+    apply: bool,
+) -> dict[str, dict[str, int]]:
+    """Fetch and persist historical prices. Returns per-symbol summary."""
+    summary: dict[str, dict[str, int]] = {}
+    for symbol in sorted(symbols):
+        existing_dates = _existing_dates_for_symbol(session, symbol)
+        all_rows = fetch_eod([symbol], start=start, end=end)
+        new_rows = [r for r in all_rows if r["trade_date"] not in existing_dates]
+        per_symbol = {
+            "fetched": len(all_rows),
+            "already_present": len(existing_dates),
+            "new": len(new_rows),
+            "inserted": 0,
+            "skipped": 0,
+        }
+        if apply and new_rows:
+            inserted, skipped = _persist_rows(session, new_rows)
+            per_symbol["inserted"] = inserted
+            per_symbol["skipped"] = skipped
+        summary[symbol] = per_symbol
+        logger.info(
+            "%s: fetched=%d already=%d new=%d inserted=%d",
+            symbol,
+            per_symbol["fetched"],
+            per_symbol["already_present"],
+            per_symbol["new"],
+            per_symbol["inserted"],
+        )
+    if apply:
+        session.commit()
+    return summary
+
+
+def _log_to_ingestion_log(
+    session: Session, summary: dict[str, dict[str, int]], apply: bool
+) -> None:
+    total_inserted = sum(s["inserted"] for s in summary.values())
+    total_new = sum(s["new"] for s in summary.values())
+    detail = json.dumps(
+        {
+            "apply": apply,
+            "symbols": sorted(summary.keys()),
+            "total_new_rows": total_new,
+            "total_inserted": total_inserted,
+            "per_symbol": summary,
+        }
+    )
+    log = IngestionLog(
+        source="yfinance_backfill",
+        run_at=datetime.now(UTC).replace(tzinfo=None),
+        status="success",
+        records_processed=total_inserted,
+        records_failed=0,
+        error_detail=detail,
+    )
+    session.add(log)
+    session.commit()
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--apply", action="store_true", help="Write to DB (default: dry-run).")
+    p.add_argument(
+        "--symbols",
+        nargs="+",
+        help="Restrict to these symbols (default: discover from DB + benchmarks).",
+    )
+    p.add_argument(
+        "--years", type=int, default=10, help="How far back to fetch (default: 10)."
+    )
+    p.add_argument(
+        "--no-benchmarks",
+        action="store_true",
+        help="Skip the SPY/VTI/QQQ/BND benchmark symbols.",
+    )
+    return p.parse_args()
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    args = _parse_args()
+
+    end = date.today()
+    start = end - timedelta(days=365 * args.years)
+
+    session = SessionLocal()
+    try:
+        if args.symbols:
+            symbols = [s.upper() for s in args.symbols]
+        else:
+            symbols = sorted(discover_symbols(session))
+            if not args.no_benchmarks:
+                for b in BENCHMARK_SYMBOLS:
+                    if b not in symbols:
+                        symbols.append(b)
+
+        if not symbols:
+            print("No symbols discovered. Nothing to do.")
+            return 0
+
+        print(f"{'APPLY' if args.apply else 'DRY-RUN'}: backfilling {len(symbols)} symbols "
+              f"from {start} to {end}")
+        summary = backfill(session, symbols, start=start, end=end, apply=args.apply)
+
+        if args.apply:
+            _log_to_ingestion_log(session, summary, args.apply)
+
+        total_inserted = sum(s["inserted"] for s in summary.values())
+        total_new = sum(s["new"] for s in summary.values())
+        total_existing = sum(s["already_present"] for s in summary.values())
+        print(f"\nTotals: existing={total_existing}, new candidates={total_new}, "
+              f"inserted={total_inserted}")
+        return 0
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

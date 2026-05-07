@@ -6,7 +6,10 @@
 		fetchBrokerageTopHoldings,
 		fetchBrokerageRecentTransactions,
 		fetchBrokerageRealizedGL,
-		fetchBrokerageDataIntegrity
+		fetchBrokerageDataIntegrity,
+		fetchBrokerageNetWorthHistory,
+		fetchBrokerageBenchmarkComparison,
+		fetchBrokerageMissingAccounts
 	} from '$lib/api';
 	import type {
 		BrokerageNetWorth,
@@ -14,7 +17,10 @@
 		BrokerageHolding,
 		BrokerageRecentTransaction,
 		BrokerageRealizedGL,
-		BrokerageDataIntegrity
+		BrokerageDataIntegrity,
+		BrokerageNetWorthHistoryPoint,
+		BrokerageBenchmarkComparison,
+		BrokerageMissingAccount
 	} from '$lib/api';
 
 	// ── State ─────────────────────────────────────────────────────────────
@@ -24,6 +30,11 @@
 	let recentTxns = $state<BrokerageRecentTransaction[] | null>(null);
 	let realizedGl = $state<BrokerageRealizedGL | null>(null);
 	let dataIntegrity = $state<BrokerageDataIntegrity | null>(null);
+	let networthHistory = $state<BrokerageNetWorthHistoryPoint[] | null>(null);
+	let hoverHistoryIdx = $state<number | null>(null);
+	let benchmarkOn = $state(false);
+	let benchmarkData = $state<BrokerageBenchmarkComparison | null>(null);
+	let missingAccounts = $state<BrokerageMissingAccount[] | null>(null);
 
 	let topN = $state(10);
 	let recentDays = $state(14);
@@ -82,13 +93,15 @@
 		loading = true;
 		error = '';
 		try {
-			const [nw, accts, holdings, txns, gl, integrity] = await Promise.all([
+			const [nw, accts, holdings, txns, gl, integrity, history, missing] = await Promise.all([
 				fetchBrokerageNetWorth(),
 				fetchBrokerageAccounts(),
 				fetchBrokerageTopHoldings(topN),
 				fetchBrokerageRecentTransactions(recentDays),
 				fetchBrokerageRealizedGL(),
-				fetchBrokerageDataIntegrity()
+				fetchBrokerageDataIntegrity(),
+				fetchBrokerageNetWorthHistory(),
+				fetchBrokerageMissingAccounts()
 			]);
 			netWorth = nw;
 			accounts = accts;
@@ -96,6 +109,8 @@
 			recentTxns = txns;
 			realizedGl = gl;
 			dataIntegrity = integrity;
+			networthHistory = history;
+			missingAccounts = missing;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -116,6 +131,18 @@
 			recentTxns = await fetchBrokerageRecentTransactions(recentDays);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function toggleBenchmark() {
+		benchmarkOn = !benchmarkOn;
+		if (benchmarkOn && !benchmarkData) {
+			try {
+				benchmarkData = await fetchBrokerageBenchmarkComparison('SPY');
+			} catch (e) {
+				error = e instanceof Error ? e.message : String(e);
+				benchmarkOn = false;
+			}
 		}
 	}
 
@@ -239,6 +266,68 @@
 		return applySort(filtered, holdSortKey, holdSortDir);
 	});
 
+	// ── Net-worth history chart geometry ──────────────────────────────────
+	const CHART_W = 720;
+	const CHART_H = 200;
+	const CHART_PAD_X = 40;
+	const CHART_PAD_Y = 16;
+
+	let historyChart = $derived.by(() => {
+		const points = networthHistory ?? [];
+		if (points.length < 2) return null;
+		const values = points.map((p) => p.balance_total);
+		// When benchmark is on, scale Y axis to include both portfolio and benchmark.
+		let benchValues: (number | null)[] = [];
+		if (benchmarkOn && benchmarkData?.series.length === points.length) {
+			benchValues = benchmarkData.series.map((p) => p.benchmark_value);
+		}
+		const allNonNull = [
+			...values,
+			...benchValues.filter((v): v is number => v !== null)
+		];
+		const minV = Math.min(...allNonNull);
+		const maxV = Math.max(...allNonNull);
+		const range = maxV - minV || 1;
+		const innerW = CHART_W - CHART_PAD_X * 2;
+		const innerH = CHART_H - CHART_PAD_Y * 2;
+		const xs = points.map((_, i) =>
+			points.length === 1 ? CHART_PAD_X + innerW / 2 : CHART_PAD_X + (i / (points.length - 1)) * innerW
+		);
+		const yFor = (v: number) => CHART_PAD_Y + innerH - ((v - minV) / range) * innerH;
+		const ys = values.map(yFor);
+		const linePath = xs.map((x, i) => `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${ys[i].toFixed(1)}`).join(' ');
+		const areaPath = `${linePath} L ${xs[xs.length - 1].toFixed(1)} ${(CHART_PAD_Y + innerH).toFixed(1)} L ${xs[0].toFixed(1)} ${(CHART_PAD_Y + innerH).toFixed(1)} Z`;
+
+		let benchPath: string | null = null;
+		if (benchValues.length === points.length) {
+			const segments: string[] = [];
+			let pen = 'M';
+			benchValues.forEach((v, i) => {
+				if (v === null) {
+					pen = 'M';
+					return;
+				}
+				segments.push(`${pen} ${xs[i].toFixed(1)} ${yFor(v).toFixed(1)}`);
+				pen = 'L';
+			});
+			benchPath = segments.join(' ') || null;
+		}
+
+		return {
+			points,
+			xs,
+			ys,
+			minV,
+			maxV,
+			linePath,
+			areaPath,
+			benchPath,
+			first: points[0],
+			last: points[points.length - 1],
+			deltaPct: (points[points.length - 1].balance_total - points[0].balance_total) / points[0].balance_total
+		};
+	});
+
 	let filteredTxns = $derived.by(() => {
 		const filtered = (recentTxns ?? []).filter((t) => {
 			if (txnBrokerFilter.size > 0 && !txnBrokerFilter.has(t.broker)) return false;
@@ -311,6 +400,76 @@
 				</div>
 			{/if}
 		</section>
+
+		<!-- ── Net-worth history ─────────────────────────────────────── -->
+		{#if historyChart}
+			<section class="section">
+				<div class="section-head">
+					<h2>Net Worth Over Time</h2>
+					<div class="history-summary">
+						<span class="muted">{historyChart.first.as_of} → {historyChart.last.as_of}</span>
+						<span class="separator">·</span>
+						<span class={historyChart.deltaPct >= 0 ? 'pos' : 'neg'}>
+							{historyChart.deltaPct >= 0 ? '+' : ''}{(historyChart.deltaPct * 100).toFixed(1)}%
+						</span>
+						{#if benchmarkOn && benchmarkData?.benchmark_pct !== null && benchmarkData?.benchmark_pct !== undefined}
+							<span class="separator">·</span>
+							<span class="muted">SPY:</span>
+							<span class={benchmarkData.benchmark_pct >= 0 ? 'pos' : 'neg'}>
+								{benchmarkData.benchmark_pct >= 0 ? '+' : ''}{(benchmarkData.benchmark_pct * 100).toFixed(1)}%
+							</span>
+						{/if}
+					</div>
+					<button
+						type="button"
+						class="chip"
+						class:active={benchmarkOn}
+						onclick={toggleBenchmark}
+					>
+						{benchmarkOn ? '✓ S&P 500' : 'Compare to S&P 500'}
+					</button>
+				</div>
+				<svg class="history-chart" viewBox={`0 0 ${CHART_W} ${CHART_H}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Net worth over time">
+					<defs>
+						<linearGradient id="history-fill" x1="0" y1="0" x2="0" y2="1">
+							<stop offset="0%" stop-color="#007aff" stop-opacity="0.18" />
+							<stop offset="100%" stop-color="#007aff" stop-opacity="0" />
+						</linearGradient>
+					</defs>
+					<path d={historyChart.areaPath} fill="url(#history-fill)" />
+					<path d={historyChart.linePath} fill="none" stroke="#007aff" stroke-width="2" />
+					{#if benchmarkOn && historyChart.benchPath}
+						<path d={historyChart.benchPath} fill="none" stroke="#ff9500" stroke-width="2" stroke-dasharray="4 4" />
+					{/if}
+					{#each historyChart.points as p, i (p.as_of)}
+						<circle
+							cx={historyChart.xs[i]}
+							cy={historyChart.ys[i]}
+							r={hoverHistoryIdx === i ? 5 : 3}
+							fill="#007aff"
+							class="history-dot"
+							onmouseenter={() => (hoverHistoryIdx = i)}
+							onmouseleave={() => (hoverHistoryIdx = null)}
+						/>
+					{/each}
+					{#if hoverHistoryIdx !== null}
+						{@const p = historyChart.points[hoverHistoryIdx]}
+						{@const cx = historyChart.xs[hoverHistoryIdx]}
+						{@const cy = historyChart.ys[hoverHistoryIdx]}
+						<line x1={cx} y1={CHART_PAD_Y} x2={cx} y2={CHART_H - CHART_PAD_Y} stroke="#c7c7cc" stroke-dasharray="2 3" />
+						<g transform={`translate(${Math.min(cx + 8, CHART_W - 140)} ${Math.max(cy - 28, 0)})`}>
+							<rect x="0" y="0" width="130" height="40" rx="6" fill="#1d1d1f" />
+							<text x="8" y="16" fill="#fff" font-size="11">{p.as_of}</text>
+							<text x="8" y="32" fill="#fff" font-size="13" font-weight="600">{fmtCurrency(p.balance_total)}</text>
+						</g>
+					{/if}
+				</svg>
+				<div class="history-axis muted">
+					<span>{fmtCurrency(historyChart.minV)}</span>
+					<span>{fmtCurrency(historyChart.maxV)}</span>
+				</div>
+			</section>
+		{/if}
 
 		<!-- ── Accounts ──────────────────────────────────────────────── -->
 		<section class="section">
@@ -641,6 +800,49 @@
 				</div>
 			{/if}
 		</section>
+
+		<!-- ── Missing Accounts ─────────────────────────────────────── -->
+		{#if missingAccounts && missingAccounts.length > 0}
+			<section class="section missing-accounts">
+				<h2>
+					Missing Accounts
+					<span class="badge missing-badge">{missingAccounts.length}</span>
+				</h2>
+				<p class="muted missing-note">
+					Accounts you've marked active that haven't reported a fresh balance in 60+ days
+					(or never linked to a live account at all). Add a snapshot or close the account
+					to clear it.
+				</p>
+				<table class="data-table">
+					<thead>
+						<tr>
+							<th>Institution</th>
+							<th>Account</th>
+							<th>Last 4</th>
+							<th>Source</th>
+							<th class="num">Last seen</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each missingAccounts as m (m.id)}
+							<tr>
+								<td>{m.institution}</td>
+								<td>{m.account_name}</td>
+								<td>{m.last_4 ?? '—'}</td>
+								<td>{m.source}</td>
+								<td class="num">
+									{#if m.last_seen_days_ago === null}
+										<span class="muted">never</span>
+									{:else}
+										{m.last_seen_days_ago}d ago
+									{/if}
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</section>
+		{/if}
 
 		<!-- ── Data Integrity ───────────────────────────────────────── -->
 		<section class="section integrity" class:has-warnings={hasIntegrityWarnings}>
@@ -1021,5 +1223,52 @@
 	.networth .meta .separator {
 		margin: 0 8px;
 		color: #c7c7cc;
+	}
+
+	/* Net-worth history chart */
+	.history-summary {
+		font-size: 13px;
+		color: #6e6e73;
+	}
+	.history-summary .separator {
+		margin: 0 8px;
+		color: #c7c7cc;
+	}
+	.history-chart {
+		width: 100%;
+		height: auto;
+		max-height: 240px;
+		display: block;
+		margin-top: 4px;
+	}
+	.history-dot {
+		cursor: pointer;
+		transition: r 0.1s;
+	}
+	.history-axis {
+		display: flex;
+		justify-content: space-between;
+		font-size: 11px;
+		margin-top: 4px;
+		padding: 0 8px;
+		font-feature-settings: 'tnum' 1;
+	}
+
+	/* Missing accounts panel */
+	.missing-accounts h2 {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.missing-badge {
+		background: #ff9500;
+		color: #fff;
+		font-size: 12px;
+		padding: 2px 8px;
+		border-radius: 999px;
+	}
+	.missing-note {
+		font-size: 13px;
+		margin: -6px 0 12px;
 	}
 </style>

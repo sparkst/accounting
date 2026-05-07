@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sparkry.accounting-prices-daily</string>
+
+  <!-- Wraps in `doppler run` so DATABASE_PATH and other secrets are present.
+       Backfill script is incremental: existing (symbol, date) rows are skipped. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/doppler</string>
+    <string>run</string>
+    <string>--</string>
+    <string>/Users/travis/SGDrive/dev/accounting/.venv/bin/python3</string>
+    <string>-m</string>
+    <string>scripts.backfill_historical_prices</string>
+    <string>--years</string>
+    <string>1</string>
+    <string>--apply</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/travis/SGDrive/dev/accounting</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- Mon-Fri at 5:30 PM local time. yfinance returns yesterday's close
+       reliably after market close + adjustment lag. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.accounting-prices-daily.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.accounting-prices-daily.error.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

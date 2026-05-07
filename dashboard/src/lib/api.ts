@@ -17,7 +17,7 @@ const BASE = '/api';
 /**
  * Read the API key from the Vite public env var VITE_API_KEY.
  * In local dev this is typically unset (auth disabled on the server).
- * Set VITE_API_KEY in dashboard/.env.local to match the server's API_KEY.
+ * Set VITE_API_KEY in dashboard/.env.local to match the server's API_KEY (managed via Doppler).
  */
 function getApiKeyHeader(): Record<string, string> {
 	const key =
@@ -838,4 +838,186 @@ export async function importBrokerageCsv(file: File): Promise<BrokerageCsvResult
 		throw new Error(`Import failed (${res.status}): ${text}`);
 	}
 	return res.json() as Promise<BrokerageCsvResult>;
+}
+
+// ─── Brokerage (Phase 2 / Option 2) ─────────────────────────────────────────
+
+export interface BrokerageNetWorth {
+	total: number;
+	by_broker: Record<string, number>;
+	by_entity: Record<string, number>;
+	as_of_min: string | null;
+	as_of_max: string | null;
+	zero_snapshot_account_count: number;
+	plan_wrapper_excluded_count: number;
+}
+
+export interface BrokerageAccount {
+	account_id: string;
+	broker: string;
+	account_number_masked: string;
+	account_name: string | null;
+	account_type: string;
+	entity: string;
+	tax_sheltered: boolean;
+	is_plan_wrapper: boolean;
+	as_of: string | null;
+	market_value: number;
+}
+
+export interface BrokerageHolding {
+	symbol: string | null;
+	description: string | null;
+	total_quantity: number;
+	total_market_value: number;
+	pct_of_net_worth: number;
+	account_count: number;
+	is_cash_sleeve: boolean;
+}
+
+export interface BrokerageRecentTransaction {
+	trade_date: string;
+	broker: string;
+	account_number_masked: string;
+	action: string;
+	canonical_action: string;
+	symbol: string | null;
+	quantity: number | null;
+	amount: number | null;
+}
+
+export interface BrokerageRealizedGLBucket {
+	short_term: number;
+	long_term: number;
+	unknown: number;
+	total: number;
+	lots: number;
+}
+
+export interface BrokerageRealizedGL {
+	by_year: Record<string, BrokerageRealizedGLBucket>;
+	wash_sales: { lots: number; total_disallowed_loss: number };
+}
+
+export interface BrokerageDataIntegrity {
+	accounts: number;
+	transactions: number;
+	position_snapshots: number;
+	realized_lots: number;
+	orphan_transactions: number;
+	orphan_snapshots: number;
+	stale_snapshot_accounts: number;
+	suspect_symbols: number;
+	duplicate_position_groups: number;
+	duplicate_transaction_groups: number;
+}
+
+export async function fetchBrokerageNetWorth(): Promise<BrokerageNetWorth> {
+	return request<BrokerageNetWorth>('/brokerage/networth');
+}
+
+export async function fetchBrokerageAccounts(): Promise<BrokerageAccount[]> {
+	return request<BrokerageAccount[]>('/brokerage/accounts');
+}
+
+export async function fetchBrokerageTopHoldings(n = 10): Promise<BrokerageHolding[]> {
+	return request<BrokerageHolding[]>(`/brokerage/top-holdings?n=${n}`);
+}
+
+export async function fetchBrokerageRecentTransactions(
+	days = 14
+): Promise<BrokerageRecentTransaction[]> {
+	return request<BrokerageRecentTransaction[]>(`/brokerage/recent-transactions?days=${days}`);
+}
+
+export async function fetchBrokerageRealizedGL(): Promise<BrokerageRealizedGL> {
+	return request<BrokerageRealizedGL>('/brokerage/realized-gl');
+}
+
+export async function fetchBrokerageDataIntegrity(): Promise<BrokerageDataIntegrity> {
+	return request<BrokerageDataIntegrity>('/brokerage/data-integrity');
+}
+
+export interface BrokerageNetWorthHistoryPoint {
+	as_of: string;
+	balance_total: number;
+	account_count: number;
+}
+
+export async function fetchBrokerageNetWorthHistory(
+	includeUnmatched = false
+): Promise<BrokerageNetWorthHistoryPoint[]> {
+	const qs = includeUnmatched ? '?include_unmatched=true' : '';
+	return request<BrokerageNetWorthHistoryPoint[]>(`/brokerage/networth-history${qs}`);
+}
+
+export interface BrokerageHoldingValuePoint {
+	as_of: string;
+	market_value: number;
+	quantity: number;
+}
+
+export interface BrokerageHoldingLot {
+	open_date: string;
+	raw_account_name: string;
+	quantity: number;
+	cost_per_share: number;
+	cost_total: number;
+	source: string;
+}
+
+export interface BrokerageHoldingHistory {
+	symbol: string;
+	security_name: string | null;
+	current_value: number;
+	current_quantity: number;
+	cost_basis: number;
+	unrealized_gain: number;
+	unrealized_pct: number;
+	value_series: BrokerageHoldingValuePoint[];
+	lots: BrokerageHoldingLot[];
+}
+
+export async function fetchBrokerageHoldingHistory(
+	symbol: string
+): Promise<BrokerageHoldingHistory> {
+	return request<BrokerageHoldingHistory>(
+		`/brokerage/holdings/${encodeURIComponent(symbol)}/history`
+	);
+}
+
+export interface BrokerageBenchmarkPoint {
+	as_of: string;
+	portfolio_value: number;
+	benchmark_value: number | null;
+}
+
+export interface BrokerageBenchmarkComparison {
+	benchmark_symbol: string;
+	series: BrokerageBenchmarkPoint[];
+	portfolio_pct: number | null;
+	benchmark_pct: number | null;
+}
+
+export async function fetchBrokerageBenchmarkComparison(
+	benchmark = 'SPY'
+): Promise<BrokerageBenchmarkComparison> {
+	return request<BrokerageBenchmarkComparison>(
+		`/brokerage/networth-history-benchmark?benchmark=${encodeURIComponent(benchmark)}`
+	);
+}
+
+export interface BrokerageMissingAccount {
+	id: string;
+	institution: string;
+	account_name: string;
+	last_4: string | null;
+	status: string;
+	source: string;
+	resolved_account_id: string | null;
+	last_seen_days_ago: number | null;
+}
+
+export async function fetchBrokerageMissingAccounts(): Promise<BrokerageMissingAccount[]> {
+	return request<BrokerageMissingAccount[]>('/brokerage/missing-accounts');
 }

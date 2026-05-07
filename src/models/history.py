@@ -14,6 +14,7 @@ Decimal precision matches src/models/brokerage.py:
 
 import uuid
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     CheckConstraint,
@@ -57,16 +58,16 @@ class HistoricalPrice(Base):
 
     symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
     trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
-    close: Mapped[float] = mapped_column(
+    close: Mapped[Decimal] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=False
     )
-    open: Mapped[float | None] = mapped_column(
+    open: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=True
     )
-    high: Mapped[float | None] = mapped_column(
+    high: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=True
     )
-    low: Mapped[float | None] = mapped_column(
+    low: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=True
     )
     volume: Mapped[int | None] = mapped_column(nullable=True)
@@ -104,7 +105,7 @@ class AccountBalanceSnapshot(Base):
     )
     raw_account_name: Mapped[str] = mapped_column(String(255), nullable=False)
     as_of: Mapped[date] = mapped_column(Date, nullable=False)
-    balance: Mapped[float] = mapped_column(
+    balance: Mapped[Decimal] = mapped_column(
         Numeric(precision=14, scale=2, asdecimal=True), nullable=False
     )
     source: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -175,16 +176,16 @@ class CostBasisLot(Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     security_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     open_date: Mapped[date] = mapped_column(Date, nullable=False)
-    quantity: Mapped[float] = mapped_column(
+    quantity: Mapped[Decimal] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=False
     )
-    cost_per_share: Mapped[float] = mapped_column(
+    cost_per_share: Mapped[Decimal] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=False
     )
-    cost_total: Mapped[float] = mapped_column(
+    cost_total: Mapped[Decimal] = mapped_column(
         Numeric(precision=14, scale=2, asdecimal=True), nullable=False
     )
-    wash_sale_adj: Mapped[float | None] = mapped_column(
+    wash_sale_adj: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=14, scale=2, asdecimal=True), nullable=True
     )
     source: Mapped[str] = mapped_column(String(32), nullable=False)

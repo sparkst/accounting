@@ -959,13 +959,30 @@ export interface BrokerageNetWorthHistoryPoint {
 	account_count: number;
 }
 
+export interface BrokerageHistoryQuery {
+	includeUnmatched?: boolean;
+	accountIds?: string[];
+	tagsInclude?: string[];
+	tagsExclude?: string[];
+}
+
 export async function fetchBrokerageNetWorthHistory(
-	includeUnmatched = true
+	q: BrokerageHistoryQuery | boolean = true
 ): Promise<BrokerageNetWorthHistoryPoint[]> {
-	// Default to include_unmatched=true so the history chart shows the full
-	// XLSX series before the manual account-matching review step.
-	const qs = includeUnmatched ? '?include_unmatched=true' : '';
-	return request<BrokerageNetWorthHistoryPoint[]>(`/brokerage/networth-history${qs}`);
+	// Backwards-compatible: callers passing a bare boolean get the
+	// include_unmatched-only behavior (default true so the chart renders
+	// the full XLSX series before the manual matching step lands).
+	const opts: BrokerageHistoryQuery =
+		typeof q === 'boolean' ? { includeUnmatched: q } : q;
+	const params = new URLSearchParams();
+	if (opts.includeUnmatched ?? true) params.set('include_unmatched', 'true');
+	if (opts.accountIds?.length) params.set('account_ids', opts.accountIds.join(','));
+	if (opts.tagsInclude?.length) params.set('tags_include', opts.tagsInclude.join(','));
+	if (opts.tagsExclude?.length) params.set('tags_exclude', opts.tagsExclude.join(','));
+	const qs = params.toString();
+	return request<BrokerageNetWorthHistoryPoint[]>(
+		`/brokerage/networth-history${qs ? `?${qs}` : ''}`
+	);
 }
 
 export interface BrokerageHoldingValuePoint {

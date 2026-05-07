@@ -171,32 +171,19 @@
 	async function refetchFilteredHistory(ids: string[]): Promise<void> {
 		try {
 			if (!acctIsFiltered) {
-				networthHistory = await fetchBrokerageNetWorthHistory(true);
+				networthHistory = await fetchBrokerageNetWorthHistory({});
 				return;
 			}
 			if (ids.length === 0) {
 				networthHistory = []; // empty filter → chart will render at $0
 				return;
 			}
-			const qs = new URLSearchParams({
-				include_unmatched: 'true',
-				account_ids: ids.join(',')
-			});
-			const res = await fetch(`/api/brokerage/networth-history?${qs}`, {
-				headers: getApiHeaders()
-			});
-			if (!res.ok) throw new Error(`history fetch ${res.status}`);
-			networthHistory = await res.json();
+			// Route through the typed api.ts helper so we inherit its X-Api-Key
+			// forwarding, Content-Type defaults, and in-flight-dedup abort logic.
+			networthHistory = await fetchBrokerageNetWorthHistory({ accountIds: ids });
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
-	}
-
-	function getApiHeaders(): Record<string, string> {
-		// The api.ts request() helper handles X-Api-Key for us; here we're
-		// hitting fetch directly so mirror its behavior.
-		const key = (import.meta.env.VITE_API_KEY as string | undefined) ?? '';
-		return key ? { 'X-Api-Key': key } : {};
 	}
 
 	onMount(loadAll);

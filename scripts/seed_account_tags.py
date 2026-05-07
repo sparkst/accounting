@@ -1,13 +1,21 @@
 """Seed default tags for every Account based on type + beneficiary + name.
 
-Defaults:
-    401k, roth_ira, trad_ira, brokeragelink → "retirement"
-    hsa                                      → "tax-advantaged", "retirement"
-    529 with beneficiary "Aiden"             → "529", "aiden"
-    529 with beneficiary "Emerson"           → "529", "emerson"
-    529 (other beneficiary)                  → "529", "<lower(beneficiary)>"
-    taxable, tod, joint                      → "taxable"
-    rsu                                       → "taxable", "rsu"
+Each account gets BOTH a coarse-grained category tag AND its account-type
+tag, so users can filter at either granularity. Examples below show every
+tag added (in alphabetical order, the on-disk order):
+
+    type=401k                       → "401k", "retirement"
+    type=403b                       → "403b", "retirement"
+    type=roth_ira                   → "retirement", "roth_ira"
+    type=trad_ira                   → "retirement", "trad_ira"
+    type=brokeragelink              → "brokeragelink", "retirement"
+    type=hsa                        → "hsa", "retirement", "tax-advantaged"
+    type=529, beneficiary="Aiden"   → "529", "aiden", "tax-advantaged"
+    type=529, beneficiary="Emerson" → "529", "emerson", "tax-advantaged"
+    type=taxable                    → "taxable"
+    type=tod                        → "taxable"
+    type=joint                      → "taxable"
+    type=rsu                        → "rsu", "taxable"
 
 Tag values are normalised to lower-case. Re-runs are idempotent — the
 composite PK (account_id, tag) catches duplicates.

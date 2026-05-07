@@ -1192,6 +1192,37 @@ class TestHistoryTagFilter:
         ])
         return a.id, b.id
 
+    def _seed_three_accounts_with_snapshots(
+        self, session: Session
+    ) -> tuple[Any, Any, Any]:
+        """Seed three accounts each with one snapshot. Returns (a, b, c) ORM objects."""
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        a = Account(
+            broker="fidelity", account_number="A1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        b = Account(
+            broker="vanguard", account_number="B1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        c = Account(
+            broker="schwab", account_number="C1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        session.add_all([a, b, c])
+        session.flush()
+        for acct, hash_ in [(a, "ha"), (b, "hb"), (c, "hc")]:
+            session.add(
+                AccountBalanceSnapshot(
+                    account_id=acct.id, raw_account_name=acct.account_number,
+                    as_of=date(2024, 1, 1), balance=Decimal("100"),
+                    source="xlsx", source_row_hash=hash_,
+                )
+            )
+        return a, b, c
+
     def test_tags_include_single_tag(
         self, empty_client: TestClient, empty: Session
     ) -> None:
@@ -1275,3 +1306,132 @@ class TestHistoryTagFilter:
         )
         assert r.status_code == 200
         assert r.json() == []
+
+    def test_combined_account_ids_and_tags_filters(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """account_ids ∩ tags_include − tags_exclude — verify the conjunction."""
+        from src.models.history import AccountTag
+
+        a1, a2, a3 = self._seed_three_accounts_with_snapshots(empty)
+        # a1 = retirement, a2 = retirement+rsu, a3 = retirement+rsu+ignored
+        for tag in ["retirement"]:
+            empty.add(AccountTag(account_id=a1.id, tag=tag))
+        for tag in ["retirement", "rsu"]:
+            empty.add(AccountTag(account_id=a2.id, tag=tag))
+        for tag in ["retirement", "rsu", "legacy"]:
+            empty.add(AccountTag(account_id=a3.id, tag=tag))
+        empty.commit()
+
+        # Restrict to {a1, a2, a3}, require "retirement", exclude "rsu" → only a1.
+        r = empty_client.get(
+            "/api/brokerage/networth-history?"
+            f"account_ids={a1.id},{a2.id},{a3.id}"
+            "&tags_include=retirement&tags_exclude=rsu"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # a1 only contributes; sum is whatever its snapshots add up to (>0).
+        assert len(body) >= 1
+        assert all(p["account_count"] == 1 for p in body)
+
+    def test_multi_value_account_ids_csv(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a1, a2, _a3 = self._seed_three_accounts_with_snapshots(empty)
+        empty.commit()
+
+        r = empty_client.get(
+            f"/api/brokerage/networth-history?account_ids={a1.id},{a2.id}"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # Both accounts present in every date bucket → account_count == 2.
+        assert all(p["account_count"] == 2 for p in body)
+
+    def test_multi_value_tags_exclude_csv(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a1, a2, a3 = self._seed_three_accounts_with_snapshots(empty)
+        empty.add(AccountTag(account_id=a1.id, tag="retirement"))
+        empty.add(AccountTag(account_id=a2.id, tag="rsu"))
+        empty.add(AccountTag(account_id=a3.id, tag="legacy"))
+        empty.commit()
+
+        # Exclude both rsu and legacy → only a1 survives.
+        r = empty_client.get(
+            "/api/brokerage/networth-history?tags_exclude=rsu,legacy"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert all(p["account_count"] == 1 for p in body)
+
+
+class TestBenchmarkTagFilter:
+    """Same filter param contract on /networth-history-benchmark."""
+
+    def test_benchmark_endpoint_honors_account_ids_filter(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot, HistoricalPrice
+
+        a1 = Account(
+            broker="fidelity", account_number="X1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        a2 = Account(
+            broker="vanguard", account_number="X2", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        empty.add_all([a1, a2])
+        empty.flush()
+        for acct, balance in [(a1, "1000"), (a2, "9999")]:
+            empty.add(
+                AccountBalanceSnapshot(
+                    account_id=acct.id, raw_account_name=acct.account_number,
+                    as_of=date(2024, 1, 1), balance=Decimal(balance),
+                    source="xlsx_2024", source_row_hash=f"h-{acct.id}",
+                )
+            )
+        empty.add(
+            HistoricalPrice(symbol="SPY", trade_date=date(2024, 1, 1), close=Decimal("100"))
+        )
+        empty.commit()
+
+        # Filter to just a1 → portfolio_value should be 1000, not 10999.
+        r = empty_client.get(
+            f"/api/brokerage/networth-history-benchmark?benchmark=SPY&account_ids={a1.id}"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["series"]) == 1
+        assert body["series"][0]["portfolio_value"] == 1000.0
+
+
+class TestAccountTagsDedup:
+    """The PUT validator dedupes case-folded duplicates."""
+
+    def test_put_dedupes_case_folded_duplicates(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+        from src.models.history import AccountTag
+
+        a = Account(
+            broker="fidelity", account_number="X1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        empty.add(a)
+        empty.commit()
+
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": ["retirement", "RETIREMENT", "  retirement  "]},
+        )
+        assert r.status_code == 200
+        assert r.json()["tags"] == ["retirement"]
+        rows = empty.query(AccountTag).filter_by(account_id=a.id).all()
+        assert len(rows) == 1

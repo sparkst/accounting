@@ -201,7 +201,7 @@ def test_import_positions_dry_run_inline_brokerage(
 
     assert isinstance(result, ImportResult)
     assert result.parsed == 3
-    assert result.inserted == 0
+    assert result.imported == 0
     assert result.transactions_seen == 2
     # Dry-run must not write IngestionLog rows.
     assert session.query(func.count(IngestionLog.id)).scalar() == 0
@@ -218,7 +218,7 @@ def test_import_positions_apply_writes_position_snapshots(
     result = import_positions(csv, dry_run=False, session=session,
                               as_of=date(2026, 5, 1))
 
-    assert result.inserted == 3
+    assert result.imported == 3
     assert result.parsed == 3
     assert not result.errors
     # Three snapshots, two for a1 and one for a2.
@@ -251,11 +251,11 @@ def test_import_positions_dedupes_on_second_apply(
 
     first = import_positions(csv, dry_run=False, session=session,
                              as_of=date(2026, 5, 1))
-    assert first.inserted == 3
+    assert first.imported == 3
 
     second = import_positions(csv, dry_run=False, session=session,
                               as_of=date(2026, 5, 1))
-    assert second.inserted == 0
+    assert second.imported == 0
     assert second.dup_skipped == 3
     # Still only 3 PositionSnapshot rows total.
     assert session.query(func.count(PositionSnapshot.id)).scalar() == 3
@@ -273,7 +273,7 @@ def test_import_positions_per_row_error_isolation(
 
     assert len(result.errors) == 1
     # Two good rows (VOO + VMFXX) inserted; the malformed MGK row skipped.
-    assert result.inserted == 2
+    assert result.imported == 2
     snaps = session.execute(select(PositionSnapshot)).scalars().all()
     symbols = sorted(s.symbol for s in snaps if s.symbol is not None)
     assert symbols == ["VMFXX", "VOO"]
@@ -290,7 +290,7 @@ def test_import_positions_unmapped_account_appends_error(
 
     # The unmapped 99999999 row should produce an error and not insert,
     # but the two 65344815 rows should still land.
-    assert result.inserted == 2
+    assert result.imported == 2
     assert any("99999999" in e for e in result.errors)
     snaps = session.execute(select(PositionSnapshot)).scalars().all()
     assert {s.symbol for s in snaps} == {"VOO", "VMFXX"}
@@ -305,7 +305,7 @@ def test_import_positions_529_writes_with_null_symbol(
     result = import_positions(csv, dry_run=False, session=session,
                               as_of=date(2026, 5, 4))
 
-    assert result.inserted == 2
+    assert result.imported == 2
     assert result.transactions_seen == 1
     snaps = session.execute(select(PositionSnapshot)).scalars().all()
     assert len(snaps) == 2
@@ -334,7 +334,7 @@ def test_import_positions_dry_run_with_no_matching_account_still_parses(
                               as_of=date(2026, 5, 1))
 
     assert result.parsed == 3
-    assert result.inserted == 0
+    assert result.imported == 0
     # Dry-run on unmapped accounts should also surface them as errors so the
     # operator sees what's missing before --apply.
     assert any("65344815" in e for e in result.errors)
@@ -357,7 +357,7 @@ def test_as_of_defaults_to_file_mtime(
     os.utime(csv, (epoch, epoch))
 
     result = import_positions(csv, dry_run=False, session=session)
-    assert result.inserted == 3
+    assert result.imported == 3
     snap = session.execute(select(PositionSnapshot)).scalars().first()
     assert snap is not None
     assert snap.as_of.date() == target
@@ -376,7 +376,7 @@ def test_real_amy_brokerage_dry_run(session: Session) -> None:
     result = import_positions(REAL_BROKERAGE_AMY, dry_run=True,
                               session=session, as_of=date(2026, 5, 1))
     assert result.parsed > 0
-    assert result.inserted == 0
+    assert result.imported == 0
 
 
 @pytest.mark.skipif(

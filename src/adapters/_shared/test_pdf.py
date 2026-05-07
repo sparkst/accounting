@@ -1,4 +1,4 @@
-"""Tests for src.adapters._shared.pdf — uses an existing tiny fixture PDF."""
+"""Tests for src.adapters._shared.pdf — uses a committed tiny fixture PDF."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import pytest
 from src.adapters._shared.pdf import pdftotext_layout
 
 _FIXTURE_DIR = Path(__file__).parent / "fixtures"
-_GSK_FIXTURE = Path("/Users/travis/Downloads/accounts/gsk/GSK Cash Balance Account Activity.pdf")
+_SAMPLE_PDF = _FIXTURE_DIR / "sample.pdf"
+# Known string embedded in the fixture PDF at generation time.
+_KNOWN_PHRASE = "PHASE4_TEST_MARKER"
 
 
 def _have_pdftotext() -> bool:
@@ -20,13 +22,11 @@ def _have_pdftotext() -> bool:
 
 
 @pytest.mark.skipif(not _have_pdftotext(), reason="pdftotext binary not installed")
-@pytest.mark.skipif(
-    not _GSK_FIXTURE.exists(), reason="GSK fixture PDF not present"
-)
 def test_pdftotext_layout_extracts_known_phrase() -> None:
-    text = pdftotext_layout(_GSK_FIXTURE)
-    assert "Closing Balance" in text
-    assert "GSK Cash Balance Pension Plan" in text
+    """Non-skippable: fixture PDF is committed; known phrase must be present."""
+    assert _SAMPLE_PDF.exists(), f"fixture PDF missing at {_SAMPLE_PDF}"
+    text = pdftotext_layout(_SAMPLE_PDF)
+    assert _KNOWN_PHRASE in text
 
 
 def test_missing_file_raises_filenotfound() -> None:

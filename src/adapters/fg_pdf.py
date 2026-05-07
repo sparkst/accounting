@@ -27,14 +27,13 @@ The adapter follows the canonical pattern from
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import logging
 import re
 import sys
 import traceback
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -42,12 +41,13 @@ from typing import Literal
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.models.brokerage import Account
-from src.models.enums import IngestionStatus
+from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog
+from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ SOURCE_TAG = "fg_pdf"
 ADAPTER_NAME = "fg_pdf"
 """Identifier written to ``ingestion_log.source``."""
 
-BROKER = "fg_annuity"
+BROKER = Broker.FG_ANNUITY.value
 """Account.broker value to look up by."""
 
 
@@ -89,6 +89,9 @@ class ImportResult:
 
     errors: list[str] = field(default_factory=list)
     """Per-record error strings."""
+
+    warnings: list[str] = field(default_factory=list)
+    """Non-fatal per-record warning strings."""
 
     distinct_accounts: list[str] = field(default_factory=list)
     """Distinct contract numbers observed."""
@@ -234,9 +237,11 @@ def import_pdf(
     except (FileNotFoundError, RuntimeError) as exc:
         result.errors.append(f"{path.name}: pdftotext failed: {exc}")
         if session is not None and not dry_run:
-            _log_run(
+            write_ingestion_log(
                 session,
-                result,
+                source=ADAPTER_NAME,
+                records_processed=0,
+                records_failed=1,
                 status=IngestionStatus.FAILURE,
                 error_detail=result.errors[-1],
             )
@@ -257,9 +262,11 @@ def import_pdf(
     except ValueError as exc:
         result.errors.append(f"{path.name}: {exc}")
         if session is not None and not dry_run:
-            _log_run(
+            write_ingestion_log(
                 session,
-                result,
+                source=ADAPTER_NAME,
+                records_processed=0,
+                records_failed=1,
                 status=IngestionStatus.FAILURE,
                 error_detail=result.errors[-1],
             )
@@ -294,9 +301,11 @@ def import_pdf(
             f"`seed_expected_accounts confirm`"
         )
         result.errors.append(msg)
-        _log_run(
+        write_ingestion_log(
             session,
-            result,
+            source=ADAPTER_NAME,
+            records_processed=0,
+            records_failed=1,
             status=IngestionStatus.FAILURE,
             error_detail=msg,
         )
@@ -310,37 +319,31 @@ def import_pdf(
     )
     if existing is not None:
         result.dup_skipped += 1
-        _log_run(
-            session,
-            result,
-            status=IngestionStatus.SUCCESS,
-            error_detail=None,
-        )
-        return result
-
-    try:
-        with session.begin_nested():
-            session.add(
-                AccountBalanceSnapshot(
-                    account_id=account.id,
-                    raw_account_name=raw_account_name,
-                    as_of=snap_as_of,
-                    balance=balance,
-                    source=SOURCE_TAG,
-                    source_row_hash=row_hash,
+        # Fall through to the single commit+log path below.
+    else:
+        try:
+            with session.begin_nested():
+                session.add(
+                    AccountBalanceSnapshot(
+                        account_id=account.id,
+                        raw_account_name=raw_account_name,
+                        as_of=snap_as_of,
+                        balance=balance,
+                        source=SOURCE_TAG,
+                        source_row_hash=row_hash,
+                    )
                 )
+            result.imported = 1
+            result.matched = 1
+        except IntegrityError:
+            # Either the natural-key UNIQUE or the hash UNIQUE caught a duplicate
+            # we missed in the pre-flight (race / re-import edge case).
+            result.dup_skipped += 1
+        except Exception as exc:  # noqa: BLE001 — per-record isolation
+            result.errors.append(f"{record_label}: {exc}")
+            logger.warning(
+                "fg_pdf: row %s failed: %s", record_label, exc, exc_info=True
             )
-        result.imported = 1
-        result.matched = 1
-    except IntegrityError:
-        # Either the natural-key UNIQUE or the hash UNIQUE caught a duplicate
-        # we missed in the pre-flight (race / re-import edge case).
-        result.dup_skipped += 1
-    except Exception as exc:  # noqa: BLE001 — per-record isolation
-        result.errors.append(f"{record_label}: {exc}")
-        logger.warning(
-            "fg_pdf: row %s failed: %s", record_label, exc, exc_info=True
-        )
 
     session.commit()
 
@@ -349,9 +352,11 @@ def import_pdf(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(
+    write_ingestion_log(
         session,
-        result,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
         status=status,
         error_detail="\n".join(result.errors) or None,
     )
@@ -359,7 +364,7 @@ def import_pdf(
 
 
 def _file_mtime_date(path: Path) -> date:
-    """Return ``path``'s mtime truncated to a date (UTC date semantics).
+    """Return ``path``'s mtime truncated to a UTC date.
 
     Falls back to today if the file doesn't exist (caller has already errored
     in that case, but we still need a non-None date for type purity).
@@ -367,32 +372,8 @@ def _file_mtime_date(path: Path) -> date:
     try:
         ts = path.stat().st_mtime
     except OSError:
-        return date.today()
-    return datetime.fromtimestamp(ts).date()
-
-
-def _log_run(
-    session: Session,
-    result: ImportResult,
-    *,
-    status: IngestionStatus,
-    error_detail: str | None,
-) -> None:
-    """Record an :class:`IngestionLog` entry. Failures here are swallowed."""
-    try:
-        log = IngestionLog(
-            source=ADAPTER_NAME,
-            status=status.value,
-            records_processed=result.imported + result.dup_skipped,
-            records_failed=len(result.errors),
-            error_detail=error_detail,
-        )
-        session.add(log)
-        session.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("failed to write IngestionLog for %s", ADAPTER_NAME)
-        with contextlib.suppress(Exception):
-            session.rollback()
+        return datetime.now(tz=UTC).date()
+    return datetime.fromtimestamp(ts, tz=UTC).date()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -405,7 +386,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser(
-        "import",
+        "import-pdf",
         help="Parse one F&G PDF and write one AccountBalanceSnapshot.",
     )
     s.add_argument("--file", required=True, help="Path to the PDF.")
@@ -444,7 +425,7 @@ def _print_summary(result: ImportResult, dry_run: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    if args.cmd != "import":
+    if args.cmd != "import-pdf":
         return 2
 
     as_of: date | None = None

@@ -39,7 +39,6 @@ Pattern conformance with ``src/adapters/xlsx_savings_plan.py``:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import csv as _csv
 import hashlib
 import logging
@@ -55,6 +54,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import (
     parse_currency,
     quantize_balance,
@@ -62,7 +62,7 @@ from src.adapters._shared.money import (
 )
 from src.models.brokerage import Account, PositionSnapshot
 from src.models.enums import Broker, IngestionStatus
-from src.models.ingestion_log import IngestionLog
+from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +101,14 @@ class ImportResult:
       counts but does not write these.
     """
 
-    inserted: int = 0
+    imported: int = 0
     """Newly inserted PositionSnapshot rows."""
+
+    matched: int = 0
+    """Rows whose account_id resolved to a live Account."""
+
+    unmatched: int = 0
+    """Rows that parsed but could not be matched to an Account."""
 
     parsed: int = 0
     """Position-block rows successfully parsed (independent of dry_run)."""
@@ -115,6 +121,9 @@ class ImportResult:
 
     errors: list[str] = field(default_factory=list)
     """Per-row error strings (record_label: message)."""
+
+    warnings: list[str] = field(default_factory=list)
+    """Non-fatal per-row warning strings."""
 
     distinct_accounts: list[str] = field(default_factory=list)
     """Distinct ``account_number`` values observed in the positions block."""
@@ -280,14 +289,14 @@ def _parse_position(flavor: str, cells: dict[str, str]) -> _PositionRow:
 def _resolve_as_of(path: Path, as_of: date | None) -> date:
     """Pick the snapshot date.
 
-    Override > file mtime. mtime is converted in the local timezone so the
-    user's day-stamp matches whatever date they observe in Finder.
+    Override > file mtime. mtime is converted in UTC so the date is
+    consistent regardless of the local timezone.
     """
     if as_of is not None:
         return as_of
     try:
         ts = path.stat().st_mtime
-        return datetime.fromtimestamp(ts).date()
+        return datetime.fromtimestamp(ts, tz=UTC).date()
     except OSError:
         return datetime.now(tz=UTC).date()
 
@@ -323,16 +332,20 @@ def import_positions(
     except OSError as exc:
         result.errors.append(f"{source_file}: {exc}")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     blocks = split_blocks(text)
     if not blocks:
         result.errors.append(f"{source_file}: no blocks parsed")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     # Block 0 is the positions block; block 1 (if present) is transactions.
@@ -342,8 +355,10 @@ def import_positions(
     except ValueError as exc:
         result.errors.append(f"{source_file}: {exc}")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     if len(blocks) >= 2:
@@ -448,7 +463,7 @@ def import_positions(
                         raw_data=parsed.raw,
                     )
                 )
-            result.inserted += 1
+            result.imported += 1
         except IntegrityError:
             # UNIQUE on (account_id, source_row_hash) — same logical row exists.
             result.dup_skipped += 1
@@ -464,8 +479,14 @@ def import_positions(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(session, result, status=status,
-             error_detail=_format_log_detail(result))
+    write_ingestion_log(
+        session,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail=_format_log_detail(result),
+    )
 
     return result
 
@@ -482,30 +503,6 @@ def _format_log_detail(result: ImportResult) -> str | None:
     if result.errors:
         parts.append("errors:\n" + "\n".join(result.errors))
     return "\n".join(parts) if parts else None
-
-
-def _log_run(
-    session: Session,
-    result: ImportResult,
-    *,
-    status: IngestionStatus,
-    error_detail: str | None,
-) -> None:
-    """Record an IngestionLog entry. Failures here are swallowed (log-only)."""
-    try:
-        log = IngestionLog(
-            source=ADAPTER_NAME,
-            status=status.value,
-            records_processed=result.inserted + result.dup_skipped,
-            records_failed=len(result.errors),
-            error_detail=error_detail,
-        )
-        session.add(log)
-        session.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("failed to write IngestionLog for %s", ADAPTER_NAME)
-        with contextlib.suppress(Exception):
-            session.rollback()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -544,7 +541,7 @@ def _print_summary(result: ImportResult, dry_run: bool) -> None:
     mode = "DRY RUN" if dry_run else "APPLIED"
     print(f"=== vanguard_csv:positions ({mode}) ===")
     print(f"  parsed             : {result.parsed}")
-    print(f"  inserted           : {result.inserted}")
+    print(f"  imported           : {result.imported}")
     print(f"  dup_skipped        : {result.dup_skipped}")
     print(f"  transactions_seen  : {result.transactions_seen}")
     print(f"  errors             : {len(result.errors)}")

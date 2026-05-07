@@ -23,7 +23,6 @@ per-row savepoint, ``IngestionLog`` row on apply, ``--apply`` opt-in CLI.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import logging
 import re
@@ -37,12 +36,13 @@ from pathlib import Path
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.models.brokerage import Account
-from src.models.enums import IngestionStatus
+from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog
+from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ SOURCE_TAG = "gsk_pdf"
 ADAPTER_NAME = "gsk_pdf"
 """Identifier written to ``ingestion_log.source``."""
 
-GSK_BROKER = "gsk_pension"
+GSK_BROKER = Broker.GSK_PENSION.value
 """Broker enum value used to look up the pre-seeded Account row."""
 
 GSK_ACCOUNT_NUMBER = "GSK_PENSION"
@@ -102,6 +102,9 @@ class ImportResult:
     errors: list[str] = field(default_factory=list)
     """Per-record error strings."""
 
+    warnings: list[str] = field(default_factory=list)
+    """Non-fatal per-record warning strings."""
+
 
 # ── Pure parsing ─────────────────────────────────────────────────────────────
 
@@ -146,6 +149,7 @@ def import_pdf(
     *,
     dry_run: bool = True,
     session: Session | None = None,
+    as_of: date | None = None,
 ) -> ImportResult:
     """Import a single GSK Cash Balance PDF.
 
@@ -154,6 +158,8 @@ def import_pdf(
         dry_run: When True, parse-and-count only; never write to ``session``.
                  Default True to protect the live DB.
         session: SQLAlchemy session. Required when ``dry_run`` is False.
+        as_of:   Override the as-of date extracted from the PDF. When supplied,
+                 this date wins over whatever the document contains.
 
     Returns:
         :class:`ImportResult` with counts and per-record errors.
@@ -164,15 +170,24 @@ def import_pdf(
     # ── Extract ──────────────────────────────────────────────────────────────
     try:
         text = pdftotext_layout(path)
-        as_of, balance = extract_closing_balance(text)
+        extracted_as_of, balance = extract_closing_balance(text)
     except Exception as exc:  # noqa: BLE001 — per-record isolation
         result.errors.append(f"{record_label}: {exc}")
         logger.warning("gsk_pdf: extraction failed for %s: %s",
                        path, exc, exc_info=True)
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail="\n".join(result.errors))
+            write_ingestion_log(
+                session,
+                source=ADAPTER_NAME,
+                records_processed=0,
+                records_failed=1,
+                status=IngestionStatus.FAILURE,
+                error_detail="\n".join(result.errors),
+            )
         return result
+
+    # Honour the caller's as_of override (used when re-tagging a backfill).
+    snap_as_of = as_of if as_of is not None else extracted_as_of
 
     result.parsed = 1
 
@@ -199,11 +214,17 @@ def import_pdf(
             f"(broker={GSK_BROKER!r}, account_number={GSK_ACCOUNT_NUMBER!r}); "
             "seed via scripts/seed_expected_accounts confirm"
         )
-        _log_run(session, result, status=IngestionStatus.FAILURE,
-                 error_detail="\n".join(result.errors))
+        write_ingestion_log(
+            session,
+            source=ADAPTER_NAME,
+            records_processed=0,
+            records_failed=1,
+            status=IngestionStatus.FAILURE,
+            error_detail="\n".join(result.errors),
+        )
         return result
 
-    row_hash = _row_hash(GSK_ACCOUNT_NUMBER, as_of, balance)
+    row_hash = _row_hash(GSK_ACCOUNT_NUMBER, snap_as_of, balance)
 
     existing = (
         session.query(AccountBalanceSnapshot.id)
@@ -219,7 +240,7 @@ def import_pdf(
                     AccountBalanceSnapshot(
                         account_id=account.id,
                         raw_account_name=GSK_RAW_ACCOUNT_NAME,
-                        as_of=as_of,
+                        as_of=snap_as_of,
                         balance=balance,
                         source=SOURCE_TAG,
                         source_row_hash=row_hash,
@@ -242,34 +263,16 @@ def import_pdf(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(session, result, status=status,
-             error_detail="\n".join(result.errors) or None)
+    write_ingestion_log(
+        session,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail="\n".join(result.errors) or None,
+    )
 
     return result
-
-
-def _log_run(
-    session: Session,
-    result: ImportResult,
-    *,
-    status: IngestionStatus,
-    error_detail: str | None,
-) -> None:
-    """Record an IngestionLog entry. Failures here are swallowed (log-only)."""
-    try:
-        log = IngestionLog(
-            source=ADAPTER_NAME,
-            status=status.value,
-            records_processed=result.imported + result.dup_skipped,
-            records_failed=len(result.errors),
-            error_detail=error_detail,
-        )
-        session.add(log)
-        session.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("failed to write IngestionLog for %s", ADAPTER_NAME)
-        with contextlib.suppress(Exception):
-            session.rollback()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -281,12 +284,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Import a GSK Cash Balance pension PDF as one snapshot.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("import", help="Parse one PDF and (optionally) write a snapshot.")
+    s = sub.add_parser("import-pdf", help="Parse one PDF and (optionally) write a snapshot.")
     s.add_argument("--file", required=True, help="Path to the GSK PDF.")
     s.add_argument(
         "--apply",
         action="store_true",
         help="Actually write to the live DB. Default is dry-run.",
+    )
+    s.add_argument(
+        "--as-of",
+        dest="as_of",
+        default=None,
+        help="Override the as-of date (YYYY-MM-DD). Defaults to date in the PDF.",
     )
     return p
 
@@ -308,14 +317,22 @@ def _print_summary(result: ImportResult, dry_run: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    if args.cmd != "import":
+    if args.cmd != "import-pdf":
         return 2
 
     dry_run = not args.apply
     pdf = Path(args.file)
 
+    as_of: date | None = None
+    if args.as_of:
+        try:
+            as_of = datetime.strptime(args.as_of, "%Y-%m-%d").date()
+        except ValueError as exc:
+            print(f"invalid --as-of: {exc}", file=sys.stderr)
+            return 2
+
     if dry_run:
-        result = import_pdf(pdf, dry_run=True)
+        result = import_pdf(pdf, dry_run=True, as_of=as_of)
         _print_summary(result, dry_run=True)
         return 0
 
@@ -326,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     with get_session() as session:
-        result = import_pdf(pdf, dry_run=False, session=session)
+        result = import_pdf(pdf, dry_run=False, session=session, as_of=as_of)
 
     _print_summary(result, dry_run=False)
     return 0

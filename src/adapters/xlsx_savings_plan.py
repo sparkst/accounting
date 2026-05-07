@@ -23,7 +23,6 @@ every row lands with ``account_id = NULL``.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import logging
 import sys
@@ -37,9 +36,10 @@ import openpyxl
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_ingestion_log
 from src.models.enums import IngestionStatus
 from src.models.history import AccountBalanceSnapshot, CostBasisLot, HistoricalPrice
-from src.models.ingestion_log import IngestionLog
+from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 if TYPE_CHECKING:
     from openpyxl.worksheet.worksheet import Worksheet
@@ -253,8 +253,10 @@ def import_account_balances(
     if SHEET_NAME not in wb.sheetnames:
         result.errors.append(f"workbook missing sheet '{SHEET_NAME}'")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     ws = wb[SHEET_NAME]
@@ -262,8 +264,10 @@ def import_account_balances(
     if not date_cols:
         result.errors.append("no date columns found in header row")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     rows = _iter_snapshot_rows(ws, date_cols)
@@ -327,34 +331,16 @@ def import_account_balances(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(session, result, status=status,
-             error_detail="\n".join(result.errors) or None)
+    write_ingestion_log(
+        session,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail="\n".join(result.errors) or None,
+    )
 
     return result
-
-
-def _log_run(
-    session: Session,
-    result: ImportResult,
-    *,
-    status: IngestionStatus,
-    error_detail: str | None,
-) -> None:
-    """Record an IngestionLog entry. Failures here are swallowed (log-only)."""
-    try:
-        log = IngestionLog(
-            source=ADAPTER_NAME,
-            status=status.value,
-            records_processed=result.imported + result.dup_skipped,
-            records_failed=len(result.errors),
-            error_detail=error_detail,
-        )
-        session.add(log)
-        session.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("failed to write IngestionLog for %s", ADAPTER_NAME)
-        with contextlib.suppress(Exception):
-            session.rollback()
 
 
 # ── Historical Prices ────────────────────────────────────────────────────────
@@ -427,8 +413,10 @@ def import_historical_prices(
     if PRICES_SHEET_NAME not in wb.sheetnames:
         result.errors.append(f"workbook missing sheet '{PRICES_SHEET_NAME}'")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     ws = wb[PRICES_SHEET_NAME]
@@ -436,8 +424,10 @@ def import_historical_prices(
     if not date_cols:
         result.errors.append("no date columns found in Historical Prices row 3")
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     rows = _iter_price_rows(ws, date_cols)
@@ -492,8 +482,14 @@ def import_historical_prices(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(session, result, status=status,
-             error_detail="\n".join(result.errors) or None)
+    write_ingestion_log(
+        session,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail="\n".join(result.errors) or None,
+    )
 
     return result
 
@@ -733,8 +729,10 @@ def import_cost_basis_lots(
             f"'{SB_LOTS_SHEET_NAME}'"
         )
         if session is not None and not dry_run:
-            _log_run(session, result, status=IngestionStatus.FAILURE,
-                     error_detail=result.errors[-1])
+            write_ingestion_log(session, source=ADAPTER_NAME,
+                                records_processed=0, records_failed=1,
+                                status=IngestionStatus.FAILURE,
+                                error_detail=result.errors[-1])
         return result
 
     if dry_run:
@@ -754,8 +752,14 @@ def import_cost_basis_lots(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(session, result, status=status,
-             error_detail="\n".join(result.errors) or None)
+    write_ingestion_log(
+        session,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail="\n".join(result.errors) or None,
+    )
 
     return result
 

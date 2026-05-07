@@ -10,9 +10,11 @@ are not present so the test suite stays portable.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Generator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -20,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from src.adapters.ft_pdf import (
     ADAPTER_NAME,
+    FT_ACCOUNT_NUMBER,
+    FT_BROKER,
     SOURCE_TAG,
     ImportResult,
     count_csv_transactions,
@@ -44,8 +48,8 @@ _FT_CSV = _FT_DIR / "accounthistory.csv"
 
 
 @pytest.fixture
-def session() -> Session:
-    """Fresh in-memory SQLite with FK enforcement."""
+def session() -> Generator[Session, None, None]:
+    """Fresh in-memory SQLite with FK enforcement. Yields and cleans up."""
     engine = create_engine("sqlite:///:memory:")
 
     @event.listens_for(engine, "connect")
@@ -53,7 +57,12 @@ def session() -> Session:
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    return Session(bind=engine)
+    s = Session(bind=engine)
+    try:
+        yield s
+    finally:
+        s.close()
+        engine.dispose()
 
 
 @pytest.fixture
@@ -280,3 +289,121 @@ def test_count_csv_transactions_handles_empty(tmp_path: Path) -> None:
 def test_count_csv_transactions_missing_file(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         count_csv_transactions(tmp_path / "does-not-exist.csv")
+
+
+# ── FIX-K: Inline-mock apply tests (no real PDFs required) ──────────────────
+
+# Reuse the inline fixture text from the extraction tests.
+_MOCK_TEXT_2024 = _SAMPLE_TEXT  # date 2024-12-31, balance $16,406.38
+_MOCK_TEXT_2026 = """\
+                                                                Year-End Statement
+                                                                January 1, 2026 to March 31, 2026
+
+PORTFOLIO OVERVIEW                                                      $17,500.00
+"""
+
+
+def _seed_ft_account(session: Session) -> Account:
+    acct = Account(
+        broker=FT_BROKER,
+        account_number=FT_ACCOUNT_NUMBER,
+        account_name="Templeton Growth Fund",
+        account_type="other",
+        entity="personal",
+    )
+    session.add(acct)
+    session.commit()
+    return acct
+
+
+def test_import_statements_inline_mock_writes_one_row_per_file(
+    tmp_path: Path, session: Session
+) -> None:
+    """FIX-K Test 1: apply writes one row per PDF; balance is pinned."""
+    _seed_ft_account(session)
+
+    # Two statement PDFs with names that parse to valid dates.
+    (tmp_path / "2024-12-31.pdf").write_bytes(b"placeholder")
+    (tmp_path / "2026-03-31.pdf").write_bytes(b"placeholder")
+
+    # Route each file to a different mock text.
+    def _mock_pdftotext(path: Path) -> str:
+        if path.name == "2024-12-31.pdf":
+            return _MOCK_TEXT_2024
+        return _MOCK_TEXT_2026
+
+    with patch("src.adapters.ft_pdf.pdftotext_layout", side_effect=_mock_pdftotext):
+        result = import_statements(tmp_path, dry_run=False, session=session)
+
+    assert result.imported == 2, f"unexpected: {result}"
+    assert result.errors == []
+    rows = (
+        session.query(AccountBalanceSnapshot)
+        .order_by(AccountBalanceSnapshot.as_of)
+        .all()
+    )
+    assert len(rows) == 2
+    assert rows[0].as_of == date(2024, 12, 31)
+    assert rows[0].balance == Decimal("16406.38")  # pinned value from fixture
+    assert rows[1].as_of == date(2026, 3, 31)
+    assert rows[1].balance == Decimal("17500.00")
+
+    # IngestionLog row written.
+    log = session.query(IngestionLog).filter(IngestionLog.source == ADAPTER_NAME).one()
+    assert log.records_processed >= 2
+
+
+def test_import_statements_inline_mock_idempotent(
+    tmp_path: Path, session: Session
+) -> None:
+    """FIX-K Test 2: second apply reports dup_skipped == row count."""
+    _seed_ft_account(session)
+    (tmp_path / "2024-12-31.pdf").write_bytes(b"placeholder")
+
+    with patch("src.adapters.ft_pdf.pdftotext_layout", return_value=_MOCK_TEXT_2024):
+        first = import_statements(tmp_path, dry_run=False, session=session)
+        second = import_statements(tmp_path, dry_run=False, session=session)
+
+    assert first.imported == 1
+    assert second.imported == 0
+    assert second.dup_skipped == 1
+    assert session.query(AccountBalanceSnapshot).count() == 1
+
+
+def test_import_statements_inline_mock_per_file_error_isolation(
+    tmp_path: Path, session: Session
+) -> None:
+    """FIX-K Test 3: one PDF raises → that file errors, others still imported."""
+    _seed_ft_account(session)
+    (tmp_path / "2024-12-31.pdf").write_bytes(b"placeholder")
+    (tmp_path / "2026-03-31.pdf").write_bytes(b"placeholder")
+
+    def _mock_pdftotext(path: Path) -> str:
+        if path.name == "2024-12-31.pdf":
+            raise RuntimeError("simulated pdftotext failure")
+        return _MOCK_TEXT_2026
+
+    with patch("src.adapters.ft_pdf.pdftotext_layout", side_effect=_mock_pdftotext):
+        result = import_statements(tmp_path, dry_run=False, session=session)
+
+    # The failed file produces an error; the good file still imports.
+    assert result.imported == 1
+    assert len(result.errors) == 1
+    assert "2024-12-31.pdf" in result.errors[0]
+    assert session.query(AccountBalanceSnapshot).count() == 1
+
+
+def test_import_statements_inline_mock_unmapped_account(
+    tmp_path: Path, session: Session
+) -> None:
+    """FIX-K Test 4: unmapped account → all rows error, no rows written."""
+    # Note: deliberately do NOT seed an FT Account row.
+    (tmp_path / "2024-12-31.pdf").write_bytes(b"placeholder")
+
+    with patch("src.adapters.ft_pdf.pdftotext_layout", return_value=_MOCK_TEXT_2024):
+        result = import_statements(tmp_path, dry_run=False, session=session)
+
+    assert result.imported == 0
+    assert result.errors, "expected unmapped account errors"
+    assert any(FT_ACCOUNT_NUMBER in e or FT_BROKER in e for e in result.errors)
+    assert session.query(AccountBalanceSnapshot).count() == 0

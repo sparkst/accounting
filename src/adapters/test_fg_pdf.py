@@ -11,13 +11,19 @@ one ``AccountBalanceSnapshot``; unmapped contracts yield an error and no row.
 from __future__ import annotations
 
 import shutil
+from collections.abc import Generator
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
 from src.adapters.fg_pdf import (
+    ADAPTER_NAME,
+    BROKER,
     SOURCE_TAG,
     ImportResult,
     detect_template,
@@ -40,8 +46,8 @@ LIVE_PORTAL = Path("/Users/travis/Downloads/accounts/FG/MZ152585.pdf")
 
 
 @pytest.fixture
-def session() -> Session:
-    """Fresh in-memory SQLite with FK enforcement."""
+def session() -> Generator[Session, None, None]:
+    """Fresh in-memory SQLite with FK enforcement. Yields and cleans up."""
     engine = create_engine("sqlite:///:memory:")
 
     @event.listens_for(engine, "connect")
@@ -49,14 +55,19 @@ def session() -> Session:
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    return Session(bind=engine)
+    s = Session(bind=engine)
+    try:
+        yield s
+    finally:
+        s.close()
+        engine.dispose()
 
 
 @pytest.fixture
 def seeded_account(session: Session) -> Account:
     """Pre-create the F&G account that the live PDFs map to."""
     acct = Account(
-        broker="fg_annuity",
+        broker=BROKER,
         account_number="MZ152585",
         account_type="other",
         entity="personal",
@@ -298,3 +309,85 @@ def test_import_pdf_as_of_override_used_when_extraction_lacks_date(
     assert contract == "MZ999999"
     assert as_of == date(2024, 1, 2)
     assert balance == Decimal("42.00")
+
+
+# ── Inline-mock apply tests (FIX-I, FIX-J) ──────────────────────────────────
+
+
+def test_import_pdf_portal_apply_writes_snapshot(
+    session: Session, tmp_path: Path
+) -> None:
+    """Portal flavor apply path: patches pdftotext, seeds Account, asserts snapshot."""
+    # Seed the Account row the adapter will look up.
+    acct = Account(
+        broker=BROKER,
+        account_number="MZ152585",
+        account_type="other",
+        entity="personal",
+    )
+    session.add(acct)
+    session.commit()
+
+    pdf = tmp_path / "portal.pdf"
+    pdf.write_bytes(b"placeholder")
+
+    with patch("src.adapters.fg_pdf.pdftotext_layout", return_value=PORTAL_TEXT_FIXTURE):
+        result = import_pdf(pdf, dry_run=False, session=session)
+
+    assert result.imported == 1
+    assert result.errors == []
+    snaps = session.query(AccountBalanceSnapshot).all()
+    assert len(snaps) == 1
+    snap = snaps[0]
+    assert snap.account_id == acct.id
+    # The portal fixture has "Values displayed are current as of 05/06/2026"
+    assert snap.as_of == date(2026, 5, 6)
+    assert snap.balance == Decimal("660218.55")
+    assert snap.source == SOURCE_TAG
+
+    # IngestionLog written.
+    logs = session.query(IngestionLog).all()
+    assert len(logs) == 1
+    assert logs[0].source == ADAPTER_NAME
+
+
+def test_import_pdf_portal_idempotent(session: Session, tmp_path: Path) -> None:
+    """Second apply of the same portal PDF reports dup_skipped, not re-insert."""
+    acct = Account(
+        broker=BROKER,
+        account_number="MZ152585",
+        account_type="other",
+        entity="personal",
+    )
+    session.add(acct)
+    session.commit()
+
+    pdf = tmp_path / "portal.pdf"
+    pdf.write_bytes(b"placeholder")
+
+    with patch("src.adapters.fg_pdf.pdftotext_layout", return_value=PORTAL_TEXT_FIXTURE):
+        first = import_pdf(pdf, dry_run=False, session=session)
+        second = import_pdf(pdf, dry_run=False, session=session)
+
+    assert first.imported == 1
+    assert second.imported == 0
+    assert second.dup_skipped == 1
+    assert session.query(AccountBalanceSnapshot).count() == 1
+
+
+def test_import_pdf_unmapped_contract_inline(session: Session, tmp_path: Path) -> None:
+    """FIX-J: unmapped contract → error appended, no row written (no real PDF)."""
+    # Synthetic annual fixture text with a contract that has no Account row.
+    synthetic_annual = """\
+ Contract #:        MZ999999                                     Issue Date:            05/01/2025
+        Total Account Value as of 05/01/2026                                                       $             100,000.00
+"""
+    pdf = tmp_path / "unknown.pdf"
+    pdf.write_bytes(b"placeholder")
+
+    with patch("src.adapters.fg_pdf.pdftotext_layout", return_value=synthetic_annual):
+        result = import_pdf(pdf, dry_run=False, session=session)
+
+    assert result.imported == 0
+    assert any("MZ999999" in e for e in result.errors), result.errors
+    assert session.query(AccountBalanceSnapshot).count() == 0

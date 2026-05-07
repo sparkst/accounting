@@ -37,6 +37,7 @@ def pdftotext_layout(path: Path) -> str:
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            f"pdftotext failed (rc={proc.returncode}) on {path}: {proc.stderr.strip()}"
+            f"pdftotext failed (rc={proc.returncode}) on {path.name}: "
+            f"{proc.stderr.strip()[:200]}"
         )
     return proc.stdout

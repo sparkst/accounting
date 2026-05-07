@@ -6,6 +6,7 @@ Mirrors ``test_xlsx_savings_plan.py`` for in-memory SQLite + FK enforcement.
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -68,8 +69,8 @@ Tools and Calculators
 
 
 @pytest.fixture
-def session() -> Session:
-    """Fresh in-memory SQLite with FK enforcement."""
+def session() -> Generator[Session, None, None]:
+    """Fresh in-memory SQLite with FK enforcement. Yields and cleans up."""
     engine = create_engine("sqlite:///:memory:")
 
     @event.listens_for(engine, "connect")
@@ -77,7 +78,12 @@ def session() -> Session:
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    return Session(bind=engine)
+    s = Session(bind=engine)
+    try:
+        yield s
+    finally:
+        s.close()
+        engine.dispose()
 
 
 def _seed_gsk_account(session: Session) -> Account:
@@ -175,3 +181,23 @@ def test_import_pdf_unmapped_account_appends_error(
     assert len(result.errors) == 1
     assert "GSK_PENSION" in result.errors[0]
     assert session.query(AccountBalanceSnapshot).count() == 0
+
+
+# ── FIX-R: --as-of override ─────────────────────────────────────────────────
+
+
+def test_import_pdf_as_of_override(session: Session, tmp_path: Path) -> None:
+    """When as_of is supplied, the override date wins over the PDF's date."""
+    _seed_gsk_account(session)
+    pdf = tmp_path / "gsk.pdf"
+    pdf.write_bytes(b"placeholder")
+
+    override = date(2025, 12, 31)  # different from the SAMPLE_TEXT date (2026-05-07)
+
+    with patch("src.adapters.gsk_pdf.pdftotext_layout", return_value=SAMPLE_TEXT):
+        result = import_pdf(pdf, dry_run=False, session=session, as_of=override)
+
+    assert result.imported == 1
+    assert result.errors == []
+    snap = session.query(AccountBalanceSnapshot).one()
+    assert snap.as_of == override

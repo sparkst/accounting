@@ -18,7 +18,6 @@ Canonical reference: ``src/adapters/xlsx_savings_plan.py``. Mirrors the
 from __future__ import annotations
 
 import argparse
-import contextlib
 import csv
 import hashlib
 import logging
@@ -34,12 +33,13 @@ from typing import Final
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.models.brokerage import Account
-from src.models.enums import IngestionStatus
+from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog
+from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ SOURCE_TAG: Final[str] = "ft_pdf"
 ADAPTER_NAME: Final[str] = "ft_pdf"
 """Identifier written to ``ingestion_log.source``."""
 
-FT_BROKER: Final[str] = "franklin_templeton"
+FT_BROKER: Final[str] = Broker.FRANKLIN_TEMPLETON.value
 FT_ACCOUNT_NUMBER: Final[str] = "8291"
 FT_RAW_ACCOUNT_NAME: Final[str] = "Franklin Templeton — Templeton Growth Fund 8291"
 
@@ -86,8 +86,14 @@ class ImportResult:
     errors: list[str] = field(default_factory=list)
     """Per-file error strings (``filename: message``)."""
 
+    warnings: list[str] = field(default_factory=list)
+    """Non-fatal per-file warning strings."""
+
     files_seen: int = 0
     """Number of ``*.pdf`` files walked (informational)."""
+
+    distinct_accounts: list[str] = field(default_factory=list)
+    """Distinct account identifiers observed."""
 
 
 # ── Public extraction helpers ────────────────────────────────────────────────
@@ -239,9 +245,11 @@ def import_statements(
                 f"{pdf_path.name}: unmapped account "
                 f"(broker={FT_BROKER}, account_number={FT_ACCOUNT_NUMBER})"
             )
-        _log_run(
+        write_ingestion_log(
             session,
-            result,
+            source=ADAPTER_NAME,
+            records_processed=0,
+            records_failed=len(result.errors),
             status=IngestionStatus.FAILURE,
             error_detail="\n".join(result.errors) or None,
         )
@@ -290,37 +298,15 @@ def import_statements(
         if not result.errors
         else IngestionStatus.PARTIAL_FAILURE
     )
-    _log_run(
+    write_ingestion_log(
         session,
-        result,
+        source=ADAPTER_NAME,
+        records_processed=result.imported + result.dup_skipped,
+        records_failed=len(result.errors),
         status=status,
         error_detail="\n".join(result.errors) or None,
     )
     return result
-
-
-def _log_run(
-    session: Session,
-    result: ImportResult,
-    *,
-    status: IngestionStatus,
-    error_detail: str | None,
-) -> None:
-    """Record an IngestionLog entry. Failures here are swallowed (log-only)."""
-    try:
-        log = IngestionLog(
-            source=ADAPTER_NAME,
-            status=status.value,
-            records_processed=result.imported + result.dup_skipped,
-            records_failed=len(result.errors),
-            error_detail=error_detail,
-        )
-        session.add(log)
-        session.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("failed to write IngestionLog for %s", ADAPTER_NAME)
-        with contextlib.suppress(Exception):
-            session.rollback()
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

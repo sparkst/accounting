@@ -59,9 +59,9 @@ python -m scripts.seed_account_tags                                      # defau
 # Brokerage Phase 4 per-institution adapters (DRY-RUN default; --apply to write)
 # Migration p4ext1enum0xt must be applied first (extends Broker + AccountType enums).
 python -m src.adapters.vanguard_csv    import-positions --file <csv>     # Vanguard OFX-style CSV (brokerage 6-col + 529 5-col)
-python -m src.adapters.fg_pdf          import          --file <pdf>      # F&G annuity annual/portal PDF
-python -m src.adapters.nw_mutual_xlsx  import          --file <xlsx>     # NW Mutual whole-life policies
-python -m src.adapters.gsk_pdf         import          --file <pdf>      # GSK cash-balance pension PDF
+python -m src.adapters.fg_pdf          import-pdf       --file <pdf>     # F&G annuity annual/portal PDF
+python -m src.adapters.nw_mutual_xlsx  import-balances  --file <xlsx>    # NW Mutual whole-life policies
+python -m src.adapters.gsk_pdf         import-pdf       --file <pdf>     # GSK cash-balance pension PDF
 python -m src.adapters.ft_pdf          import-statements --dir <path>    # Franklin Templeton year-end statements
 ```
 

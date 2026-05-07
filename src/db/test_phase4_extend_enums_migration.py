@@ -112,10 +112,26 @@ def test_phase4_extend_enums_round_trip(tmp_path: Path) -> None:
         # 0. Bring fresh DB up to the prior head.
         _stamp_at(db_path, _PREV_REVISION)
 
+        # FIX-Q: insert one pre-existing row (schwab, which the old schema allows)
+        # before upgrading to confirm it survives the migration.
+        pre_engine = sa.create_engine(f"sqlite:///{db_path}")
+        _insert_account(pre_engine, broker="schwab",
+                        account_number="pre-existing-acct")
+        pre_engine.dispose()
+
         # 1. Upgrade to Phase-4.
         _run_alembic("upgrade", _PHASE4_REVISION)
 
         engine = sa.create_engine(f"sqlite:///{db_path}")
+
+        # FIX-Q: verify the pre-existing schwab row survived the migration.
+        with engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT broker, account_number FROM account"
+                        " WHERE account_number = 'pre-existing-acct'")
+            ).fetchall()
+        assert len(rows) == 1, "pre-existing row lost during migration"
+        assert rows[0][0] == "schwab"
 
         # 2. New broker values accepted.
         for new_broker in (

@@ -343,3 +343,77 @@ class TestConfirmInteractive:
             session.query(Account).filter(Account.broker == "gsk_pension").count()
             == 0
         )
+
+    def test_active_with_nw_mutual_institution_offers_account_creation(
+        self, session: Session
+    ) -> None:
+        """FIX-N: Northwestern Mutual maps to broker=nw_mutual."""
+        from src.models.brokerage import Account
+
+        e = ExpectedAccount(
+            institution="Northwestern Mutual Investment Services",
+            account_name="90 LIFE",
+            last_4="9215",
+            source="credit_karma",
+            status="unconfirmed",
+        )
+        session.add(e)
+        session.commit()
+
+        responses = iter(["a", "17399215"])  # active, supply account_number
+        outputs: list[str] = []
+        counts = seeder.confirm_interactive(
+            session,
+            input_fn=lambda _p: next(responses),
+            output_fn=outputs.append,
+        )
+        assert counts["active"] == 1
+        assert counts["accounts_created"] == 1
+
+        accts = (
+            session.query(Account)
+            .filter(Account.broker == "nw_mutual")
+            .all()
+        )
+        assert len(accts) == 1
+        assert accts[0].account_number == "17399215"
+
+        e_reloaded = session.query(ExpectedAccount).one()
+        assert e_reloaded.resolved_account_id == accts[0].id
+
+    def test_active_with_fg_annuity_institution_offers_account_creation(
+        self, session: Session
+    ) -> None:
+        """FIX-N: F&G Life maps to broker=fg_annuity."""
+        from src.models.brokerage import Account
+
+        e = ExpectedAccount(
+            institution="F&G Life",
+            account_name="FG AccumulatorPlus 10",
+            last_4="2585",
+            source="manual",
+            status="unconfirmed",
+        )
+        session.add(e)
+        session.commit()
+
+        responses = iter(["a", "MZ152585"])
+        outputs: list[str] = []
+        counts = seeder.confirm_interactive(
+            session,
+            input_fn=lambda _p: next(responses),
+            output_fn=outputs.append,
+        )
+        assert counts["active"] == 1
+        assert counts["accounts_created"] == 1
+
+        accts = (
+            session.query(Account)
+            .filter(Account.broker == "fg_annuity")
+            .all()
+        )
+        assert len(accts) == 1
+        assert accts[0].account_number == "MZ152585"
+
+        e_reloaded = session.query(ExpectedAccount).one()
+        assert e_reloaded.resolved_account_id == accts[0].id

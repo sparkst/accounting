@@ -10,6 +10,7 @@ Uses an in-memory SQLite engine with FK enforcement, mirroring
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -34,8 +35,8 @@ from src.models.ingestion_log import IngestionLog
 
 
 @pytest.fixture
-def session() -> Session:
-    """Fresh in-memory SQLite with FK enforcement."""
+def session() -> Generator[Session, None, None]:
+    """Fresh in-memory SQLite with FK enforcement. Yields and cleans up."""
     engine = create_engine("sqlite:///:memory:")
 
     @event.listens_for(engine, "connect")
@@ -43,7 +44,12 @@ def session() -> Session:
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
 
     Base.metadata.create_all(engine)
-    return Session(bind=engine)
+    s = Session(bind=engine)
+    try:
+        yield s
+    finally:
+        s.close()
+        engine.dispose()
 
 
 def _build_fixture_workbook(path: Path) -> None:
@@ -70,6 +76,33 @@ def _build_fixture_workbook(path: Path) -> None:
         ("Travis D Sparks", "18305148", "$28,547.00", "$327.84", "$157.65", "$0.00", "$5,621.63"),
         ("Travis D Sparks", "17399215", "$28,327.00", "$349.80", "$163.75", "$0.00", "$7,280.48"),
         ("Travis D Sparks", "17399232", "$275,000.00", "$601.92", "$117.86", "$0.00", "N/A"),
+    ]
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, val in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=val)
+
+    wb.save(path)
+
+
+def _build_invalid_row_workbook(path: Path) -> None:
+    """Fixture workbook with one bad NAV cell ($invalid) + 3 valid rows."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Life Insurance"
+
+    headers = [
+        "Insured", "Account Number", "Net Death Benefit", "Annualized Premium",
+        "Last Annual Dividend", "Loans", "Net Accumulated Value",
+    ]
+    for col_idx, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=col_idx, value=h)
+
+    rows = [
+        ("Aiden C Sparks", "17397277", "$32,216.00", "$200.16", "$80.37", "$0.00", "$3,250.34"),
+        ("Travis D Sparks", "18305148", "$28,547.00", "$327.84", "$157.65", "$0.00", "$invalid"),
+        ("Travis D Sparks", "17399215", "$28,327.00", "$349.80", "$163.75", "$0.00", "$7,280.48"),
+        ("Travis D Sparks", "17399232", "$275,000.00", "$601.92", "$117.86", "$0.00", "$1,234.56"),
     ]
     for r_idx, row in enumerate(rows, start=2):
         for c_idx, val in enumerate(row, start=1):
@@ -150,14 +183,21 @@ def test_parse_workbook_other_columns(fixture_xlsx: Path) -> None:
 # ── import_balances dry-run ──────────────────────────────────────────────────
 
 
-def test_dry_run_reports_3_inserts_and_skip_warning(fixture_xlsx: Path) -> None:
-    result = import_balances(fixture_xlsx, dry_run=True, as_of=date(2026, 5, 7))
+def test_dry_run_reports_3_inserts_and_skip_warning(
+    session: Session, fixture_xlsx: Path
+) -> None:
+    result = import_balances(fixture_xlsx, dry_run=True, session=session,
+                             as_of=date(2026, 5, 7))
     assert isinstance(result, ImportResult)
-    # 4 parsed, 3 would-be-inserted, 1 skipped with warning in errors.
+    # 4 parsed, N/A skip goes to warnings (not errors).
     assert result.parsed == 4
-    assert result.would_insert == 3
-    # The N/A row appears as a warning in errors.
-    assert any("17399232" in e and "N/A" in e for e in result.errors), result.errors
+    # N/A row goes to warnings, not errors.
+    assert any("17399232" in w and "N/A" in w for w in result.warnings), result.warnings
+    # No genuine errors.
+    assert result.errors == []
+    # DB must be untouched.
+    assert session.query(AccountBalanceSnapshot).count() == 0
+    assert session.query(IngestionLog).count() == 0
 
 
 # ── import_balances apply ───────────────────────────────────────────────────
@@ -182,6 +222,9 @@ def test_apply_writes_three_snapshots(session: Session, fixture_xlsx: Path) -> N
     # IngestionLog written.
     logs = session.query(IngestionLog).all()
     assert len(logs) == 1
+    # FIX-T: assert source and records_processed on the log.
+    assert logs[0].source == SOURCE_TAG
+    assert logs[0].records_processed == 3
 
 
 def test_apply_is_idempotent(session: Session, fixture_xlsx: Path) -> None:
@@ -204,9 +247,11 @@ def test_unmapped_policy_appends_error(session: Session, fixture_xlsx: Path) -> 
     result = import_balances(
         fixture_xlsx, dry_run=False, session=session, as_of=date(2026, 5, 7)
     )
-    # 2 imported, 1 unmapped error, 1 N/A skip warning → 2 errors total.
+    # 2 imported, 1 unmapped error, 1 N/A skip warning.
     assert result.imported == 2
     assert any("17399215" in e for e in result.errors), result.errors
+    # N/A skip in warnings, not errors.
+    assert any("17399232" in w for w in result.warnings), result.warnings
     snaps = session.query(AccountBalanceSnapshot).all()
     assert len(snaps) == 2
 
@@ -216,7 +261,63 @@ def test_default_as_of_uses_file_mtime(session: Session, fixture_xlsx: Path) -> 
     _seed_accounts(session, ALL_POLICIES)
     result = import_balances(fixture_xlsx, dry_run=False, session=session)
     assert result.imported == 3
-    expected = date.fromtimestamp(fixture_xlsx.stat().st_mtime)
+    from datetime import UTC, datetime
+    expected = datetime.fromtimestamp(fixture_xlsx.stat().st_mtime, tz=UTC).date()
     snaps = session.query(AccountBalanceSnapshot).all()
     for s in snaps:
         assert s.as_of == expected
+
+
+def test_na_skip_goes_to_warnings_not_errors(
+    session: Session, fixture_xlsx: Path
+) -> None:
+    """N/A rows must produce a warning, not an error — SUCCESS status, not PARTIAL."""
+    _seed_accounts(session, ALL_POLICIES)
+    result = import_balances(
+        fixture_xlsx, dry_run=False, session=session, as_of=date(2026, 5, 7)
+    )
+    assert result.imported == 3
+    # N/A skip in warnings only.
+    assert any("17399232" in w for w in result.warnings)
+    # No genuine errors.
+    assert result.errors == []
+    # IngestionLog status == "success" (not partial_failure).
+    log = session.query(IngestionLog).one()
+    assert log.status == "success"
+    assert log.records_failed == 0
+
+
+def test_na_warning_does_not_contain_insured_name(
+    session: Session, fixture_xlsx: Path
+) -> None:
+    """FIX-E: insured name must NOT appear in warnings (PII leak prevention)."""
+    _seed_accounts(session, ALL_POLICIES)
+    result = import_balances(
+        fixture_xlsx, dry_run=False, session=session, as_of=date(2026, 5, 7)
+    )
+    for w in result.warnings:
+        assert "Travis D Sparks" not in w, f"PII in warning: {w}"
+        assert "Aiden C Sparks" not in w, f"PII in warning: {w}"
+
+
+# ── FIX-M: per-row error isolation ──────────────────────────────────────────
+
+
+def test_per_row_error_isolation_does_not_break_batch(
+    tmp_path: Path, session: Session
+) -> None:
+    """One invalid NAV cell ($invalid) errors; other 3 valid rows still imported."""
+    xlsx = tmp_path / "invalid_row.xlsx"
+    _build_invalid_row_workbook(xlsx)
+
+    # Seed all 4 policy accounts (17397277, 18305148, 17399215, 17399232).
+    _seed_accounts(session, ["17397277", "18305148", "17399215", "17399232"])
+
+    result = import_balances(xlsx, dry_run=False, session=session,
+                             as_of=date(2026, 5, 7))
+
+    # 18305148 has "$invalid" → 1 parse error.
+    assert len(result.errors) == 1, f"expected 1 error, got: {result.errors}"
+    # The other 3 valid rows should be imported.
+    assert result.imported == 3, f"expected 3 imported, got: {result.imported}"
+    assert session.query(AccountBalanceSnapshot).count() == 3

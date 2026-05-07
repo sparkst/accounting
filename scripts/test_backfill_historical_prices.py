@@ -168,6 +168,9 @@ def test_backfill_isolates_one_failing_symbol(session: Session) -> None:
     assert summary["GOOD"]["inserted"] == 1
     assert summary["BAD"]["errored"] == 1
     assert summary["BAD"]["fetched"] == 0
+    # Verify the GOOD row actually survived the commit, not just that the
+    # in-memory counter was incremented.
+    assert session.query(HistoricalPrice).filter_by(symbol="GOOD").count() == 1
 
     log = session.query(IngestionLog).filter_by(source="yfinance_backfill").one()
     assert log.records_failed == 1

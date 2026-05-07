@@ -692,7 +692,11 @@ def import_cost_basis_lots(
     NULL and ``raw_account_name`` carries the audit trail.
 
     Idempotency is enforced via UNIQUE on ``cost_basis_lot.source_row_hash``,
-    which is SHA256 of ``"{symbol}|{open_date}|{qty}|{cost_total}|{source}"``.
+    which is SHA256 of
+    ``"{symbol}|{open_date}|{qty}|{cost_per_share}|{cost_total}|{row_idx}|{source}"``.
+    Including ``row_idx`` disambiguates same-day RSU vesting tranches that
+    share economics; including ``cost_per_share`` lets re-imports detect
+    rows whose totals were normalised differently.
     """
     result = ImportResult()
 

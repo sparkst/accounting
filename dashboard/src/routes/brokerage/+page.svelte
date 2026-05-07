@@ -9,7 +9,8 @@
 		fetchBrokerageDataIntegrity,
 		fetchBrokerageNetWorthHistory,
 		fetchBrokerageBenchmarkComparison,
-		fetchBrokerageMissingAccounts
+		fetchBrokerageMissingAccounts,
+		updateBrokerageAccountTags
 	} from '$lib/api';
 	import type {
 		BrokerageNetWorth,
@@ -53,6 +54,14 @@
 	let acctSortKey = $state<string | null>('market_value');
 	let acctSortDir = $state<SortDir>('desc');
 	let acctBrokerFilter = $state<Set<string>>(new Set());
+	// Tag filter state: tags whose presence is required (include) and tags
+	// whose presence excludes (exclude). UI uses three states per chip:
+	// neutral → include → exclude → neutral.
+	let acctTagInclude = $state<Set<string>>(new Set());
+	let acctTagExclude = $state<Set<string>>(new Set());
+	// Editing state: which account row's tag chips are being edited.
+	let editingTagsAccountId = $state<string | null>(null);
+	let tagDraftInput = $state('');
 
 	let holdQuery = $state('');
 	let holdSortKey = $state<string | null>('total_market_value');
@@ -144,6 +153,50 @@
 				benchmarkOn = false;
 			}
 		}
+	}
+
+	// Refetch the history series when the account filter changes. We pass the
+	// visible account_ids (those passing every active filter) to the API so
+	// the chart matches whatever the headline is summing.
+	let _lastFilterKey = '';
+	$effect(() => {
+		const ids = filteredAccounts.map((a) => a.account_id).sort();
+		const key = `${acctIsFiltered}|${ids.join(',')}`;
+		if (key === _lastFilterKey) return;
+		_lastFilterKey = key;
+		if (!accounts) return; // initial load handled by loadAll()
+		void refetchFilteredHistory(ids);
+	});
+
+	async function refetchFilteredHistory(ids: string[]): Promise<void> {
+		try {
+			if (!acctIsFiltered) {
+				networthHistory = await fetchBrokerageNetWorthHistory(true);
+				return;
+			}
+			if (ids.length === 0) {
+				networthHistory = []; // empty filter → chart will render at $0
+				return;
+			}
+			const qs = new URLSearchParams({
+				include_unmatched: 'true',
+				account_ids: ids.join(',')
+			});
+			const res = await fetch(`/api/brokerage/networth-history?${qs}`, {
+				headers: getApiHeaders()
+			});
+			if (!res.ok) throw new Error(`history fetch ${res.status}`);
+			networthHistory = await res.json();
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	function getApiHeaders(): Record<string, string> {
+		// The api.ts request() helper handles X-Api-Key for us; here we're
+		// hitting fetch directly so mirror its behavior.
+		const key = (import.meta.env.VITE_API_KEY as string | undefined) ?? '';
+		return key ? { 'X-Api-Key': key } : {};
 	}
 
 	onMount(loadAll);
@@ -239,6 +292,17 @@
 	let filteredAccounts = $derived.by(() => {
 		const filtered = withSnapshots.filter((a) => {
 			if (acctBrokerFilter.size > 0 && !acctBrokerFilter.has(a.broker)) return false;
+			const tags = new Set(a.tags ?? []);
+			if (acctTagInclude.size > 0) {
+				for (const need of acctTagInclude) {
+					if (!tags.has(need)) return false;
+				}
+			}
+			if (acctTagExclude.size > 0) {
+				for (const block of acctTagExclude) {
+					if (tags.has(block)) return false;
+				}
+			}
 			return matchesQuery(
 				[a.broker, a.account_number_masked, a.account_name, a.account_type, a.entity],
 				acctQuery
@@ -254,8 +318,44 @@
 		withSnapshots.reduce((sum, a) => sum + (a.market_value ?? 0), 0)
 	);
 	let acctIsFiltered = $derived(
-		acctQuery.trim() !== '' || acctBrokerFilter.size > 0
+		acctQuery.trim() !== '' ||
+			acctBrokerFilter.size > 0 ||
+			acctTagInclude.size > 0 ||
+			acctTagExclude.size > 0
 	);
+
+	// Tag universe: distinct tags from all accounts, sorted alphabetically.
+	let allTags = $derived.by(() => {
+		const t = new Set<string>();
+		for (const a of withSnapshots) for (const tag of a.tags ?? []) t.add(tag);
+		return Array.from(t).sort();
+	});
+
+	// Three-state cycle: neutral → include → exclude → neutral.
+	function cycleTag(tag: string): void {
+		if (acctTagInclude.has(tag)) {
+			const next = new Set(acctTagInclude);
+			next.delete(tag);
+			acctTagInclude = next;
+			const ex = new Set(acctTagExclude);
+			ex.add(tag);
+			acctTagExclude = ex;
+		} else if (acctTagExclude.has(tag)) {
+			const next = new Set(acctTagExclude);
+			next.delete(tag);
+			acctTagExclude = next;
+		} else {
+			const inc = new Set(acctTagInclude);
+			inc.add(tag);
+			acctTagInclude = inc;
+		}
+	}
+
+	function tagState(tag: string): 'include' | 'exclude' | 'neutral' {
+		if (acctTagInclude.has(tag)) return 'include';
+		if (acctTagExclude.has(tag)) return 'exclude';
+		return 'neutral';
+	}
 
 	let filteredHoldings = $derived.by(() => {
 		const filtered = (topHoldings ?? []).filter((h) => {
@@ -272,14 +372,91 @@
 	const CHART_PAD_X = 40;
 	const CHART_PAD_Y = 16;
 
+	// Today's value to anchor the chart's right edge: prefer the filtered
+	// visible total (so the chart matches the headline) when a filter is on,
+	// otherwise the live whole-portfolio net worth from PositionSnapshot.
+	let chartLiveValue = $derived(
+		acctIsFiltered ? acctVisibleTotal : (netWorth?.total ?? 0)
+	);
+
+	function formatAxisDollars(v: number): string {
+		if (Math.abs(v) >= 1e6) return `$${(v / 1e6).toFixed(1)}M`;
+		if (Math.abs(v) >= 1e3) return `$${(v / 1e3).toFixed(0)}k`;
+		return `$${v.toFixed(0)}`;
+	}
+
+	function pickAxisTicks(min: number, max: number, count: number): number[] {
+		if (max <= min) return [min];
+		const range = max - min;
+		const step = range / (count - 1);
+		return Array.from({ length: count }, (_, i) => min + step * i);
+	}
+
+	function pickDateTicks(points: { as_of: string }[], count: number): { idx: number; label: string }[] {
+		if (points.length === 0) return [];
+		const indices = Array.from({ length: count }, (_, i) =>
+			Math.round((i / (count - 1)) * (points.length - 1))
+		);
+		return indices.map((idx) => {
+			const d = new Date(points[idx].as_of);
+			return { idx, label: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}` };
+		});
+	}
+
 	let historyChart = $derived.by(() => {
-		const points = networthHistory ?? [];
+		// Empty-filter: show a flat $0 line so the user sees "no data matches"
+		// without losing the chart frame entirely.
+		if (acctIsFiltered && filteredAccounts.length === 0) {
+			return {
+				points: [],
+				xs: [],
+				ys: [],
+				minV: 0,
+				maxV: 0,
+				linePath: `M ${CHART_PAD_X} ${CHART_H - CHART_PAD_Y} L ${CHART_W - CHART_PAD_X} ${CHART_H - CHART_PAD_Y}`,
+				areaPath: '',
+				benchPath: null,
+				todayIdx: null,
+				first: null,
+				last: null,
+				deltaPct: 0,
+				dateTicks: [],
+				dollarTicks: [0],
+				yFor: () => CHART_H - CHART_PAD_Y,
+				empty: true
+			};
+		}
+
+		// Append a synthetic 'today' point using the live aggregate so the
+		// chart's right edge matches the headline. Only append when we have
+		// an actual live value AND the historical series doesn't already
+		// include today.
+		const baseHistory = networthHistory ?? [];
+		const todayIso = new Date().toISOString().slice(0, 10);
+		const lastHistoricalIso = baseHistory[baseHistory.length - 1]?.as_of;
+		const points = [...baseHistory];
+		let todayIdx: number | null = null;
+		if (chartLiveValue > 0 && lastHistoricalIso !== todayIso) {
+			points.push({
+				as_of: todayIso,
+				balance_total: chartLiveValue,
+				account_count: filteredAccounts.length || (accounts ?? []).length
+			});
+			todayIdx = points.length - 1;
+		}
+
 		if (points.length < 2) return null;
+
 		const values = points.map((p) => p.balance_total);
-		// When benchmark is on, scale Y axis to include both portfolio and benchmark.
 		let benchValues: (number | null)[] = [];
-		if (benchmarkOn && benchmarkData?.series.length === points.length) {
-			benchValues = benchmarkData.series.map((p) => p.benchmark_value);
+		if (benchmarkOn && benchmarkData?.series.length) {
+			// Align benchmark to the historical (non-today) points only; the
+			// today point gets benchmark=null since SPY isn't in the bench
+			// series for today.
+			benchValues = points.map((p) => {
+				const match = benchmarkData!.series.find((b) => b.as_of === p.as_of);
+				return match ? match.benchmark_value : null;
+			});
 		}
 		const allNonNull = [
 			...values,
@@ -299,7 +476,7 @@
 		const areaPath = `${linePath} L ${xs[xs.length - 1].toFixed(1)} ${(CHART_PAD_Y + innerH).toFixed(1)} L ${xs[0].toFixed(1)} ${(CHART_PAD_Y + innerH).toFixed(1)} Z`;
 
 		let benchPath: string | null = null;
-		if (benchValues.length === points.length) {
+		if (benchValues.some((v) => v !== null)) {
 			const segments: string[] = [];
 			let pen = 'M';
 			benchValues.forEach((v, i) => {
@@ -322,9 +499,14 @@
 			linePath,
 			areaPath,
 			benchPath,
+			todayIdx,
 			first: points[0],
 			last: points[points.length - 1],
-			deltaPct: (points[points.length - 1].balance_total - points[0].balance_total) / points[0].balance_total
+			deltaPct: (points[points.length - 1].balance_total - points[0].balance_total) / points[0].balance_total,
+			dateTicks: pickDateTicks(points, 5),
+			dollarTicks: pickAxisTicks(minV, maxV, 5),
+			yFor,
+			empty: false
 		};
 	});
 
@@ -407,11 +589,15 @@
 				<div class="section-head">
 					<h2>Net Worth Over Time</h2>
 					<div class="history-summary">
-						<span class="muted">{historyChart.first.as_of} → {historyChart.last.as_of}</span>
-						<span class="separator">·</span>
-						<span class={historyChart.deltaPct >= 0 ? 'pos' : 'neg'}>
-							{historyChart.deltaPct >= 0 ? '+' : ''}{(historyChart.deltaPct * 100).toFixed(1)}%
-						</span>
+						{#if historyChart.first && historyChart.last}
+							<span class="muted">{historyChart.first.as_of} → {historyChart.last.as_of}</span>
+							<span class="separator">·</span>
+							<span class={historyChart.deltaPct >= 0 ? 'pos' : 'neg'}>
+								{historyChart.deltaPct >= 0 ? '+' : ''}{(historyChart.deltaPct * 100).toFixed(1)}%
+							</span>
+						{:else}
+							<span class="muted">No accounts match the current filter</span>
+						{/if}
 						{#if benchmarkOn && benchmarkData?.benchmark_pct !== null && benchmarkData?.benchmark_pct !== undefined}
 							<span class="separator">·</span>
 							<span class="muted">SPY:</span>
@@ -429,45 +615,57 @@
 						{benchmarkOn ? '✓ S&P 500' : 'Compare to S&P 500'}
 					</button>
 				</div>
-				<svg class="history-chart" viewBox={`0 0 ${CHART_W} ${CHART_H}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Net worth over time">
+				<svg class="history-chart" viewBox={`0 0 ${CHART_W} ${CHART_H + 30}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Net worth over time">
 					<defs>
 						<linearGradient id="history-fill" x1="0" y1="0" x2="0" y2="1">
 							<stop offset="0%" stop-color="#007aff" stop-opacity="0.18" />
 							<stop offset="100%" stop-color="#007aff" stop-opacity="0" />
 						</linearGradient>
 					</defs>
+					<!-- Y-axis dollar grid lines -->
+					{#each historyChart.dollarTicks as tick (tick)}
+						{@const y = historyChart.yFor(tick)}
+						<line x1={CHART_PAD_X} y1={y} x2={CHART_W - CHART_PAD_X} y2={y} stroke="#f0f0f2" stroke-width="1" />
+						<text x={CHART_PAD_X - 4} y={y + 3} text-anchor="end" font-size="10" fill="#6e6e73" font-family="-apple-system,Helvetica">{formatAxisDollars(tick)}</text>
+					{/each}
 					<path d={historyChart.areaPath} fill="url(#history-fill)" />
 					<path d={historyChart.linePath} fill="none" stroke="#007aff" stroke-width="2" />
 					{#if benchmarkOn && historyChart.benchPath}
 						<path d={historyChart.benchPath} fill="none" stroke="#ff9500" stroke-width="2" stroke-dasharray="4 4" />
 					{/if}
 					{#each historyChart.points as p, i (p.as_of)}
+						{@const isToday = historyChart.todayIdx === i}
 						<circle
 							cx={historyChart.xs[i]}
 							cy={historyChart.ys[i]}
-							r={hoverHistoryIdx === i ? 5 : 3}
-							fill="#007aff"
+							r={hoverHistoryIdx === i ? 6 : isToday ? 5 : 3}
+							fill={isToday ? '#047a04' : '#007aff'}
+							stroke={isToday ? '#fff' : 'none'}
+							stroke-width={isToday ? 1.5 : 0}
 							class="history-dot"
 							onmouseenter={() => (hoverHistoryIdx = i)}
 							onmouseleave={() => (hoverHistoryIdx = null)}
 						/>
 					{/each}
-					{#if hoverHistoryIdx !== null}
+					{#if hoverHistoryIdx !== null && !historyChart.empty}
 						{@const p = historyChart.points[hoverHistoryIdx]}
 						{@const cx = historyChart.xs[hoverHistoryIdx]}
 						{@const cy = historyChart.ys[hoverHistoryIdx]}
+						{@const isToday = historyChart.todayIdx === hoverHistoryIdx}
 						<line x1={cx} y1={CHART_PAD_Y} x2={cx} y2={CHART_H - CHART_PAD_Y} stroke="#c7c7cc" stroke-dasharray="2 3" />
-						<g transform={`translate(${Math.min(cx + 8, CHART_W - 140)} ${Math.max(cy - 28, 0)})`}>
-							<rect x="0" y="0" width="130" height="40" rx="6" fill="#1d1d1f" />
-							<text x="8" y="16" fill="#fff" font-size="11">{p.as_of}</text>
+						<g transform={`translate(${Math.min(cx + 8, CHART_W - 150)} ${Math.max(cy - 32, 0)})`}>
+							<rect x="0" y="0" width="140" height={isToday ? 50 : 40} rx="6" fill="#1d1d1f" />
+							<text x="8" y="16" fill="#fff" font-size="11">{p.as_of}{isToday ? ' · Live' : ''}</text>
 							<text x="8" y="32" fill="#fff" font-size="13" font-weight="600">{fmtCurrency(p.balance_total)}</text>
+							{#if isToday}<text x="8" y="46" fill="#a7d99e" font-size="10">live PositionSnapshot total</text>{/if}
 						</g>
 					{/if}
+					<!-- X-axis date ticks -->
+					{#each historyChart.dateTicks as tick (tick.idx)}
+						{@const x = historyChart.xs[tick.idx] ?? CHART_PAD_X}
+						<text x={x} y={CHART_H - 2} text-anchor="middle" font-size="10" fill="#6e6e73" font-family="-apple-system,Helvetica">{tick.label}</text>
+					{/each}
 				</svg>
-				<div class="history-axis muted">
-					<span>{fmtCurrency(historyChart.minV)}</span>
-					<span>{fmtCurrency(historyChart.maxV)}</span>
-				</div>
 			</section>
 		{/if}
 
@@ -484,6 +682,37 @@
 					/>
 				</div>
 			</div>
+
+			{#if allTags.length > 0}
+				<div class="filter-chips">
+					<span class="chip-label">Tags:</span>
+					{#each allTags as tag (tag)}
+						{@const state = tagState(tag)}
+						<button
+							type="button"
+							class="chip tag-chip"
+							class:include={state === 'include'}
+							class:exclude={state === 'exclude'}
+							onclick={() => cycleTag(tag)}
+							title="Click to cycle: include → exclude → off"
+						>
+							{state === 'exclude' ? '−' : state === 'include' ? '+' : ''} {tag}
+						</button>
+					{/each}
+					{#if acctTagInclude.size + acctTagExclude.size > 0}
+						<button
+							type="button"
+							class="chip clear"
+							onclick={() => {
+								acctTagInclude = new Set();
+								acctTagExclude = new Set();
+							}}
+						>
+							Clear tags
+						</button>
+					{/if}
+				</div>
+			{/if}
 
 			{#if acctBrokerOptions.length > 1}
 				<div class="filter-chips">
@@ -513,7 +742,15 @@
 			<table class="data-table">
 				<thead>
 					<tr>
-						{#each [{ key: 'broker', label: 'Broker' }, { key: 'account_number_masked', label: 'Account' }, { key: 'account_type', label: 'Type' }, { key: 'entity', label: 'Entity' }, { key: 'tax_sheltered', label: 'Tax-sheltered' }, { key: 'as_of', label: 'As of' }] as col (col.key)}
+						{#each [{ key: 'broker', label: 'Broker' }, { key: 'account_number_masked', label: 'Account' }, { key: 'account_type', label: 'Type' }] as col (col.key)}
+							<th class="sortable" onclick={() => {
+								const r = toggleSort(col.key, acctSortKey, acctSortDir);
+								acctSortKey = r.key;
+								acctSortDir = r.dir;
+							}}>{col.label}{sortIndicator(col.key, acctSortKey, acctSortDir)}</th>
+						{/each}
+						<th>Tags</th>
+						{#each [{ key: 'entity', label: 'Entity' }, { key: 'as_of', label: 'As of' }] as col (col.key)}
 							<th class="sortable" onclick={() => {
 								const r = toggleSort(col.key, acctSortKey, acctSortDir);
 								acctSortKey = r.key;
@@ -541,8 +778,77 @@
 								{/if}
 							</td>
 							<td>{a.account_type}</td>
+							<td class="tags-cell">
+								{#if editingTagsAccountId === a.account_id}
+									<div class="tags-edit">
+										{#each a.tags ?? [] as tag (tag)}
+											<span class="tag-pill editing">
+												{tag}
+												<button
+													type="button"
+													class="tag-remove"
+													aria-label={`Remove ${tag}`}
+													onclick={async () => {
+														const next = (a.tags ?? []).filter((t) => t !== tag);
+														try {
+															await updateBrokerageAccountTags(a.account_id, next);
+															a.tags = next;
+														} catch (e) {
+															error = e instanceof Error ? e.message : String(e);
+														}
+													}}
+												>×</button>
+											</span>
+										{/each}
+										<input
+											type="text"
+											class="tag-input"
+											bind:value={tagDraftInput}
+											placeholder="add tag…"
+											onkeydown={async (e) => {
+												if (e.key !== 'Enter') return;
+												const draft = tagDraftInput.trim().toLowerCase();
+												if (!draft) return;
+												if ((a.tags ?? []).includes(draft)) return;
+												const next = [...(a.tags ?? []), draft].sort();
+												try {
+													await updateBrokerageAccountTags(a.account_id, next);
+													a.tags = next;
+													tagDraftInput = '';
+												} catch (err) {
+													error = err instanceof Error ? err.message : String(err);
+												}
+											}}
+										/>
+										<button
+											type="button"
+											class="tag-edit-done"
+											onclick={() => {
+												editingTagsAccountId = null;
+												tagDraftInput = '';
+											}}
+										>Done</button>
+									</div>
+								{:else}
+									<button
+										type="button"
+										class="tags-display"
+										onclick={() => {
+											editingTagsAccountId = a.account_id;
+											tagDraftInput = '';
+										}}
+										title="Click to edit tags"
+									>
+										{#each a.tags ?? [] as tag (tag)}
+											<span class="tag-pill">{tag}</span>
+										{/each}
+										{#if (a.tags ?? []).length === 0}
+											<span class="muted">+ add</span>
+										{/if}
+									</button>
+								{/if}
+							</td>
 							<td>{a.entity}</td>
-							<td>{a.tax_sheltered ? 'Yes' : 'No'}</td>
 							<td>{a.as_of}</td>
 							<td class="num">{fmtCurrency(a.market_value)}</td>
 						</tr>
@@ -1270,5 +1576,88 @@
 	.missing-note {
 		font-size: 13px;
 		margin: -6px 0 12px;
+	}
+
+	/* Tag chips: three-state (neutral / include / exclude) */
+	.chip.tag-chip.include {
+		background: #047a04;
+		border-color: #047a04;
+		color: #fff;
+	}
+	.chip.tag-chip.exclude {
+		background: #d70015;
+		border-color: #d70015;
+		color: #fff;
+	}
+
+	/* Tag pills inline in account rows */
+	.tags-cell {
+		max-width: 240px;
+	}
+	.tags-display {
+		background: none;
+		border: 1px dashed transparent;
+		border-radius: 6px;
+		padding: 2px 4px;
+		cursor: text;
+		display: inline-flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		min-height: 22px;
+		font: inherit;
+		color: inherit;
+		text-align: left;
+	}
+	.tags-display:hover {
+		border-color: #d2d2d7;
+		background: #fafafc;
+	}
+	.tag-pill {
+		display: inline-block;
+		font-size: 11px;
+		padding: 1px 7px;
+		background: #f0f0f2;
+		color: #1d1d1f;
+		border-radius: 999px;
+		font-feature-settings: 'tnum' 0;
+	}
+	.tags-edit {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		align-items: center;
+	}
+	.tag-pill.editing {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+	}
+	.tag-remove {
+		background: none;
+		border: none;
+		color: #6e6e73;
+		cursor: pointer;
+		font-size: 14px;
+		padding: 0;
+		line-height: 1;
+	}
+	.tag-input {
+		font: inherit;
+		font-size: 11px;
+		padding: 1px 6px;
+		border: 1px solid #d2d2d7;
+		border-radius: 999px;
+		background: #fff;
+		min-width: 80px;
+	}
+	.tag-edit-done {
+		font: inherit;
+		font-size: 11px;
+		padding: 1px 8px;
+		border: 1px solid #1d1d1f;
+		border-radius: 999px;
+		background: #1d1d1f;
+		color: #fff;
+		cursor: pointer;
 	}
 </style>

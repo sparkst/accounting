@@ -863,6 +863,21 @@ export interface BrokerageAccount {
 	is_plan_wrapper: boolean;
 	as_of: string | null;
 	market_value: number;
+	tags: string[];
+}
+
+export async function updateBrokerageAccountTags(
+	accountId: string,
+	tags: string[]
+): Promise<{ tags: string[] }> {
+	return request<{ tags: string[] }>(
+		`/brokerage/accounts/${encodeURIComponent(accountId)}/tags`,
+		{
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ tags })
+		}
+	);
 }
 
 export interface BrokerageHolding {

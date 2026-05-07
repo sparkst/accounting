@@ -154,6 +154,28 @@ class ExpectedAccount(Base):
     resolved_account = relationship("Account")
 
 
+class AccountTag(Base):
+    """A single (account, tag) association.
+
+    Composite PK on (account_id, tag) — an account holds the same tag at most
+    once, but may have many tags. Tags are free-text but case-insensitive at
+    query time (callers must normalise to lower-case before insert/lookup).
+    """
+
+    __tablename__ = "account_tag"
+    __table_args__ = (
+        Index("ix_account_tag_tag", "tag"),
+    )
+
+    account_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("account.id"), primary_key=True
+    )
+    tag: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+
+    account = relationship("Account")
+
+
 class CostBasisLot(Base):
     """A single lot of a security with cost basis, ingested from XLSX (TD/SB).
 

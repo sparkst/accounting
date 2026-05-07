@@ -2,27 +2,30 @@
 
 Exposes the pure-function output from `src.reports.brokerage_summary` plus
 historical-balance, benchmark, and per-holding views over the `history.py`
-tables. All endpoints are GET; no mutation. Mounted at `/api/brokerage`
-behind the API-key auth dependency in `src/api/main.py`.
+tables. Mostly GET; PUT on `/accounts/{id}/tags` for the small tag-edit
+surface. Mounted at `/api/brokerage` behind the API-key auth dependency in
+`src/api/main.py`.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Generator
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal
-from src.models.brokerage import PositionSnapshot
+from src.models.brokerage import Account, PositionSnapshot
 from src.models.history import (
     AccountBalanceSnapshot,
+    AccountTag,
     CostBasisLot,
     ExpectedAccount,
     HistoricalPrice,
@@ -90,10 +93,48 @@ class AccountSummaryRow(BaseModel):
     is_plan_wrapper: bool
     as_of: date | None = None
     market_value: Decimal
+    tags: list[str] = []
 
     @field_serializer("market_value")
     def _ser_mv(self, v: Decimal) -> float:
         return float(v)
+
+
+# Tag pattern: lower-case letters, digits, hyphens, underscores; 1–32 chars.
+_TAG_PATTERN = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+class AccountTagsUpdate(BaseModel):
+    """Request body for PUT /accounts/{id}/tags — full replacement."""
+
+    tags: list[str]
+
+    @field_validator("tags")
+    @classmethod
+    def _validate_tags(cls, v: list[str]) -> list[str]:
+        normalised: list[str] = []
+        for raw in v:
+            if not isinstance(raw, str):
+                raise ValueError("tags must be strings")
+            t = raw.strip().lower()
+            if not _TAG_PATTERN.match(t):
+                raise ValueError(
+                    f"invalid tag {raw!r}: must match ^[a-z0-9_-]{{1,32}}$"
+                )
+            normalised.append(t)
+        # Deduplicate while preserving insertion order.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for t in normalised:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+        return unique
+
+
+class AccountTagsResponse(BaseModel):
+    account_id: str
+    tags: list[str]
 
 
 class TopHoldingRow(BaseModel):
@@ -181,10 +222,61 @@ def networth(session: Session = Depends(get_db)) -> dict[str, Any]:  # noqa: B00
     return compute_net_worth(session)
 
 
+def _load_tags_by_account(session: Session) -> dict[str, list[str]]:
+    """Single-query fetch of all (account_id, tag) rows, grouped by account_id.
+
+    Returned dict has tags sorted lower-case for deterministic API output.
+    Avoids N+1 by reading the entire `account_tag` table once.
+    """
+    rows = session.query(AccountTag.account_id, AccountTag.tag).all()
+    grouped: dict[str, list[str]] = {}
+    for account_id, tag in rows:
+        grouped.setdefault(account_id, []).append(tag)
+    for account_id in grouped:
+        grouped[account_id].sort()
+    return grouped
+
+
 @router.get("/brokerage/accounts", response_model=list[AccountSummaryRow])
 def accounts(session: Session = Depends(get_db)) -> list[dict[str, Any]]:  # noqa: B008
-    """All accounts (including plan-wrappers, flagged), sorted by market_value desc."""
-    return get_account_summary(session)
+    """All accounts (including plan-wrappers, flagged), sorted by market_value desc.
+
+    Includes per-account `tags` (sorted, lower-case, possibly empty list).
+    """
+    rows = get_account_summary(session)
+    tags_by_account = _load_tags_by_account(session)
+    for row in rows:
+        row["tags"] = tags_by_account.get(row["account_id"], [])
+    return rows
+
+
+@router.put(
+    "/brokerage/accounts/{account_id}/tags",
+    response_model=AccountTagsResponse,
+)
+def update_account_tags(
+    payload: AccountTagsUpdate,
+    account_id: str = Path(min_length=1, max_length=64),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Replace the full set of tags on an account.
+
+    Wholesale-replacement semantics: all existing AccountTag rows for the
+    account are deleted, then the new (validated, lower-cased, de-duped)
+    set is inserted in a single transaction. Returns the new tag list.
+    """
+    account_exists = session.query(Account.id).filter(Account.id == account_id).first()
+    if account_exists is None:
+        raise HTTPException(status_code=404, detail=f"account {account_id} not found")
+
+    session.query(AccountTag).filter(AccountTag.account_id == account_id).delete(
+        synchronize_session=False
+    )
+    for tag in payload.tags:
+        session.add(AccountTag(account_id=account_id, tag=tag))
+    session.commit()
+
+    return {"account_id": account_id, "tags": list(payload.tags)}
 
 
 @router.get("/brokerage/top-holdings", response_model=list[TopHoldingRow])
@@ -224,6 +316,74 @@ def data_integrity(
 # ── Net-worth history ──────────────────────────────────────────────────
 
 
+def _parse_csv_param(raw: str | None) -> list[str]:
+    """Split a comma-separated query param into a list of trimmed non-empty values."""
+    if not raw:
+        return []
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _resolve_filtered_account_ids(
+    session: Session,
+    *,
+    tags_include: list[str],
+    tags_exclude: list[str],
+    account_ids: list[str],
+) -> set[str] | None:
+    """Compute the set of account_ids matching the tag/account filters.
+
+    Semantics:
+      - account_ids (if non-empty): start from this explicit set.
+      - tags_include: AND-of-tags — account must carry every listed tag.
+      - tags_exclude: account must carry NONE of these tags.
+      - All filters combine with AND.
+
+    Returns None when no filters were supplied (caller skips filtering).
+    Returns an empty set when filters are supplied but resolve to nothing —
+    caller should yield an empty series.
+    """
+    if not tags_include and not tags_exclude and not account_ids:
+        return None
+
+    # Normalise tags lower-case (matches insert-time normalisation).
+    inc = [t.strip().lower() for t in tags_include if t.strip()]
+    exc = [t.strip().lower() for t in tags_exclude if t.strip()]
+
+    # Start population: explicit account_ids if provided, else all accounts.
+    if account_ids:
+        candidate_ids: set[str] = set(account_ids)
+    else:
+        candidate_ids = {a_id for a_id, in session.query(Account.id).all()}
+
+    if inc:
+        # AND-of-tags: count distinct matching tags per account_id and require
+        # the count == len(inc). Done in Python from a single query rather than
+        # building a HAVING-with-IN, which is cleaner with SQLAlchemy and small N.
+        rows = (
+            session.query(AccountTag.account_id, AccountTag.tag)
+            .filter(AccountTag.tag.in_(inc))
+            .all()
+        )
+        per_account: dict[str, set[str]] = {}
+        for a_id, tag in rows:
+            per_account.setdefault(a_id, set()).add(tag)
+        required = set(inc)
+        with_all = {a_id for a_id, tags in per_account.items() if required.issubset(tags)}
+        candidate_ids &= with_all
+
+    if exc:
+        excluded_ids = {
+            a_id
+            for a_id, in session.query(AccountTag.account_id)
+            .filter(AccountTag.tag.in_(exc))
+            .distinct()
+            .all()
+        }
+        candidate_ids -= excluded_ids
+
+    return candidate_ids
+
+
 class NetWorthHistoryPoint(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -248,12 +408,32 @@ def networth_history(
             "a live Account. Defaults False so users see the verified series."
         ),
     ),
+    tags_include: str | None = Query(
+        None,
+        description=(
+            "Comma-separated list of tags. Account must carry ALL listed tags "
+            "(AND semantics)."
+        ),
+    ),
+    tags_exclude: str | None = Query(
+        None,
+        description="Comma-separated list of tags to exclude (any match excludes).",
+    ),
+    account_ids: str | None = Query(
+        None,
+        description="Comma-separated explicit account_id allow-list.",
+    ),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> list[dict[str, Any]]:
     """Aggregated balance series from `account_balance_snapshot`.
 
     For each `as_of` date, sum balances across accounts. Rows linked to an
     `expected_account` whose status is `'closed'` are excluded.
+
+    Optional filters: `tags_include` (AND), `tags_exclude` (NONE), `account_ids`
+    (explicit allow-list). When supplied, only snapshots whose `account_id`
+    is in the resolved set are aggregated. An empty resolved set yields an
+    empty series (not an error).
 
     Returned ascending by date.
     """
@@ -267,9 +447,20 @@ def networth_history(
         .all()
     }
 
+    allowed_ids = _resolve_filtered_account_ids(
+        session,
+        tags_include=_parse_csv_param(tags_include),
+        tags_exclude=_parse_csv_param(tags_exclude),
+        account_ids=_parse_csv_param(account_ids),
+    )
+    if allowed_ids is not None and not allowed_ids:
+        return []
+
     query = session.query(AccountBalanceSnapshot).order_by(AccountBalanceSnapshot.as_of.asc())
     if not include_unmatched:
         query = query.filter(AccountBalanceSnapshot.account_id.isnot(None))
+    if allowed_ids is not None:
+        query = query.filter(AccountBalanceSnapshot.account_id.in_(allowed_ids))
 
     by_date: dict[date, dict[str, Any]] = {}
     for snap in query.all():
@@ -494,6 +685,18 @@ def _nearest_price_lookup(
 )
 def networth_history_benchmark(
     benchmark: str = Query("SPY", min_length=1, max_length=8),
+    tags_include: str | None = Query(
+        None,
+        description="Comma-separated list of tags; account must carry ALL (AND).",
+    ),
+    tags_exclude: str | None = Query(
+        None,
+        description="Comma-separated list of tags to exclude (any match excludes).",
+    ),
+    account_ids: str | None = Query(
+        None,
+        description="Comma-separated explicit account_id allow-list.",
+    ),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """Portfolio history alongside a buy-and-hold benchmark simulation.
@@ -502,6 +705,9 @@ def networth_history_benchmark(
     allowlist return 400. Buy-and-hold sim ignores contributions/withdrawals
     so deltas vs portfolio_value should be read as "vs simulated benchmark"
     rather than perfect attribution.
+
+    Optional account-set filters mirror /networth-history. Empty resolved set
+    returns an empty series.
     """
     bench_symbol = benchmark.upper()
     if bench_symbol not in _ALLOWED_BENCHMARKS:
@@ -509,6 +715,20 @@ def networth_history_benchmark(
             status_code=400,
             detail=f"benchmark must be one of {sorted(_ALLOWED_BENCHMARKS)}",
         )
+
+    allowed_ids = _resolve_filtered_account_ids(
+        session,
+        tags_include=_parse_csv_param(tags_include),
+        tags_exclude=_parse_csv_param(tags_exclude),
+        account_ids=_parse_csv_param(account_ids),
+    )
+    if allowed_ids is not None and not allowed_ids:
+        return {
+            "benchmark_symbol": bench_symbol,
+            "series": [],
+            "portfolio_pct": None,
+            "benchmark_pct": None,
+        }
 
     # Reuse the matched-only portfolio series.
     closed_account_ids: set[str] = {
@@ -520,12 +740,16 @@ def networth_history_benchmark(
         )
         .all()
     }
-    snapshots = (
+    snap_query = (
         session.query(AccountBalanceSnapshot)
         .filter(AccountBalanceSnapshot.account_id.isnot(None))
         .order_by(AccountBalanceSnapshot.as_of.asc())
-        .all()
     )
+    if allowed_ids is not None:
+        snap_query = snap_query.filter(
+            AccountBalanceSnapshot.account_id.in_(allowed_ids)
+        )
+    snapshots = snap_query.all()
     by_date: dict[date, Decimal] = {}
     for snap in snapshots:
         if snap.account_id in closed_account_ids:

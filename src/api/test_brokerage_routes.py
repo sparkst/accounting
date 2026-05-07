@@ -990,3 +990,288 @@ class TestHoldingHistory:
         r = empty_client.get("/api/brokerage/holdings/AMZN/history")
         body = r.json()
         assert len(body["lots"]) == 1
+
+
+# ── /api/brokerage/accounts/{id}/tags (PUT) ────────────────────────────
+
+
+def _make_acct(session: Session, *, account_number: str = "X1") -> Any:
+    from src.models.brokerage import Account
+
+    a = Account(
+        broker="fidelity",
+        account_number=account_number,
+        account_type="taxable",
+        entity="personal",
+        tax_sheltered=False,
+    )
+    session.add(a)
+    session.flush()
+    return a
+
+
+class TestAccountTagsEdit:
+    def test_put_replaces_existing_tags_wholesale(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a = _make_acct(empty)
+        # Pre-existing tags that should be wiped on PUT.
+        empty.add_all([
+            AccountTag(account_id=a.id, tag="legacy"),
+            AccountTag(account_id=a.id, tag="old"),
+        ])
+        empty.commit()
+
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": ["retirement", "rsu"]},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["account_id"] == a.id
+        assert sorted(body["tags"]) == ["retirement", "rsu"]
+
+        # Verify DB state.
+        empty.expire_all()
+        rows = empty.query(AccountTag).filter(AccountTag.account_id == a.id).all()
+        assert sorted(t.tag for t in rows) == ["retirement", "rsu"]
+
+    def test_put_empty_list_clears_tags(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a = _make_acct(empty)
+        empty.add(AccountTag(account_id=a.id, tag="rsu"))
+        empty.commit()
+
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": []},
+        )
+        assert r.status_code == 200
+        assert r.json()["tags"] == []
+
+        empty.expire_all()
+        rows = empty.query(AccountTag).filter(AccountTag.account_id == a.id).all()
+        assert rows == []
+
+    def test_put_lowercases_input(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        # Validator lowercases (whitespace stripped) — uppercase rejected if it
+        # contains a disallowed character class but lower() of "RETIREMENT"
+        # passes the pattern. The validator accepts "RETIREMENT" by lowercasing.
+        a = _make_acct(empty)
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": ["  Retirement  "]},
+        )
+        assert r.status_code == 200
+        assert r.json()["tags"] == ["retirement"]
+
+    def test_put_rejects_bad_pattern(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a = _make_acct(empty)
+        # Special chars not allowed.
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": ["bad tag!"]},
+        )
+        assert r.status_code == 422
+
+        # Empty string fails the {1,32} length.
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": [""]},
+        )
+        assert r.status_code == 422
+
+    def test_put_missing_account_returns_404(
+        self, empty_client: TestClient
+    ) -> None:
+        r = empty_client.put(
+            "/api/brokerage/accounts/no-such-id/tags",
+            json={"tags": ["retirement"]},
+        )
+        assert r.status_code == 404
+
+    def test_round_trip_get_put_get(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a = _make_acct(empty)
+        empty.commit()
+
+        # Initially: no tags.
+        r = empty_client.get("/api/brokerage/accounts")
+        rows = r.json()
+        row = next(r for r in rows if r["account_id"] == a.id)
+        assert row["tags"] == []
+
+        # PUT new set.
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": ["taxable", "personal"]},
+        )
+        assert r.status_code == 200
+
+        # GET reflects the new set.
+        r = empty_client.get("/api/brokerage/accounts")
+        rows = r.json()
+        row = next(r for r in rows if r["account_id"] == a.id)
+        assert sorted(row["tags"]) == ["personal", "taxable"]
+
+
+class TestAccountsTagsInResponse:
+    def test_accounts_includes_tags_sorted(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a = _make_acct(empty)
+        empty.add_all([
+            AccountTag(account_id=a.id, tag="rsu"),
+            AccountTag(account_id=a.id, tag="brokerage"),
+            AccountTag(account_id=a.id, tag="taxable"),
+        ])
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/accounts")
+        assert r.status_code == 200
+        rows = r.json()
+        row = next(r for r in rows if r["account_id"] == a.id)
+        # Sorted lower-case.
+        assert row["tags"] == ["brokerage", "rsu", "taxable"]
+
+    def test_account_with_zero_tags_returns_empty_list(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a = _make_acct(empty)
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/accounts")
+        rows = r.json()
+        row = next(r for r in rows if r["account_id"] == a.id)
+        assert row["tags"] == []
+
+
+class TestHistoryTagFilter:
+    """Tag/account-id filters on /networth-history (and benchmark)."""
+
+    def _seed_two_accounts_with_snapshots(
+        self, session: Session
+    ) -> tuple[str, str]:
+        """Seed two accounts each with one snapshot. Returns (id_a, id_b)."""
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        a = Account(
+            broker="fidelity", account_number="A1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        b = Account(
+            broker="fidelity", account_number="B1", account_type="roth_ira",
+            entity="personal", tax_sheltered=True,
+        )
+        session.add_all([a, b])
+        session.flush()
+        session.add_all([
+            AccountBalanceSnapshot(
+                account_id=a.id, raw_account_name="A1",
+                as_of=date(2024, 1, 1), balance=Decimal("100"),
+                source="xlsx", source_row_hash="ha",
+            ),
+            AccountBalanceSnapshot(
+                account_id=b.id, raw_account_name="B1",
+                as_of=date(2024, 1, 1), balance=Decimal("250"),
+                source="xlsx", source_row_hash="hb",
+            ),
+        ])
+        return a.id, b.id
+
+    def test_tags_include_single_tag(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a_id, b_id = self._seed_two_accounts_with_snapshots(empty)
+        empty.add(AccountTag(account_id=a_id, tag="retirement"))
+        empty.commit()
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?tags_include=retirement"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        # Only a's snapshot ($100) survives the filter.
+        assert len(body) == 1
+        assert body[0]["balance_total"] == 100.0
+        assert body[0]["account_count"] == 1
+
+    def test_tags_include_and_semantics(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a_id, b_id = self._seed_two_accounts_with_snapshots(empty)
+        # a has BOTH retirement and rsu; b only has retirement.
+        empty.add_all([
+            AccountTag(account_id=a_id, tag="retirement"),
+            AccountTag(account_id=a_id, tag="rsu"),
+            AccountTag(account_id=b_id, tag="retirement"),
+        ])
+        empty.commit()
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?tags_include=retirement,rsu"
+        )
+        body = r.json()
+        # Only a survives — total = 100.
+        assert len(body) == 1
+        assert body[0]["balance_total"] == 100.0
+
+    def test_tags_exclude(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a_id, b_id = self._seed_two_accounts_with_snapshots(empty)
+        empty.add(AccountTag(account_id=a_id, tag="retirement"))
+        empty.commit()
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?tags_exclude=retirement"
+        )
+        body = r.json()
+        # b survives ($250).
+        assert len(body) == 1
+        assert body[0]["balance_total"] == 250.0
+
+    def test_account_ids_filter(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a_id, b_id = self._seed_two_accounts_with_snapshots(empty)
+        empty.commit()
+
+        r = empty_client.get(
+            f"/api/brokerage/networth-history?account_ids={a_id}"
+        )
+        body = r.json()
+        assert len(body) == 1
+        assert body[0]["balance_total"] == 100.0
+
+    def test_empty_filter_result_returns_empty_series(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        # Seed accounts but no tags; filter by a non-existent tag.
+        self._seed_two_accounts_with_snapshots(empty)
+        empty.commit()
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?tags_include=ghost"
+        )
+        assert r.status_code == 200
+        assert r.json() == []

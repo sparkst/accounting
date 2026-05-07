@@ -25,6 +25,7 @@ from src.models.brokerage import (  # noqa: F401
 )
 from src.models.history import (  # noqa: F401
     AccountBalanceSnapshot,
+    AccountTag,
     CostBasisLot,
     ExpectedAccount,
     HistoricalPrice,

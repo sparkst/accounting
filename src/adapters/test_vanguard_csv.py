@@ -175,6 +175,39 @@ def test_split_blocks_separates_positions_and_transactions() -> None:
     assert len(tx_rows) == 2
 
 
+def test_split_blocks_keeps_multi_account_positions_in_one_block() -> None:
+    """Regression: real Vanguard CSVs put a blank line BETWEEN accounts inside
+    the positions block. The splitter must not treat that as a section boundary
+    or accounts after the first will silently disappear (was the live-apply
+    bug — only 3 of 6 Vanguard accounts wrote snapshots until this was fixed)."""
+    multi_account = (
+        "Account Number,Investment Name,Symbol,Shares,Share Price,Total Value,\n"
+        "65344815,VANGUARD S&P 500 INDEX ETF,VOO,81.65,659.35,53835.93,\n"
+        "65344815,VANGUARD FEDERAL MONEY MARKET INVESTOR CL,VMFXX,14873.89,1,14873.89,\n"
+        "\n"
+        "70862729,VANGUARD MEGA CAP GROWTH ETF,MGK,103.8863,84.51,8779.43,\n"
+        "70862729,VANGUARD FEDERAL MONEY MARKET INVESTOR CL,VMFXX,3110.61,1,3110.61,\n"
+        "\n"
+        "32628019,VANGUARD MEGA CAP VALUE ETF,MGV,629.2141,152.47,95936.27,\n"
+        "\n"
+        "\n"
+        "Account Number,Trade Date,Settlement Date,Transaction Type,"
+        "Transaction Description,Investment Name,Symbol,Shares,Share Price,"
+        "Principal Amount,Commissions and Fees,Net Amount,Accrued Interest,"
+        "Account Type,\n"
+        "65344815,2025-05-23,2025-05-27,Buy,Buy,VOO,VOO,1,1,1,0,1,0,CASH,\n"
+    )
+    blocks = split_blocks(multi_account)
+    assert len(blocks) == 2, "positions + transactions = 2 sections"
+    pos_header, pos_rows = blocks[0]
+    assert pos_header.startswith("Account Number,Investment Name")
+    assert len(pos_rows) == 5, (
+        "5 position rows across 3 accounts must all land in the positions block"
+    )
+    distinct = {row[0] for row in pos_rows}
+    assert distinct == {"65344815", "70862729", "32628019"}
+
+
 def test_split_blocks_handles_single_block_529() -> None:
     blocks = split_blocks(INLINE_529)
     assert len(blocks) == 2

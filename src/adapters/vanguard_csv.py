@@ -126,15 +126,26 @@ def detect_csv_flavor(header_line: str) -> str:
     raise ValueError(f"unknown vanguard csv flavor: {cleaned[:80]!r}")
 
 
+_HEADER_PREFIXES = ("Account Number,", "Fund Account Number,")
+
+
+def _is_header_line(line: str) -> bool:
+    """A line is a section header if it starts with a Vanguard column-row prefix."""
+    return any(line.startswith(p) for p in _HEADER_PREFIXES)
+
+
 def split_blocks(text: str) -> list[tuple[str, list[list[str]]]]:
-    """Split a Vanguard CSV into ``[(header, rows), ...]`` per blank-line block.
+    """Split a Vanguard CSV into ``[(header, rows), ...]`` per section header.
 
-    Each block is a header line followed by zero-or-more data rows. Empty
-    blocks (consecutive blank lines) are skipped. Each row is parsed by the
-    stdlib ``csv`` module so commas inside quoted cells survive.
+    Vanguard's CSV layout: a section header (positions or transactions),
+    followed by data rows for one or more accounts. Single blank lines appear
+    BETWEEN accounts within the same section — those are not section breaks.
+    A new section is detected by encountering another header line.
 
-    Trailing empty cells (which Vanguard emits because every row ends with
-    ``,``) are NOT trimmed; the row→dict mapper drops them by header-key.
+    Each row is parsed by the stdlib ``csv`` module so commas inside quoted
+    cells survive. Trailing empty cells (which Vanguard emits because every
+    row ends with ``,``) are NOT trimmed; the row→dict mapper drops them by
+    header-key.
     """
     out: list[tuple[str, list[list[str]]]] = []
     current_header: str | None = None
@@ -150,13 +161,16 @@ def split_blocks(text: str) -> list[tuple[str, list[list[str]]]]:
     for raw_line in text.splitlines():
         line = raw_line.rstrip("\r")
         if not line.strip():
-            _flush()
+            # Blank line within a section → not a boundary. Drop it.
             continue
-        if current_header is None:
+        if _is_header_line(line):
+            _flush()
             current_header = line
             current_rows = []
             continue
-        # Use csv.reader on a single-line StringIO so quoted cells survive.
+        if current_header is None:
+            # Pre-header garbage; ignore.
+            continue
         row = next(_csv.reader(StringIO(line)))
         current_rows.append(row)
     _flush()

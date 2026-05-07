@@ -7,7 +7,7 @@ Reuses the canonical Option 1 fixture from src.reports.test_brokerage_summary.
 from __future__ import annotations
 
 from collections.abc import Generator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import patch
@@ -639,6 +639,55 @@ class TestMissingAccounts:
         body = r.json()
         assert len(body) == 1
         assert body[0]["last_seen_days_ago"] == 30
+
+    def test_position_snapshot_counts_as_fresh_evidence(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """An account with a fresh PositionSnapshot should NOT be flagged as
+        missing even if no AccountBalanceSnapshot exists for it (matches the
+        live setup where XLSX names aren't yet matched to live accounts but
+        live brokerage ingest is producing PositionSnapshot rows)."""
+        from src.models.brokerage import PositionSnapshot
+        from src.models.history import ExpectedAccount
+
+        acct = self._make_account(empty)
+        # PositionSnapshot 5 days old — fresh.
+        empty.add(
+            PositionSnapshot(
+                account_id=acct.id,
+                as_of=datetime(2025, 12, 27),  # PositionSnapshot.as_of is DateTime
+                symbol="AAPL",
+                quantity=Decimal("1"),
+                price=Decimal("100"),
+                source_file="seed.csv",
+                source_row_hash="ps-h",
+                raw_data={},
+            )
+        )
+        empty.add(
+            ExpectedAccount(
+                institution="Vanguard",
+                account_name="Travis Roth",
+                source="credit_karma",
+                status="active",
+                resolved_account_id=acct.id,
+            )
+        )
+        empty.commit()
+
+        # Pin _today() to give the PositionSnapshot a 5-day age (well within
+        # the 60-day default cutoff).
+        from src.api.routes import brokerage as routes_mod
+        import datetime as _dt
+
+        original_today = routes_mod._today
+        routes_mod._today = lambda: _dt.date(2026, 1, 1)
+        try:
+            r = empty_client.get("/api/brokerage/missing-accounts")
+            assert r.status_code == 200
+            assert r.json() == []  # NOT missing — PositionSnapshot is fresh
+        finally:
+            routes_mod._today = original_today
 
 
 # ── /api/brokerage/networth-history-benchmark (T12) ────────────────────

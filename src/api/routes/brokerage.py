@@ -528,9 +528,25 @@ def missing_accounts(
     today = _today()
     cutoff = today - timedelta(days=stale_days)
 
-    # Pre-aggregate latest as_of per account_id (only for accounts that have
-    # at least one snapshot).
-    latest_rows = (
+    # Latest as_of per account_id, taking the max across BOTH the
+    # account_balance_snapshot table (XLSX historical balances) AND the
+    # position_snapshot table (live brokerage feed). Without the position
+    # source, accounts that are reporting freshly via brokerage CSV but
+    # haven't been XLSX-matched would falsely appear as "never seen."
+    latest_by_account: dict[str, date] = {}
+
+    def _record(account_id: str | None, latest_as_of: object) -> None:
+        if account_id is None or latest_as_of is None:
+            return
+        if isinstance(latest_as_of, datetime):
+            latest_as_of = latest_as_of.date()
+        if not isinstance(latest_as_of, date):
+            return
+        prev = latest_by_account.get(account_id)
+        if prev is None or latest_as_of > prev:
+            latest_by_account[account_id] = latest_as_of
+
+    bal_rows = (
         session.query(
             AccountBalanceSnapshot.account_id,
             func.max(AccountBalanceSnapshot.as_of).label("latest_as_of"),
@@ -539,15 +555,19 @@ def missing_accounts(
         .group_by(AccountBalanceSnapshot.account_id)
         .all()
     )
-    latest_by_account: dict[str, date] = {}
-    for account_id, latest_as_of in latest_rows:
-        if account_id is None or latest_as_of is None:
-            continue
-        # SQLite may hand back a datetime where SQLAlchemy expects date —
-        # normalise both to date for the comparison.
-        if isinstance(latest_as_of, datetime):
-            latest_as_of = latest_as_of.date()
-        latest_by_account[account_id] = latest_as_of
+    for account_id, latest_as_of in bal_rows:
+        _record(account_id, latest_as_of)
+
+    pos_rows = (
+        session.query(
+            PositionSnapshot.account_id,
+            func.max(PositionSnapshot.as_of).label("latest_as_of"),
+        )
+        .group_by(PositionSnapshot.account_id)
+        .all()
+    )
+    for account_id, latest_as_of in pos_rows:
+        _record(account_id, latest_as_of)
 
     out: list[dict[str, Any]] = []
     expected_rows = (

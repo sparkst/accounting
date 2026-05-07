@@ -291,7 +291,7 @@ def import_statements(
     write_ingestion_log(
         session,
         source=ADAPTER_NAME,
-        records_processed=result.imported + result.dup_skipped,
+        records_processed=result.imported + result.dup_skipped + result.unmatched,
         records_failed=len(result.errors),
         status=status,
         error_detail="\n".join(result.errors) or None,

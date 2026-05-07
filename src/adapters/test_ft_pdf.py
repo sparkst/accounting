@@ -235,7 +235,7 @@ def test_import_statements_unmapped_account_errors(
     result = import_statements(tmp_path, dry_run=False, session=session)
     assert result.imported == 0
     assert result.errors, "expected an unmapped-account error"
-    assert any("8291" in e or "franklin_templeton" in e for e in result.errors)
+    assert any("8291" in e or FT_BROKER in e for e in result.errors)
     assert session.query(AccountBalanceSnapshot).count() == 0
 
 

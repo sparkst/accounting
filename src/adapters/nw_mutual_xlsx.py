@@ -276,6 +276,7 @@ def import_balances(
                 f"policy {policy_number}: no Account row "
                 f"(broker={NW_MUTUAL_BROKER}, account_number={policy_number})"
             )
+            result.unmatched += 1
             continue
 
         try:
@@ -315,7 +316,7 @@ def import_balances(
     write_ingestion_log(
         session,
         source=ADAPTER_NAME,
-        records_processed=result.imported + result.dup_skipped,
+        records_processed=result.imported + result.dup_skipped + result.unmatched,
         records_failed=len(result.errors),
         status=status,
         error_detail="\n".join(result.errors) or None,

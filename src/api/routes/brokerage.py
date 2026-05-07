@@ -1,10 +1,9 @@
 """Read-only brokerage API endpoints.
 
-Exposes the pure-function output from `src.reports.brokerage_summary` as
-JSON over HTTP. All endpoints are GET; no mutation. Mounted at `/api/brokerage`
-behind the existing API-key auth dependency in `src/api/main.py`.
-
-REQ-005a..g visibility — Option 2.
+Exposes the pure-function output from `src.reports.brokerage_summary` plus
+historical-balance, benchmark, and per-holding views over the `history.py`
+tables. All endpoints are GET; no mutation. Mounted at `/api/brokerage`
+behind the API-key auth dependency in `src/api/main.py`.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, field_serializer
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -50,13 +49,12 @@ def get_db() -> Generator[Session, None, None]:
         session.close()
 
 
+def _today() -> date:
+    """Wrapper around ``date.today`` that tests monkeypatch for determinism."""
+    return date.today()
+
+
 # ── Pydantic response models ────────────────────────────────────────────
-
-
-def _decimal_to_float(d: Decimal | None) -> float | None:
-    """Project convention: Decimal serialised as float in API responses
-    (mirrors `transactions.py:107`)."""
-    return float(d) if d is not None else None
 
 
 class NetWorthResponse(BaseModel):
@@ -223,7 +221,7 @@ def data_integrity(
     return compute_data_integrity(session, stale_days=stale_days)
 
 
-# ── Phase 3: net-worth history ──────────────────────────────────────────
+# ── Net-worth history ──────────────────────────────────────────────────
 
 
 class NetWorthHistoryPoint(BaseModel):
@@ -286,11 +284,11 @@ def networth_history(
     return [by_date[k] for k in sorted(by_date.keys())]
 
 
-# ── Phase 3 T18: missing-accounts panel ────────────────────────────────────
+# ── Missing-accounts panel ─────────────────────────────────────────────
 
 
-# Snapshots older than this are considered "stale" — the resolved Account
-# has not had a balance update recently enough to count as covered.
+# 60 days = monthly statement cadence + ~30-day grace before we surface an
+# account as needing attention. Tunable per-call via the `stale_days` query.
 _STALE_SNAPSHOT_DAYS = 60
 
 
@@ -336,7 +334,7 @@ def missing_accounts(
       - the resolved account's most-recent ``account_balance_snapshot.as_of``
         is older than ``stale_days``.
     """
-    today = date.today()
+    today = _today()
     cutoff = today - timedelta(days=stale_days)
 
     # Pre-aggregate latest as_of per account_id (only for accounts that have
@@ -417,7 +415,10 @@ def missing_accounts(
     return out
 
 
-# ── Phase 3 T12: benchmark-comparison series ───────────────────────────
+# ── Benchmark-comparison series ────────────────────────────────────────
+
+
+_ALLOWED_BENCHMARKS: frozenset[str] = frozenset({"SPY", "VTI", "QQQ", "BND"})
 
 
 class BenchmarkPoint(BaseModel):
@@ -454,20 +455,37 @@ class BenchmarkComparisonResponse(BaseModel):
     benchmark_pct: float | None
 
 
-def _nearest_price(
-    session: Session, symbol: str, target: date
-) -> Decimal | None:
-    """Return the close on or just before ``target`` (forward-fill behavior)."""
-    row = (
-        session.query(HistoricalPrice.close)
-        .filter(
-            HistoricalPrice.symbol == symbol,
-            HistoricalPrice.trade_date <= target,
-        )
-        .order_by(HistoricalPrice.trade_date.desc())
-        .first()
+def _build_price_lookup(
+    session: Session, symbol: str
+) -> list[tuple[date, Decimal]]:
+    """Single-query fetch of (trade_date, close) for ``symbol`` ascending.
+
+    Caller uses the returned list with ``_nearest_price_lookup`` for O(N) total
+    work across many target dates instead of N database round-trips.
+    """
+    rows = (
+        session.query(HistoricalPrice.trade_date, HistoricalPrice.close)
+        .filter(HistoricalPrice.symbol == symbol)
+        .order_by(HistoricalPrice.trade_date.asc())
+        .all()
     )
-    return row[0] if row is not None else None
+    return [(r[0], r[1]) for r in rows]
+
+
+def _nearest_price_lookup(
+    prices: list[tuple[date, Decimal]], target: date
+) -> Decimal | None:
+    """Forward-fill: return the close on or just before ``target``."""
+    if not prices:
+        return None
+    # Linear scan from the end is cheap enough for the small N we deal with;
+    # bisect would be faster but adds complexity not worth it at this scale.
+    last: Decimal | None = None
+    for d, close in prices:
+        if d > target:
+            break
+        last = close
+    return last
 
 
 @router.get(
@@ -475,15 +493,22 @@ def _nearest_price(
     response_model=BenchmarkComparisonResponse,
 )
 def networth_history_benchmark(
-    benchmark: str = Query("SPY", min_length=1, max_length=16),
+    benchmark: str = Query("SPY", min_length=1, max_length=8),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """Portfolio history alongside a buy-and-hold benchmark simulation.
 
-    Returns ``series`` aligned to portfolio dates with ``benchmark_value`` set
-    when a price is available for that date (or earlier — forward-filled).
+    ``benchmark`` is restricted to a small allowlist; values outside the
+    allowlist return 400. Buy-and-hold sim ignores contributions/withdrawals
+    so deltas vs portfolio_value should be read as "vs simulated benchmark"
+    rather than perfect attribution.
     """
     bench_symbol = benchmark.upper()
+    if bench_symbol not in _ALLOWED_BENCHMARKS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"benchmark must be one of {sorted(_ALLOWED_BENCHMARKS)}",
+        )
 
     # Reuse the matched-only portfolio series.
     closed_account_ids: set[str] = {
@@ -518,16 +543,23 @@ def networth_history_benchmark(
     sorted_dates = sorted(by_date.keys())
     initial_portfolio = by_date[sorted_dates[0]]
 
-    # Anchor benchmark at first portfolio date.
-    bench_anchor_price = _nearest_price(session, bench_symbol, sorted_dates[0])
+    # Single-query fetch of the benchmark's full price history; subsequent
+    # per-date lookups walk the in-memory list. Avoids N+1.
+    bench_prices = _build_price_lookup(session, bench_symbol)
+    bench_anchor_price = _nearest_price_lookup(bench_prices, sorted_dates[0])
+    shares: Decimal | None = (
+        initial_portfolio / bench_anchor_price
+        if bench_anchor_price is not None and bench_anchor_price > 0
+        else None
+    )
+
     series: list[dict[str, Any]] = []
     benchmark_final: Decimal | None = None
     for d in sorted_dates:
         port_v = by_date[d]
-        bench_price = _nearest_price(session, bench_symbol, d)
-        if bench_anchor_price is not None and bench_anchor_price > 0 and bench_price is not None:
-            shares = initial_portfolio / bench_anchor_price
-            bench_v = (shares * bench_price).quantize(Decimal("0.01"))
+        bench_price = _nearest_price_lookup(bench_prices, d)
+        if shares is not None and bench_price is not None:
+            bench_v: Decimal | None = (shares * bench_price).quantize(Decimal("0.01"))
         else:
             bench_v = None
         if bench_v is not None:
@@ -560,7 +592,7 @@ def networth_history_benchmark(
     }
 
 
-# ── Phase 3 T14: per-holding history ───────────────────────────────────
+# ── Per-holding history ────────────────────────────────────────────────
 
 
 class HoldingValuePoint(BaseModel):
@@ -613,7 +645,7 @@ class HoldingHistoryResponse(BaseModel):
     response_model=HoldingHistoryResponse,
 )
 def holding_history(
-    symbol: str,
+    symbol: str = Path(min_length=1, max_length=16, pattern=r"^[A-Za-z0-9.\-]+$"),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """Per-symbol time series of position value + lot-level cost basis.

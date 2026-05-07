@@ -164,11 +164,12 @@ def test_with_api_key_set_correct_header_gets_200(client: TestClient) -> None:
         assert resp.status_code == 200, resp.text
 
 
-def test_with_api_key_set_correct_query_param_gets_200(client: TestClient) -> None:
-    """REQ-ID: S1-009-07 — Correct key via api_key query param → 200."""
+def test_with_api_key_set_query_param_is_rejected(client: TestClient) -> None:
+    """The ``?api_key=`` query-parameter form was removed because uvicorn's
+    access log writes full URLs to disk, persisting the secret in plaintext."""
     with patch.dict("os.environ", {"API_KEY": "secret-test-key"}):
         resp = client.get("/api/transactions?api_key=secret-test-key")
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 401
 
 
 def test_health_always_accessible_with_api_key_set(client: TestClient) -> None:

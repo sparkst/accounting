@@ -117,7 +117,7 @@ class TestHelpers:
 
     def test_strip_last_4_short(self) -> None:
         # A 3-char input stays 3 chars (we only truncate when >=4).
-        assert seeder._strip_last_4("...316") == "X316" or seeder._strip_last_4("...316") == "316"
+        assert seeder._strip_last_4("...316") == "316"
 
     def test_strip_last_4_empty(self) -> None:
         assert seeder._strip_last_4("") is None

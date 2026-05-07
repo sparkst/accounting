@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.adapters.yfinance_prices import fetch_eod
 
@@ -259,3 +260,71 @@ def test_empty_dataframe_returns_empty_list() -> None:
     ):
         rows = fetch_eod(["AAPL"], date(2025, 1, 2), date(2025, 1, 3))
     assert rows == []
+
+
+def test_tz_aware_timestamp_index_normalises_to_utc_date() -> None:
+    """yfinance occasionally returns tz-aware Timestamps (notably for crypto).
+
+    Calling .date() directly would silently shift dates by ±1 day depending
+    on the offset. We normalise to UTC before extracting the date.
+    """
+    # 2025-01-02 23:00 in US/Eastern (UTC-5) is 2025-01-03 04:00 UTC.
+    tz_aware_idx = pd.DatetimeIndex(
+        [pd.Timestamp("2025-01-02 23:00:00", tz="US/Eastern")]
+    )
+    df = pd.DataFrame(
+        {
+            "Open": [150.0],
+            "High": [151.0],
+            "Low": [149.0],
+            "Close": [150.5],
+            "Adj Close": [150.5],
+            "Volume": [1000],
+        },
+        index=tz_aware_idx,
+    )
+    with patch("src.adapters.yfinance_prices.yf.download", return_value=df):
+        rows = fetch_eod(["BTC-USD"], date(2025, 1, 2), date(2025, 1, 3))
+
+    assert len(rows) == 1
+    # Without UTC normalisation, .date() on the tz-aware Timestamp returns
+    # 2025-01-02 (the local-tz date). After normalisation it returns 2025-01-03.
+    assert rows[0]["trade_date"] == date(2025, 1, 3)
+
+
+def test_multi_symbol_missing_symbol_in_response_is_skipped() -> None:
+    """yfinance can return a partial response when one symbol is invalid;
+    requested-but-absent symbols should not produce rows or raise."""
+    idx = pd.DatetimeIndex([pd.Timestamp("2025-01-02")])
+    columns = pd.MultiIndex.from_tuples(
+        [
+            ("AAPL", "Open"),
+            ("AAPL", "High"),
+            ("AAPL", "Low"),
+            ("AAPL", "Close"),
+            ("AAPL", "Adj Close"),
+            ("AAPL", "Volume"),
+        ]
+    )
+    df = pd.DataFrame(
+        [[150.0, 151.0, 149.0, 150.5, 150.5, 1000]], index=idx, columns=columns
+    )
+    with patch("src.adapters.yfinance_prices.yf.download", return_value=df):
+        rows = fetch_eod(["AAPL", "BADSYM"], date(2025, 1, 2), date(2025, 1, 3))
+
+    symbols = {r["symbol"] for r in rows}
+    assert symbols == {"AAPL"}  # BADSYM silently absent, no exception
+
+
+def test_to_decimal_logs_and_returns_none_on_invalid_string(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Non-numeric scalar values should warn-log and return None rather than raise."""
+    from src.adapters.yfinance_prices import _to_decimal
+
+    with caplog.at_level("WARNING", logger="src.adapters.yfinance_prices"):
+        result = _to_decimal("not-a-number")
+    assert result is None
+    assert any(
+        "could not coerce" in record.getMessage() for record in caplog.records
+    )

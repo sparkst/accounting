@@ -69,7 +69,12 @@ def _existing_dates_for_symbol(session: Session, symbol: str) -> set[date]:
 def _persist_rows(
     session: Session, rows: Iterable[HistoricalPriceRow]
 ) -> tuple[int, int]:
-    """Insert HistoricalPrice rows, skipping PK conflicts. Returns (inserted, skipped)."""
+    """Insert HistoricalPrice rows, skipping PK conflicts. Returns (inserted, skipped).
+
+    Per-row savepoint isolates IntegrityError so a conflicting row in a
+    concurrent run can't roll back previously-inserted rows in the same batch.
+    Caller commits.
+    """
     inserted = 0
     skipped = 0
     for row in rows:
@@ -78,22 +83,21 @@ def _persist_rows(
             skipped += 1
             continue
         try:
-            session.add(
-                HistoricalPrice(
-                    symbol=row["symbol"],
-                    trade_date=row["trade_date"],
-                    close=row["close"],
-                    open=row["open"],
-                    high=row["high"],
-                    low=row["low"],
-                    volume=row["volume"],
-                    source="yfinance",
+            with session.begin_nested():
+                session.add(
+                    HistoricalPrice(
+                        symbol=row["symbol"],
+                        trade_date=row["trade_date"],
+                        close=row["close"],
+                        open=row["open"],
+                        high=row["high"],
+                        low=row["low"],
+                        volume=row["volume"],
+                        source="yfinance",
+                    )
                 )
-            )
-            session.flush()
             inserted += 1
         except IntegrityError:
-            session.rollback()
             skipped += 1
     return inserted, skipped
 
@@ -103,9 +107,15 @@ def backfill(
     symbols: list[str],
     start: date,
     end: date,
-    apply: bool,
+    *,
+    dry_run: bool = True,
 ) -> dict[str, dict[str, int]]:
-    """Fetch and persist historical prices. Returns per-symbol summary."""
+    """Fetch and persist historical prices. Returns per-symbol summary.
+
+    Defaults to dry-run for safety — programmatic callers from tests or other
+    scripts must explicitly pass ``dry_run=False`` to write.
+    """
+    apply = not dry_run
     summary: dict[str, dict[str, int]] = {}
     for symbol in sorted(symbols):
         existing_dates = _existing_dates_for_symbol(session, symbol)
@@ -205,7 +215,9 @@ def main() -> int:
 
         print(f"{'APPLY' if args.apply else 'DRY-RUN'}: backfilling {len(symbols)} symbols "
               f"from {start} to {end}")
-        summary = backfill(session, symbols, start=start, end=end, apply=args.apply)
+        summary = backfill(
+            session, symbols, start=start, end=end, dry_run=not args.apply
+        )
 
         if args.apply:
             _log_to_ingestion_log(session, summary, args.apply)

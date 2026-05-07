@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { page } from '$app/state';
 	import {
 		fetchBrokerageHoldingHistory,
@@ -45,7 +44,8 @@
 		}
 	}
 
-	onMount(load);
+	// $effect picks up route-param changes on mount AND on subsequent navigation;
+	// no separate onMount needed.
 	$effect(() => {
 		if (symbol) load();
 	});

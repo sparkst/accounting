@@ -15,19 +15,15 @@ with ``source = 'xlsx_2024'``. The importer is idempotent: re-runs over the
 same workbook produce zero new rows because the row-hash and the natural-key
 UNIQUE constraints both reject duplicates.
 
-Account-name → Account mapping is intentionally NOT done here. Phase T5 will
-review unmatched ``raw_account_name`` values and assign ``account_id``s; for
-now we leave ``account_id = NULL`` on every row.
-
-REQ-ID: ADAPTER-XLSX-001  Account Summary sheet → AccountBalanceSnapshot.
-REQ-ID: ADAPTER-XLSX-002  Skip aggregate rows (Savings/Retirement/Total/etc.).
-REQ-ID: ADAPTER-XLSX-003  Idempotent re-import (UNIQUE/hash dedup).
-REQ-ID: ADAPTER-XLSX-004  Per-row error isolation; logs to IngestionLog.
+Account-name → Account mapping is intentionally NOT done here. A separate
+review step assigns ``account_id`` to ``raw_account_name`` values; for now
+every row lands with ``account_id = NULL``.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import logging
 import sys
@@ -62,10 +58,11 @@ ADAPTER_NAME = "xlsx_savings_plan"
 SHEET_NAME = "Account Summary"
 
 PRICES_SHEET_NAME = "Historical Prices"
-"""Sheet for T11 historical-price seed import."""
+"""Sheet that seeds ``historical_price`` rows."""
 
-PRICES_SOURCE_TAG = "xlsx_2024"
-"""Source written to ``historical_price.source`` for XLSX-seeded rows."""
+PRICES_SOURCE_TAG = "xlsx_2024_prices"
+"""Distinct from ``SOURCE_TAG`` so the source column lets us filter "XLSX
+balances" vs "XLSX prices" independently for downstream cleanup."""
 
 TD_LOTS_SHEET_NAME = "TD GainLoss Raw"
 SB_LOTS_SHEET_NAME = "SB Raw"
@@ -129,10 +126,19 @@ class ImportResult:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+# Quantize Decimals before hashing: same economic value with different
+# trailing-zero representations (Decimal('10.50') vs '10.5') would otherwise
+# hash differently and break re-import idempotence.
+_QTY_QUANT = Decimal("0.00000001")
+_MONEY_QUANT = Decimal("0.01")
+
 
 def _row_hash(raw_account_name: str, as_of: date, balance: Decimal) -> str:
     """SHA256 hex of the canonical row identity tuple."""
-    payload = f"{raw_account_name}|{as_of.isoformat()}|{balance}|{SOURCE_TAG}"
+    payload = (
+        f"{raw_account_name}|{as_of.isoformat()}"
+        f"|{balance.quantize(_MONEY_QUANT)}|{SOURCE_TAG}"
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -276,45 +282,44 @@ def import_account_balances(
         return result
 
     # ── Apply ────────────────────────────────────────────────────────────────
+    # Per-row savepoint isolates IntegrityError without losing earlier rows;
+    # outer commit batches the whole sheet into one fsync at the end.
     for raw_account_name, as_of, balance in rows:
         record_label = f"{raw_account_name}@{as_of.isoformat()}"
+        row_hash = _row_hash(raw_account_name, as_of, balance)
+
+        existing = (
+            session.query(AccountBalanceSnapshot.id)
+            .filter(AccountBalanceSnapshot.source_row_hash == row_hash)
+            .first()
+        )
+        if existing is not None:
+            result.dup_skipped += 1
+            continue
+
         try:
-            row_hash = _row_hash(raw_account_name, as_of, balance)
-
-            # Fast-path dedup: if a row with this exact hash already exists,
-            # skip without an INSERT attempt (avoids noisy IntegrityError logs).
-            existing = (
-                session.query(AccountBalanceSnapshot.id)
-                .filter(AccountBalanceSnapshot.source_row_hash == row_hash)
-                .first()
-            )
-            if existing is not None:
-                result.dup_skipped += 1
-                continue
-
-            snap = AccountBalanceSnapshot(
-                account_id=None,  # T5 will reconcile names → accounts
-                raw_account_name=raw_account_name,
-                as_of=as_of,
-                balance=balance,
-                source=SOURCE_TAG,
-                source_row_hash=row_hash,
-            )
-            session.add(snap)
-            session.commit()
+            with session.begin_nested():
+                session.add(
+                    AccountBalanceSnapshot(
+                        account_id=None,
+                        raw_account_name=raw_account_name,
+                        as_of=as_of,
+                        balance=balance,
+                        source=SOURCE_TAG,
+                        source_row_hash=row_hash,
+                    )
+                )
             result.imported += 1
             result.unmatched += 1  # account_id is always NULL in this pass
         except IntegrityError:
-            # UNIQUE violation on (raw_account_name, as_of, source) — a row
-            # exists with the same natural key but a different balance/hash.
-            # Treat as a duplicate (idempotent re-import semantics).
-            session.rollback()
+            # UNIQUE on natural key — same logical row already exists.
             result.dup_skipped += 1
         except Exception as exc:  # noqa: BLE001 — per-record isolation
-            session.rollback()
             result.errors.append(f"{record_label}: {exc}")
             logger.warning("xlsx_savings_plan: row %s failed: %s",
                            record_label, exc, exc_info=True)
+
+    session.commit()
 
     # ── Audit log ────────────────────────────────────────────────────────────
     status = (
@@ -348,16 +353,19 @@ def _log_run(
         session.commit()
     except Exception:  # noqa: BLE001
         logger.exception("failed to write IngestionLog for %s", ADAPTER_NAME)
-        with _suppress_errors():
+        with contextlib.suppress(Exception):
             session.rollback()
 
 
-# ── T11 Historical Prices ────────────────────────────────────────────────────
+# ── Historical Prices ────────────────────────────────────────────────────────
 
 
 def _price_row_hash(symbol: str, trade_date: date, close: Decimal) -> str:
     """SHA256 hex of the canonical price-row identity tuple."""
-    payload = f"{symbol}|{trade_date.isoformat()}|{close}|{PRICES_SOURCE_TAG}"
+    payload = (
+        f"{symbol}|{trade_date.isoformat()}"
+        f"|{close.quantize(_QTY_QUANT)}|{PRICES_SOURCE_TAG}"
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -452,36 +460,36 @@ def import_historical_prices(
 
     for symbol, trade_date, close in rows:
         record_label = f"{symbol}@{trade_date.isoformat()}"
+        existing = (
+            session.query(HistoricalPrice.symbol)
+            .filter(
+                HistoricalPrice.symbol == symbol,
+                HistoricalPrice.trade_date == trade_date,
+            )
+            .first()
+        )
+        if existing is not None:
+            result.dup_skipped += 1
+            continue
         try:
-            existing = (
-                session.query(HistoricalPrice.symbol)
-                .filter(
-                    HistoricalPrice.symbol == symbol,
-                    HistoricalPrice.trade_date == trade_date,
+            with session.begin_nested():
+                session.add(
+                    HistoricalPrice(
+                        symbol=symbol,
+                        trade_date=trade_date,
+                        close=close,
+                        source=PRICES_SOURCE_TAG,
+                    )
                 )
-                .first()
-            )
-            if existing is not None:
-                result.dup_skipped += 1
-                continue
-
-            price = HistoricalPrice(
-                symbol=symbol,
-                trade_date=trade_date,
-                close=close,
-                source=PRICES_SOURCE_TAG,
-            )
-            session.add(price)
-            session.commit()
             result.imported += 1
         except IntegrityError:
-            session.rollback()
             result.dup_skipped += 1
         except Exception as exc:  # noqa: BLE001 — per-record isolation
-            session.rollback()
             result.errors.append(f"{record_label}: {exc}")
             logger.warning("xlsx_savings_plan.prices: row %s failed: %s",
                            record_label, exc, exc_info=True)
+
+    session.commit()
 
     status = (
         IngestionStatus.SUCCESS
@@ -494,7 +502,7 @@ def import_historical_prices(
     return result
 
 
-# ── T16 Cost Basis Lots ──────────────────────────────────────────────────────
+# ── Cost Basis Lots ──────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -508,6 +516,7 @@ class _LotRow:
     cost_per_share: Decimal
     cost_total: Decimal
     wash_sale_adj: Decimal | None
+    row_idx: int
 
 
 def _lot_row_hash(
@@ -516,9 +525,20 @@ def _lot_row_hash(
     quantity: Decimal,
     cost_total: Decimal,
     source: str,
+    row_idx: int,
 ) -> str:
-    """SHA256 hex of the canonical lot-row identity tuple."""
-    payload = f"{symbol}|{open_date.isoformat()}|{quantity}|{cost_total}|{source}"
+    """SHA256 hex of the canonical lot-row identity tuple.
+
+    ``row_idx`` is included so two lot rows with identical
+    (symbol, open_date, quantity, cost_total) — common for RSU same-day
+    tranches or repeated ETF buys at the same price — don't collide.
+    """
+    payload = (
+        f"{symbol}|{open_date.isoformat()}"
+        f"|{quantity.quantize(_QTY_QUANT)}"
+        f"|{cost_total.quantize(_MONEY_QUANT)}"
+        f"|{row_idx}|{source}"
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -564,6 +584,7 @@ def _parse_lot_row(
         cost_per_share=cps,
         cost_total=cost_total,
         wash_sale_adj=wash_adj,
+        row_idx=row_idx,
     )
 
 
@@ -606,45 +627,45 @@ def _import_lots_from_sheet(
 
     for r in rows:
         record_label = f"{raw_account_name}:{r.symbol}@{r.open_date.isoformat()}"
+        row_hash = _lot_row_hash(
+            r.symbol, r.open_date, r.quantity, r.cost_total, source_tag, r.row_idx
+        )
+
+        existing = (
+            session.query(CostBasisLot.id)
+            .filter(CostBasisLot.source_row_hash == row_hash)
+            .first()
+        )
+        if existing is not None:
+            result.dup_skipped += 1
+            continue
+
         try:
-            row_hash = _lot_row_hash(
-                r.symbol, r.open_date, r.quantity, r.cost_total, source_tag
-            )
-
-            existing = (
-                session.query(CostBasisLot.id)
-                .filter(CostBasisLot.source_row_hash == row_hash)
-                .first()
-            )
-            if existing is not None:
-                result.dup_skipped += 1
-                continue
-
-            lot = CostBasisLot(
-                account_id=None,  # T-future: name → account resolution
-                raw_account_name=raw_account_name,
-                symbol=r.symbol,
-                security_name=r.security_name,
-                open_date=r.open_date,
-                quantity=r.quantity,
-                cost_per_share=r.cost_per_share,
-                cost_total=r.cost_total,
-                wash_sale_adj=r.wash_sale_adj,
-                source=source_tag,
-                source_row_hash=row_hash,
-            )
-            session.add(lot)
-            session.commit()
+            with session.begin_nested():
+                session.add(
+                    CostBasisLot(
+                        account_id=None,
+                        raw_account_name=raw_account_name,
+                        symbol=r.symbol,
+                        security_name=r.security_name,
+                        open_date=r.open_date,
+                        quantity=r.quantity,
+                        cost_per_share=r.cost_per_share,
+                        cost_total=r.cost_total,
+                        wash_sale_adj=r.wash_sale_adj,
+                        source=source_tag,
+                        source_row_hash=row_hash,
+                    )
+                )
             result.imported += 1
             result.unmatched += 1
         except IntegrityError:
-            session.rollback()
             result.dup_skipped += 1
         except Exception as exc:  # noqa: BLE001 — per-record isolation
-            session.rollback()
             result.errors.append(f"{record_label}: {exc}")
             logger.warning("xlsx_savings_plan.lots: row %s failed: %s",
                            record_label, exc, exc_info=True)
+    # Outer commit happens in the caller after both TD and SB sheets process.
 
 
 def import_cost_basis_lots(
@@ -714,6 +735,9 @@ def import_cost_basis_lots(
         # _import_lots_from_sheet would have already recorded the error.
         return result
 
+    # Commit the batch of savepoint-isolated rows from both sheets.
+    session.commit()
+
     status = (
         IngestionStatus.SUCCESS
         if not result.errors
@@ -723,20 +747,6 @@ def import_cost_basis_lots(
              error_detail="\n".join(result.errors) or None)
 
     return result
-
-
-class _suppress_errors:
-    """Tiny context-manager equivalent to ``contextlib.suppress(Exception)``.
-
-    Inlined to avoid pulling in another import where the rest of the file uses
-    none.
-    """
-
-    def __enter__(self) -> _suppress_errors:
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
-        return True
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────

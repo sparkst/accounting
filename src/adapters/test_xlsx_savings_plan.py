@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import openpyxl
 import pytest
@@ -168,8 +169,13 @@ def test_decimal_precision_preserved(session: Session, fixture_xlsx: Path) -> No
     balances = [r.balance for r in vanguard_rows]
     # All Decimals, not floats.
     assert all(isinstance(b, Decimal) for b in balances)
-    # The DB column is Numeric(14,2). Values quantize to 2 dp; sum stays exact.
-    assert sum(balances) == Decimal("240.85")
+    # Assert each value individually so two errors can't cancel into a
+    # passing aggregate. Sort because the fixture's dates are newest-first.
+    assert sorted(balances) == [
+        Decimal("40.25"),
+        Decimal("80.10"),
+        Decimal("120.50"),
+    ]
 
 
 def test_unmatched_account_id_is_null(session: Session, fixture_xlsx: Path) -> None:
@@ -206,7 +212,55 @@ def test_ingestion_log_written_on_apply(session: Session, fixture_xlsx: Path) ->
     assert logs[0].records_failed == 0
 
 
-# ── T11 — Historical Prices ──────────────────────────────────────────────────
+def test_per_record_error_isolation_one_bad_row_does_not_halt_batch(
+    session: Session, tmp_path: Path
+) -> None:
+    """CLAUDE.md project rule: per-record error isolation.
+
+    Force an INSERT-time failure on one row (by patching
+    AccountBalanceSnapshot to raise on flush for a specific raw_account_name)
+    and verify the remaining rows still land.
+    """
+    fx = tmp_path / "iso.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Account Summary"
+    ws.cell(row=1, column=1, value="Account")
+    ws.cell(row=1, column=2, value=datetime(2024, 1, 1))
+    ws.cell(row=2, column=1, value="GoodAccount1")
+    ws.cell(row=2, column=2, value=100.00)
+    ws.cell(row=3, column=1, value="BadAccount")
+    ws.cell(row=3, column=2, value=200.00)
+    ws.cell(row=4, column=1, value="GoodAccount2")
+    ws.cell(row=4, column=2, value=300.00)
+    wb.save(fx)
+
+    from src.adapters import xlsx_savings_plan as adapter
+
+    real_init = adapter.AccountBalanceSnapshot.__init__
+
+    def boom(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("raw_account_name") == "BadAccount":
+            raise RuntimeError("simulated row failure")
+        real_init(self, *args, **kwargs)
+
+    with patch.object(adapter.AccountBalanceSnapshot, "__init__", boom):
+        result = adapter.import_account_balances(
+            str(fx), dry_run=False, session=session
+        )
+
+    assert result.imported == 2  # GoodAccount1 + GoodAccount2 landed
+    assert len(result.errors) == 1
+    assert "BadAccount" in result.errors[0]
+    saved_names = {
+        r.raw_account_name
+        for r in session.query(adapter.AccountBalanceSnapshot).all()
+    }
+    assert saved_names == {"GoodAccount1", "GoodAccount2"}
+
+
+# ── Historical Prices ───────────────────────────────────────────────────────
 
 
 def _build_prices_workbook(path: Path) -> None:

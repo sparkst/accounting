@@ -7,6 +7,7 @@ Reuses the canonical Option 1 fixture from src.reports.test_brokerage_summary.
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import patch
@@ -445,7 +446,16 @@ class TestNetWorthHistory:
 
 
 class TestMissingAccounts:
-    """Phase 3 T18: active expected_accounts with no/stale coverage."""
+    """active expected_accounts with no/stale coverage."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin the route's clock to a fixed date so day-delta math is deterministic."""
+        from src.api.routes import brokerage as routes_mod
+
+        monkeypatch.setattr(
+            routes_mod, "_today", lambda: date(2026, 1, 1), raising=False
+        )
 
     def _make_account(self, session: Session) -> Any:
         from src.models.brokerage import Account
@@ -506,7 +516,7 @@ class TestMissingAccounts:
             AccountBalanceSnapshot(
                 account_id=acct.id,
                 raw_account_name="A",
-                as_of=date.today() - timedelta(days=90),
+                as_of=date(2026, 1, 1) - timedelta(days=90),
                 balance=Decimal("100"),
                 source="xlsx_2024",
                 source_row_hash="stale-h",
@@ -542,7 +552,7 @@ class TestMissingAccounts:
             AccountBalanceSnapshot(
                 account_id=acct.id,
                 raw_account_name="A",
-                as_of=date.today() - timedelta(days=10),
+                as_of=date(2026, 1, 1) - timedelta(days=10),
                 balance=Decimal("100"),
                 source="xlsx_2024",
                 source_row_hash="fresh-h",
@@ -603,7 +613,7 @@ class TestMissingAccounts:
             AccountBalanceSnapshot(
                 account_id=acct.id,
                 raw_account_name="A",
-                as_of=date.today() - timedelta(days=30),
+                as_of=date(2026, 1, 1) - timedelta(days=30),
                 balance=Decimal("100"),
                 source="xlsx_2024",
                 source_row_hash="med-h",
@@ -635,7 +645,13 @@ class TestMissingAccounts:
 
 
 class TestBenchmarkComparison:
-    """Phase 3 T12: portfolio history vs buy-and-hold benchmark simulation."""
+    """portfolio history vs buy-and-hold benchmark simulation."""
+
+    def test_disallowed_benchmark_returns_400(self, empty_client: TestClient) -> None:
+        r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=GME")
+        assert r.status_code == 400
+        assert "GME" not in r.json()["detail"]  # detail lists allowed, not the rejection
+        assert "SPY" in r.json()["detail"]
 
     def test_empty_returns_empty_series(self, empty_client: TestClient) -> None:
         r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
@@ -743,7 +759,39 @@ class TestBenchmarkComparison:
 
 
 class TestHoldingHistory:
-    """Phase 3 T14: per-symbol value series + lot-level cost basis."""
+    """per-symbol value series + lot-level cost basis."""
+
+    def test_invalid_symbol_charset_returns_422(self, empty_client: TestClient) -> None:
+        # Path constraint pattern rejects symbols with disallowed chars.
+        r = empty_client.get("/api/brokerage/holdings/A;DROP/history")
+        assert r.status_code == 422
+
+    def test_overlong_symbol_returns_422(self, empty_client: TestClient) -> None:
+        r = empty_client.get(f"/api/brokerage/holdings/{'A' * 17}/history")
+        assert r.status_code == 422
+
+    def test_dotted_symbol_accepted(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        # BRK.B is a real ticker with a period — must pass the pattern.
+        from src.models.history import CostBasisLot
+        from datetime import date as _d
+
+        empty.add(
+            CostBasisLot(
+                raw_account_name="X",
+                symbol="BRK.B",
+                open_date=_d(2020, 1, 1),
+                quantity=Decimal("1"),
+                cost_per_share=Decimal("250"),
+                cost_total=Decimal("250"),
+                source="xlsx_td_gainloss",
+                source_row_hash="brkb-h",
+            )
+        )
+        empty.commit()
+        r = empty_client.get("/api/brokerage/holdings/BRK.B/history")
+        assert r.status_code == 200
 
     def test_unknown_symbol_returns_zeros(self, empty_client: TestClient) -> None:
         r = empty_client.get("/api/brokerage/holdings/NOPE/history")

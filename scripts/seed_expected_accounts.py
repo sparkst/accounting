@@ -1,6 +1,6 @@
 """Seed `expected_account` rows from XLSX + Credit Karma list.
 
-Phase 3 T17. Two sources:
+Two sources:
 
 1. **XLSX `Account Summary` sheet** (`/Users/travis/Downloads/Savings & Retirement
    Plan.xlsx`): every distinct non-aggregate account label becomes one

@@ -1,15 +1,14 @@
-"""Phase 3 history models — historical balances, prices, expected accounts, lot basis.
+"""History models — balance snapshots, EOD prices, expected accounts, lot basis.
 
-These tables exist alongside the live brokerage models to support:
-- Net-worth-over-time (account_balance_snapshot)
-- Per-holding price history (historical_price)
-- Account-coverage / "missing accounts" panel (expected_account)
-- Lot-level cost basis ingested from Excel (cost_basis_lot — read-only/historical)
+These tables sit alongside the live brokerage models and support:
+- Net-worth-over-time (``account_balance_snapshot``)
+- Per-holding price history (``historical_price``)
+- Account-coverage / "missing accounts" panel (``expected_account``)
+- Lot-level cost basis ingested from Excel (``cost_basis_lot`` — read-only)
 
-Decimal precision matches src/models/brokerage.py:
-- quantity, price: Numeric(18, 8)
-- balance, cost_total, wash_sale_adj: Numeric(14, 2) (slightly wider than brokerage's 12,2 because XLSX totals
-  reach 8 figures)
+Decimal precision matches ``src/models/brokerage.py``: quantity/price use
+``Numeric(18, 8)``; balance/cost_total/wash_sale_adj use ``Numeric(14, 2)``
+(wider than brokerage's 12,2 because XLSX totals reach 8 figures).
 """
 
 import uuid

@@ -1,20 +1,19 @@
 """yfinance EOD price adapter.
 
 Pure adapter that fetches end-of-day OHLCV data from Yahoo Finance via the
-``yfinance`` library and returns a list of normalized rows ready to be persisted
-into the ``historical_price`` table by a separate caller (T9 backfill script).
+``yfinance`` library and returns a list of normalized rows. The caller handles
+persistence — this module never writes to the database.
 
-Phase 3 — Brokerage T8.
-
-Design notes
-------------
-- No DB writes here. The caller handles persistence.
-- All price values are converted via ``Decimal(str(value))`` to avoid float
-  precision loss.
-- ``Adj Close`` is intentionally dropped. We persist the raw close so downstream
-  total-return calculations can apply their own adjustment policy.
-- Rows whose Close is NaN (e.g. delisted dates, partial sessions) are skipped.
-- Open/High/Low values that are NaN pass through as ``None`` rather than zero.
+Conventions
+-----------
+- Float→Decimal conversions go through ``Decimal(str(value))`` to avoid the
+  precision loss that ``Decimal(float_value)`` introduces.
+- ``Adj Close`` is dropped; we persist the raw close so downstream total-return
+  math can apply its own adjustment policy.
+- Rows whose Close is NaN (delisted dates, partial sessions) are skipped.
+- Open/High/Low NaN pass through as ``None`` rather than zero.
+- Yahoo occasionally returns tz-aware Timestamps; we normalise to UTC before
+  extracting the date so daily series don't drift by one day.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, TypedDict, cast
 
 import pandas as pd
@@ -53,19 +52,27 @@ class HistoricalPriceRow(TypedDict):
 
 
 def _to_decimal(value: Any) -> Decimal | None:
-    """Convert a pandas/numpy scalar to Decimal, returning None for NaN/None."""
+    """Convert a pandas/numpy scalar to Decimal, returning None for NaN/None.
+
+    A non-numeric string that yfinance unexpectedly returns is logged and
+    coerced to None rather than crashing the batch — silent field-level
+    failures here would still record the row's Close (the gate at line 96)
+    but lose ancillary fields, which is the right tradeoff vs aborting.
+    """
     if value is None:
         return None
     try:
         if isinstance(value, float) and math.isnan(value):
             return None
-        # pandas may return numpy scalars; pd.isna catches NaT, NaN, None
         if pd.isna(value):
             return None
     except (TypeError, ValueError):
         pass
-    # NEVER Decimal(value) on a float — go through str.
-    return Decimal(str(value))
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        logger.warning("yfinance: could not coerce %r to Decimal (%s)", value, exc)
+        return None
 
 
 def _to_int(value: Any) -> int | None:
@@ -79,7 +86,8 @@ def _to_int(value: Any) -> int | None:
         pass
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError) as exc:
+        logger.warning("yfinance: could not coerce %r to int (%s)", value, exc)
         return None
 
 
@@ -108,14 +116,19 @@ def _row_for_symbol(
 
 
 def _index_to_date(idx: Any) -> date:
-    """Coerce a DataFrame index value (Timestamp, datetime, or date) into a date."""
+    """Coerce a DataFrame index value (Timestamp/datetime/date) into a UTC date.
+
+    yfinance occasionally returns tz-aware Timestamps (notably for crypto
+    symbols); calling ``.date()`` directly would strip the tz info and
+    silently shift dates by ±1 day depending on the offset. Normalise to UTC
+    first.
+    """
     if isinstance(idx, date) and not hasattr(idx, "hour"):
         return idx
-    # pandas Timestamp / datetime both expose .date()
-    if hasattr(idx, "date"):
-        return cast(date, idx.date())
-    # Fallback: parse via pandas
-    return cast(date, pd.Timestamp(idx).date())
+    ts = pd.Timestamp(idx)
+    if ts.tz is not None:
+        ts = ts.tz_convert("UTC")
+    return cast(date, ts.date())
 
 
 # ---------------------------------------------------------------------------

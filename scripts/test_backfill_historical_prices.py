@@ -116,7 +116,7 @@ def test_backfill_uses_yfinance_adapter_and_persists(session: Session) -> None:
          "open": None, "high": None, "low": None, "volume": None},
     ]
     with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
-        summary = backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30), apply=True)
+        summary = backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30), dry_run=False)
 
     assert summary["SPY"]["fetched"] == 2
     assert summary["SPY"]["inserted"] == 2
@@ -129,7 +129,7 @@ def test_backfill_dry_run_writes_nothing(session: Session) -> None:
          "open": None, "high": None, "low": None, "volume": None},
     ]
     with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
-        summary = backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30), apply=False)
+        summary = backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30), dry_run=True)
     assert summary["SPY"]["fetched"] == 1
     assert summary["SPY"]["inserted"] == 0  # dry-run doesn't write
     assert session.query(HistoricalPrice).count() == 0

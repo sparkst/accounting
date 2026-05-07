@@ -20,6 +20,12 @@ from src.models.audit_event import AuditEvent  # noqa: F401
 # Import all models so their tables are registered on Base.metadata before
 # init_db() calls create_all().
 from src.models.base import Base
+from src.models.brokerage import (  # noqa: F401
+    Account,
+    BrokerageTransaction,
+    PositionSnapshot,
+    RealizedGainLoss,
+)
 from src.models.history import (  # noqa: F401
     AccountBalanceSnapshot,
     CostBasisLot,

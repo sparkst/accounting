@@ -157,6 +157,10 @@ class Source(enum.StrEnum):
     STRIPE = "stripe"
     SHOPIFY = "shopify"
     BROKERAGE_CSV = "brokerage_csv"
+    FIDELITY_CSV = "fidelity_csv"
+    SCHWAB_CSV = "schwab_csv"
+    ETRADE_CSV = "etrade_csv"
+    VANGUARD_CSV = "vanguard_csv"
     BANK_CSV = "bank_csv"
     PHOTO_RECEIPT = "photo_receipt"
     DEDUCTION_EMAIL = "deduction_email"
@@ -248,3 +252,86 @@ class TaxDocumentStatus(enum.StrEnum):
 
     ACTIVE = "active"
     INACTIVE = "inactive"  # soft delete
+
+
+# ── Brokerage (REQ-005a..g) ───────────────────────────────────────────────
+
+
+class Broker(enum.StrEnum):
+    """Brokerage source for the per-broker CSV adapters.
+
+    Phase 4 added the four non-broker institutions (FT mutual fund, NW Mutual
+    whole-life policies, F&G annuity, GSK cash-balance pension) so they share
+    the Account / AccountBalanceSnapshot / missing-accounts machinery.
+    """
+
+    ETRADE = "etrade"
+    SCHWAB = "schwab"
+    VANGUARD = "vanguard"
+    FIDELITY = "fidelity"
+    FRANKLIN_TEMPLETON = "franklin_templeton"
+    NW_MUTUAL = "nw_mutual"
+    FG_ANNUITY = "fg_annuity"
+    GSK_PENSION = "gsk_pension"
+
+
+class AccountType(enum.StrEnum):
+    """Brokerage account type. Drives `tax_sheltered` and downstream P&L flow.
+
+    Member names are UPPER_CASE and cannot start with a digit, so 401k/403b/529
+    are spelled K401/K403B/K529 in Python; the DB-stored values keep the
+    natural form.
+    """
+
+    TAXABLE = "taxable"
+    JOINT = "joint"
+    ROTH_IRA = "roth_ira"
+    TRAD_IRA = "trad_ira"
+    K401 = "401k"
+    K403B = "403b"
+    HSA = "hsa"
+    K529 = "529"
+    TOD = "tod"
+    BROKERAGELINK = "brokeragelink"
+    RSU = "rsu"
+    OTHER = "other"
+
+
+class CanonicalAction(enum.StrEnum):
+    """Normalized broker action across Fidelity/Schwab/E*TRADE/Vanguard."""
+
+    BUY = "buy"
+    SELL = "sell"
+    DIVIDEND_QUALIFIED = "dividend_qualified"
+    DIVIDEND_ORDINARY = "dividend_ordinary"
+    INTEREST = "interest"
+    REINVEST = "reinvest"
+    CAPITAL_GAIN_LT = "capital_gain_lt"
+    CAPITAL_GAIN_ST = "capital_gain_st"
+    RSU_VEST = "rsu_vest"
+    STOCK_SPLIT = "stock_split"
+    CASH_IN_LIEU = "cash_in_lieu"
+    SWEEP = "sweep"
+    EXCHANGE = "exchange"
+    TRANSFER = "transfer"
+    CONTRIBUTION = "contribution"
+    DISTRIBUTION = "distribution"
+    FEE = "fee"
+    JOURNAL = "journal"
+    VALUATION_ADJUSTMENT = "valuation_adjustment"
+    OTHER = "other"
+
+
+class GainLossTerm(enum.StrEnum):
+    """Holding-period classification for realized lots."""
+
+    SHORT = "short"
+    LONG = "long"
+
+
+class BrokerageTxStatus(enum.StrEnum):
+    """Lifecycle status of a brokerage transaction (mirrors Transaction.status)."""
+
+    IMPORTED = "imported"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"

@@ -155,10 +155,12 @@ def fetch_eod(
 
     Notes:
         - Calls ``yf.download`` with ``auto_adjust=False`` so we get raw Close.
-        - When ``len(symbols) > 1`` the returned DataFrame has a MultiIndex on
-          its columns of the form ``(symbol, field)``; we iterate per symbol.
-        - When ``len(symbols) == 1`` the columns are flat
-          ('Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume').
+        - yfinance 1.x always returns a MultiIndex on columns even for a
+          single symbol (in newer versions the level order is
+          ``(field, symbol)``; in older multi-symbol calls with
+          ``group_by='ticker'`` it's ``(symbol, field)``). We normalise to
+          ``(symbol, field)`` before iterating so both paths share the same
+          inner loop.
         - The caller is responsible for DB persistence and dedup.
     """
     if not symbols:
@@ -178,45 +180,28 @@ def fetch_eod(
         logger.info("yfinance returned empty frame for symbols=%s", symbols)
         return []
 
-    rows: list[HistoricalPriceRow] = []
-
-    if multi:
-        # Multi-symbol: columns are MultiIndex of (symbol, field).
-        for symbol in symbols:
-            if symbol not in df.columns.get_level_values(0):
-                logger.info("yfinance: %s — no data in response, skipping", symbol)
-                continue
-            sub = df[symbol]
-            kept = 0
-            skipped = 0
-            for idx, sub_row in sub.iterrows():
-                trade_date = _index_to_date(idx)
-                row = _row_for_symbol(
-                    symbol=symbol,
-                    trade_date=trade_date,
-                    close_raw=sub_row.get("Close"),
-                    open_raw=sub_row.get("Open"),
-                    high_raw=sub_row.get("High"),
-                    low_raw=sub_row.get("Low"),
-                    volume_raw=sub_row.get("Volume"),
-                )
-                if row is None:
-                    skipped += 1
-                    continue
-                rows.append(row)
-                kept += 1
-            logger.info(
-                "yfinance: %s — kept %d rows, skipped %d (NaN Close)",
-                symbol,
-                kept,
-                skipped,
-            )
+    # Normalise to (symbol, field) MultiIndex regardless of yfinance version.
+    if isinstance(df.columns, pd.MultiIndex):
+        # If level 0 holds field names ("Open", "Close", ...), swap so level
+        # 0 is the symbol — that's the layout the loop below expects.
+        level0 = set(df.columns.get_level_values(0))
+        if level0 & {"Open", "Close", "High", "Low", "Adj Close", "Volume"}:
+            df = df.swaplevel(axis=1).sort_index(axis=1)
     else:
-        # Single-symbol: flat columns.
-        symbol = symbols[0]
+        # Flat columns (older yfinance single-symbol path) — wrap in a
+        # MultiIndex keyed by the lone symbol.
+        df.columns = pd.MultiIndex.from_product([[symbols[0]], df.columns])
+
+    rows: list[HistoricalPriceRow] = []
+    # Iterate per symbol over the normalised (symbol, field) MultiIndex.
+    for symbol in symbols:
+        if symbol not in df.columns.get_level_values(0):
+            logger.info("yfinance: %s — no data in response, skipping", symbol)
+            continue
+        sub = df[symbol]
         kept = 0
         skipped = 0
-        for idx, sub_row in df.iterrows():
+        for idx, sub_row in sub.iterrows():
             trade_date = _index_to_date(idx)
             row = _row_for_symbol(
                 symbol=symbol,

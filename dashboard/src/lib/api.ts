@@ -945,8 +945,10 @@ export interface BrokerageNetWorthHistoryPoint {
 }
 
 export async function fetchBrokerageNetWorthHistory(
-	includeUnmatched = false
+	includeUnmatched = true
 ): Promise<BrokerageNetWorthHistoryPoint[]> {
+	// Default to include_unmatched=true so the history chart shows the full
+	// XLSX series before the manual account-matching review step.
 	const qs = includeUnmatched ? '?include_unmatched=true' : '';
 	return request<BrokerageNetWorthHistoryPoint[]>(`/brokerage/networth-history${qs}`);
 }

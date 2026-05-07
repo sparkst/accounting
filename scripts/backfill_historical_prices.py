@@ -112,22 +112,37 @@ def backfill(
 ) -> dict[str, dict[str, int]]:
     """Fetch and persist historical prices. Returns per-symbol summary.
 
-    Defaults to dry-run for safety — programmatic callers from tests or other
-    scripts must explicitly pass ``dry_run=False`` to write.
+    Defaults to dry-run for safety — programmatic callers must explicitly
+    pass ``dry_run=False`` to write. On apply runs, writes one IngestionLog
+    audit row regardless of caller (CLI or library), and isolates yfinance
+    failures per-symbol so one bad ticker can't kill the whole batch.
     """
     apply = not dry_run
     summary: dict[str, dict[str, int]] = {}
+    failed_symbols: list[str] = []
     for symbol in sorted(symbols):
         existing_dates = _existing_dates_for_symbol(session, symbol)
-        all_rows = fetch_eod([symbol], start=start, end=end)
-        new_rows = [r for r in all_rows if r["trade_date"] not in existing_dates]
-        per_symbol = {
-            "fetched": len(all_rows),
+        per_symbol: dict[str, int] = {
+            "fetched": 0,
             "already_present": len(existing_dates),
-            "new": len(new_rows),
+            "new": 0,
             "inserted": 0,
             "skipped": 0,
+            "errored": 0,
         }
+        try:
+            all_rows = fetch_eod([symbol], start=start, end=end)
+        except Exception as exc:  # noqa: BLE001 — per-symbol isolation
+            logger.warning("backfill: fetch failed for %s: %s", symbol, exc)
+            per_symbol["errored"] = 1
+            failed_symbols.append(symbol)
+            summary[symbol] = per_symbol
+            continue
+
+        new_rows = [r for r in all_rows if r["trade_date"] not in existing_dates]
+        per_symbol["fetched"] = len(all_rows)
+        per_symbol["new"] = len(new_rows)
+
         if apply and new_rows:
             inserted, skipped = _persist_rows(session, new_rows)
             per_symbol["inserted"] = inserted
@@ -141,32 +156,46 @@ def backfill(
             per_symbol["new"],
             per_symbol["inserted"],
         )
+
     if apply:
         session.commit()
+        _log_to_ingestion_log(session, summary, failed_symbols=failed_symbols)
     return summary
 
 
 def _log_to_ingestion_log(
-    session: Session, summary: dict[str, dict[str, int]], apply: bool
+    session: Session,
+    summary: dict[str, dict[str, int]],
+    *,
+    failed_symbols: list[str],
 ) -> None:
-    total_inserted = sum(s["inserted"] for s in summary.values())
-    total_new = sum(s["new"] for s in summary.values())
-    detail = json.dumps(
+    """Audit row for the run. Stores per-symbol counts as JSON in error_detail
+    (the IngestionLog model has no dedicated payload column)."""
+    from src.models.enums import IngestionStatus
+
+    total_inserted = sum(s.get("inserted", 0) for s in summary.values())
+    total_new = sum(s.get("new", 0) for s in summary.values())
+    payload = json.dumps(
         {
-            "apply": apply,
             "symbols": sorted(summary.keys()),
+            "failed_symbols": failed_symbols,
             "total_new_rows": total_new,
             "total_inserted": total_inserted,
             "per_symbol": summary,
         }
     )
+    status = (
+        IngestionStatus.PARTIAL_FAILURE.value
+        if failed_symbols
+        else IngestionStatus.SUCCESS.value
+    )
     log = IngestionLog(
         source="yfinance_backfill",
         run_at=datetime.now(UTC).replace(tzinfo=None),
-        status="success",
+        status=status,
         records_processed=total_inserted,
-        records_failed=0,
-        error_detail=detail,
+        records_failed=len(failed_symbols),
+        error_detail=payload,
     )
     session.add(log)
     session.commit()
@@ -215,12 +244,10 @@ def main() -> int:
 
         print(f"{'APPLY' if args.apply else 'DRY-RUN'}: backfilling {len(symbols)} symbols "
               f"from {start} to {end}")
+        # backfill() handles its own IngestionLog write on apply runs.
         summary = backfill(
             session, symbols, start=start, end=end, dry_run=not args.apply
         )
-
-        if args.apply:
-            _log_to_ingestion_log(session, summary, args.apply)
 
         total_inserted = sum(s["inserted"] for s in summary.values())
         total_new = sum(s["new"] for s in summary.values())

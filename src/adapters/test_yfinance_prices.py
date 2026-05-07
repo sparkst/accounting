@@ -262,16 +262,28 @@ def test_empty_dataframe_returns_empty_list() -> None:
     assert rows == []
 
 
-def test_tz_aware_timestamp_index_normalises_to_utc_date() -> None:
-    """yfinance occasionally returns tz-aware Timestamps (notably for crypto).
+@pytest.mark.parametrize(
+    ("ts_str", "tz", "expected"),
+    [
+        # 2025-01-02 23:00 ET (-5) → 2025-01-03 UTC
+        ("2025-01-02 23:00:00", "US/Eastern", date(2025, 1, 3)),
+        # 2025-01-03 02:00 Pacific/Kiritimati (+14) → 2025-01-02 UTC
+        ("2025-01-03 02:00:00", "Pacific/Kiritimati", date(2025, 1, 2)),
+        # UTC midnight stays as that day
+        ("2025-01-02 00:00:00", "UTC", date(2025, 1, 2)),
+        # Naive Timestamp passes through (.date() of midnight)
+        ("2025-01-02 12:00:00", None, date(2025, 1, 2)),
+    ],
+)
+def test_tz_aware_timestamp_index_normalises_to_utc_date(
+    ts_str: str, tz: str | None, expected: date
+) -> None:
+    """yfinance occasionally returns tz-aware Timestamps (notably crypto).
 
-    Calling .date() directly would silently shift dates by ±1 day depending
-    on the offset. We normalise to UTC before extracting the date.
+    Without UTC normalisation, .date() on a tz-aware Timestamp yields the
+    local-tz date and shifts results by ±1 day depending on offset.
     """
-    # 2025-01-02 23:00 in US/Eastern (UTC-5) is 2025-01-03 04:00 UTC.
-    tz_aware_idx = pd.DatetimeIndex(
-        [pd.Timestamp("2025-01-02 23:00:00", tz="US/Eastern")]
-    )
+    ts = pd.Timestamp(ts_str, tz=tz) if tz else pd.Timestamp(ts_str)
     df = pd.DataFrame(
         {
             "Open": [150.0],
@@ -281,15 +293,13 @@ def test_tz_aware_timestamp_index_normalises_to_utc_date() -> None:
             "Adj Close": [150.5],
             "Volume": [1000],
         },
-        index=tz_aware_idx,
+        index=pd.DatetimeIndex([ts]),
     )
     with patch("src.adapters.yfinance_prices.yf.download", return_value=df):
-        rows = fetch_eod(["BTC-USD"], date(2025, 1, 2), date(2025, 1, 3))
+        rows = fetch_eod(["BTC-USD"], date(2025, 1, 1), date(2025, 1, 5))
 
     assert len(rows) == 1
-    # Without UTC normalisation, .date() on the tz-aware Timestamp returns
-    # 2025-01-02 (the local-tz date). After normalisation it returns 2025-01-03.
-    assert rows[0]["trade_date"] == date(2025, 1, 3)
+    assert rows[0]["trade_date"] == expected
 
 
 def test_multi_symbol_missing_symbol_in_response_is_skipped() -> None:

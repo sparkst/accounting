@@ -358,15 +358,11 @@ def _log_run(
 
 
 # ── Historical Prices ────────────────────────────────────────────────────────
-
-
-def _price_row_hash(symbol: str, trade_date: date, close: Decimal) -> str:
-    """SHA256 hex of the canonical price-row identity tuple."""
-    payload = (
-        f"{symbol}|{trade_date.isoformat()}"
-        f"|{close.quantize(_QTY_QUANT)}|{PRICES_SOURCE_TAG}"
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+#
+# `historical_price` has a composite PK on (symbol, trade_date) and no
+# `source_row_hash` column, so dedup happens at the PK level via a pre-flight
+# `session.query(...)` lookup followed by IntegrityError fallback. No row-hash
+# helper here — the schema already provides natural-key uniqueness.
 
 
 def _read_price_date_columns(ws: Worksheet) -> list[tuple[int, date]]:
@@ -523,19 +519,22 @@ def _lot_row_hash(
     symbol: str,
     open_date: date,
     quantity: Decimal,
+    cost_per_share: Decimal,
     cost_total: Decimal,
     source: str,
     row_idx: int,
 ) -> str:
     """SHA256 hex of the canonical lot-row identity tuple.
 
-    ``row_idx`` is included so two lot rows with identical
-    (symbol, open_date, quantity, cost_total) — common for RSU same-day
-    tranches or repeated ETF buys at the same price — don't collide.
+    Includes every column the adapter treats as part of the lot's identity:
+    symbol, open_date, quantity, cost_per_share, cost_total, plus row_idx
+    to disambiguate same-day tranches with identical economics (RSU vesting,
+    repeated ETF buys at the same price).
     """
     payload = (
         f"{symbol}|{open_date.isoformat()}"
         f"|{quantity.quantize(_QTY_QUANT)}"
+        f"|{cost_per_share.quantize(_QTY_QUANT)}"
         f"|{cost_total.quantize(_MONEY_QUANT)}"
         f"|{row_idx}|{source}"
     )
@@ -628,7 +627,13 @@ def _import_lots_from_sheet(
     for r in rows:
         record_label = f"{raw_account_name}:{r.symbol}@{r.open_date.isoformat()}"
         row_hash = _lot_row_hash(
-            r.symbol, r.open_date, r.quantity, r.cost_total, source_tag, r.row_idx
+            r.symbol,
+            r.open_date,
+            r.quantity,
+            r.cost_per_share,
+            r.cost_total,
+            source_tag,
+            r.row_idx,
         )
 
         existing = (
@@ -732,7 +737,9 @@ def import_cost_basis_lots(
         return result
 
     if session is None:
-        # _import_lots_from_sheet would have already recorded the error.
+        # _import_lots_from_sheet already appended a "session required" error
+        # for each sheet it processed. Return without committing — there's
+        # nothing to commit and no session to commit on.
         return result
 
     # Commit the batch of savepoint-isolated rows from both sheets.

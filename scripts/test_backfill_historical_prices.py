@@ -138,3 +138,87 @@ def test_backfill_dry_run_writes_nothing(session: Session) -> None:
 def test_benchmark_symbols_set() -> None:
     assert "SPY" in BENCHMARK_SYMBOLS
     assert "VTI" in BENCHMARK_SYMBOLS
+
+
+def test_backfill_isolates_one_failing_symbol(session: Session) -> None:
+    """A yfinance error on one symbol must not abort the batch; other symbols
+    still process and the failure is recorded in the per-symbol summary."""
+    from src.models.ingestion_log import IngestionLog
+
+    def fake_fetch(symbols: list[str], start, end):  # type: ignore[no-untyped-def]
+        if symbols == ["BAD"]:
+            raise RuntimeError("simulated network error")
+        return [
+            {
+                "symbol": symbols[0], "trade_date": date(2024, 6, 1),
+                "close": Decimal("100"),
+                "open": None, "high": None, "low": None, "volume": None,
+            }
+        ]
+
+    with patch("scripts.backfill_historical_prices.fetch_eod", side_effect=fake_fetch):
+        summary = backfill(
+            session,
+            ["GOOD", "BAD"],
+            start=date(2024, 6, 1),
+            end=date(2024, 6, 30),
+            dry_run=False,
+        )
+
+    assert summary["GOOD"]["inserted"] == 1
+    assert summary["BAD"]["errored"] == 1
+    assert summary["BAD"]["fetched"] == 0
+
+    log = session.query(IngestionLog).filter_by(source="yfinance_backfill").one()
+    assert log.records_failed == 1
+    assert log.status == "partial_failure"
+
+
+def test_backfill_apply_writes_ingestion_log_even_when_called_programmatically(
+    session: Session,
+) -> None:
+    """The audit row must land regardless of whether main() wraps the call."""
+    from src.models.ingestion_log import IngestionLog
+
+    fake_rows = [
+        {
+            "symbol": "SPY", "trade_date": date(2024, 6, 1),
+            "close": Decimal("520"),
+            "open": None, "high": None, "low": None, "volume": None,
+        }
+    ]
+    with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
+        backfill(
+            session,
+            ["SPY"],
+            start=date(2024, 6, 1),
+            end=date(2024, 6, 30),
+            dry_run=False,
+        )
+
+    logs = session.query(IngestionLog).filter_by(source="yfinance_backfill").all()
+    assert len(logs) == 1
+    assert logs[0].status == "success"
+    assert logs[0].records_processed == 1
+
+
+def test_backfill_dry_run_does_not_write_ingestion_log(session: Session) -> None:
+    """Dry-run must remain audit-silent so we don't pollute the log table."""
+    from src.models.ingestion_log import IngestionLog
+
+    fake_rows = [
+        {
+            "symbol": "SPY", "trade_date": date(2024, 6, 1),
+            "close": Decimal("520"),
+            "open": None, "high": None, "low": None, "volume": None,
+        }
+    ]
+    with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
+        backfill(
+            session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30),
+            dry_run=True,
+        )
+
+    assert (
+        session.query(IngestionLog).filter_by(source="yfinance_backfill").count() == 0
+    )

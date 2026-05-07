@@ -212,6 +212,78 @@ def test_ingestion_log_written_on_apply(session: Session, fixture_xlsx: Path) ->
     assert logs[0].records_failed == 0
 
 
+def test_hash_quantization_treats_decimal_with_trailing_zero_as_same(
+) -> None:
+    """The hash fix in _row_hash, _lot_row_hash quantizes Decimals before
+    stringifying so identical economic values don't hash differently because
+    of trailing-zero representation."""
+    from src.adapters.xlsx_savings_plan import _lot_row_hash, _row_hash
+
+    h1 = _row_hash("A", date(2024, 1, 1), Decimal("10.50"))
+    h2 = _row_hash("A", date(2024, 1, 1), Decimal("10.5"))
+    assert h1 == h2  # quantized to 0.01 → same hex
+
+    lh1 = _lot_row_hash(
+        "AMZN",
+        date(2024, 1, 1),
+        Decimal("1.00000000"),
+        Decimal("100.00"),
+        Decimal("100.00"),
+        "src",
+        7,
+    )
+    lh2 = _lot_row_hash(
+        "AMZN",
+        date(2024, 1, 1),
+        Decimal("1"),
+        Decimal("100"),
+        Decimal("100"),
+        "src",
+        7,
+    )
+    assert lh1 == lh2
+
+
+def test_lot_row_hash_includes_row_idx_to_prevent_same_day_tranche_collision(
+) -> None:
+    """Two RSU tranches with identical (symbol, open_date, qty, cost) but
+    different row indices must hash differently — otherwise the second one
+    would silently dedupe-skip on import."""
+    from src.adapters.xlsx_savings_plan import _lot_row_hash
+
+    args = (
+        "AMZN",
+        date(2024, 1, 15),
+        Decimal("100"),
+        Decimal("180.00"),
+        Decimal("18000.00"),
+        "xlsx_td_gainloss",
+    )
+    h_row3 = _lot_row_hash(*args, 3)
+    h_row4 = _lot_row_hash(*args, 4)
+    assert h_row3 != h_row4
+
+
+def test_lot_row_hash_includes_cost_per_share() -> None:
+    """Two lots with identical (symbol, open_date, qty, cost_total, row_idx)
+    but different cost_per_share must still hash differently. (Possible if
+    a re-import normalises totals differently.)"""
+    from src.adapters.xlsx_savings_plan import _lot_row_hash
+
+    base = (
+        "AMZN",
+        date(2024, 1, 15),
+        Decimal("100"),
+    )
+    h1 = _lot_row_hash(
+        *base, Decimal("180.00"), Decimal("18000.00"), "src", 3
+    )
+    h2 = _lot_row_hash(
+        *base, Decimal("181.00"), Decimal("18000.00"), "src", 3
+    )
+    assert h1 != h2
+
+
 def test_per_record_error_isolation_one_bad_row_does_not_halt_batch(
     session: Session, tmp_path: Path
 ) -> None:
@@ -258,6 +330,56 @@ def test_per_record_error_isolation_one_bad_row_does_not_halt_batch(
         for r in session.query(adapter.AccountBalanceSnapshot).all()
     }
     assert saved_names == {"GoodAccount1", "GoodAccount2"}
+
+
+def test_savepoint_isolates_integrity_error_on_flush(
+    session: Session, tmp_path: Path
+) -> None:
+    """The savepoint exists to handle IntegrityError raised at flush time
+    (DB-side UNIQUE/CHECK violations). Trigger one mid-batch and verify the
+    surrounding rows still land."""
+    fx = tmp_path / "ie.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    assert ws is not None
+    ws.title = "Account Summary"
+    ws.cell(row=1, column=1, value="Account")
+    ws.cell(row=1, column=2, value=datetime(2024, 1, 1))
+    ws.cell(row=2, column=1, value="GoodAccount1")
+    ws.cell(row=2, column=2, value=100.00)
+    ws.cell(row=3, column=1, value="DupName")
+    ws.cell(row=3, column=2, value=200.00)
+    ws.cell(row=4, column=1, value="GoodAccount2")
+    ws.cell(row=4, column=2, value=300.00)
+    wb.save(fx)
+
+    from src.adapters import xlsx_savings_plan as adapter
+
+    # Pre-seed a row that will collide with DupName on the natural-key UNIQUE
+    # so the second insert raises IntegrityError when the savepoint flushes.
+    pre = adapter.AccountBalanceSnapshot(
+        account_id=None,
+        raw_account_name="DupName",
+        as_of=date(2024, 1, 1),
+        balance=Decimal("999"),
+        source=adapter.SOURCE_TAG,
+        source_row_hash="distinct-hash",  # different from what import will compute
+    )
+    session.add(pre)
+    session.commit()
+
+    result = adapter.import_account_balances(str(fx), dry_run=False, session=session)
+
+    # Outer rows still land; the IntegrityError on DupName is caught and
+    # counted as dup_skipped (the savepoint protects subsequent rows).
+    saved_names = {
+        r.raw_account_name
+        for r in session.query(adapter.AccountBalanceSnapshot).all()
+    }
+    assert "GoodAccount1" in saved_names
+    assert "GoodAccount2" in saved_names
+    assert result.imported == 2
+    assert result.dup_skipped == 1
 
 
 # ── Historical Prices ───────────────────────────────────────────────────────

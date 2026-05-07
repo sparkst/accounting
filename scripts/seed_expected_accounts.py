@@ -100,7 +100,7 @@ _XLSX_INSTITUTION_HINTS: dict[str, str] = {
 }
 
 
-# Hard-coded Credit Karma list as provided in T17. 18 rows.
+# Hard-coded snapshot of the Credit Karma account list. 18 rows.
 @dataclass(frozen=True)
 class _CKRow:
     account_name: str

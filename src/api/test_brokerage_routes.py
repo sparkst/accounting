@@ -506,7 +506,7 @@ class TestMissingAccounts:
     def test_active_with_stale_snapshot_appears(
         self, empty_client: TestClient, empty: Session
     ) -> None:
-        from datetime import date, timedelta
+        from datetime import date
 
         from src.models.history import AccountBalanceSnapshot, ExpectedAccount
 
@@ -543,7 +543,7 @@ class TestMissingAccounts:
     def test_active_with_fresh_snapshot_excluded(
         self, empty_client: TestClient, empty: Session
     ) -> None:
-        from datetime import date, timedelta
+        from datetime import date
 
         from src.models.history import AccountBalanceSnapshot, ExpectedAccount
 
@@ -604,7 +604,7 @@ class TestMissingAccounts:
         self, empty_client: TestClient, empty: Session
     ) -> None:
         """A snapshot 30 days old is fresh at 60-day cutoff, stale at 14-day."""
-        from datetime import date, timedelta
+        from datetime import date
 
         from src.models.history import AccountBalanceSnapshot, ExpectedAccount
 
@@ -754,6 +754,73 @@ class TestBenchmarkComparison:
         assert body["series"][0]["benchmark_value"] is None
         assert body["benchmark_pct"] is None
 
+    def test_single_snapshot_returns_one_point_with_zero_pct(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """Single snapshot ⇒ start == end ⇒ 0% return for both lines."""
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot, HistoricalPrice
+
+        a = Account(
+            broker="fidelity", account_number="X1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        empty.add(a)
+        empty.flush()
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=a.id, raw_account_name="A",
+                as_of=date(2024, 1, 1), balance=Decimal("1000"),
+                source="xlsx_2024", source_row_hash="h",
+            )
+        )
+        empty.add(
+            HistoricalPrice(symbol="SPY", trade_date=date(2024, 1, 1), close=Decimal("100"))
+        )
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
+        body = r.json()
+        assert len(body["series"]) == 1
+        assert body["portfolio_pct"] == 0.0
+        assert body["benchmark_pct"] == 0.0
+
+    def test_negative_return_drawdown(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot, HistoricalPrice
+
+        a = Account(
+            broker="fidelity", account_number="X1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        empty.add(a)
+        empty.flush()
+        # Portfolio drops 100k → 80k. SPY drops 100 → 90.
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=a.id, raw_account_name="A",
+                as_of=date(2024, 1, 1), balance=Decimal("100000"),
+                source="xlsx_2024", source_row_hash="d1",
+            )
+        )
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=a.id, raw_account_name="A",
+                as_of=date(2024, 12, 31), balance=Decimal("80000"),
+                source="xlsx_2024", source_row_hash="d2",
+            )
+        )
+        empty.add(HistoricalPrice(symbol="SPY", trade_date=date(2024, 1, 1), close=Decimal("100")))
+        empty.add(HistoricalPrice(symbol="SPY", trade_date=date(2024, 12, 31), close=Decimal("90")))
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
+        body = r.json()
+        assert body["portfolio_pct"] == pytest.approx(-0.20)
+        assert body["benchmark_pct"] == pytest.approx(-0.10)
+
 
 # ── /api/brokerage/holdings/{symbol}/history (T14) ─────────────────────
 
@@ -774,8 +841,9 @@ class TestHoldingHistory:
         self, empty_client: TestClient, empty: Session
     ) -> None:
         # BRK.B is a real ticker with a period — must pass the pattern.
-        from src.models.history import CostBasisLot
         from datetime import date as _d
+
+        from src.models.history import CostBasisLot
 
         empty.add(
             CostBasisLot(

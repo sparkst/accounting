@@ -1090,6 +1090,29 @@ class TestAccountTagsEdit:
         )
         assert r.status_code == 422
 
+    def test_put_tag_length_boundary(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """Pattern is {1,32} so 32 chars OK, 33 not."""
+        a = _make_acct(empty)
+        empty.commit()
+
+        ok = "a" * 32
+        too_long = "a" * 33
+
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": [ok]},
+        )
+        assert r.status_code == 200
+        assert r.json()["tags"] == [ok]
+
+        r = empty_client.put(
+            f"/api/brokerage/accounts/{a.id}/tags",
+            json={"tags": [too_long]},
+        )
+        assert r.status_code == 422
+
     def test_put_missing_account_returns_404(
         self, empty_client: TestClient
     ) -> None:
@@ -1314,9 +1337,8 @@ class TestHistoryTagFilter:
         from src.models.history import AccountTag
 
         a1, a2, a3 = self._seed_three_accounts_with_snapshots(empty)
-        # a1 = retirement, a2 = retirement+rsu, a3 = retirement+rsu+ignored
-        for tag in ["retirement"]:
-            empty.add(AccountTag(account_id=a1.id, tag=tag))
+        # a1 = retirement, a2 = retirement+rsu, a3 = retirement+rsu+legacy
+        empty.add(AccountTag(account_id=a1.id, tag="retirement"))
         for tag in ["retirement", "rsu"]:
             empty.add(AccountTag(account_id=a2.id, tag=tag))
         for tag in ["retirement", "rsu", "legacy"]:
@@ -1331,9 +1353,12 @@ class TestHistoryTagFilter:
         )
         assert r.status_code == 200
         body = r.json()
-        # a1 only contributes; sum is whatever its snapshots add up to (>0).
-        assert len(body) >= 1
-        assert all(p["account_count"] == 1 for p in body)
+        # Each helper-seeded account contributes exactly one snapshot at
+        # 2024-01-01 with balance Decimal("100"); a1 alone is the survivor.
+        assert len(body) == 1
+        assert body[0]["as_of"] == "2024-01-01"
+        assert body[0]["account_count"] == 1
+        assert body[0]["balance_total"] == 100.0
 
     def test_multi_value_account_ids_csv(
         self, empty_client: TestClient, empty: Session

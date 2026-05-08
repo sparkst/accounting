@@ -3,7 +3,8 @@
 Exposes the pure-function output from `src.reports.brokerage_summary` plus
 historical-balance, benchmark, and per-holding views over the `history.py`
 tables. Mostly GET; PUT on `/accounts/{id}/tags` for the small tag-edit
-surface. Mounted at `/api/brokerage` behind the API-key auth dependency in
+surface; PATCH on `/accounts/{id}` for human-curated metadata updates.
+Mounted at `/api/brokerage` behind the API-key auth dependency in
 `src/api/main.py`.
 """
 
@@ -38,6 +39,7 @@ from src.models.history import (
 )
 from src.models.ingestion_log import IngestionLog
 from src.reports.brokerage_summary import (
+    _mask_account_number,
     compute_data_integrity,
     compute_net_worth,
     get_account_summary,
@@ -114,6 +116,8 @@ _TAG_PATTERN = re.compile(r"^[a-z0-9_-]{1,32}$")
 class AccountTagsUpdate(BaseModel):
     """Request body for PUT /accounts/{id}/tags — full replacement."""
 
+    model_config = ConfigDict(extra="forbid")
+
     tags: list[str]
 
     @field_validator("tags")
@@ -151,14 +155,15 @@ class AccountPatchRequest(BaseModel):
     distinguish "field omitted" (leave existing value alone) from "field
     explicitly set to null" (clear the column to NULL). Max-length validators
     mirror the SQLAlchemy column widths in `Account` (`account_name=128`,
-    `beneficiary=64`, `notes=Text/unbounded`).
+    `beneficiary=64`); `notes` is unbounded in the DB but capped at 4096
+    chars here to bound payload size (Tailscale-only audience).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     account_name: str | None = Field(default=None, max_length=128)
     beneficiary: str | None = Field(default=None, max_length=64)
-    notes: str | None = Field(default=None)
+    notes: str | None = Field(default=None, max_length=4096)
 
 
 class AccountPatchResponse(BaseModel):
@@ -183,7 +188,7 @@ class AccountDetailAccount(BaseModel):
 
     id: str
     broker: str
-    account_number: str
+    account_number_masked: str
     account_name: str | None = None
     account_type: str
     entity: str
@@ -245,7 +250,12 @@ class AccountRealizedGLSummary(BaseModel):
 
 
 class IngestionLogDetailRow(BaseModel):
-    """Subset of IngestionLog fields surfaced in the detail panel."""
+    """Subset of IngestionLog fields surfaced in the detail panel.
+
+    ``error_detail`` is truncated to 200 chars server-side to bound the
+    payload. Full details are available in the server logs. This endpoint
+    is Tailscale-only (operator audience).
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -255,6 +265,7 @@ class IngestionLogDetailRow(BaseModel):
     status: str
     records_processed: int
     records_failed: int
+    error_detail: str | None = None
 
 
 class AccountDetailResponse(BaseModel):
@@ -613,6 +624,8 @@ def account_detail(
             "status": log.status,
             "records_processed": log.records_processed,
             "records_failed": log.records_failed,
+            # Truncate to 200 chars to bound payload (Tailscale-only audience).
+            "error_detail": (log.error_detail[:200] if log.error_detail else None),
         }
         for log in ingestion_rows
     ]
@@ -621,7 +634,7 @@ def account_detail(
         "account": {
             "id": account.id,
             "broker": account.broker,
-            "account_number": account.account_number,
+            "account_number_masked": _mask_account_number(account.account_number),
             "account_name": account.account_name,
             "account_type": account.account_type,
             "entity": account.entity,

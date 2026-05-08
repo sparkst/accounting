@@ -869,8 +869,8 @@ export interface BrokerageAccount {
 export async function updateBrokerageAccountTags(
 	accountId: string,
 	tags: string[]
-): Promise<{ tags: string[] }> {
-	return request<{ tags: string[] }>(
+): Promise<{ account_id: string; tags: string[] }> {
+	return request<{ account_id: string; tags: string[] }>(
 		`/brokerage/accounts/${encodeURIComponent(accountId)}/tags`,
 		{
 			method: 'PUT',
@@ -1096,7 +1096,7 @@ export async function patchBrokerageAccount(
 export interface AccountDetailAccount {
 	id: string;
 	broker: string;
-	account_number: string;
+	account_number_masked: string;
 	account_name: string | null;
 	account_type: string;
 	entity: string;
@@ -1144,12 +1144,8 @@ export interface IngestionLogDetailRow {
 	status: string;
 	records_processed: number;
 	records_failed: number;
-	/**
-	 * Optional. The current backend response model omits this field, but the
-	 * underlying IngestionLog row carries it. Declared optional so a future
-	 * API extension can populate it without a frontend type change.
-	 */
-	error_detail?: string | null;
+	/** Truncated to 200 chars server-side. Null when no error occurred. */
+	error_detail: string | null;
 }
 
 export interface AccountDetailResponse {

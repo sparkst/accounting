@@ -1568,15 +1568,6 @@
 		cursor: pointer;
 		transition: r 0.1s;
 	}
-	.history-axis {
-		display: flex;
-		justify-content: space-between;
-		font-size: 11px;
-		margin-top: 4px;
-		padding: 0 8px;
-		font-feature-settings: 'tnum' 1;
-	}
-
 	/* Missing accounts panel */
 	.missing-accounts h2 {
 		display: flex;

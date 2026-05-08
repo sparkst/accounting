@@ -1723,7 +1723,9 @@ class TestAccountDetail:
         # Account fields populated.
         assert body["account"]["id"] == a.id
         assert body["account"]["broker"] == "fidelity"
-        assert body["account"]["account_number"] == "X1"
+        # account_number is masked in the detail response (FIX-1).
+        assert body["account"]["account_number_masked"] == "****"  # "X1" → short → "****"
+        assert "account_number" not in body["account"]
         assert body["account"]["account_type"] == "taxable"
         assert body["account"]["entity"] == "personal"
         assert body["account"]["tax_sheltered"] is False
@@ -1996,3 +1998,155 @@ class TestAccountDetail:
         assert run_ats == sorted(run_ats, reverse=True)
         # Most recent fidelity (i=6) first → 2025-01-07.
         assert run_ats[0].startswith("2025-01-07")
+
+    def test_balance_snapshot_list_capped_at_10(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-9: latest_balance_snapshots must be capped at 10 (mirroring positions)."""
+        from src.models.history import AccountBalanceSnapshot
+
+        a = _make_acct(empty)
+        empty.flush()
+
+        # Seed 15 balance snapshots on distinct dates.
+        for i in range(15):
+            empty.add(
+                AccountBalanceSnapshot(
+                    account_id=a.id,
+                    raw_account_name="X1",
+                    as_of=date(2025, 1, 1) + timedelta(days=i),
+                    balance=Decimal(f"{1000 + i * 10}"),
+                    source="xlsx_2025",
+                    source_row_hash=f"bs-cap-{i}",
+                )
+            )
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        # Capped at 10, most recent first.
+        assert len(body["latest_balance_snapshots"]) == 10
+        bal_dates = [b["as_of"] for b in body["latest_balance_snapshots"]]
+        assert bal_dates == sorted(bal_dates, reverse=True)
+        # Latest snapshot (i=14) should be first → 2025-01-15.
+        assert bal_dates[0] == "2025-01-15"
+
+    def test_detail_account_number_is_masked(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-1: detail endpoint must return account_number_masked, not raw account_number."""
+        a = _make_acct(empty)  # account_number = "X1"
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        # Must have the masked field, not the raw one.
+        assert "account_number_masked" in body["account"]
+        assert "account_number" not in body["account"]
+        # account_number "X1" is short, so _mask_account_number returns "****".
+        assert body["account"]["account_number_masked"] == "****"
+
+    def test_ingestion_log_exposes_error_detail(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-4: ingestion_log_recent must include error_detail (truncated to 200 chars)."""
+        from src.models.ingestion_log import IngestionLog
+
+        a = _make_acct(empty)  # broker = "fidelity"
+        empty.flush()
+        long_error = "E" * 300
+        empty.add(
+            IngestionLog(
+                source="fidelity_csv",
+                run_at=datetime(2025, 6, 1, 12, 0, 0),
+                status="error",
+                records_processed=0,
+                records_failed=5,
+                error_detail=long_error,
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        logs = body["ingestion_log_recent"]
+        assert len(logs) == 1
+        # error_detail must be present and truncated to 200 chars.
+        assert logs[0]["error_detail"] == "E" * 200
+
+    def test_ingestion_log_error_detail_null_when_no_error(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-4: error_detail is null for successful runs."""
+        from src.models.ingestion_log import IngestionLog
+
+        a = _make_acct(empty)  # broker = "fidelity"
+        empty.flush()
+        empty.add(
+            IngestionLog(
+                source="fidelity_csv",
+                run_at=datetime(2025, 6, 1, 12, 0, 0),
+                status="success",
+                records_processed=10,
+                records_failed=0,
+                error_detail=None,
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        assert body["ingestion_log_recent"][0]["error_detail"] is None
+
+
+# ── Additional TestPatchAccount tests ──────────────────────────────────
+
+
+class TestPatchAccountAdditional:
+    """FIX-2, FIX-10, FIX-11: additional validation tests for PATCH endpoint."""
+
+    def test_patch_notes_too_long_returns_422(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-2: notes field must be capped at 4096 chars."""
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"notes": "x" * 5000},
+        )
+        assert r.status_code == 422
+
+    def test_patch_beneficiary_too_long_returns_422(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-11: beneficiary must be capped at 64 chars."""
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"beneficiary": "x" * 65},
+        )
+        assert r.status_code == 422
+
+    def test_patch_empty_body_updated_at_unchanged(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-10: empty body must not bump updated_at."""
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty)
+        prior_updated_at = a.updated_at
+
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={},
+        )
+        assert r.status_code == 200
+        body = r.json()
+
+        # updated_at in response must equal the pre-existing value.
+        assert body["updated_at"] == prior_updated_at.isoformat()
+
+        # DB row must be unchanged.
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.updated_at == prior_updated_at

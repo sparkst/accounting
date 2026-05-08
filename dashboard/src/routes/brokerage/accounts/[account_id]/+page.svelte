@@ -16,6 +16,10 @@
 	let formName = $state('');
 	let formBeneficiary = $state('');
 	let formNotes = $state('');
+	// Captured originals at form-open time, used to build a true partial PATCH.
+	let origName = $state('');
+	let origBeneficiary = $state('');
+	let origNotes = $state('');
 	let saving = $state(false);
 	let saveError = $state('');
 	let savedAt = $state<string | null>(null);
@@ -75,7 +79,9 @@
 		if (!detail) return '';
 		const a = detail.account;
 		if (a.account_name && a.account_name.trim()) return a.account_name;
-		const last4 = a.account_number ? a.account_number.slice(-4) : '';
+		// account_number_masked is e.g. "****1234" — take last 4 chars.
+		const masked = a.account_number_masked ?? '';
+		const last4 = masked.slice(-4);
 		return last4 ? `Account ····${last4}` : 'Account';
 	});
 
@@ -103,6 +109,10 @@
 		formName = detail.account.account_name ?? '';
 		formBeneficiary = detail.account.beneficiary ?? '';
 		formNotes = detail.account.notes ?? '';
+		// Capture originals so save() can diff and only send changed keys.
+		origName = formName;
+		origBeneficiary = formBeneficiary;
+		origNotes = formNotes;
 		saveError = '';
 		editing = true;
 	}
@@ -117,14 +127,18 @@
 		saving = true;
 		saveError = '';
 		try {
-			// Send all three so blanking a field clears it. Empty-string → null
-			// keeps the DB clean (no zero-length names).
-			const patch = {
-				account_name: formName.trim() === '' ? null : formName.trim(),
-				beneficiary: formBeneficiary.trim() === '' ? null : formBeneficiary.trim(),
-				notes: formNotes.trim() === '' ? null : formNotes
-			};
-			await patchBrokerageAccount(detail.account.id, patch);
+			// True PATCH semantics: only include keys that changed from the values
+			// captured at form-open time. This avoids spurious updated_at bumps
+			// when the user opens the form and clicks Save without editing.
+			// Empty-string → null keeps the DB clean (no zero-length names).
+			const coerce = (s: string): string | null => (s.trim() === '' ? null : s.trim());
+			const patch: Record<string, string | null> = {};
+			if (formName !== origName) patch.account_name = coerce(formName);
+			if (formBeneficiary !== origBeneficiary) patch.beneficiary = coerce(formBeneficiary);
+			if (formNotes !== origNotes) patch.notes = coerce(formNotes);
+			if (Object.keys(patch).length > 0) {
+				await patchBrokerageAccount(detail.account.id, patch);
+			}
 			// Reload the full detail so derived fields like updated_at refresh.
 			await load();
 			editing = false;
@@ -155,7 +169,7 @@
 		{#if detail}
 			<h1>{titleName}</h1>
 			<p class="sub">
-				{detail.account.broker} · {detail.account.account_number} · {detail.account.account_type}
+				{detail.account.broker} · {detail.account.account_number_masked} · {detail.account.account_type}
 			</p>
 		{:else if notFound}
 			<h1>Account not found</h1>
@@ -221,6 +235,7 @@
 						<textarea
 							class="field-input"
 							rows="3"
+							maxlength="4096"
 							bind:value={formNotes}
 							placeholder="Anything worth remembering about this account…"
 						></textarea>
@@ -245,7 +260,7 @@
 			{:else}
 				<dl class="meta-grid">
 					<dt>Broker</dt><dd>{a.broker}</dd>
-					<dt>Account number</dt><dd class="mono">{a.account_number}</dd>
+					<dt>Account number</dt><dd class="mono">{a.account_number_masked}</dd>
 					<dt>Account name</dt><dd>{a.account_name ?? '—'}</dd>
 					<dt>Type</dt><dd>{a.account_type}</dd>
 					<dt>Entity</dt><dd>{a.entity}</dd>

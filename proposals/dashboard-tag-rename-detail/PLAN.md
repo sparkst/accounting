@@ -63,7 +63,7 @@ Use `model_fields_set` (Pydantic v2) to detect which fields the caller actually 
 - `latest_balance_snapshots: list[BalanceSnapshotRow]` (top 10 by as_of desc)
 - `transaction_count_by_action: dict[str, int]` (canonical_action → count)
 - `realized_gl_summary: {short_term: Decimal, long_term: Decimal, total: Decimal, lots: int}` (lifetime totals across all years for this account)
-- `ingestion_log_recent: list[IngestionLogRow]` (top 5 by started_at desc — filtered to runs whose source touched this broker; approximate filter is "log.source contains the broker name")
+- `ingestion_log_recent: list[IngestionLogRow]` (top 5 by run_at desc — filtered to runs whose source touched this broker; approximate filter is "log.source contains the broker name")
 
 **Tests:**
 1. GET unknown account → 404.

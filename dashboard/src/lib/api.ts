@@ -1055,3 +1055,116 @@ export interface BrokerageMissingAccount {
 export async function fetchBrokerageMissingAccounts(): Promise<BrokerageMissingAccount[]> {
 	return request<BrokerageMissingAccount[]>('/brokerage/missing-accounts');
 }
+
+// ─── Brokerage account PATCH + detail ────────────────────────────────────────
+
+/**
+ * Partial-update payload for PATCH /brokerage/accounts/{id}.
+ *
+ * All fields are optional. The API uses Pydantic's ``model_fields_set`` to
+ * distinguish "field omitted" (leave existing value alone) from "field
+ * explicitly set to null" (clear the column). Pass ``null`` to clear, omit
+ * the key to leave unchanged.
+ */
+export interface AccountPatchBody {
+	account_name?: string | null;
+	beneficiary?: string | null;
+	notes?: string | null;
+}
+
+export interface AccountPatchResponse {
+	account_id: string;
+	account_name: string | null;
+	beneficiary: string | null;
+	notes: string | null;
+	updated_at: string;
+}
+
+export async function patchBrokerageAccount(
+	accountId: string,
+	patch: AccountPatchBody
+): Promise<AccountPatchResponse> {
+	return request<AccountPatchResponse>(
+		`/brokerage/accounts/${encodeURIComponent(accountId)}`,
+		{
+			method: 'PATCH',
+			body: JSON.stringify(patch)
+		}
+	);
+}
+
+export interface AccountDetailAccount {
+	id: string;
+	broker: string;
+	account_number: string;
+	account_name: string | null;
+	account_type: string;
+	entity: string;
+	tax_sheltered: boolean;
+	beneficiary: string | null;
+	notes: string | null;
+	parent_account_id: string | null;
+	is_plan_wrapper: boolean;
+	created_at: string;
+	updated_at: string;
+	tags: string[];
+}
+
+export interface PositionSnapshotDetailRow {
+	id: string;
+	as_of: string;
+	symbol: string | null;
+	description: string | null;
+	quantity: number | null;
+	price: number | null;
+	market_value: number | null;
+	source_file: string;
+	source_row_hash: string;
+}
+
+export interface BalanceSnapshotDetailRow {
+	id: string;
+	as_of: string;
+	raw_account_name: string;
+	balance: number;
+	source: string;
+}
+
+export interface AccountRealizedGLSummary {
+	short_term: number;
+	long_term: number;
+	total: number;
+	lots: number;
+}
+
+export interface IngestionLogDetailRow {
+	id: string;
+	source: string;
+	run_at: string;
+	status: string;
+	records_processed: number;
+	records_failed: number;
+	/**
+	 * Optional. The current backend response model omits this field, but the
+	 * underlying IngestionLog row carries it. Declared optional so a future
+	 * API extension can populate it without a frontend type change.
+	 */
+	error_detail?: string | null;
+}
+
+export interface AccountDetailResponse {
+	account: AccountDetailAccount;
+	latest_position_snapshots: PositionSnapshotDetailRow[];
+	latest_balance_snapshots: BalanceSnapshotDetailRow[];
+	transaction_count_by_action: Record<string, number>;
+	realized_gl_summary: AccountRealizedGLSummary;
+	ingestion_log_recent: IngestionLogDetailRow[];
+}
+
+export async function fetchBrokerageAccountDetail(
+	accountId: string
+): Promise<AccountDetailResponse> {
+	return request<AccountDetailResponse>(
+		`/brokerage/accounts/${encodeURIComponent(accountId)}/detail`
+	);
+}

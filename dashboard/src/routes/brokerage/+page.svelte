@@ -319,6 +319,22 @@
 	});
 
 	// Three-state cycle: neutral → include → exclude → neutral.
+	//
+	// Manual repro for this code path (no e2e harness exists in dashboard/):
+	//   1. Open https://macbook.ancon-cliff.ts.net/brokerage
+	//   2. Click any tag chip in the Accounts filter strip:
+	//        a. First click → green "+ <tag>" (include)
+	//        b. Second click → red "− <tag>" (exclude)
+	//        c. Third click → neutral (no class, no symbol)
+	//   3. Repeat — cycle should be stable.
+	//
+	// The reassign pattern below is intentional: Svelte 5 tracks reads on
+	// the binding identity, so swapping in a fresh Set instance is the most
+	// reliable way to trigger a re-render across all consumers (the chart
+	// derived state, the filteredAccounts derived, tagState in the {#each}
+	// loop). Direct `.add()/.delete()` mutations on the $state Set are NOT
+	// reliably reactive in this version of Svelte for non-SvelteSet plain
+	// Sets, so we keep the copy-and-reassign pattern.
 	function cycleTag(tag: string): void {
 		if (acctTagInclude.has(tag)) {
 			const next = new Set(acctTagInclude);
@@ -609,8 +625,16 @@
 							<stop offset="100%" stop-color="#007aff" stop-opacity="0" />
 						</linearGradient>
 					</defs>
-					<!-- Y-axis dollar grid lines -->
-					{#each historyChart.dollarTicks as tick (tick)}
+					<!-- Y-axis dollar grid lines.
+					     Key by index, not value: pickAxisTicks can yield duplicate
+					     values when min == max (single-point series, flatlined
+					     filter). Duplicate keys throw each_key_duplicate, which
+					     halts subsequent reactive updates and is the root cause
+					     of the tag-chip click-bug — the filter handler succeeds,
+					     but the chart re-derive throws on re-render and Svelte
+					     stops processing the batch, so the chip class never
+					     updates. -->
+					{#each historyChart.dollarTicks as tick, i (i)}
 						{@const y = historyChart.yFor(tick)}
 						<line x1={CHART_PAD_X} y1={y} x2={CHART_W - CHART_PAD_X} y2={y} stroke="#f0f0f2" stroke-width="1" />
 						<text x={CHART_PAD_X - 4} y={y + 3} text-anchor="end" font-size="10" fill="#6e6e73" font-family="-apple-system,Helvetica">{formatAxisDollars(tick)}</text>
@@ -647,8 +671,12 @@
 							{#if isToday}<text x="8" y="46" fill="#a7d99e" font-size="10">live PositionSnapshot total</text>{/if}
 						</g>
 					{/if}
-					<!-- X-axis date ticks -->
-					{#each historyChart.dateTicks as tick (tick.idx)}
+					<!-- X-axis date ticks.
+					     Key by index: pickDateTicks can yield duplicate `idx`
+					     values when points.length is small (Math.round on a
+					     short series collapses multiple slots to the same
+					     index). Same root cause as dollarTicks above. -->
+					{#each historyChart.dateTicks as tick, i (i)}
 						{@const x = historyChart.xs[tick.idx] ?? CHART_PAD_X}
 						<text x={x} y={CHART_H - 2} text-anchor="middle" font-size="10" fill="#6e6e73" font-family="-apple-system,Helvetica">{tick.label}</text>
 					{/each}
@@ -756,10 +784,12 @@
 						<tr class:wrapper={a.is_plan_wrapper}>
 							<td>{a.broker}</td>
 							<td>
-								{a.account_number_masked}
-								{#if a.account_name}
-									<span class="muted"> · {a.account_name}</span>
-								{/if}
+								<a class="account-link" href={`/brokerage/accounts/${a.account_id}`} title="Open account detail">
+									{a.account_number_masked}
+									{#if a.account_name}
+										<span class="muted"> · {a.account_name}</span>
+									{/if}
+								</a>
 								{#if a.is_plan_wrapper}
 									<span class="badge">wrapper</span>
 								{/if}
@@ -1646,5 +1676,15 @@
 		background: #1d1d1f;
 		color: #fff;
 		cursor: pointer;
+	}
+
+	.account-link {
+		color: inherit;
+		text-decoration: none;
+		cursor: pointer;
+	}
+	.account-link:hover {
+		color: #007aff;
+		text-decoration: underline;
 	}
 </style>

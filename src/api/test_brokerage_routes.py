@@ -677,8 +677,9 @@ class TestMissingAccounts:
 
         # Pin _today() to give the PositionSnapshot a 5-day age (well within
         # the 60-day default cutoff).
-        from src.api.routes import brokerage as routes_mod
         import datetime as _dt
+
+        from src.api.routes import brokerage as routes_mod
 
         original_today = routes_mod._today
         routes_mod._today = lambda: _dt.date(2026, 1, 1)
@@ -1509,3 +1510,489 @@ class TestAccountTagsDedup:
         assert r.json()["tags"] == ["retirement"]
         rows = empty.query(AccountTag).filter_by(account_id=a.id).all()
         assert len(rows) == 1
+
+
+# ── PATCH /api/brokerage/accounts/{id} (metadata) ─────────────────────
+
+
+def _make_acct_full(
+    session: Session,
+    *,
+    account_number: str = "PATCH1",
+    account_name: str | None = "Original Name",
+    beneficiary: str | None = "Original Bene",
+    notes: str | None = "Original notes.",
+) -> Any:
+    """Seed an account with all three patchable fields populated."""
+    from src.models.brokerage import Account
+
+    a = Account(
+        broker="fidelity",
+        account_number=account_number,
+        account_type="taxable",
+        entity="personal",
+        tax_sheltered=False,
+        account_name=account_name,
+        beneficiary=beneficiary,
+        notes=notes,
+    )
+    session.add(a)
+    session.commit()
+    return a
+
+
+class TestPatchAccount:
+    """PATCH /api/brokerage/accounts/{account_id} — partial metadata updates."""
+
+    def test_patch_account_unknown_returns_404(
+        self, empty_client: TestClient
+    ) -> None:
+        r = empty_client.patch(
+            "/api/brokerage/accounts/no-such-id",
+            json={"account_name": "ignored"},
+        )
+        assert r.status_code == 404
+
+    def test_patch_account_updates_only_supplied_field(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"account_name": "Travis Trad IRA"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["account_id"] == a.id
+        assert body["account_name"] == "Travis Trad IRA"
+        assert body["beneficiary"] == "Original Bene"
+        assert body["notes"] == "Original notes."
+
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.account_name == "Travis Trad IRA"
+        assert row.beneficiary == "Original Bene"
+        assert row.notes == "Original notes."
+
+    def test_patch_account_explicit_null_clears_field(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"account_name": None},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["account_name"] is None
+        assert body["beneficiary"] == "Original Bene"
+
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.account_name is None
+        assert row.beneficiary == "Original Bene"
+        assert row.notes == "Original notes."
+
+    def test_patch_account_empty_body_no_changes(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["account_name"] == "Original Name"
+        assert body["beneficiary"] == "Original Bene"
+        assert body["notes"] == "Original notes."
+
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.account_name == "Original Name"
+        assert row.beneficiary == "Original Bene"
+        assert row.notes == "Original notes."
+
+    def test_patch_account_name_too_long_returns_422(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"account_name": "x" * 200},
+        )
+        assert r.status_code == 422
+
+    def test_patch_account_beneficiary_updates(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"beneficiary": "Travis"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["beneficiary"] == "Travis"
+        assert body["account_name"] == "Original Name"
+        assert body["notes"] == "Original notes."
+
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.beneficiary == "Travis"
+        assert row.account_name == "Original Name"
+
+    def test_patch_account_bumps_updated_at(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        import time
+
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty)
+        prior_updated_at = a.updated_at
+        # Sleep enough that the SQLite-stored datetime resolution distinguishes.
+        time.sleep(0.01)
+
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"account_name": "Renamed Account"},
+        )
+        assert r.status_code == 200
+
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.updated_at > prior_updated_at
+        # Response also reports the bumped timestamp.
+        body = r.json()
+        assert body["updated_at"] is not None
+        # ISO-format response > prior ISO-format string lexicographically too.
+        assert body["updated_at"] > prior_updated_at.isoformat()
+
+    def test_patch_account_notes_updates(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import Account
+
+        a = _make_acct_full(empty, notes=None)
+        r = empty_client.patch(
+            f"/api/brokerage/accounts/{a.id}",
+            json={"notes": "Some long-form notes here"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["notes"] == "Some long-form notes here"
+        assert body["account_name"] == "Original Name"
+        assert body["beneficiary"] == "Original Bene"
+
+        empty.expire_all()
+        row = empty.query(Account).filter_by(id=a.id).one()
+        assert row.notes == "Some long-form notes here"
+
+
+# ── GET /api/brokerage/accounts/{id}/detail ───────────────────────────
+
+
+class TestAccountDetail:
+    """T3: full account detail endpoint."""
+
+    def test_unknown_account_returns_404(
+        self, empty_client: TestClient
+    ) -> None:
+        r = empty_client.get("/api/brokerage/accounts/no-such-id/detail")
+        assert r.status_code == 404
+
+    def test_empty_account_returns_empty_arrays_not_nulls(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        a = _make_acct(empty)
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        assert r.status_code == 200
+        body = r.json()
+
+        # Account fields populated.
+        assert body["account"]["id"] == a.id
+        assert body["account"]["broker"] == "fidelity"
+        assert body["account"]["account_number"] == "X1"
+        assert body["account"]["account_type"] == "taxable"
+        assert body["account"]["entity"] == "personal"
+        assert body["account"]["tax_sheltered"] is False
+        assert body["account"]["is_plan_wrapper"] is False
+        assert body["account"]["tags"] == []
+
+        # Empty arrays, not nulls.
+        assert body["latest_position_snapshots"] == []
+        assert body["latest_balance_snapshots"] == []
+        assert body["transaction_count_by_action"] == {}
+        assert body["ingestion_log_recent"] == []
+
+        # Realized G/L summary returns zero values, not nulls.
+        rgl = body["realized_gl_summary"]
+        assert rgl["short_term"] == 0
+        assert rgl["long_term"] == 0
+        assert rgl["total"] == 0
+        assert rgl["lots"] == 0
+
+    def test_mixed_positions_and_balances_sorted_desc(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import PositionSnapshot
+        from src.models.history import AccountBalanceSnapshot
+
+        a = _make_acct(empty)
+        empty.flush()
+
+        # Three position snapshots on different dates.
+        for i, day in enumerate([1, 5, 10]):
+            ps = PositionSnapshot(
+                account_id=a.id,
+                as_of=datetime(2025, 1, day, 12, 0, 0),
+                symbol=f"SYM{i}",
+                description=f"Sec {i}",
+                quantity=Decimal("10"),
+                price=Decimal("100"),
+                market_value=Decimal("1000"),
+                source_file="t.csv",
+                source_row_hash=f"ps-{i}",
+                raw_data={"x": True},
+            )
+            empty.add(ps)
+
+        # Two balance snapshots on different dates.
+        for i, day in enumerate([3, 9]):
+            empty.add(
+                AccountBalanceSnapshot(
+                    account_id=a.id,
+                    raw_account_name="X1",
+                    as_of=date(2025, 1, day),
+                    balance=Decimal(f"{1000 + i * 500}"),
+                    source="xlsx_2025",
+                    source_row_hash=f"bs-{i}",
+                )
+            )
+
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        assert r.status_code == 200
+        body = r.json()
+
+        positions = body["latest_position_snapshots"]
+        assert len(positions) == 3
+        # Sorted desc by as_of.
+        as_of_dates = [p["as_of"] for p in positions]
+        assert as_of_dates == sorted(as_of_dates, reverse=True)
+
+        balances = body["latest_balance_snapshots"]
+        assert len(balances) == 2
+        bal_dates = [b["as_of"] for b in balances]
+        assert bal_dates == sorted(bal_dates, reverse=True)
+
+    def test_position_snapshot_list_capped_at_10(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import PositionSnapshot
+
+        a = _make_acct(empty)
+        empty.flush()
+
+        # Seed 15 snapshots.
+        for i in range(15):
+            ps = PositionSnapshot(
+                account_id=a.id,
+                as_of=datetime(2025, 1, 1, 12, 0, 0) + timedelta(days=i),
+                symbol="SYM",
+                quantity=Decimal("1"),
+                market_value=Decimal("10"),
+                source_file="t.csv",
+                source_row_hash=f"ps-{i}",
+                raw_data={"x": True},
+            )
+            empty.add(ps)
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        # Capped at 10, most recent first.
+        assert len(body["latest_position_snapshots"]) == 10
+        as_of_dates = [p["as_of"] for p in body["latest_position_snapshots"]]
+        assert as_of_dates == sorted(as_of_dates, reverse=True)
+        # Latest snapshot (i=14) is first → 2025-01-15.
+        assert as_of_dates[0].startswith("2025-01-15")
+
+    def test_transaction_count_by_action(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import BrokerageTransaction
+        from src.models.enums import BrokerageTxStatus, CanonicalAction
+
+        a = _make_acct(empty)
+        empty.flush()
+
+        action_counts = {
+            CanonicalAction.BUY: 3,
+            CanonicalAction.SELL: 2,
+            CanonicalAction.DIVIDEND_ORDINARY: 5,
+        }
+        idx = 0
+        for action, n in action_counts.items():
+            for _ in range(n):
+                empty.add(
+                    BrokerageTransaction(
+                        account_id=a.id,
+                        trade_date=date(2025, 1, 1),
+                        action=action.value.upper(),
+                        canonical_action=action.value,
+                        symbol="X",
+                        amount=Decimal("100"),
+                        status=BrokerageTxStatus.IMPORTED.value,
+                        source_file="t.csv",
+                        source_row_hash=f"tx-{idx}",
+                        raw_data={"x": True},
+                    )
+                )
+                idx += 1
+
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        assert body["transaction_count_by_action"] == {
+            "buy": 3,
+            "sell": 2,
+            "dividend_ordinary": 5,
+        }
+
+    def test_realized_gl_summary_sums_correctly(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.brokerage import RealizedGainLoss
+        from src.models.enums import GainLossTerm
+
+        a = _make_acct(empty)
+        empty.flush()
+
+        # Two short-term and one long-term lot, across two years.
+        empty.add_all([
+            RealizedGainLoss(
+                account_id=a.id,
+                symbol="A",
+                closed_date=date(2024, 6, 1),
+                quantity=Decimal("1"),
+                proceeds=Decimal("200"),
+                cost_basis=Decimal("100"),
+                gain_loss=Decimal("100"),
+                st_gain_loss=Decimal("100"),
+                term=GainLossTerm.SHORT.value,
+                source_file="t.csv",
+                source_row_hash="g1",
+                raw_data={},
+            ),
+            RealizedGainLoss(
+                account_id=a.id,
+                symbol="B",
+                closed_date=date(2025, 1, 1),
+                quantity=Decimal("1"),
+                proceeds=Decimal("250"),
+                cost_basis=Decimal("200"),
+                gain_loss=Decimal("50"),
+                st_gain_loss=Decimal("50"),
+                term=GainLossTerm.SHORT.value,
+                source_file="t.csv",
+                source_row_hash="g2",
+                raw_data={},
+            ),
+            RealizedGainLoss(
+                account_id=a.id,
+                symbol="C",
+                closed_date=date(2025, 1, 1),
+                quantity=Decimal("1"),
+                proceeds=Decimal("500"),
+                cost_basis=Decimal("100"),
+                gain_loss=Decimal("400"),
+                lt_gain_loss=Decimal("400"),
+                term=GainLossTerm.LONG.value,
+                source_file="t.csv",
+                source_row_hash="g3",
+                raw_data={},
+            ),
+        ])
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        rgl = body["realized_gl_summary"]
+        assert rgl["short_term"] == 150.0  # 100 + 50
+        assert rgl["long_term"] == 400.0
+        assert rgl["total"] == 550.0
+        assert rgl["lots"] == 3
+
+    def test_tags_array_populated(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.history import AccountTag
+
+        a = _make_acct(empty)
+        empty.add_all([
+            AccountTag(account_id=a.id, tag="retirement"),
+            AccountTag(account_id=a.id, tag="personal"),
+        ])
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        # Sorted alphabetically.
+        assert body["account"]["tags"] == ["personal", "retirement"]
+
+    def test_ingestion_log_recent_capped_and_sorted(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        from src.models.ingestion_log import IngestionLog
+
+        a = _make_acct(empty)  # broker = "fidelity"
+        empty.flush()
+
+        base = datetime(2025, 1, 1, 12, 0, 0)
+        # 7 fidelity logs (5 should be returned), 1 schwab (excluded).
+        for i in range(7):
+            empty.add(
+                IngestionLog(
+                    source="fidelity_csv",
+                    run_at=base + timedelta(days=i),
+                    status="success",
+                    records_processed=10,
+                    records_failed=0,
+                )
+            )
+        empty.add(
+            IngestionLog(
+                source="schwab_csv",
+                run_at=base + timedelta(days=100),
+                status="success",
+                records_processed=1,
+                records_failed=0,
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get(f"/api/brokerage/accounts/{a.id}/detail")
+        body = r.json()
+        logs = body["ingestion_log_recent"]
+        assert len(logs) == 5
+        # All fidelity (no schwab).
+        assert all("fidelity" in log["source"] for log in logs)
+        # Sorted desc by run_at.
+        run_ats = [log["run_at"] for log in logs]
+        assert run_ats == sorted(run_ats, reverse=True)
+        # Most recent fidelity (i=6) first → 2025-01-07.
+        assert run_ats[0].startswith("2025-01-07")

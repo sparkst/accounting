@@ -17,12 +17,18 @@ from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal
-from src.models.brokerage import Account, PositionSnapshot
+from src.models.brokerage import (
+    Account,
+    BrokerageTransaction,
+    PositionSnapshot,
+    RealizedGainLoss,
+)
+from src.models.enums import GainLossTerm
 from src.models.history import (
     AccountBalanceSnapshot,
     AccountTag,
@@ -30,6 +36,7 @@ from src.models.history import (
     ExpectedAccount,
     HistoricalPrice,
 )
+from src.models.ingestion_log import IngestionLog
 from src.reports.brokerage_summary import (
     compute_data_integrity,
     compute_net_worth,
@@ -135,6 +142,130 @@ class AccountTagsUpdate(BaseModel):
 class AccountTagsResponse(BaseModel):
     account_id: str
     tags: list[str]
+
+
+class AccountPatchRequest(BaseModel):
+    """Partial-update body for PATCH /accounts/{id}.
+
+    All fields are optional. We rely on Pydantic v2's ``model_fields_set`` to
+    distinguish "field omitted" (leave existing value alone) from "field
+    explicitly set to null" (clear the column to NULL). Max-length validators
+    mirror the SQLAlchemy column widths in `Account` (`account_name=128`,
+    `beneficiary=64`, `notes=Text/unbounded`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    account_name: str | None = Field(default=None, max_length=128)
+    beneficiary: str | None = Field(default=None, max_length=64)
+    notes: str | None = Field(default=None)
+
+
+class AccountPatchResponse(BaseModel):
+    """Response for PATCH /accounts/{id} — the post-update row."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    account_id: str
+    account_name: str | None = None
+    beneficiary: str | None = None
+    notes: str | None = None
+    updated_at: datetime
+
+
+# ── Account-detail response models ─────────────────────────────────────
+
+
+class AccountDetailAccount(BaseModel):
+    """Full Account row + tags, for GET /accounts/{id}/detail."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: str
+    broker: str
+    account_number: str
+    account_name: str | None = None
+    account_type: str
+    entity: str
+    tax_sheltered: bool
+    beneficiary: str | None = None
+    notes: str | None = None
+    parent_account_id: str | None = None
+    is_plan_wrapper: bool
+    created_at: datetime
+    updated_at: datetime
+    tags: list[str] = []
+
+
+class PositionSnapshotDetailRow(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: str
+    as_of: datetime
+    symbol: str | None = None
+    description: str | None = None
+    quantity: Decimal | None = None
+    price: Decimal | None = None
+    market_value: Decimal | None = None
+    source_file: str
+    source_row_hash: str
+
+    @field_serializer("quantity", "price", "market_value")
+    def _ser_dec(self, v: Decimal | None) -> float | None:
+        return float(v) if v is not None else None
+
+
+class BalanceSnapshotDetailRow(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: str
+    as_of: date
+    raw_account_name: str
+    balance: Decimal
+    source: str
+
+    @field_serializer("balance")
+    def _ser_bal(self, v: Decimal) -> float:
+        return float(v)
+
+
+class AccountRealizedGLSummary(BaseModel):
+    """Lifetime realized G/L across all years for one account."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    short_term: Decimal
+    long_term: Decimal
+    total: Decimal
+    lots: int
+
+    @field_serializer("short_term", "long_term", "total")
+    def _ser_dec(self, v: Decimal) -> float:
+        return float(v)
+
+
+class IngestionLogDetailRow(BaseModel):
+    """Subset of IngestionLog fields surfaced in the detail panel."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: str
+    source: str
+    run_at: datetime
+    status: str
+    records_processed: int
+    records_failed: int
+
+
+class AccountDetailResponse(BaseModel):
+    """Full account-detail payload for GET /accounts/{id}/detail."""
+
+    account: AccountDetailAccount
+    latest_position_snapshots: list[PositionSnapshotDetailRow]
+    latest_balance_snapshots: list[BalanceSnapshotDetailRow]
+    transaction_count_by_action: dict[str, int]
+    realized_gl_summary: AccountRealizedGLSummary
+    ingestion_log_recent: list[IngestionLogDetailRow]
 
 
 class TopHoldingRow(BaseModel):
@@ -277,6 +408,238 @@ def update_account_tags(
     session.commit()
 
     return {"account_id": account_id, "tags": list(payload.tags)}
+
+
+@router.patch(
+    "/brokerage/accounts/{account_id}",
+    response_model=AccountPatchResponse,
+)
+def patch_account(
+    payload: AccountPatchRequest,
+    account_id: str = Path(min_length=1, max_length=64),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Partial-update of human-curated account metadata.
+
+    Patchable fields: ``account_name``, ``beneficiary``, ``notes``.
+
+    Semantics: only fields the caller actually supplied (per Pydantic v2's
+    ``model_fields_set``) are written. Omitting a field leaves the DB column
+    untouched. Sending ``null`` explicitly clears the column to NULL. An
+    empty body is a valid 200 — returns the unchanged row.
+
+    ``updated_at`` only bumps when at least one column is actually written
+    (the SQLAlchemy ``onupdate`` trigger fires per UPDATE statement).
+    """
+    account = session.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"account {account_id} not found")
+
+    supplied = payload.model_fields_set
+    changed = False
+    if "account_name" in supplied:
+        account.account_name = payload.account_name
+        changed = True
+    if "beneficiary" in supplied:
+        account.beneficiary = payload.beneficiary
+        changed = True
+    if "notes" in supplied:
+        account.notes = payload.notes
+        changed = True
+
+    if changed:
+        session.commit()
+        session.refresh(account)
+
+    return {
+        "account_id": account.id,
+        "account_name": account.account_name,
+        "beneficiary": account.beneficiary,
+        "notes": account.notes,
+        "updated_at": account.updated_at,
+    }
+
+
+def _summarise_realized_gl_for_account(
+    session: Session, account_id: str
+) -> dict[str, Any]:
+    """Lifetime realized G/L summary for one account.
+
+    Aggregates all RealizedGainLoss rows for the account and buckets them by
+    ``term`` into short_term / long_term. Rows missing both ``term`` and
+    explicit ``st_gain_loss``/``lt_gain_loss`` (the "unknown" bucket from the
+    portfolio-wide summary) fall through to ``total`` only — but at the
+    per-account scale we just sum what we can attribute.
+
+    Returns zeros (not None) when the account has no realized lots.
+    """
+    rows = (
+        session.query(RealizedGainLoss)
+        .filter(RealizedGainLoss.account_id == account_id)
+        .all()
+    )
+    short_term = Decimal("0")
+    long_term = Decimal("0")
+    total = Decimal("0")
+    for row in rows:
+        # Prefer the explicit term-bucketed columns; fall back to ``term``.
+        if row.st_gain_loss is not None:
+            short_term += row.st_gain_loss
+        elif row.term == GainLossTerm.SHORT.value and row.gain_loss is not None:
+            short_term += row.gain_loss
+
+        if row.lt_gain_loss is not None:
+            long_term += row.lt_gain_loss
+        elif row.term == GainLossTerm.LONG.value and row.gain_loss is not None:
+            long_term += row.gain_loss
+
+        if row.gain_loss is not None:
+            total += row.gain_loss
+
+    return {
+        "short_term": short_term,
+        "long_term": long_term,
+        "total": total,
+        "lots": len(rows),
+    }
+
+
+@router.get(
+    "/brokerage/accounts/{account_id}/detail",
+    response_model=AccountDetailResponse,
+)
+def account_detail(
+    account_id: str = Path(min_length=1, max_length=64),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Full account view: metadata, recent snapshots, transaction roll-up,
+    realized G/L, and recent ingestion runs touching this broker.
+
+    Returns 404 when the account_id doesn't exist. All list-shaped fields
+    return empty arrays (not nulls) when no data is available so the frontend
+    can render uniformly. ``realized_gl_summary`` returns explicit zero
+    Decimals when the account has no realized lots.
+
+    Sub-list caps:
+      - ``latest_position_snapshots``: 10 most recent by ``as_of`` desc.
+      - ``latest_balance_snapshots``: 10 most recent by ``as_of`` desc.
+      - ``ingestion_log_recent``: 5 most recent by ``run_at`` desc, filtered
+        to logs whose ``source`` contains the account's broker (substring
+        match — adapter source values like ``fidelity_csv`` carry the
+        broker name).
+    """
+    account = session.query(Account).filter(Account.id == account_id).first()
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"account {account_id} not found")
+
+    # Tags (sorted lower-case for deterministic output).
+    tag_rows = (
+        session.query(AccountTag.tag)
+        .filter(AccountTag.account_id == account_id)
+        .all()
+    )
+    tags = sorted(t for (t,) in tag_rows)
+
+    # Latest 10 position snapshots.
+    pos_snaps = (
+        session.query(PositionSnapshot)
+        .filter(PositionSnapshot.account_id == account_id)
+        .order_by(PositionSnapshot.as_of.desc())
+        .limit(10)
+        .all()
+    )
+    latest_position_snapshots = [
+        {
+            "id": ps.id,
+            "as_of": ps.as_of,
+            "symbol": ps.symbol,
+            "description": ps.description,
+            "quantity": ps.quantity,
+            "price": ps.price,
+            "market_value": ps.market_value,
+            "source_file": ps.source_file,
+            "source_row_hash": ps.source_row_hash,
+        }
+        for ps in pos_snaps
+    ]
+
+    # Latest 10 balance snapshots.
+    bal_snaps = (
+        session.query(AccountBalanceSnapshot)
+        .filter(AccountBalanceSnapshot.account_id == account_id)
+        .order_by(AccountBalanceSnapshot.as_of.desc())
+        .limit(10)
+        .all()
+    )
+    latest_balance_snapshots = [
+        {
+            "id": bs.id,
+            "as_of": bs.as_of,
+            "raw_account_name": bs.raw_account_name,
+            "balance": bs.balance,
+            "source": bs.source,
+        }
+        for bs in bal_snaps
+    ]
+
+    # Transaction count by canonical_action (single GROUP BY query).
+    tx_counts_rows = (
+        session.query(
+            BrokerageTransaction.canonical_action,
+            func.count(BrokerageTransaction.id),
+        )
+        .filter(BrokerageTransaction.account_id == account_id)
+        .group_by(BrokerageTransaction.canonical_action)
+        .all()
+    )
+    transaction_count_by_action = {action: count for action, count in tx_counts_rows}
+
+    realized_gl_summary = _summarise_realized_gl_for_account(session, account_id)
+
+    # Ingestion logs whose source carries the broker name (substring match).
+    # Adapter source values follow ``<broker>_<source>`` (e.g. fidelity_csv).
+    ingestion_rows = (
+        session.query(IngestionLog)
+        .filter(IngestionLog.source.like(f"%{account.broker}%"))
+        .order_by(IngestionLog.run_at.desc())
+        .limit(5)
+        .all()
+    )
+    ingestion_log_recent = [
+        {
+            "id": log.id,
+            "source": log.source,
+            "run_at": log.run_at,
+            "status": log.status,
+            "records_processed": log.records_processed,
+            "records_failed": log.records_failed,
+        }
+        for log in ingestion_rows
+    ]
+
+    return {
+        "account": {
+            "id": account.id,
+            "broker": account.broker,
+            "account_number": account.account_number,
+            "account_name": account.account_name,
+            "account_type": account.account_type,
+            "entity": account.entity,
+            "tax_sheltered": account.tax_sheltered,
+            "beneficiary": account.beneficiary,
+            "notes": account.notes,
+            "parent_account_id": account.parent_account_id,
+            "is_plan_wrapper": account.is_plan_wrapper,
+            "created_at": account.created_at,
+            "updated_at": account.updated_at,
+            "tags": tags,
+        },
+        "latest_position_snapshots": latest_position_snapshots,
+        "latest_balance_snapshots": latest_balance_snapshots,
+        "transaction_count_by_action": transaction_count_by_action,
+        "realized_gl_summary": realized_gl_summary,
+        "ingestion_log_recent": ingestion_log_recent,
+    }
 
 
 @router.get("/brokerage/top-holdings", response_model=list[TopHoldingRow])

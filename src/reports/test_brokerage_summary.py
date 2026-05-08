@@ -34,6 +34,7 @@ from src.models.enums import (
     Entity,
     GainLossTerm,
 )
+from src.models.history import AccountBalanceSnapshot
 
 # ── Fixture ──────────────────────────────────────────────────────────────
 
@@ -1265,7 +1266,6 @@ def _make_balance(
     balance: Decimal,
     source: str = "test_source",
 ) -> None:
-    from src.models.history import AccountBalanceSnapshot
     s.add(AccountBalanceSnapshot(
         account_id=account_id,
         raw_account_name=raw_account_name,
@@ -1291,6 +1291,8 @@ def test_per_account_value_position_only(empty_session: Session) -> None:
     assert "acct-pos-only" in result
     assert result["acct-pos-only"]["market_value"] == Decimal("1234.56")
     assert result["acct-pos-only"]["source"] == "position"
+    assert result["acct-pos-only"]["as_of"] == TODAY
+    _assert_clean(s)
 
 
 def test_per_account_value_balance_only(empty_session: Session) -> None:
@@ -1307,6 +1309,7 @@ def test_per_account_value_balance_only(empty_session: Session) -> None:
     assert "acct-bal-only" in result
     assert result["acct-bal-only"]["market_value"] == Decimal("9876.54")
     assert result["acct-bal-only"]["source"] == "balance"
+    _assert_clean(s)
 
 
 def test_per_account_value_position_wins_over_balance(empty_session: Session) -> None:
@@ -1322,6 +1325,7 @@ def test_per_account_value_position_wins_over_balance(empty_session: Session) ->
     result = _per_account_value(s)
     assert result["acct-both"]["market_value"] == Decimal("100000")
     assert result["acct-both"]["source"] == "position"
+    _assert_clean(s)
 
 
 def test_per_account_value_no_snapshots_excluded(empty_session: Session) -> None:
@@ -1330,6 +1334,7 @@ def test_per_account_value_no_snapshots_excluded(empty_session: Session) -> None
     _make_account(s, id="acct-nothing")
     s.commit()
     assert "acct-nothing" not in _per_account_value(s)
+    _assert_clean(s)
 
 
 def test_per_account_value_picks_latest_balance(empty_session: Session) -> None:
@@ -1346,6 +1351,62 @@ def test_per_account_value_picks_latest_balance(empty_session: Session) -> None:
     result = _per_account_value(s)
     assert result["acct-many-bal"]["market_value"] == Decimal("999")
     assert result["acct-many-bal"]["as_of"] == date(2026, 5, 7)
+    _assert_clean(s)
+
+
+def test_per_account_value_picks_latest_position(empty_session: Session) -> None:
+    """FIX-4: Two PositionSnapshots for one account at different dates —
+    _per_account_value must return the later date's value."""
+    from src.reports.brokerage_summary import _per_account_value
+    s = empty_session
+    _make_account(s, id="acct-pos-dates")
+    _make_position(s, account_id="acct-pos-dates", as_of=date(2025, 1, 1),
+                   market_value=Decimal("500"), symbol="VTI")
+    _make_position(s, account_id="acct-pos-dates", as_of=TODAY,
+                   market_value=Decimal("750"), symbol="VTI")
+    s.commit()
+
+    result = _per_account_value(s)
+    assert "acct-pos-dates" in result
+    assert result["acct-pos-dates"]["market_value"] == Decimal("750"), \
+        "Latest date's market_value must win"
+    assert result["acct-pos-dates"]["as_of"] == TODAY, \
+        "as_of must reflect the later snapshot date"
+    assert result["acct-pos-dates"]["source"] == "position"
+    _assert_clean(s)
+
+
+def test_per_account_value_none_market_value_falls_back_to_abs(
+    empty_session: Session,
+) -> None:
+    """FIX-5: Account with one PositionSnapshot where market_value=None AND
+    one AccountBalanceSnapshot with a real balance — result must be source='balance'."""
+    from src.reports.brokerage_summary import _per_account_value
+    s = empty_session
+    _make_account(s, id="acct-null-mv", broker=Broker.NW_MUTUAL.value,
+                  account_type=AccountType.OTHER.value)
+    # PositionSnapshot with null market_value — filtered out by _latest_position_snapshots
+    s.add(PositionSnapshot(
+        account_id="acct-null-mv",
+        as_of=_ts(TODAY),
+        symbol="X",
+        description="X",
+        quantity=Decimal("1"),
+        market_value=None,
+        source_file="test.csv",
+        source_row_hash="null-mv-snap",
+        raw_data={},
+    ))
+    _make_balance(s, account_id="acct-null-mv", raw_account_name="NW Mutual X",
+                  as_of=TODAY, balance=Decimal("4321.00"))
+    s.commit()
+
+    result = _per_account_value(s)
+    assert "acct-null-mv" in result, \
+        "Account must appear via ABS fallback when PositionSnapshot has null market_value"
+    assert result["acct-null-mv"]["source"] == "balance"
+    assert result["acct-null-mv"]["market_value"] == Decimal("4321.00")
+    _assert_clean(s)
 
 
 # ── compute_net_worth (T2) ─────────────────────────────────────────────
@@ -1369,6 +1430,7 @@ def test_compute_net_worth_includes_balance_only_brokers(empty_session: Session)
     assert nw["total"] == Decimal("760218.55")
     assert nw["by_broker"][Broker.FG_ANNUITY.value] == Decimal("660218.55")
     assert nw["by_broker"][Broker.SCHWAB.value] == Decimal("100000")
+    _assert_clean(s)
 
 
 def test_compute_net_worth_position_wins_for_dual_source_account(
@@ -1385,6 +1447,7 @@ def test_compute_net_worth_position_wins_for_dual_source_account(
     nw = compute_net_worth(s)
     assert nw["total"] == Decimal("500"), \
         "PositionSnapshot must win when both sources exist"
+    _assert_clean(s)
 
 
 def test_compute_net_worth_excludes_plan_wrapper_balance_source(
@@ -1400,6 +1463,7 @@ def test_compute_net_worth_excludes_plan_wrapper_balance_source(
     nw = compute_net_worth(s)
     assert nw["total"] == Decimal("0")
     assert nw["plan_wrapper_excluded_count"] == 1
+    _assert_clean(s)
 
 
 def test_compute_net_worth_zero_snapshot_excludes_balance_only_accounts(
@@ -1417,6 +1481,9 @@ def test_compute_net_worth_zero_snapshot_excludes_balance_only_accounts(
     nw = compute_net_worth(s)
     assert nw["zero_snapshot_account_count"] == 1, \
         "Only the truly-empty account should count; bal1 has an ABS"
+    assert nw["total"] == Decimal("10"), \
+        "bal1's ABS balance must contribute to the total"
+    _assert_clean(s)
 
 
 # ── get_account_summary (T3) ───────────────────────────────────────────
@@ -1439,6 +1506,7 @@ def test_get_account_summary_balance_only_account_has_as_of(
     assert nw_rows[0]["as_of"] == date(2026, 5, 7), \
         "Balance-only account must have non-null as_of"
     assert nw_rows[0]["market_value"] == Decimal("7280.48")
+    _assert_clean(s)
 
 
 def test_get_account_summary_dual_source_uses_position(
@@ -1456,6 +1524,7 @@ def test_get_account_summary_dual_source_uses_position(
     dual = next(r for r in rows if r["account_id"] == "dual2")
     assert dual["market_value"] == Decimal("123")
     assert dual["as_of"] == date(2026, 5, 7)
+    _assert_clean(s)
 
 
 def test_get_account_summary_sort_order_across_mixed_sources(
@@ -1477,6 +1546,15 @@ def test_get_account_summary_sort_order_across_mixed_sources(
     assert ours[0]["account_id"] == "big-bal", \
         "Higher market_value must sort first regardless of source"
     assert ours[1]["account_id"] == "small"
+    # Values and dates must also be correct, not just order.
+    assert ours[0]["market_value"] == Decimal("9999"), \
+        "big-bal market_value must match ABS balance"
+    assert ours[0]["as_of"] == TODAY, \
+        "big-bal as_of must reflect ABS as_of date"
+    assert ours[1]["market_value"] == Decimal("100"), \
+        "small market_value must match PositionSnapshot value"
+    assert ours[1]["as_of"] == TODAY
+    _assert_clean(s)
 
 
 def test_get_account_summary_plan_wrapper_still_returned(
@@ -1496,3 +1574,40 @@ def test_get_account_summary_plan_wrapper_still_returned(
     wrap = next(r for r in rows if r["account_id"] == "wrap2")
     assert wrap["is_plan_wrapper"] is True
     assert wrap["market_value"] == Decimal("500")
+    _assert_clean(s)
+
+
+def test_compute_net_worth_plan_wrapper_excluded_regardless_of_source(
+    empty_session: Session,
+) -> None:
+    """FIX-8: plan-wrapper exclusion fires whether the value comes from
+    PositionSnapshot, AccountBalanceSnapshot, or both.  A sibling non-wrapper
+    account with its own ABS must still be counted.
+
+    Assertions:
+    - wrapper excluded → total excludes wrapper's value
+    - sibling included → total = sibling ABS balance
+    - plan_wrapper_excluded_count == 1
+    """
+    from src.reports.brokerage_summary import compute_net_worth
+    s = empty_session
+    # Wrapper with BOTH sources — exclusion must fire regardless.
+    _make_account(s, id="wrap-both", broker=Broker.FIDELITY.value,
+                  is_plan_wrapper=True, account_number="wp01")
+    _make_position(s, account_id="wrap-both", as_of=TODAY,
+                   market_value=Decimal("200000"))
+    _make_balance(s, account_id="wrap-both", raw_account_name="Fidelity 401K",
+                  as_of=TODAY, balance=Decimal("195000"))
+    # Non-wrapper sibling with ABS only.
+    _make_account(s, id="sibling", broker=Broker.NW_MUTUAL.value,
+                  account_type=AccountType.OTHER.value, account_number="sb01")
+    _make_balance(s, account_id="sibling", raw_account_name="NW Mutual sibling",
+                  as_of=TODAY, balance=Decimal("55000"))
+    s.commit()
+
+    nw = compute_net_worth(s)
+    assert nw["plan_wrapper_excluded_count"] == 1, \
+        "Exactly one plan-wrapper account exists"
+    assert nw["total"] == Decimal("55000"), \
+        "Only the non-wrapper sibling ABS contributes; wrapper is excluded"
+    _assert_clean(s)

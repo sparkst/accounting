@@ -144,6 +144,13 @@ class BrokerageSummaryData(TypedDict):
     data_integrity: DataIntegrityData
 
 
+class _AccountSlot(TypedDict):
+    """Internal per-account valuation slot returned by :func:`_per_account_value`."""
+    market_value: Decimal
+    as_of: date | None
+    source: str
+
+
 # ── Time helpers (monkey-patchable for tests) ─────────────────────────────
 
 
@@ -292,25 +299,47 @@ def _latest_balance_snapshot_per_account(
     non-null account_id.
 
     "Latest" = the row with the maximum ``as_of`` for that account; ties
-    broken arbitrarily (in practice the per-account/per-date UNIQUE constraint
-    avoids ties). Used to surface balance-only brokers (FG, GSK, NW Mutual,
-    FT) whose statement-level data lives in ``account_balance_snapshot``
-    rather than ``position_snapshot``.
+    broken by MIN(id) for determinism (the per-account/per-date/per-source
+    UNIQUE constraint prevents same-source ties, but different sources on the
+    same date are resolved predictably). Uses a correlated subquery — mirrors
+    the pattern from ``_latest_position_snapshots`` — so we return only N rows
+    (one per account), not N*months.
     """
-    out: dict[str, AccountBalanceSnapshot] = {}
-    rows = (
+    # Subquery: for each account_id, the maximum as_of date.
+    max_as_of_q = (
+        select(
+            AccountBalanceSnapshot.account_id.label("account_id"),
+            func.max(AccountBalanceSnapshot.as_of).label("max_as_of"),
+        )
+        .where(AccountBalanceSnapshot.account_id.isnot(None))
+        .group_by(AccountBalanceSnapshot.account_id)
+        .subquery()
+    )
+
+    # Join back to AccountBalanceSnapshot to get the full row(s) at that date,
+    # then pick MIN(id) to break ties deterministically.
+    abs2 = aliased(AccountBalanceSnapshot)
+    min_id_q = (
+        select(func.min(abs2.id).label("id"))
+        .join(
+            max_as_of_q,
+            (abs2.account_id == max_as_of_q.c.account_id)
+            & (abs2.as_of == max_as_of_q.c.max_as_of),
+        )
+        .where(abs2.account_id.isnot(None))
+        .group_by(abs2.account_id)
+        .subquery()
+    )
+
+    rows: list[AccountBalanceSnapshot] = (
         session.query(AccountBalanceSnapshot)
-        .filter(AccountBalanceSnapshot.account_id.isnot(None))
+        .join(min_id_q, AccountBalanceSnapshot.id == min_id_q.c.id)
         .all()
     )
-    for row in rows:
-        prev = out.get(row.account_id)
-        if prev is None or row.as_of > prev.as_of:
-            out[row.account_id] = row
-    return out
+    return {row.account_id: row for row in rows}
 
 
-def _per_account_value(session: Session) -> dict[str, dict[str, Any]]:
+def _per_account_value(session: Session) -> dict[str, _AccountSlot]:
     """Per-account latest valuation, merged across PositionSnapshot and
     AccountBalanceSnapshot.
 
@@ -324,20 +353,20 @@ def _per_account_value(session: Session) -> dict[str, dict[str, Any]]:
 
     Accounts with neither snapshot type are absent from the returned dict.
     """
-    out: dict[str, dict[str, Any]] = {}
+    out: dict[str, _AccountSlot] = {}
 
     for ps in _latest_snapshot_rows(session):
         if ps.market_value is None:
             continue
         slot = out.get(ps.account_id)
         if slot is None:
-            slot = {
-                "market_value": Decimal("0"),
-                "as_of": None,
-                "source": "position",
-            }
+            slot = _AccountSlot(
+                market_value=Decimal("0"),
+                as_of=None,
+                source="position",
+            )
             out[ps.account_id] = slot
-        slot["market_value"] += Decimal(ps.market_value)
+        slot["market_value"] += Decimal(str(ps.market_value))
         if ps.as_of is not None:
             ps_date = ps.as_of.date() if isinstance(ps.as_of, datetime) else ps.as_of
             if slot["as_of"] is None or ps_date > slot["as_of"]:
@@ -346,11 +375,11 @@ def _per_account_value(session: Session) -> dict[str, dict[str, Any]]:
     for account_id, abs_row in _latest_balance_snapshot_per_account(session).items():
         if account_id in out:
             continue  # PositionSnapshot wins
-        out[account_id] = {
-            "market_value": Decimal(abs_row.balance),
-            "as_of": abs_row.as_of,
-            "source": "balance",
-        }
+        out[account_id] = _AccountSlot(
+            market_value=Decimal(str(abs_row.balance)),
+            as_of=abs_row.as_of,
+            source="balance",
+        )
     return out
 
 
@@ -394,7 +423,9 @@ def compute_net_worth(session: Session) -> dict[str, Any]:
     # the table level (independent of whether the row's value is null) to
     # preserve the historical semantic of this metric.
     snapshot_account_ids = {
-        a_id for a_id, in session.query(PositionSnapshot.account_id).distinct()
+        a_id for a_id, in session.query(PositionSnapshot.account_id)
+        .filter(PositionSnapshot.account_id.isnot(None))
+        .distinct()
     } | {
         a_id for a_id, in session.query(AccountBalanceSnapshot.account_id)
         .filter(AccountBalanceSnapshot.account_id.isnot(None))

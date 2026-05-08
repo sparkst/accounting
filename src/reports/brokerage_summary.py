@@ -145,7 +145,8 @@ class BrokerageSummaryData(TypedDict):
 
 
 class _AccountSlot(TypedDict):
-    """Internal per-account valuation slot returned by :func:`_per_account_value`."""
+    """Internal per-account valuation slot returned by :func:`_per_account_value`
+    and :func:`_per_account_value_at`."""
     market_value: Decimal
     as_of: date | None
     source: str
@@ -340,53 +341,17 @@ def _latest_balance_snapshot_per_account(
 
 
 def _per_account_value(session: Session) -> dict[str, _AccountSlot]:
-    """Per-account latest valuation, merged across PositionSnapshot and
-    AccountBalanceSnapshot.
+    """Per-account latest valuation as of today, merged across PositionSnapshot
+    and AccountBalanceSnapshot.
 
-    Returns ``{account_id: {market_value, as_of, source}}`` where ``source`` is
-    ``'position'`` for PositionSnapshot-derived rows and ``'balance'`` for
-    AccountBalanceSnapshot-derived rows. ``market_value`` is the per-account
-    sum (PositionSnapshot may have many rows per account; AccountBalanceSnapshot
-    is one row per account-date). PositionSnapshot wins when both exist for the
-    same account — actively-imported per-position data is more current and
-    finer-grained than a statement total.
+    Thin wrapper around :func:`_per_account_value_at` with ``target_date =
+    _today()``.  Use :func:`_per_account_value_at` directly when you need
+    as-of-a-specific-date semantics (e.g. the networth-history series).
 
-    Accounts with neither snapshot type are absent from the returned dict.
-
-    Date-blind: returns whatever the most recent row is, even if it's
-    future-dated relative to ``_today()`` — preserved for the
-    headline-net-worth views where we always want the freshest data. Use
-    :func:`_per_account_value_at` for as-of-a-date semantics with
-    forward-fill + live re-pricing.
+    Returns ``{account_id: {market_value, as_of, source}}``.  Accounts with
+    neither snapshot type are absent from the returned dict.
     """
-    out: dict[str, _AccountSlot] = {}
-
-    for ps in _latest_snapshot_rows(session):
-        if ps.market_value is None:
-            continue
-        slot = out.get(ps.account_id)
-        if slot is None:
-            slot = _AccountSlot(
-                market_value=Decimal("0"),
-                as_of=None,
-                source="position",
-            )
-            out[ps.account_id] = slot
-        slot["market_value"] += Decimal(str(ps.market_value))
-        if ps.as_of is not None:
-            ps_date = ps.as_of.date() if isinstance(ps.as_of, datetime) else ps.as_of
-            if slot["as_of"] is None or ps_date > slot["as_of"]:
-                slot["as_of"] = ps_date
-
-    for account_id, abs_row in _latest_balance_snapshot_per_account(session).items():
-        if account_id in out:
-            continue  # PositionSnapshot wins
-        out[account_id] = _AccountSlot(
-            market_value=Decimal(str(abs_row.balance)),
-            as_of=abs_row.as_of,
-            source="balance",
-        )
-    return out
+    return _per_account_value_at(session, _today())
 
 
 # ── Forward-fill + live re-pricing helpers (Pipeline 004) ────────────────
@@ -504,10 +469,10 @@ def _latest_at_or_before(
 ) -> Any | None:
     """Return the value paired with the largest date ≤ ``target``, or None.
 
-    ``sorted_pairs`` must be ascending by date. Linear scan from the end —
-    fast enough for the modest N (≤ a few hundred snapshots per account, a
-    few thousand prices per symbol). Switch to ``bisect`` if profiling
-    shows this on a hot path.
+    ``sorted_pairs`` must be ascending by date. Linear scan from the start,
+    updating last until we exceed target — fast enough for the modest N
+    (≤ a few hundred snapshots per account, a few thousand prices per symbol).
+    Switch to ``bisect`` if profiling shows this on a hot path.
     """
     last: Any | None = None
     for d, val in sorted_pairs:
@@ -779,17 +744,17 @@ def get_top_holdings(
             aggregated[key] = {
                 "symbol": display_symbol,
                 "description": description,
-                "total_quantity": Decimal(ps.quantity) if ps.quantity is not None else Decimal("0"),
-                "total_market_value": Decimal(ps.market_value),
+                "total_quantity": Decimal(str(ps.quantity)) if ps.quantity is not None else Decimal("0"),
+                "total_market_value": Decimal(str(ps.market_value)),
                 "account_count": 1,
                 "is_cash_sleeve": is_cash,
                 "_account_ids": {ps.account_id},
             }
         else:
             existing["total_quantity"] += (
-                Decimal(ps.quantity) if ps.quantity is not None else Decimal("0")
+                Decimal(str(ps.quantity)) if ps.quantity is not None else Decimal("0")
             )
-            existing["total_market_value"] += Decimal(ps.market_value)
+            existing["total_market_value"] += Decimal(str(ps.market_value))
             existing["_account_ids"].add(ps.account_id)
             existing["account_count"] = len(existing["_account_ids"])
 
@@ -1280,7 +1245,4 @@ __all__ = [
     "compute_data_integrity",
     "render_report",
     "main",
-    # Pipeline 004 — networth-history forward-fill + re-pricing
-    "_per_account_value_at",
-    "_load_history_state",
 ]

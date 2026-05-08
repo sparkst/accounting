@@ -380,7 +380,9 @@ class TestNetWorthHistory:
         # Weekly Saturdays from 2024-01-06 (first Sat after 2024-01-01) to
         # 2024-06-29 plus today (2024-07-01) = 26 Saturdays + today = 27.
         assert len(body) >= 26
-        # Earliest sampled point uses the Jan 1 snapshots → $300.
+        # Earliest sampled point is 2024-01-06 (first Saturday after 2024-01-01).
+        assert body[0]["as_of"] == "2024-01-06"
+        # It uses the Jan 1 snapshots forward-filled → $300.
         assert body[0]["balance_total"] == 300.0
         assert body[0]["account_count"] == 2
         # Last point is today, with the latest forward-filled values → $400.
@@ -462,6 +464,7 @@ class TestNetWorthHistory:
         # has balance_total=0 / account_count=0.
         r = empty_client.get("/api/brokerage/networth-history")
         body = r.json()
+        assert len(body) >= 1, "Series must be non-empty when a closed account has a snapshot"
         assert all(p["balance_total"] == 0.0 for p in body)
         assert all(p["account_count"] == 0 for p in body)
 
@@ -721,6 +724,14 @@ class TestMissingAccounts:
 class TestBenchmarkComparison:
     """portfolio history vs buy-and-hold benchmark simulation."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin the route's clock so series boundaries are deterministic."""
+        from src.api.routes import brokerage as routes_mod
+        monkeypatch.setattr(
+            routes_mod, "_today", lambda: date(2024, 1, 1), raising=False
+        )
+
     def test_disallowed_benchmark_returns_400(self, empty_client: TestClient) -> None:
         r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=GME")
         assert r.status_code == 400
@@ -737,9 +748,15 @@ class TestBenchmarkComparison:
         assert body["benchmark_pct"] is None
 
     def test_buy_and_hold_simulation(
-        self, empty_client: TestClient, empty: Session
+        self, empty_client: TestClient, empty: Session,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        from datetime import date
+        """FIX-4: end uses _per_account_value_at forward-fill; granularity=daily
+        so we can check specific date values without coupling to weekly Saturday
+        alignment."""
+        from src.api.routes import brokerage as routes_mod
+        # Pin today to 2024-12-31 so both ABS dates are in the series.
+        monkeypatch.setattr(routes_mod, "_today", lambda: date(2024, 12, 31), raising=False)
 
         from src.models.brokerage import Account
         from src.models.history import AccountBalanceSnapshot, HistoricalPrice
@@ -779,24 +796,30 @@ class TestBenchmarkComparison:
         empty.add(HistoricalPrice(symbol="SPY", trade_date=date(2024, 12, 31), close=Decimal("130")))
         empty.commit()
 
-        r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
+        # Use daily so we can assert on the first and last day directly.
+        r = empty_client.get(
+            "/api/brokerage/networth-history-benchmark?benchmark=SPY&granularity=daily"
+        )
         assert r.status_code == 200
         body = r.json()
-        assert len(body["series"]) == 2
-        # First point: portfolio = 100k, benchmark = 100k (anchor).
-        assert body["series"][0]["portfolio_value"] == 100000.0
-        assert body["series"][0]["benchmark_value"] == 100000.0
-        # Second point: portfolio = 200k, benchmark = 100k * 130/100 = 130k.
-        assert body["series"][1]["portfolio_value"] == 200000.0
-        assert body["series"][1]["benchmark_value"] == 130000.0
-        assert body["portfolio_pct"] == pytest.approx(1.0)  # +100%
+        # 366 daily points (2024 is a leap year) from Jan 1 to Dec 31.
+        assert len(body["series"]) == 366
+        # First point: portfolio = 100k, benchmark anchored = 100k.
+        first = body["series"][0]
+        assert first["as_of"] == "2024-01-01"
+        assert first["portfolio_value"] == pytest.approx(100000.0)
+        assert first["benchmark_value"] == pytest.approx(100000.0)
+        # Last point: portfolio forward-fills to 200k; SPY at $130 → benchmark 130k.
+        last = body["series"][-1]
+        assert last["as_of"] == "2024-12-31"
+        assert last["portfolio_value"] == pytest.approx(200000.0)
+        assert last["benchmark_value"] == pytest.approx(130000.0)
+        assert body["portfolio_pct"] == pytest.approx(1.0)   # +100%
         assert body["benchmark_pct"] == pytest.approx(0.30)  # +30%
 
     def test_missing_benchmark_prices_returns_null_benchmark(
         self, empty_client: TestClient, empty: Session
     ) -> None:
-        from datetime import date
-
         from src.models.brokerage import Account
         from src.models.history import AccountBalanceSnapshot
 
@@ -825,13 +848,19 @@ class TestBenchmarkComparison:
         r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
         assert r.status_code == 200
         body = r.json()
+        # First point (today = 2024-01-01, only 1 point) has null benchmark.
         assert body["series"][0]["benchmark_value"] is None
         assert body["benchmark_pct"] is None
 
-    def test_single_snapshot_returns_one_point_with_zero_pct(
-        self, empty_client: TestClient, empty: Session
+    def test_single_snapshot_is_today_returns_one_point_with_zero_pct(
+        self, empty_client: TestClient, empty: Session,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Single snapshot ⇒ start == end ⇒ 0% return for both lines."""
+        """Single snapshot on today → 1-point series. Forward-fill: start==end→0%."""
+        from src.api.routes import brokerage as routes_mod
+        # Today IS the snapshot date.
+        monkeypatch.setattr(routes_mod, "_today", lambda: date(2024, 1, 1), raising=False)
+
         from src.models.brokerage import Account
         from src.models.history import AccountBalanceSnapshot, HistoricalPrice
 
@@ -856,12 +885,17 @@ class TestBenchmarkComparison:
         r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
         body = r.json()
         assert len(body["series"]) == 1
+        assert body["series"][0]["as_of"] == "2024-01-01"
         assert body["portfolio_pct"] == 0.0
         assert body["benchmark_pct"] == 0.0
 
     def test_negative_return_drawdown(
-        self, empty_client: TestClient, empty: Session
+        self, empty_client: TestClient, empty: Session,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        from src.api.routes import brokerage as routes_mod
+        monkeypatch.setattr(routes_mod, "_today", lambda: date(2024, 12, 31), raising=False)
+
         from src.models.brokerage import Account
         from src.models.history import AccountBalanceSnapshot, HistoricalPrice
 
@@ -890,10 +924,63 @@ class TestBenchmarkComparison:
         empty.add(HistoricalPrice(symbol="SPY", trade_date=date(2024, 12, 31), close=Decimal("90")))
         empty.commit()
 
-        r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
+        r = empty_client.get(
+            "/api/brokerage/networth-history-benchmark?benchmark=SPY&granularity=daily"
+        )
         body = r.json()
         assert body["portfolio_pct"] == pytest.approx(-0.20)
         assert body["benchmark_pct"] == pytest.approx(-0.10)
+
+    def test_benchmark_forward_fill_regression(
+        self, empty_client: TestClient, empty: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FIX-4 regression: a PositionSnapshot must be re-priced via
+        HistoricalPrice at intermediate target dates, confirming _per_account_value_at
+        is used (not a raw ABS sum)."""
+        from src.api.routes import brokerage as routes_mod
+        monkeypatch.setattr(routes_mod, "_today", lambda: date(2024, 6, 1), raising=False)
+
+        from src.models.brokerage import Account, PositionSnapshot
+        from src.models.history import HistoricalPrice
+
+        a = Account(
+            broker="schwab", account_number="FF1", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        empty.add(a)
+        empty.flush()
+        # 100 shares of VTI, stored mv $20k at 2024-01-01.
+        empty.add(PositionSnapshot(
+            account_id=a.id,
+            as_of=datetime(2024, 1, 1, 12, 0, 0),
+            symbol="VTI", description="VTI",
+            quantity=Decimal("100"), market_value=Decimal("20000"),
+            source_file="t.csv", source_row_hash="ff-rp", raw_data={},
+        ))
+        # Historical price on 2024-06-01: VTI = $300 → re-priced mv = $30k.
+        empty.add(HistoricalPrice(
+            symbol="VTI", trade_date=date(2024, 6, 1), close=Decimal("300"), source="test"
+        ))
+        # Benchmark prices.
+        empty.add(HistoricalPrice(symbol="SPY", trade_date=date(2024, 1, 6), close=Decimal("400")))
+        empty.add(HistoricalPrice(symbol="SPY", trade_date=date(2024, 6, 1), close=Decimal("440")))
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/networth-history-benchmark?benchmark=SPY")
+        assert r.status_code == 200
+        body = r.json()
+        # First weekly point (2024-01-06): stored mv = $20k, SPY anchor = $400.
+        # initial_portfolio = $20k, shares = 20000/400 = 50.
+        first = body["series"][0]
+        assert first["portfolio_value"] == pytest.approx(20000.0)
+        assert first["benchmark_value"] == pytest.approx(20000.0)  # 50 × $400
+        # Last point (2024-06-01, today): re-priced mv = $30k.
+        # SPY at 440 → benchmark = 50 × $440 = $22k.
+        last = body["series"][-1]
+        assert last["as_of"] == "2024-06-01"
+        assert last["portfolio_value"] == pytest.approx(30000.0)
+        assert last["benchmark_value"] == pytest.approx(22000.0)  # 50 × $440
 
 
 # ── /api/brokerage/holdings/{symbol}/history (T14) ─────────────────────
@@ -1479,6 +1566,14 @@ class TestHistoryTagFilter:
 
 class TestBenchmarkTagFilter:
     """Same filter param contract on /networth-history-benchmark."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin today to the snapshot date so the series has exactly 1 weekly point."""
+        from src.api.routes import brokerage as routes_mod
+        monkeypatch.setattr(
+            routes_mod, "_today", lambda: date(2024, 1, 6), raising=False
+        )
 
     def test_benchmark_endpoint_honors_account_ids_filter(
         self, empty_client: TestClient, empty: Session
@@ -2271,6 +2366,7 @@ class TestNetworthHistoryForwardFill:
         body = r.json()
         # Month-ends Jan 31, Feb 29, Mar 31, Apr 30, May 31, Jun 30 (= 6) plus
         # today (2024-07-01) appended at the end.
+        assert len(body) == 7, f"Expected 6 month-ends + today = 7 points, got {len(body)}"
         as_ofs = [p["as_of"] for p in body]
         assert "2024-01-31" in as_ofs
         assert "2024-06-30" in as_ofs
@@ -2341,3 +2437,215 @@ class TestNetworthHistoryForwardFill:
         # the 2024-06-29 close → re-priced to $30k.
         assert body[-1]["as_of"] == "2024-07-01"
         assert body[-1]["balance_total"] == 30000.0
+
+    def test_unmatched_continues_to_contribute_when_other_account_matched(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-1 scenario A: Unmatched "Aiden 529" must still contribute after
+        "Vanguard 65344815" gets a matched ABS row.  Different raw_account_name
+        means no suppression — the per-account cutoff is name-based."""
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        # Matched live account with a different raw_account_name.
+        live = Account(
+            broker="vanguard",
+            account_number="65344815",
+            account_type="taxable",
+            entity="personal",
+            tax_sheltered=False,
+        )
+        empty.add(live)
+        empty.flush()
+
+        # Unmatched XLSX row: "Aiden 529" has no matched counterpart.
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=None,
+                raw_account_name="Aiden 529",
+                as_of=date(2024, 1, 1),
+                balance=Decimal("1000"),
+                source="xlsx_2024",
+                source_row_hash="aiden-529-h",
+            )
+        )
+        # Matched ABS for the live account under a different name.
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=live.id,
+                raw_account_name="Vanguard 65344815",
+                as_of=date(2024, 6, 1),
+                balance=Decimal("5000"),
+                source="xlsx_2024",
+                source_row_hash="vg-live-h",
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?include_unmatched=true"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        final = body[-1]
+        assert final["as_of"] == "2024-07-01"
+        # Matched $5k (live account) + unmatched $1k (Aiden 529) = $6k.
+        assert final["balance_total"] == pytest.approx(6000.0), (
+            "Aiden 529 ($1000 unmatched) must not be suppressed by "
+            "Vanguard 65344815 ($5000 matched) — different raw_account_names"
+        )
+
+    def test_unmatched_suppressed_when_same_raw_name_matched(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-1 scenario B: Unmatched "Travis Roth" must be suppressed once a
+        matched ABS row with the same raw_account_name exists at-or-before target."""
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        live = Account(
+            broker="vanguard",
+            account_number="11111111",
+            account_type="taxable",
+            entity="personal",
+            tax_sheltered=False,
+        )
+        empty.add(live)
+        empty.flush()
+
+        # Unmatched row dated 2024-01-01.
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=None,
+                raw_account_name="Travis Roth",
+                as_of=date(2024, 1, 1),
+                balance=Decimal("2000"),
+                source="xlsx_2024",
+                source_row_hash="tr-unmatched-h",
+            )
+        )
+        # Matched row with same name starts 2024-06-01.
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=live.id,
+                raw_account_name="Travis Roth",
+                as_of=date(2024, 6, 1),
+                balance=Decimal("2500"),
+                source="xlsx_2024",
+                source_row_hash="tr-matched-h",
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?include_unmatched=true"
+        )
+        assert r.status_code == 200
+        body = r.json()
+        final = body[-1]
+        assert final["as_of"] == "2024-07-01"
+        # After 2024-06-01 only the matched $2500 should contribute.
+        assert final["balance_total"] == pytest.approx(2500.0), (
+            "Unmatched Travis Roth ($2000) must be suppressed once matched "
+            "Travis Roth ($2500) exists — same name prevents double-count"
+        )
+
+    def test_networth_history_excludes_plan_wrapper(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """FIX-2: plan-wrapper accounts must NOT contribute to balance_total
+        at any point in the series."""
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        wrapper = Account(
+            broker="fidelity",
+            account_number="WRAP01",
+            account_type="401k",
+            entity="personal",
+            tax_sheltered=True,
+            is_plan_wrapper=True,
+        )
+        non_wrapper = Account(
+            broker="vanguard",
+            account_number="REAL01",
+            account_type="taxable",
+            entity="personal",
+            tax_sheltered=False,
+        )
+        empty.add_all([wrapper, non_wrapper])
+        empty.flush()
+
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=wrapper.id,
+                raw_account_name="Fidelity 401k Plan",
+                as_of=date(2024, 1, 1),
+                balance=Decimal("100000"),
+                source="xlsx_2024",
+                source_row_hash="wrap-h",
+            )
+        )
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=non_wrapper.id,
+                raw_account_name="Vanguard Taxable",
+                as_of=date(2024, 1, 1),
+                balance=Decimal("50000"),
+                source="xlsx_2024",
+                source_row_hash="real-h",
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/networth-history")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body) >= 1
+        for pt in body:
+            assert pt["balance_total"] == pytest.approx(50000.0), (
+                f"Plan-wrapper $100k must be excluded; got {pt['balance_total']} "
+                f"at {pt['as_of']}"
+            )
+
+    def test_single_snapshot_today_wednesday_returns_one_point(
+        self, empty_client: TestClient, empty: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FIX-8: When the only snapshot is dated today (a Wednesday), the
+        weekly series has no Saturday before today, so today is appended and
+        the series must be exactly 1 point."""
+        from src.api.routes import brokerage as routes_mod
+        # 2024-07-03 is a Wednesday.
+        monkeypatch.setattr(routes_mod, "_today", lambda: date(2024, 7, 3), raising=False)
+
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        a = Account(
+            broker="schwab", account_number="WED01", account_type="taxable",
+            entity="personal", tax_sheltered=False,
+        )
+        empty.add(a)
+        empty.flush()
+        empty.add(
+            AccountBalanceSnapshot(
+                account_id=a.id,
+                raw_account_name="Wednesday Account",
+                as_of=date(2024, 7, 3),  # today (Wednesday)
+                balance=Decimal("42000"),
+                source="xlsx_2024",
+                source_row_hash="wed-only",
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/networth-history")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body) == 1, (
+            f"Expected exactly 1 point for a snapshot dated today (Wednesday); "
+            f"got {len(body)}: {[p['as_of'] for p in body]}"
+        )
+        assert body[0]["as_of"] == "2024-07-03"
+        assert body[0]["balance_total"] == pytest.approx(42000.0)

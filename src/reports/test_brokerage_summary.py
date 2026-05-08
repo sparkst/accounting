@@ -1345,12 +1345,12 @@ def test_per_account_value_picks_latest_balance(empty_session: Session) -> None:
     _make_balance(s, account_id="acct-many-bal", raw_account_name="x",
                   as_of=date(2024, 1, 1), balance=Decimal("100"))
     _make_balance(s, account_id="acct-many-bal", raw_account_name="x",
-                  as_of=date(2026, 5, 7), balance=Decimal("999"))
+                  as_of=TODAY, balance=Decimal("999"))
     s.commit()
 
     result = _per_account_value(s)
     assert result["acct-many-bal"]["market_value"] == Decimal("999")
-    assert result["acct-many-bal"]["as_of"] == date(2026, 5, 7)
+    assert result["acct-many-bal"]["as_of"] == TODAY
     _assert_clean(s)
 
 
@@ -1497,13 +1497,13 @@ def test_get_account_summary_balance_only_account_has_as_of(
     _make_account(s, id="nw1", broker=Broker.NW_MUTUAL.value,
                   account_type=AccountType.OTHER.value, account_number="17399215")
     _make_balance(s, account_id="nw1", raw_account_name="NW Mutual 17399215",
-                  as_of=date(2026, 5, 7), balance=Decimal("7280.48"))
+                  as_of=TODAY, balance=Decimal("7280.48"))
     s.commit()
 
     rows = get_account_summary(s)
     nw_rows = [r for r in rows if r["account_id"] == "nw1"]
     assert len(nw_rows) == 1
-    assert nw_rows[0]["as_of"] == date(2026, 5, 7), \
+    assert nw_rows[0]["as_of"] == TODAY, \
         "Balance-only account must have non-null as_of"
     assert nw_rows[0]["market_value"] == Decimal("7280.48")
     _assert_clean(s)
@@ -1515,7 +1515,7 @@ def test_get_account_summary_dual_source_uses_position(
     from src.reports.brokerage_summary import get_account_summary
     s = empty_session
     _make_account(s, id="dual2")
-    _make_position(s, account_id="dual2", as_of=date(2026, 5, 7),
+    _make_position(s, account_id="dual2", as_of=TODAY,
                    market_value=Decimal("123"))
     _make_balance(s, account_id="dual2", raw_account_name="x",
                   as_of=date(2026, 5, 1), balance=Decimal("999"))
@@ -1523,7 +1523,7 @@ def test_get_account_summary_dual_source_uses_position(
     rows = get_account_summary(s)
     dual = next(r for r in rows if r["account_id"] == "dual2")
     assert dual["market_value"] == Decimal("123")
-    assert dual["as_of"] == date(2026, 5, 7)
+    assert dual["as_of"] == TODAY
     _assert_clean(s)
 
 
@@ -1889,15 +1889,32 @@ def test_load_history_state_then_per_account_value_at_match(
     empty_session: Session,
 ) -> None:
     """Pre-loading state and passing it must produce the same result as
-    calling without it (the optimisation must be transparent)."""
+    calling without it (the optimisation must be transparent).
+
+    FIX-12: includes a HistoricalPrice row to confirm that the re-pricing
+    path is exercised by both the direct and via_state calls.
+    """
     from src.reports.brokerage_summary import (
         _load_history_state,
         _per_account_value_at,
     )
     s = empty_session
     _make_account(s, id="acct-opt")
-    _make_position(s, account_id="acct-opt", as_of=date(2024, 1, 1),
-                   market_value=Decimal("2000"))
+    # 10 shares of VTI, stored mv $2000.
+    s.add(PositionSnapshot(
+        account_id="acct-opt",
+        as_of=_ts(date(2024, 1, 1)),
+        symbol="VTI",
+        description="VTI",
+        quantity=Decimal("10"),
+        price=Decimal("200"),
+        market_value=Decimal("2000"),
+        source_file="test.csv",
+        source_row_hash="opt-vti",
+        raw_data={},
+    ))
+    # HistoricalPrice on the target date: VTI at $300 → re-priced mv = $3000.
+    _make_price(s, symbol="VTI", trade_date=date(2024, 6, 1), close=Decimal("300"))
     _make_account(s, id="acct-opt2", broker=Broker.NW_MUTUAL.value,
                   account_type=AccountType.OTHER.value)
     _make_balance(s, account_id="acct-opt2", raw_account_name="x",
@@ -1909,7 +1926,9 @@ def test_load_history_state_then_per_account_value_at_match(
     state = _load_history_state(s)
     via_state = _per_account_value_at(s, target, history_state=state)
     assert direct == via_state
-    assert via_state["acct-opt"]["market_value"] == Decimal("2000")
+    # Re-priced: 10 × $300 = $3000 (not stored $2000).
+    assert via_state["acct-opt"]["market_value"] == Decimal("3000"), \
+        "Re-priced via HistoricalPrice: 10 × $300"
     assert via_state["acct-opt2"]["market_value"] == Decimal("3000")
     _assert_clean(s)
 
@@ -1941,4 +1960,25 @@ def test_per_account_value_at_filters_suspect_symbols(
 
     result = _per_account_value_at(s, date(2024, 6, 1))
     assert "acct-bad" not in result, "Suspect rows must be filtered out"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_returns_wrapper(empty_session: Session) -> None:
+    """FIX-2 helper-level: _per_account_value_at INCLUDES plan-wrapper accounts —
+    the route is responsible for filtering them, not the helper.  This test
+    documents the responsibility split so that refactors don't accidentally push
+    filtering into the wrong layer."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="wrapper-acct", broker=Broker.FIDELITY.value,
+                  is_plan_wrapper=True, account_number="WRAP01")
+    _make_balance(s, account_id="wrapper-acct", raw_account_name="Fidelity 401k",
+                  as_of=TODAY, balance=Decimal("150000"))
+    s.commit()
+
+    result = _per_account_value_at(s, TODAY)
+    # Helper must include the wrapper — routing layer removes it from the series.
+    assert "wrapper-acct" in result, \
+        "_per_account_value_at must NOT filter plan_wrapper; that is the route's job"
+    assert result["wrapper-acct"]["market_value"] == Decimal("150000")
     _assert_clean(s)

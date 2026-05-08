@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from calendar import monthrange
 from collections.abc import Generator
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -803,15 +804,13 @@ def _generate_target_dates(
             cur = cur + timedelta(days=7)
     else:  # monthly
         # Last day of each calendar month on or after start.
-        from calendar import monthrange
         year, month = start.year, start.month
         while True:
             last_day = monthrange(year, month)[1]
             d = date(year, month, last_day)
             if d > end:
                 break
-            if d >= start:
-                out.append(d)
+            out.append(d)
             month += 1
             if month > 12:
                 month = 1
@@ -967,32 +966,61 @@ def networth_history(
     # Account metadata we need every iteration.
     accounts_by_id = state["accounts_by_id"]
 
-    # Helper to forward-fill an unmatched pseudo-account at a target date.
-    # We cap forward-fill at the date when matched live data takes over —
-    # the earliest PositionSnapshot date in the system. Past that boundary
-    # the live broker feeds (PositionSnapshot) own the chart; otherwise
-    # parallel-tracked accounts (XLSX historical name "Travis Roth" +
-    # matched live "Vanguard Travis 65344815") would double-count at every
-    # point past the latest unmatched row.
-    unmatched_cutoff: date | None
-    if earliest_pos is not None:
-        unmatched_cutoff = (
-            earliest_pos.date()
-            if isinstance(earliest_pos, datetime)
-            else earliest_pos
+    # ── Suppression index for unmatched (legacy XLSX) rows ──────────────
+    # Two-tier rule for suppressing an unmatched pseudo-account R at target
+    # date T (only one needs to fire):
+    #   (1) Per-name: any *matched* AccountBalanceSnapshot exists with the
+    #       same raw_account_name (case-insensitive) at-or-before T.
+    #   (2) Fallback global cutoff: target date T is at-or-after the earliest
+    #       PositionSnapshot in the system (i.e., live broker data has
+    #       started).  This catches the common case where the legacy XLSX
+    #       label ("Amy IRA") differs from the live ABS rollup label
+    #       ("Vanguard Amy 65344815") so per-name doesn't match — but the
+    #       live data IS already counted and we'd otherwise double-count.
+    # An unmatched account whose name has no matched counterpart AND whose
+    # target precedes any PositionSnapshot keeps contributing (covers the
+    # pre-live history backfill).
+    matched_name_dates: dict[str, list[date]] = {}
+    global_position_cutoff: date | None = None
+    if include_unmatched and unmatched_by_pseudo:
+        for snap in (
+            session.query(AccountBalanceSnapshot)
+            .filter(AccountBalanceSnapshot.account_id.isnot(None))
+            .order_by(AccountBalanceSnapshot.as_of.asc())
+            .all()
+        ):
+            key = snap.raw_account_name.lower()
+            matched_name_dates.setdefault(key, []).append(snap.as_of)
+        earliest_pos_query = (
+            session.query(func.min(PositionSnapshot.as_of))
+            .filter(PositionSnapshot.account_id.isnot(None))
+            .scalar()
         )
-    else:
-        unmatched_cutoff = None
+        if earliest_pos_query is not None:
+            global_position_cutoff = (
+                earliest_pos_query.date()
+                if isinstance(earliest_pos_query, datetime)
+                else earliest_pos_query
+            )
 
     def _unmatched_contribution(target: date) -> tuple[Decimal, int]:
-        # Once matched live data exists at-or-before this target, suppress
-        # the unmatched series — they describe the same underlying accounts
-        # under different names.
-        if unmatched_cutoff is not None and target >= unmatched_cutoff:
-            return Decimal("0"), 0
+        """Forward-fill each unmatched pseudo-account, with two-tier suppression.
+
+        Tier 1 (per-name): suppress when a matched ABS row with the same
+        raw_account_name exists at-or-before target.
+        Tier 2 (global): suppress when target is at-or-after the earliest
+        PositionSnapshot date — live broker data is now driving the chart
+        for these accounts even when the XLSX label doesn't string-match
+        the live rollup label.
+        """
         total = Decimal("0")
         count = 0
-        for series in unmatched_by_pseudo.values():
+        for raw_name, series in unmatched_by_pseudo.items():
+            matched_dates = matched_name_dates.get(raw_name.lower(), [])
+            if matched_dates and any(d <= target for d in matched_dates):
+                continue  # tier 1 suppressed
+            if global_position_cutoff is not None and target >= global_position_cutoff:
+                continue  # tier 2 suppressed
             latest_bal: Decimal | None = None
             for d, bal in series:
                 if d > target:
@@ -1240,7 +1268,7 @@ def _build_price_lookup(
         .order_by(HistoricalPrice.trade_date.asc())
         .all()
     )
-    return [(r[0], r[1]) for r in rows]
+    return [(r[0], Decimal(str(r[1]))) for r in rows]
 
 
 def _nearest_price_lookup(
@@ -1265,6 +1293,13 @@ def _nearest_price_lookup(
 )
 def networth_history_benchmark(
     benchmark: str = Query("SPY", min_length=1, max_length=8),
+    granularity: Literal["daily", "weekly", "monthly"] = Query(
+        "weekly",
+        description=(
+            "Sampling cadence matching /networth-history. "
+            "``weekly`` (default) samples every Saturday."
+        ),
+    ),
     tags_include: str | None = Query(
         None,
         description="Comma-separated list of tags; account must carry ALL (AND).",
@@ -1280,6 +1315,11 @@ def networth_history_benchmark(
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """Portfolio history alongside a buy-and-hold benchmark simulation.
+
+    Uses the same forward-fill + live re-pricing logic as ``/networth-history``
+    (shared ``_load_history_state`` + ``_per_account_value_at`` + same target-
+    date generator). The benchmark simulation (shares × close) layers on top of
+    the same portfolio_value series.
 
     ``benchmark`` is restricted to a small allowlist; values outside the
     allowlist return 400. Buy-and-hold sim ignores contributions/withdrawals
@@ -1310,7 +1350,7 @@ def networth_history_benchmark(
             "benchmark_pct": None,
         }
 
-    # Reuse the matched-only portfolio series.
+    # Closed expected accounts — excluded from the portfolio series.
     closed_account_ids: set[str] = {
         row[0]
         for row in session.query(ExpectedAccount.resolved_account_id)
@@ -1320,23 +1360,28 @@ def networth_history_benchmark(
         )
         .all()
     }
-    snap_query = (
-        session.query(AccountBalanceSnapshot)
-        .filter(AccountBalanceSnapshot.account_id.isnot(None))
-        .order_by(AccountBalanceSnapshot.as_of.asc())
-    )
-    if allowed_ids is not None:
-        snap_query = snap_query.filter(
-            AccountBalanceSnapshot.account_id.in_(allowed_ids)
-        )
-    snapshots = snap_query.all()
-    by_date: dict[date, Decimal] = {}
-    for snap in snapshots:
-        if snap.account_id in closed_account_ids:
-            continue
-        by_date[snap.as_of] = by_date.get(snap.as_of, Decimal("0")) + snap.balance
 
-    if not by_date:
+    # Determine series start — earliest snapshot across both tables (matched only).
+    earliest_pos = (
+        session.query(func.min(PositionSnapshot.as_of))
+        .filter(PositionSnapshot.account_id.isnot(None))
+        .scalar()
+    )
+    earliest_bal = (
+        session.query(func.min(AccountBalanceSnapshot.as_of))
+        .filter(AccountBalanceSnapshot.account_id.isnot(None))
+        .scalar()
+    )
+    candidates: list[date] = []
+    if earliest_pos is not None:
+        candidates.append(
+            earliest_pos.date() if isinstance(earliest_pos, datetime) else earliest_pos
+        )
+    if earliest_bal is not None:
+        candidates.append(
+            earliest_bal.date() if isinstance(earliest_bal, datetime) else earliest_bal
+        )
+    if not candidates:
         return {
             "benchmark_symbol": bench_symbol,
             "series": [],
@@ -1344,13 +1389,47 @@ def networth_history_benchmark(
             "benchmark_pct": None,
         }
 
-    sorted_dates = sorted(by_date.keys())
-    initial_portfolio = by_date[sorted_dates[0]]
+    today = _today()
+    start = min(candidates)
+    end = today
+    if start > end:
+        start = end
+
+    # Pre-load once — avoids N+1 across many target dates.
+    state = _load_history_state(session)
+    accounts_by_id = state["accounts_by_id"]
+
+    target_dates = _generate_target_dates(start, end, granularity)
+    if not target_dates or target_dates[-1] != today:
+        target_dates.append(today)
 
     # Single-query fetch of the benchmark's full price history; subsequent
     # per-date lookups walk the in-memory list. Avoids N+1.
     bench_prices = _build_price_lookup(session, bench_symbol)
-    bench_anchor_price = _nearest_price_lookup(bench_prices, sorted_dates[0])
+
+    # Determine initial portfolio value at the first target date to anchor the
+    # benchmark simulation.
+    first_target = target_dates[0]
+
+    def _portfolio_at(target: date) -> Decimal:
+        """Compute total portfolio value at target, excluding plan-wrappers,
+        closed accounts, and accounts outside the allowed_ids filter."""
+        per_account = _per_account_value_at(session, target, history_state=state)
+        total = Decimal("0")
+        for acct_id, slot in per_account.items():
+            if acct_id in closed_account_ids:
+                continue
+            if allowed_ids is not None and acct_id not in allowed_ids:
+                continue
+            acct = accounts_by_id.get(acct_id)
+            if acct is None or acct.is_plan_wrapper:
+                continue
+            total += slot["market_value"]
+        return total
+
+    initial_portfolio = _portfolio_at(first_target)
+
+    bench_anchor_price = _nearest_price_lookup(bench_prices, first_target)
     shares: Decimal | None = (
         initial_portfolio / bench_anchor_price
         if bench_anchor_price is not None and bench_anchor_price > 0
@@ -1359,8 +1438,8 @@ def networth_history_benchmark(
 
     series: list[dict[str, Any]] = []
     benchmark_final: Decimal | None = None
-    for d in sorted_dates:
-        port_v = by_date[d]
+    for d in target_dates:
+        port_v = _portfolio_at(d)
         bench_price = _nearest_price_lookup(bench_prices, d)
         if shares is not None and bench_price is not None:
             bench_v: Decimal | None = (shares * bench_price).quantize(Decimal("0.01"))
@@ -1376,7 +1455,15 @@ def networth_history_benchmark(
             }
         )
 
-    portfolio_final = by_date[sorted_dates[-1]]
+    if not series:
+        return {
+            "benchmark_symbol": bench_symbol,
+            "series": [],
+            "portfolio_pct": None,
+            "benchmark_pct": None,
+        }
+
+    portfolio_final = series[-1]["portfolio_value"]
     portfolio_pct: float | None = (
         float((portfolio_final - initial_portfolio) / initial_portfolio)
         if initial_portfolio > 0

@@ -34,7 +34,7 @@ from src.models.enums import (
     Entity,
     GainLossTerm,
 )
-from src.models.history import AccountBalanceSnapshot
+from src.models.history import AccountBalanceSnapshot, HistoricalPrice
 
 # ── Fixture ──────────────────────────────────────────────────────────────
 
@@ -1610,4 +1610,335 @@ def test_compute_net_worth_plan_wrapper_excluded_regardless_of_source(
         "Exactly one plan-wrapper account exists"
     assert nw["total"] == Decimal("55000"), \
         "Only the non-wrapper sibling ABS contributes; wrapper is excluded"
+    _assert_clean(s)
+
+
+# ── _per_account_value_at (Pipeline 004) ────────────────────────────────
+
+
+def _make_price(
+    s: Session,
+    *,
+    symbol: str,
+    trade_date: date,
+    close: Decimal,
+) -> None:
+    s.add(HistoricalPrice(
+        symbol=symbol,
+        trade_date=trade_date,
+        close=close,
+        source="test",
+    ))
+
+
+def test_per_account_value_at_forward_fills_balance_snapshot(
+    empty_session: Session,
+) -> None:
+    """An AccountBalanceSnapshot at date X must forward-fill at every later
+    target date — that's the core fix for the chart's catastrophic-drop bug."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-bal-ff", broker=Broker.NW_MUTUAL.value,
+                  account_type=AccountType.OTHER.value)
+    _make_balance(s, account_id="acct-bal-ff", raw_account_name="x",
+                  as_of=date(2024, 1, 15), balance=Decimal("100000"))
+    s.commit()
+
+    # Same-day, two months later, a year later — all should report $100k.
+    for target in [date(2024, 1, 15), date(2024, 3, 15), date(2025, 1, 15)]:
+        result = _per_account_value_at(s, target)
+        assert result["acct-bal-ff"]["market_value"] == Decimal("100000"), \
+            f"Forward-fill must work at {target}"
+        assert result["acct-bal-ff"]["source"] == "balance"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_omits_account_before_first_snapshot(
+    empty_session: Session,
+) -> None:
+    """If target_date is before any snapshot exists, the account is omitted."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-future", broker=Broker.NW_MUTUAL.value,
+                  account_type=AccountType.OTHER.value)
+    _make_balance(s, account_id="acct-future", raw_account_name="x",
+                  as_of=date(2024, 6, 1), balance=Decimal("500"))
+    s.commit()
+
+    # Earlier than the snapshot — must be absent.
+    result = _per_account_value_at(s, date(2024, 1, 1))
+    assert "acct-future" not in result
+    # On-or-after the snapshot — must be present.
+    assert "acct-future" in _per_account_value_at(s, date(2024, 6, 1))
+    _assert_clean(s)
+
+
+def test_per_account_value_at_reprices_via_historical_price(
+    empty_session: Session,
+) -> None:
+    """PositionSnapshot at X with HistoricalPrice at later date Y → returns
+    quantity × close[Y]. This is the live-re-pricing path."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-rp")
+    # Snapshot: 100 shares of VTI on 2024-01-01 at $200/share = $20k stored mv.
+    s.add(PositionSnapshot(
+        account_id="acct-rp",
+        as_of=_ts(date(2024, 1, 1)),
+        symbol="VTI",
+        description="VTI",
+        quantity=Decimal("100"),
+        market_value=Decimal("20000"),
+        source_file="test.csv",
+        source_row_hash="rp-1",
+        raw_data={},
+    ))
+    # HistoricalPrice on 2024-06-01: VTI closed at $250.
+    _make_price(s, symbol="VTI", trade_date=date(2024, 6, 1),
+                close=Decimal("250"))
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 1))
+    assert result["acct-rp"]["market_value"] == Decimal("25000"), \
+        "Re-priced via HistoricalPrice: 100 × $250"
+    assert result["acct-rp"]["source"] == "position"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_falls_back_to_stored_mv_when_no_price(
+    empty_session: Session,
+) -> None:
+    """PositionSnapshot at X with no HistoricalPrice anywhere near Y → uses
+    snapshot's stored market_value (no re-pricing). Covers symbols outside
+    the price-coverage set (VMFXX, VTSAX, MGV, MGK, …)."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-fallback")
+    s.add(PositionSnapshot(
+        account_id="acct-fallback",
+        as_of=_ts(date(2024, 1, 1)),
+        symbol="VMFXX",  # money market — not in HistoricalPrice
+        description="VMFXX",
+        quantity=Decimal("10000"),
+        market_value=Decimal("10000"),
+        source_file="test.csv",
+        source_row_hash="fb-1",
+        raw_data={},
+    ))
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 1))
+    assert result["acct-fallback"]["market_value"] == Decimal("10000"), \
+        "Fallback to stored market_value when no price coverage"
+    assert result["acct-fallback"]["source"] == "position"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_position_wins_over_balance_at_target(
+    empty_session: Session,
+) -> None:
+    """When both a PositionSnapshot and an AccountBalanceSnapshot exist at-or-
+    before the target, the PositionSnapshot path wins (matches the date-blind
+    helper's precedence)."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-prec")
+    _make_position(s, account_id="acct-prec", as_of=date(2024, 1, 1),
+                   market_value=Decimal("100000"))
+    _make_balance(s, account_id="acct-prec", raw_account_name="x",
+                  as_of=date(2024, 1, 1), balance=Decimal("90000"))
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 1))
+    assert result["acct-prec"]["market_value"] == Decimal("100000")
+    assert result["acct-prec"]["source"] == "position"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_aggregates_multi_position_mixed_sources(
+    empty_session: Session,
+) -> None:
+    """An account with two positions where one is re-priceable and one is not
+    must sum the re-priced + the stored-fallback."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-multi")
+    s.add_all([
+        # Has price coverage — will be re-priced.
+        PositionSnapshot(
+            account_id="acct-multi",
+            as_of=_ts(date(2024, 1, 1)),
+            symbol="VTI",
+            description="VTI",
+            quantity=Decimal("10"),
+            market_value=Decimal("2000"),
+            source_file="test.csv",
+            source_row_hash="multi-1",
+            raw_data={},
+        ),
+        # No price coverage — will use stored mv.
+        PositionSnapshot(
+            account_id="acct-multi",
+            as_of=_ts(date(2024, 1, 1)),
+            symbol="VMFXX",
+            description="VMFXX",
+            quantity=Decimal("5000"),
+            market_value=Decimal("5000"),
+            source_file="test.csv",
+            source_row_hash="multi-2",
+            raw_data={},
+        ),
+    ])
+    _make_price(s, symbol="VTI", trade_date=date(2024, 6, 3),
+                close=Decimal("300"))
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 3))
+    # 10 × $300 (VTI re-priced) + $5,000 (VMFXX stored) = $8,000.
+    assert result["acct-multi"]["market_value"] == Decimal("8000")
+    assert result["acct-multi"]["source"] == "position"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_weekend_rollback_uses_friday_price(
+    empty_session: Session,
+) -> None:
+    """Target on a Sunday with the latest price on the prior Friday → rollback
+    to Friday's close. The rollback window is 7 days, so anything inside that
+    is acceptable."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-wknd")
+    s.add(PositionSnapshot(
+        account_id="acct-wknd",
+        as_of=_ts(date(2024, 1, 1)),
+        symbol="SPY",
+        description="SPY",
+        quantity=Decimal("10"),
+        market_value=Decimal("4000"),
+        source_file="test.csv",
+        source_row_hash="wknd-1",
+        raw_data={},
+    ))
+    # 2024-06-07 is a Friday. Target on Sunday 2024-06-09 → rollback.
+    _make_price(s, symbol="SPY", trade_date=date(2024, 6, 7),
+                close=Decimal("500"))
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 9))
+    assert result["acct-wknd"]["market_value"] == Decimal("5000"), \
+        "10 × Friday $500 close used for Sunday target"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_price_outside_rollback_window_falls_back(
+    empty_session: Session,
+) -> None:
+    """A price more than 7 days stale must NOT be used — fall back to stored
+    market_value to avoid silently presenting a wildly outdated re-pricing
+    as authoritative."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-stale")
+    s.add(PositionSnapshot(
+        account_id="acct-stale",
+        as_of=_ts(date(2024, 1, 1)),
+        symbol="SPY",
+        description="SPY",
+        quantity=Decimal("10"),
+        market_value=Decimal("4000"),
+        source_file="test.csv",
+        source_row_hash="stale-1",
+        raw_data={},
+    ))
+    # Price 30 days stale.
+    _make_price(s, symbol="SPY", trade_date=date(2024, 5, 1),
+                close=Decimal("999"))
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 9))
+    assert result["acct-stale"]["market_value"] == Decimal("4000"), \
+        "Stored mv used; stale price ignored"
+    _assert_clean(s)
+
+
+def test_per_account_value_at_uses_latest_position_snapshot_at_or_before(
+    empty_session: Session,
+) -> None:
+    """If multiple PositionSnapshots exist for the account, only the latest
+    one at-or-before the target date is used."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-multi-snap")
+    _make_position(s, account_id="acct-multi-snap", as_of=date(2024, 1, 1),
+                   market_value=Decimal("1000"), symbol="OLD")
+    _make_position(s, account_id="acct-multi-snap", as_of=date(2024, 6, 1),
+                   market_value=Decimal("3000"), symbol="NEW")
+    s.commit()
+
+    # Target before second snapshot: only the first one is visible.
+    early = _per_account_value_at(s, date(2024, 3, 1))
+    assert early["acct-multi-snap"]["market_value"] == Decimal("1000")
+    # Target after both: latest wins.
+    late = _per_account_value_at(s, date(2024, 12, 1))
+    assert late["acct-multi-snap"]["market_value"] == Decimal("3000")
+    _assert_clean(s)
+
+
+def test_load_history_state_then_per_account_value_at_match(
+    empty_session: Session,
+) -> None:
+    """Pre-loading state and passing it must produce the same result as
+    calling without it (the optimisation must be transparent)."""
+    from src.reports.brokerage_summary import (
+        _load_history_state,
+        _per_account_value_at,
+    )
+    s = empty_session
+    _make_account(s, id="acct-opt")
+    _make_position(s, account_id="acct-opt", as_of=date(2024, 1, 1),
+                   market_value=Decimal("2000"))
+    _make_account(s, id="acct-opt2", broker=Broker.NW_MUTUAL.value,
+                  account_type=AccountType.OTHER.value)
+    _make_balance(s, account_id="acct-opt2", raw_account_name="x",
+                  as_of=date(2024, 1, 1), balance=Decimal("3000"))
+    s.commit()
+
+    target = date(2024, 6, 1)
+    direct = _per_account_value_at(s, target)
+    state = _load_history_state(s)
+    via_state = _per_account_value_at(s, target, history_state=state)
+    assert direct == via_state
+    assert via_state["acct-opt"]["market_value"] == Decimal("2000")
+    assert via_state["acct-opt2"]["market_value"] == Decimal("3000")
+    _assert_clean(s)
+
+
+def test_per_account_value_at_filters_suspect_symbols(
+    empty_session: Session,
+) -> None:
+    """A PositionSnapshot whose symbol is 'TOTAL' or starts with 'Generated '
+    must be excluded — same defensive filter the date-blind helper applies."""
+    from src.reports.brokerage_summary import _per_account_value_at
+    s = empty_session
+    _make_account(s, id="acct-bad")
+    # Only suspect rows — must omit account from result.
+    s.add_all([
+        PositionSnapshot(
+            account_id="acct-bad", as_of=_ts(date(2024, 1, 1)),
+            symbol="TOTAL", description="x", quantity=Decimal("1"),
+            market_value=Decimal("9999999"),
+            source_file="x.csv", source_row_hash="bad-1", raw_data={},
+        ),
+        PositionSnapshot(
+            account_id="acct-bad", as_of=_ts(date(2024, 1, 1)),
+            symbol="Generated at June 1 2024", description="x",
+            quantity=Decimal("1"), market_value=Decimal("0"),
+            source_file="x.csv", source_row_hash="bad-2", raw_data={},
+        ),
+    ])
+    s.commit()
+
+    result = _per_account_value_at(s, date(2024, 6, 1))
+    assert "acct-bad" not in result, "Suspect rows must be filtered out"
     _assert_clean(s)

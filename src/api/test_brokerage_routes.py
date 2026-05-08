@@ -313,20 +313,31 @@ class TestAuth:
 
 
 class TestNetWorthHistory:
-    """Phase 3 T6: aggregated balance series from account_balance_snapshot."""
+    """Pipeline 004: forward-fill + live re-pricing series."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin the route's clock so series boundaries are deterministic."""
+        from src.api.routes import brokerage as routes_mod
+
+        monkeypatch.setattr(
+            routes_mod, "_today", lambda: date(2024, 7, 1), raising=False
+        )
 
     def test_empty_returns_empty_list(self, empty_client: TestClient) -> None:
         r = empty_client.get("/api/brokerage/networth-history")
         assert r.status_code == 200
         assert r.json() == []
 
-    def test_aggregates_by_date(self, empty_client: TestClient, empty: Session) -> None:
+    def test_aggregates_with_forward_fill(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
         from datetime import date
 
         from src.models.brokerage import Account
         from src.models.history import AccountBalanceSnapshot
 
-        # Seed two accounts and three snapshot dates.
+        # Seed two accounts and two snapshot dates each.
         a1 = Account(
             broker="fidelity",
             account_number="X1",
@@ -366,12 +377,17 @@ class TestNetWorthHistory:
         r = empty_client.get("/api/brokerage/networth-history")
         assert r.status_code == 200
         body = r.json()
-        assert len(body) == 2
-        assert body[0]["as_of"] == "2024-01-01"
+        # Weekly Saturdays from 2024-01-06 (first Sat after 2024-01-01) to
+        # 2024-06-29 plus today (2024-07-01) = 26 Saturdays + today = 27.
+        assert len(body) >= 26
+        # Earliest sampled point uses the Jan 1 snapshots → $300.
         assert body[0]["balance_total"] == 300.0
         assert body[0]["account_count"] == 2
-        assert body[1]["as_of"] == "2024-06-01"
-        assert body[1]["balance_total"] == 400.0
+        # Last point is today, with the latest forward-filled values → $400.
+        assert body[-1]["as_of"] == "2024-07-01"
+        assert body[-1]["balance_total"] == 400.0
+        # Account count is forward-filled too.
+        assert body[-1]["account_count"] == 2
 
     def test_excludes_unmatched_by_default(
         self, empty_client: TestClient, empty: Session
@@ -392,13 +408,17 @@ class TestNetWorthHistory:
         )
         empty.commit()
 
+        # Default — unmatched rows ignored, no real accounts → empty series.
         r = empty_client.get("/api/brokerage/networth-history")
         assert r.json() == []
 
+        # include_unmatched=true — orphan contributes via forward-fill.
         r = empty_client.get("/api/brokerage/networth-history?include_unmatched=true")
         body = r.json()
-        assert len(body) == 1
+        assert len(body) >= 1
+        # All points carry the same forward-filled $999 from the single Orphan.
         assert body[0]["balance_total"] == 999.0
+        assert body[-1]["balance_total"] == 999.0
 
     def test_excludes_closed_expected_accounts(
         self, empty_client: TestClient, empty: Session
@@ -438,8 +458,12 @@ class TestNetWorthHistory:
         )
         empty.commit()
 
+        # Closed account is filtered out at every target date — every point
+        # has balance_total=0 / account_count=0.
         r = empty_client.get("/api/brokerage/networth-history")
-        assert r.json() == []  # closed account is filtered out
+        body = r.json()
+        assert all(p["balance_total"] == 0.0 for p in body)
+        assert all(p["account_count"] == 0 for p in body)
 
 
 # ── /api/brokerage/missing-accounts ────────────────────────────────────────
@@ -1234,6 +1258,14 @@ class TestAccountsTagsInResponse:
 class TestHistoryTagFilter:
     """Tag/account-id filters on /networth-history (and benchmark)."""
 
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from src.api.routes import brokerage as routes_mod
+
+        monkeypatch.setattr(
+            routes_mod, "_today", lambda: date(2024, 7, 1), raising=False
+        )
+
     def _seed_two_accounts_with_snapshots(
         self, session: Session
     ) -> tuple[str, str]:
@@ -1310,10 +1342,11 @@ class TestHistoryTagFilter:
         )
         assert r.status_code == 200
         body = r.json()
-        # Only a's snapshot ($100) survives the filter.
-        assert len(body) == 1
-        assert body[0]["balance_total"] == 100.0
-        assert body[0]["account_count"] == 1
+        # Only a's snapshot ($100) survives the filter — forward-filled at
+        # every sampled point (weekly + today).
+        assert len(body) >= 1
+        assert all(p["balance_total"] == 100.0 for p in body)
+        assert all(p["account_count"] == 1 for p in body)
 
     def test_tags_include_and_semantics(
         self, empty_client: TestClient, empty: Session
@@ -1333,9 +1366,9 @@ class TestHistoryTagFilter:
             "/api/brokerage/networth-history?tags_include=retirement,rsu"
         )
         body = r.json()
-        # Only a survives — total = 100.
-        assert len(body) == 1
-        assert body[0]["balance_total"] == 100.0
+        # Only a survives — total = 100, forward-filled across the series.
+        assert len(body) >= 1
+        assert all(p["balance_total"] == 100.0 for p in body)
 
     def test_tags_exclude(
         self, empty_client: TestClient, empty: Session
@@ -1350,9 +1383,9 @@ class TestHistoryTagFilter:
             "/api/brokerage/networth-history?tags_exclude=retirement"
         )
         body = r.json()
-        # b survives ($250).
-        assert len(body) == 1
-        assert body[0]["balance_total"] == 250.0
+        # b survives ($250), forward-filled across the series.
+        assert len(body) >= 1
+        assert all(p["balance_total"] == 250.0 for p in body)
 
     def test_account_ids_filter(
         self, empty_client: TestClient, empty: Session
@@ -1364,8 +1397,8 @@ class TestHistoryTagFilter:
             f"/api/brokerage/networth-history?account_ids={a_id}"
         )
         body = r.json()
-        assert len(body) == 1
-        assert body[0]["balance_total"] == 100.0
+        assert len(body) >= 1
+        assert all(p["balance_total"] == 100.0 for p in body)
 
     def test_empty_filter_result_returns_empty_series(
         self, empty_client: TestClient, empty: Session
@@ -1405,10 +1438,10 @@ class TestHistoryTagFilter:
         body = r.json()
         # Each helper-seeded account contributes exactly one snapshot at
         # 2024-01-01 with balance Decimal("100"); a1 alone is the survivor.
-        assert len(body) == 1
-        assert body[0]["as_of"] == "2024-01-01"
-        assert body[0]["account_count"] == 1
-        assert body[0]["balance_total"] == 100.0
+        # Forward-filled across the weekly series.
+        assert len(body) >= 1
+        assert all(p["account_count"] == 1 for p in body)
+        assert all(p["balance_total"] == 100.0 for p in body)
 
     def test_multi_value_account_ids_csv(
         self, empty_client: TestClient, empty: Session
@@ -2150,3 +2183,161 @@ class TestPatchAccountAdditional:
         empty.expire_all()
         row = empty.query(Account).filter_by(id=a.id).one()
         assert row.updated_at == prior_updated_at
+
+
+# ── Pipeline 004: networth-history forward-fill + granularity ──────────
+
+
+class TestNetworthHistoryForwardFill:
+    """Pipeline 004 T2 — granularity param, today always last, end-to-end
+    forward-fill via the endpoint."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_today(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from src.api.routes import brokerage as routes_mod
+
+        monkeypatch.setattr(
+            routes_mod, "_today", lambda: date(2024, 7, 1), raising=False
+        )
+
+    def _seed_one_account_one_snapshot(
+        self, session: Session, *, as_of: date, balance: Decimal
+    ) -> str:
+        from src.models.brokerage import Account
+        from src.models.history import AccountBalanceSnapshot
+
+        a = Account(
+            broker="fidelity",
+            account_number="X1",
+            account_type="taxable",
+            entity="personal",
+            tax_sheltered=False,
+        )
+        session.add(a)
+        session.flush()
+        session.add(
+            AccountBalanceSnapshot(
+                account_id=a.id,
+                raw_account_name="X1",
+                as_of=as_of,
+                balance=balance,
+                source="xlsx_2024",
+                source_row_hash=f"ff-{as_of.isoformat()}",
+            )
+        )
+        session.commit()
+        return a.id
+
+    def test_default_granularity_is_weekly(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        self._seed_one_account_one_snapshot(
+            empty, as_of=date(2024, 1, 1), balance=Decimal("100")
+        )
+
+        r = empty_client.get("/api/brokerage/networth-history")
+        body = r.json()
+        # Saturdays from 2024-01-06 through 2024-06-29 = 26, plus today.
+        # ≥ 26 weekly points; the exact count is 26 + 1 (today) = 27.
+        assert len(body) == 27
+
+    def test_daily_granularity_produces_one_point_per_day(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        self._seed_one_account_one_snapshot(
+            empty, as_of=date(2024, 6, 25), balance=Decimal("500")
+        )
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?granularity=daily"
+        )
+        body = r.json()
+        # 2024-06-25 → 2024-07-01 inclusive = 7 days.
+        assert len(body) == 7
+        # Every point sees the forward-filled balance.
+        assert all(p["balance_total"] == 500.0 for p in body)
+
+    def test_monthly_granularity_uses_month_end(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        # Seed an early snapshot so we get a few full months of series.
+        self._seed_one_account_one_snapshot(
+            empty, as_of=date(2024, 1, 15), balance=Decimal("1000")
+        )
+
+        r = empty_client.get(
+            "/api/brokerage/networth-history?granularity=monthly"
+        )
+        body = r.json()
+        # Month-ends Jan 31, Feb 29, Mar 31, Apr 30, May 31, Jun 30 (= 6) plus
+        # today (2024-07-01) appended at the end.
+        as_ofs = [p["as_of"] for p in body]
+        assert "2024-01-31" in as_ofs
+        assert "2024-06-30" in as_ofs
+        assert as_ofs[-1] == "2024-07-01"  # today always last
+
+    def test_today_always_appended_as_last_point(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        # Snapshot is today — weekly Saturdays would land on 2024-06-29 last.
+        # Today's point must still be appended.
+        self._seed_one_account_one_snapshot(
+            empty, as_of=date(2024, 1, 1), balance=Decimal("42")
+        )
+
+        r = empty_client.get("/api/brokerage/networth-history")
+        body = r.json()
+        assert body[-1]["as_of"] == "2024-07-01"
+
+    def test_forward_fill_then_repricing_end_to_end(
+        self, empty_client: TestClient, empty: Session
+    ) -> None:
+        """End-to-end smoke: a PositionSnapshot at X with HistoricalPrice at
+        a later target date must report the re-priced value at every weekly
+        point ≥ the snapshot date."""
+        from src.models.brokerage import Account, PositionSnapshot
+        from src.models.history import HistoricalPrice
+
+        a = Account(
+            broker="schwab",
+            account_number="RP1",
+            account_type="taxable",
+            entity="personal",
+            tax_sheltered=False,
+        )
+        empty.add(a)
+        empty.flush()
+        empty.add(
+            PositionSnapshot(
+                account_id=a.id,
+                as_of=datetime(2024, 1, 1, 12, 0, 0),
+                symbol="VTI",
+                description="VTI",
+                quantity=Decimal("100"),
+                market_value=Decimal("20000"),
+                source_file="t.csv",
+                source_row_hash="rp-end-to-end",
+                raw_data={},
+            )
+        )
+        # HistoricalPrice on the most-recent Saturday before today
+        # (2024-06-29 is a Saturday). 100 × $300 = $30k.
+        empty.add(
+            HistoricalPrice(
+                symbol="VTI",
+                trade_date=date(2024, 6, 29),
+                close=Decimal("300"),
+                source="test",
+            )
+        )
+        empty.commit()
+
+        r = empty_client.get("/api/brokerage/networth-history")
+        body = r.json()
+        assert len(body) >= 2
+        # Earliest weekly point — no price coverage yet, stored mv ($20k).
+        assert body[0]["balance_total"] == 20000.0
+        # Last point is today (2024-07-01), within the 7-day rollback of
+        # the 2024-06-29 close → re-priced to $30k.
+        assert body[-1]["as_of"] == "2024-07-01"
+        assert body[-1]["balance_total"] == 30000.0

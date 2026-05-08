@@ -15,7 +15,7 @@ import re
 from collections.abc import Generator
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
@@ -39,7 +39,9 @@ from src.models.history import (
 )
 from src.models.ingestion_log import IngestionLog
 from src.reports.brokerage_summary import (
+    _load_history_state,
     _mask_account_number,
+    _per_account_value_at,
     compute_data_integrity,
     compute_net_worth,
     get_account_summary,
@@ -772,6 +774,51 @@ class NetWorthHistoryPoint(BaseModel):
         return float(v)
 
 
+def _generate_target_dates(
+    start: date, end: date, granularity: Literal["daily", "weekly", "monthly"]
+) -> list[date]:
+    """Generate target dates from ``start`` through ``end`` inclusive.
+
+    - daily: every calendar day.
+    - weekly: every Saturday on or after ``start``.
+    - monthly: the last day of every month on or after ``start``.
+
+    The caller is responsible for appending the "today" point if it isn't
+    already in the series — the chart should always end at today.
+    """
+    if start > end:
+        return []
+    out: list[date] = []
+    if granularity == "daily":
+        cur = start
+        while cur <= end:
+            out.append(cur)
+            cur = cur + timedelta(days=1)
+    elif granularity == "weekly":
+        # Saturday = weekday 5. Round start UP to the next Saturday.
+        days_to_sat = (5 - start.weekday()) % 7
+        cur = start + timedelta(days=days_to_sat)
+        while cur <= end:
+            out.append(cur)
+            cur = cur + timedelta(days=7)
+    else:  # monthly
+        # Last day of each calendar month on or after start.
+        from calendar import monthrange
+        year, month = start.year, start.month
+        while True:
+            last_day = monthrange(year, month)[1]
+            d = date(year, month, last_day)
+            if d > end:
+                break
+            if d >= start:
+                out.append(d)
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+    return out
+
+
 @router.get(
     "/brokerage/networth-history",
     response_model=list[NetWorthHistoryPoint],
@@ -780,8 +827,17 @@ def networth_history(
     include_unmatched: bool = Query(
         False,
         description=(
-            "If True, include rows whose XLSX raw_account_name didn't match "
-            "a live Account. Defaults False so users see the verified series."
+            "If True, include AccountBalanceSnapshot rows whose XLSX "
+            "raw_account_name didn't match a live Account; treats each "
+            "raw_account_name as its own pseudo-account contributing to the "
+            "total. Defaults False so users see only verified accounts."
+        ),
+    ),
+    granularity: Literal["daily", "weekly", "monthly"] = Query(
+        "weekly",
+        description=(
+            "Sampling cadence for the series. ``weekly`` (default) samples "
+            "every Saturday. The 'today' point is always appended last."
         ),
     ),
     tags_include: str | None = Query(
@@ -801,17 +857,33 @@ def networth_history(
     ),
     session: Session = Depends(get_db),  # noqa: B008
 ) -> list[dict[str, Any]]:
-    """Aggregated balance series from `account_balance_snapshot`.
+    """Net-worth series with **forward-fill + live re-pricing**.
 
-    For each `as_of` date, sum balances across accounts. Rows linked to an
-    `expected_account` whose status is `'closed'` are excluded.
+    For each target date in the generated series, every account's value is
+    taken from the most-defensible source:
 
-    Optional filters: `tags_include` (AND), `tags_exclude` (NONE), `account_ids`
-    (explicit allow-list). When supplied, only snapshots whose `account_id`
-    is in the resolved set are aggregated. An empty resolved set yields an
-    empty series (not an error).
+    1. The latest ``PositionSnapshot`` at-or-before the target date, with
+       each held position's ``market_value`` recomputed from
+       ``HistoricalPrice`` when available (live re-pricing); otherwise the
+       snapshot's stored value (forward-fill).
+    2. If no PositionSnapshot exists at-or-before, the latest
+       ``AccountBalanceSnapshot`` at-or-before the target date is used.
+    3. Accounts with neither snapshot type at-or-before contribute nothing.
 
-    Returned ascending by date.
+    See ``src/reports/brokerage_summary._per_account_value_at`` for the full
+    sourcing rules.
+
+    Sampling cadence is controlled by ``granularity`` (default ``weekly``).
+    Today's point is always appended last regardless of week alignment.
+
+    Filters:
+    - ``tags_include`` (AND), ``tags_exclude`` (NONE), ``account_ids``
+      (explicit allow-list) — when supplied, only matching accounts
+      contribute. An empty resolved set yields an empty series.
+    - ``include_unmatched`` (default False): when True, also includes
+      AccountBalanceSnapshot rows whose ``account_id`` is NULL by treating
+      ``raw_account_name`` as a pseudo-account in the per-date sum.
+    - Closed ``expected_account``-linked accounts are always excluded.
     """
     closed_account_ids: set[str] = {
         row[0]
@@ -832,23 +904,135 @@ def networth_history(
     if allowed_ids is not None and not allowed_ids:
         return []
 
-    query = session.query(AccountBalanceSnapshot).order_by(AccountBalanceSnapshot.as_of.asc())
-    if not include_unmatched:
-        query = query.filter(AccountBalanceSnapshot.account_id.isnot(None))
-    if allowed_ids is not None:
-        query = query.filter(AccountBalanceSnapshot.account_id.in_(allowed_ids))
-
-    by_date: dict[date, dict[str, Any]] = {}
-    for snap in query.all():
-        if snap.account_id in closed_account_ids:
-            continue
-        slot = by_date.setdefault(
-            snap.as_of, {"as_of": snap.as_of, "balance_total": Decimal("0"), "account_count": 0}
+    # Determine series start = earliest snapshot date across both tables.
+    # Restrict to non-null account_id rows so an orphan row alone doesn't
+    # generate a long zero-valued series when include_unmatched=False.
+    earliest_pos = (
+        session.query(func.min(PositionSnapshot.as_of))
+        .filter(PositionSnapshot.account_id.isnot(None))
+        .scalar()
+    )
+    earliest_bal = (
+        session.query(func.min(AccountBalanceSnapshot.as_of))
+        .filter(AccountBalanceSnapshot.account_id.isnot(None))
+        .scalar()
+    )
+    candidates: list[date] = []
+    if earliest_pos is not None:
+        candidates.append(
+            earliest_pos.date() if isinstance(earliest_pos, datetime) else earliest_pos
         )
-        slot["balance_total"] += snap.balance
-        slot["account_count"] += 1
+    if earliest_bal is not None:
+        candidates.append(
+            earliest_bal.date() if isinstance(earliest_bal, datetime) else earliest_bal
+        )
 
-    return [by_date[k] for k in sorted(by_date.keys())]
+    # ── Unmatched-row pseudo-account series (only when requested) ────────
+    # When include_unmatched=True we surface AccountBalanceSnapshot rows whose
+    # account_id is NULL — they have no live Account to forward-fill across,
+    # so we use the legacy "literal as_of" behaviour for those rows only and
+    # merge them into the main per-date series. raw_account_name is the
+    # natural identity for forward-fill purposes.
+    unmatched_by_pseudo: dict[str, list[tuple[date, Decimal]]] = {}
+    if include_unmatched:
+        for snap in (
+            session.query(AccountBalanceSnapshot)
+            .filter(AccountBalanceSnapshot.account_id.is_(None))
+            .order_by(AccountBalanceSnapshot.as_of.asc())
+            .all()
+        ):
+            unmatched_by_pseudo.setdefault(snap.raw_account_name, []).append(
+                (snap.as_of, Decimal(str(snap.balance)))
+            )
+            candidates.append(snap.as_of)
+
+    if not candidates:
+        return []
+
+    start = min(candidates)
+    today = _today()
+    end = today
+    if start > end:
+        # Snapshot is in the future — emit just today (forward-fill from there).
+        start = end
+
+    # Pre-load once and walk in Python — avoids N+1 across many target dates.
+    state = _load_history_state(session)
+
+    # Build the sampled date list, then ensure "today" is the final point.
+    target_dates = _generate_target_dates(start, end, granularity)
+    if not target_dates or target_dates[-1] != today:
+        target_dates.append(today)
+
+    # Account metadata we need every iteration.
+    accounts_by_id = state["accounts_by_id"]
+
+    # Helper to forward-fill an unmatched pseudo-account at a target date.
+    # We cap forward-fill at the date when matched live data takes over —
+    # the earliest PositionSnapshot date in the system. Past that boundary
+    # the live broker feeds (PositionSnapshot) own the chart; otherwise
+    # parallel-tracked accounts (XLSX historical name "Travis Roth" +
+    # matched live "Vanguard Travis 65344815") would double-count at every
+    # point past the latest unmatched row.
+    unmatched_cutoff: date | None
+    if earliest_pos is not None:
+        unmatched_cutoff = (
+            earliest_pos.date()
+            if isinstance(earliest_pos, datetime)
+            else earliest_pos
+        )
+    else:
+        unmatched_cutoff = None
+
+    def _unmatched_contribution(target: date) -> tuple[Decimal, int]:
+        # Once matched live data exists at-or-before this target, suppress
+        # the unmatched series — they describe the same underlying accounts
+        # under different names.
+        if unmatched_cutoff is not None and target >= unmatched_cutoff:
+            return Decimal("0"), 0
+        total = Decimal("0")
+        count = 0
+        for series in unmatched_by_pseudo.values():
+            latest_bal: Decimal | None = None
+            for d, bal in series:
+                if d > target:
+                    break
+                latest_bal = bal
+            if latest_bal is not None:
+                total += latest_bal
+                count += 1
+        return total, count
+
+    out: list[dict[str, Any]] = []
+    for target in target_dates:
+        per_account = _per_account_value_at(session, target, history_state=state)
+        balance_total = Decimal("0")
+        account_count = 0
+        for acct_id, slot in per_account.items():
+            if acct_id in closed_account_ids:
+                continue
+            if allowed_ids is not None and acct_id not in allowed_ids:
+                continue
+            acct = accounts_by_id.get(acct_id)
+            if acct is None or acct.is_plan_wrapper:
+                continue
+            balance_total += slot["market_value"]
+            account_count += 1
+
+        # Add unmatched pseudo-account contributions when applicable.
+        # (Skip unmatched entirely if a tag/account_ids filter is active —
+        # unmatched rows have no Account row and cannot satisfy those filters.)
+        if include_unmatched and allowed_ids is None and unmatched_by_pseudo:
+            extra_total, extra_count = _unmatched_contribution(target)
+            balance_total += extra_total
+            account_count += extra_count
+
+        out.append({
+            "as_of": target,
+            "balance_total": balance_total,
+            "account_count": account_count,
+        })
+    return out
 
 
 # ── Missing-accounts panel ─────────────────────────────────────────────

@@ -32,7 +32,7 @@ from src.models.brokerage import (
     RealizedGainLoss,
 )
 from src.models.enums import BrokerageTxStatus, CanonicalAction
-from src.models.history import AccountBalanceSnapshot
+from src.models.history import AccountBalanceSnapshot, HistoricalPrice
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -352,6 +352,12 @@ def _per_account_value(session: Session) -> dict[str, _AccountSlot]:
     finer-grained than a statement total.
 
     Accounts with neither snapshot type are absent from the returned dict.
+
+    Date-blind: returns whatever the most recent row is, even if it's
+    future-dated relative to ``_today()`` — preserved for the
+    headline-net-worth views where we always want the freshest data. Use
+    :func:`_per_account_value_at` for as-of-a-date semantics with
+    forward-fill + live re-pricing.
     """
     out: dict[str, _AccountSlot] = {}
 
@@ -380,6 +386,241 @@ def _per_account_value(session: Session) -> dict[str, _AccountSlot]:
             as_of=abs_row.as_of,
             source="balance",
         )
+    return out
+
+
+# ── Forward-fill + live re-pricing helpers (Pipeline 004) ────────────────
+
+
+# Weekend / holiday rollback window for HistoricalPrice lookup. 7 days covers
+# any weekend + a bunched-up market holiday (e.g. July 4 + weekend) without
+# rolling back so far that we silently use a stale weekly price.
+_PRICE_ROLLBACK_DAYS = 7
+
+
+class _HistoryState(TypedDict):
+    """Pre-loaded structures for repeated as-of valuation."""
+
+    # ``[(as_of date, [PositionSnapshot rows at that date])]`` per account,
+    # ascending by date. PositionSnapshot.as_of is normalised to a ``date``.
+    position_snapshots_by_account: dict[str, list[tuple[date, list[PositionSnapshot]]]]
+    # ``[(as_of, AccountBalanceSnapshot row)]`` per account, ascending.
+    balance_snapshots_by_account: dict[str, list[tuple[date, AccountBalanceSnapshot]]]
+    # ``[(trade_date, close)]`` per symbol, ascending by date.
+    prices_by_symbol: dict[str, list[tuple[date, Decimal]]]
+    # All Account rows by id — used for plan-wrapper / metadata lookups.
+    accounts_by_id: dict[str, Account]
+
+
+def _load_history_state(session: Session) -> _HistoryState:
+    """Bulk-load every snapshot, price, and account into in-memory indexes.
+
+    The endpoint walks ~52 dates/year × ~9 years = ~470 target dates. Loading
+    once and walking in Python avoids ~470 N+1 queries per call.
+
+    PositionSnapshot.as_of is stored as ``DateTime``; we coerce to ``date`` so
+    callers can do plain ``<= target_date`` comparisons.
+    """
+    # PositionSnapshots — group by account, then by as_of date. Apply the
+    # same defensive filters as ``_latest_position_snapshots``:
+    #   - market_value IS NOT NULL
+    #   - symbol NOT IN ('TOTAL') / NOT LIKE 'Generated %' (suspect rows)
+    # Then dedupe per (account, date, key) where key matches the
+    # ``COALESCE(symbol, description, sentinel)`` partition logic, picking the
+    # lowest id deterministically — matches the SQL MIN(id) tiebreak.
+    _sentinel = "__BROKERAGE_SUMMARY_NULL_SENTINEL__"
+
+    def _key(ps: PositionSnapshot) -> tuple[int, str]:
+        # has_symbol flag distinguishes (symbol='X') from (symbol=None,
+        # description='X') — same SQL partition logic.
+        has_symbol = 1 if ps.symbol is not None else 0
+        coalesced = ps.symbol or ps.description or _sentinel
+        return (has_symbol, coalesced)
+
+    pos_by_account_dated: dict[
+        str, dict[date, dict[tuple[int, str], PositionSnapshot]]
+    ] = {}
+    for ps in (
+        session.query(PositionSnapshot)
+        .filter(PositionSnapshot.account_id.isnot(None))
+        .filter(PositionSnapshot.market_value.isnot(None))
+        .order_by(PositionSnapshot.account_id, PositionSnapshot.as_of, PositionSnapshot.id)
+        .all()
+    ):
+        if ps.as_of is None:
+            continue
+        if _is_suspect_symbol(ps.symbol):
+            continue
+        d = ps.as_of.date() if isinstance(ps.as_of, datetime) else ps.as_of
+        per_date = pos_by_account_dated.setdefault(ps.account_id, {}).setdefault(d, {})
+        k = _key(ps)
+        # ORDER BY id ASC means the first row we see per key wins (MIN(id)).
+        if k not in per_date:
+            per_date[k] = ps
+    pos_by_account_sorted: dict[str, list[tuple[date, list[PositionSnapshot]]]] = {
+        a_id: sorted(
+            ((d, list(by_key.values())) for d, by_key in by_date.items()),
+            key=lambda kv: kv[0],
+        )
+        for a_id, by_date in pos_by_account_dated.items()
+    }
+
+    # AccountBalanceSnapshots — group by account, sorted by as_of.
+    bal_by_account: dict[str, list[tuple[date, AccountBalanceSnapshot]]] = {}
+    for abs_row in (
+        session.query(AccountBalanceSnapshot)
+        .filter(AccountBalanceSnapshot.account_id.isnot(None))
+        .order_by(AccountBalanceSnapshot.account_id, AccountBalanceSnapshot.as_of)
+        .all()
+    ):
+        assert abs_row.account_id is not None  # filtered above
+        bal_by_account.setdefault(abs_row.account_id, []).append(
+            (abs_row.as_of, abs_row)
+        )
+
+    # HistoricalPrices — group by symbol, sorted by trade_date.
+    prices_by_symbol: dict[str, list[tuple[date, Decimal]]] = {}
+    for hp in (
+        session.query(HistoricalPrice)
+        .order_by(HistoricalPrice.symbol, HistoricalPrice.trade_date)
+        .all()
+    ):
+        prices_by_symbol.setdefault(hp.symbol, []).append(
+            (hp.trade_date, Decimal(str(hp.close)))
+        )
+
+    accounts_by_id = {a.id: a for a in session.query(Account).all()}
+
+    return _HistoryState(
+        position_snapshots_by_account=pos_by_account_sorted,
+        balance_snapshots_by_account=bal_by_account,
+        prices_by_symbol=prices_by_symbol,
+        accounts_by_id=accounts_by_id,
+    )
+
+
+def _latest_at_or_before(
+    sorted_pairs: list[tuple[date, Any]], target: date
+) -> Any | None:
+    """Return the value paired with the largest date ≤ ``target``, or None.
+
+    ``sorted_pairs`` must be ascending by date. Linear scan from the end —
+    fast enough for the modest N (≤ a few hundred snapshots per account, a
+    few thousand prices per symbol). Switch to ``bisect`` if profiling
+    shows this on a hot path.
+    """
+    last: Any | None = None
+    for d, val in sorted_pairs:
+        if d > target:
+            break
+        last = val
+    return last
+
+
+def _price_at_or_before(
+    prices: list[tuple[date, Decimal]], target: date
+) -> Decimal | None:
+    """Lookup HistoricalPrice close on or before ``target`` within the
+    rollback window, returning None if the only available data is older
+    than the window (which would be misleading rather than helpful).
+    """
+    last_date: date | None = None
+    last_close: Decimal | None = None
+    for d, close in prices:
+        if d > target:
+            break
+        last_date = d
+        last_close = close
+    if last_date is None:
+        return None
+    if (target - last_date).days > _PRICE_ROLLBACK_DAYS:
+        return None
+    return last_close
+
+
+def _per_account_value_at(
+    session: Session,
+    target_date: date,
+    *,
+    history_state: _HistoryState | None = None,
+) -> dict[str, _AccountSlot]:
+    """Per-account valuation AS OF ``target_date``, with forward-fill +
+    live re-pricing.
+
+    Sourcing rules per account:
+
+    1. **PositionSnapshot wins** when at least one snapshot exists at or
+       before ``target_date``. We use the *latest* such snapshot. For each
+       held position with a non-null symbol, we look up the close in
+       ``HistoricalPrice`` on or before ``target_date`` (within
+       ``_PRICE_ROLLBACK_DAYS`` to handle weekends and short market closures)
+       and recompute ``market_value = quantity × close``. If no price is
+       available — the symbol isn't covered or the closest row is too old —
+       we fall back to the snapshot's stored ``market_value``.
+    2. **AccountBalanceSnapshot fallback**: when no PositionSnapshot exists
+       at or before ``target_date``, the latest AccountBalanceSnapshot at
+       or before that date is used.
+    3. **Neither at-or-before** → account is omitted from the result.
+
+    Pass ``history_state`` (from :func:`_load_history_state`) to avoid
+    re-loading data when calling this function many times in a loop.
+    """
+    state = history_state if history_state is not None else _load_history_state(session)
+
+    out: dict[str, _AccountSlot] = {}
+    pos_index = state["position_snapshots_by_account"]
+    bal_index = state["balance_snapshots_by_account"]
+    prices_index = state["prices_by_symbol"]
+
+    # Union of every account that has any snapshot data at all.
+    candidate_account_ids = set(pos_index.keys()) | set(bal_index.keys())
+
+    for account_id in candidate_account_ids:
+        pos_pairs = pos_index.get(account_id, [])
+        latest_pos_snapshots = _latest_at_or_before(pos_pairs, target_date)
+
+        if latest_pos_snapshots is not None:
+            # PositionSnapshot path — re-price each held position when possible.
+            total = Decimal("0")
+            latest_pos_date: date | None = None
+            for ps in latest_pos_snapshots:
+                if ps.market_value is None:
+                    continue
+                latest_pos_date = (
+                    ps.as_of.date() if isinstance(ps.as_of, datetime) else ps.as_of
+                )
+                close: Decimal | None = None
+                if ps.symbol is not None and ps.quantity is not None:
+                    close = _price_at_or_before(
+                        prices_index.get(ps.symbol, []), target_date
+                    )
+                if close is not None and ps.quantity is not None:
+                    total += Decimal(str(ps.quantity)) * close
+                else:
+                    total += Decimal(str(ps.market_value))
+            # Only emit the account if at least one position contributed —
+            # an all-null-market_value snapshot date should fall through to the
+            # balance branch (matching the legacy filter in
+            # ``_latest_position_snapshots``).
+            if latest_pos_date is not None:
+                out[account_id] = _AccountSlot(
+                    market_value=total,
+                    as_of=latest_pos_date,
+                    source="position",
+                )
+                continue
+
+        # Fallback: latest AccountBalanceSnapshot at or before target.
+        bal_pairs = bal_index.get(account_id, [])
+        latest_bal: AccountBalanceSnapshot | None = _latest_at_or_before(
+            bal_pairs, target_date
+        )
+        if latest_bal is not None:
+            out[account_id] = _AccountSlot(
+                market_value=Decimal(str(latest_bal.balance)),
+                as_of=latest_bal.as_of,
+                source="balance",
+            )
     return out
 
 
@@ -1039,4 +1280,7 @@ __all__ = [
     "compute_data_integrity",
     "render_report",
     "main",
+    # Pipeline 004 — networth-history forward-fill + re-pricing
+    "_per_account_value_at",
+    "_load_history_state",
 ]

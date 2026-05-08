@@ -790,10 +790,11 @@
 						<tr class:wrapper={a.is_plan_wrapper}>
 							<td>{a.broker}</td>
 							<td>
-								<a class="account-link" href={`/brokerage/accounts/${a.account_id}`} title="Open account detail">
-									{a.account_number_masked}
+								<a class="account-link" href={`/brokerage/accounts/${a.account_id}`} title={a.account_name ? `${a.account_name} (${a.account_number_masked})` : 'Open account detail'}>
 									{#if a.account_name}
-										<span class="muted"> · {a.account_name}</span>
+										{a.account_name}
+									{:else}
+										{a.account_number_masked}
 									{/if}
 								</a>
 								{#if a.is_plan_wrapper}

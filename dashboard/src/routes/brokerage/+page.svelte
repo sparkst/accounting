@@ -189,11 +189,17 @@
 	onMount(loadAll);
 
 	// ── Derived ───────────────────────────────────────────────────────────
+	// Plan-wrapper accounts (e.g. Fidelity Microsoft 401K PLAN) are logical
+	// containers whose positions duplicate their BrokerageLink child. The DB
+	// retains them for structural relationships and audit, but the dashboard
+	// hides them so the accounts table does not show two rows for the same
+	// underlying value. Net-worth math already excludes wrappers via
+	// compute_net_worth's is_plan_wrapper guard.
 	let withSnapshots = $derived(
-		(accounts ?? []).filter((a) => a.as_of !== null)
+		(accounts ?? []).filter((a) => a.as_of !== null && !a.is_plan_wrapper)
 	);
 	let awaitingSnapshots = $derived(
-		(accounts ?? []).filter((a) => a.as_of === null)
+		(accounts ?? []).filter((a) => a.as_of === null && !a.is_plan_wrapper)
 	);
 	let realizedYears = $derived(
 		realizedGl

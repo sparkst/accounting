@@ -198,9 +198,6 @@
 	let withSnapshots = $derived(
 		(accounts ?? []).filter((a) => a.as_of !== null && !a.is_plan_wrapper)
 	);
-	let awaitingSnapshots = $derived(
-		(accounts ?? []).filter((a) => a.as_of === null && !a.is_plan_wrapper)
-	);
 	let realizedYears = $derived(
 		realizedGl
 			? Object.keys(realizedGl.by_year)
@@ -576,20 +573,6 @@
 				{/each}
 			</div>
 
-			{#if netWorth.plan_wrapper_excluded_count > 0 || netWorth.zero_snapshot_account_count > 0}
-				<div class="caveats">
-					{#if netWorth.plan_wrapper_excluded_count > 0}
-						<span>
-							{netWorth.plan_wrapper_excluded_count} plan-wrapper account(s) excluded — held positions are in their child BrokerageLink accounts.
-						</span>
-					{/if}
-					{#if netWorth.zero_snapshot_account_count > 0}
-						<span>
-							{netWorth.zero_snapshot_account_count} account(s) have no snapshot data yet.
-						</span>
-					{/if}
-				</div>
-			{/if}
 		</section>
 
 		<!-- ── Net-worth history ─────────────────────────────────────── -->
@@ -883,16 +866,6 @@
 				</tbody>
 			</table>
 
-			{#if awaitingSnapshots.length > 0}
-				<div class="awaiting">
-					<h3>Awaiting Snapshot Data</h3>
-					<ul>
-						{#each awaitingSnapshots as a (a.account_id)}
-							<li>{a.broker} {a.account_number_masked} ({a.account_type}, {a.entity})</li>
-						{/each}
-					</ul>
-				</div>
-			{/if}
 		</section>
 
 		<!-- ── Top Holdings ──────────────────────────────────────────── -->
@@ -1341,15 +1314,6 @@
 		margin-top: 2px;
 	}
 
-	.caveats {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-		margin-top: 12px;
-		font-size: 13px;
-		color: #6e6e73;
-	}
-
 	.data-table {
 		width: 100%;
 		border-collapse: collapse;
@@ -1403,24 +1367,6 @@
 		padding: 1px 6px;
 		border-radius: 4px;
 		margin-left: 6px;
-	}
-
-	.awaiting {
-		margin-top: 16px;
-		padding-top: 12px;
-		border-top: 1px dashed #e5e5e7;
-	}
-	.awaiting h3 {
-		font-size: 13px;
-		font-weight: 600;
-		margin: 0 0 6px;
-		color: #6e6e73;
-	}
-	.awaiting ul {
-		margin: 0;
-		padding-left: 20px;
-		font-size: 13px;
-		color: #6e6e73;
 	}
 
 	.footer-note {

@@ -386,18 +386,13 @@ def _load_history_state(session: Session) -> _HistoryState:
     PositionSnapshot.as_of is stored as ``DateTime``; we coerce to ``date`` so
     callers can do plain ``<= target_date`` comparisons.
     """
-    # PositionSnapshots — group by account, then by as_of date. Apply the
-    # same defensive filters as ``_latest_position_snapshots``:
-    #   - market_value IS NOT NULL
-    #   - symbol NOT IN ('TOTAL') / NOT LIKE 'Generated %' (suspect rows)
-    # Then dedupe per (account, date, key) where key matches the
-    # ``COALESCE(symbol, description, sentinel)`` partition logic, picking the
-    # lowest id deterministically — matches the SQL MIN(id) tiebreak.
+    # Mirror _latest_position_snapshots invariants: drop suspect symbols and
+    # null market_value, then dedupe per (account, date, key) keeping MIN(id).
+    # The has_symbol flag in the key distinguishes (symbol='X') from
+    # (symbol=None, description='X') — same SQL partition logic.
     _sentinel = "__BROKERAGE_SUMMARY_NULL_SENTINEL__"
 
     def _key(ps: PositionSnapshot) -> tuple[int, str]:
-        # has_symbol flag distinguishes (symbol='X') from (symbol=None,
-        # description='X') — same SQL partition logic.
         has_symbol = 1 if ps.symbol is not None else 0
         coalesced = ps.symbol or ps.description or _sentinel
         return (has_symbol, coalesced)
@@ -430,7 +425,6 @@ def _load_history_state(session: Session) -> _HistoryState:
         for a_id, by_date in pos_by_account_dated.items()
     }
 
-    # AccountBalanceSnapshots — group by account, sorted by as_of.
     bal_by_account: dict[str, list[tuple[date, AccountBalanceSnapshot]]] = {}
     for abs_row in (
         session.query(AccountBalanceSnapshot)
@@ -443,7 +437,6 @@ def _load_history_state(session: Session) -> _HistoryState:
             (abs_row.as_of, abs_row)
         )
 
-    # HistoricalPrices — group by symbol, sorted by trade_date.
     prices_by_symbol: dict[str, list[tuple[date, Decimal]]] = {}
     for hp in (
         session.query(HistoricalPrice)

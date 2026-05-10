@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import {
 		fetchBrokerageNetWorth,
 		fetchBrokerageAccounts,
@@ -9,9 +9,24 @@
 		fetchBrokerageDataIntegrity,
 		fetchBrokerageNetWorthHistory,
 		fetchBrokerageBenchmarkComparison,
-		fetchBrokerageMissingAccounts,
-		updateBrokerageAccountTags
+		fetchBrokerageMissingAccounts
 	} from '$lib/api';
+	import {
+		brokerColor,
+		brokerDisplayName,
+		fmtCurrency,
+		fmtPct,
+		fmtQty,
+		amountClass,
+		fmtCompactCurrency,
+		fmtCurrencyNoCents,
+		fmtSignedCurrency,
+		fmtSignedCurrencyExact,
+		fmtSignedPct,
+		applySort,
+		matchesQuery,
+		type SortDir
+	} from '$lib/brokerage';
 	import type {
 		BrokerageNetWorth,
 		BrokerageAccount,
@@ -40,106 +55,193 @@
 	let topN = $state(10);
 	let recentDays = $state(14);
 
+	// ── Compare-account picker state ──────────────────────────────────────
+	// Selected account ids whose individual history series get overlaid on
+	// the main net-worth chart in their broker's color.
+	let compareIds = $state<Set<string>>(new Set());
+	let compareOpen = $state(false);
+	// Per-account history cached by account_id. We re-render the chart
+	// whenever the cache or compareIds change.
+	let compareCache = $state<Map<string, BrokerageNetWorthHistoryPoint[]>>(new Map());
+	// Per-account fetch state so a load failure shows a clear "(failed)"
+	// chip instead of being conflated with the "no historical data"
+	// (today-only) sparse case.
+	let compareErrors = $state<Set<string>>(new Set());
+	// Bound via bind:this so we can focus the first interactive element
+	// when the popover opens (a11y: keyboard users land inside the dialog
+	// rather than staying on the trigger button).
+	let comparePopEl = $state<HTMLElement | null>(null);
+	// Bound to the inline error banner so we can scrollIntoView when it
+	// appears — otherwise an error triggered by the chart's compare
+	// toggle (which sits below the fold) would render at the top of the
+	// page and the user would never see it.
+	let inlineErrorEl = $state<HTMLElement | null>(null);
+
 	let loading = $state(true);
-	let error = $state('');
 
 	let showRecent = $state(true);
 	let showRealizedGL = $state(true);
 	let showIntegrity = $state(false);
 
-	// ── Per-table sort/filter/search state ────────────────────────────────
-	type SortDir = 'asc' | 'desc' | null;
-
-	let acctQuery = $state('');
-	let acctSortKey = $state<string | null>('market_value');
-	let acctSortDir = $state<SortDir>('desc');
-	let acctBrokerFilter = $state<Set<string>>(new Set());
-	// Tag filter state: tags whose presence is required (include) and tags
-	// whose presence excludes (exclude). UI uses three states per chip:
-	// neutral → include → exclude → neutral.
+	// ── Account filter state ──────────────────────────────────────────────
+	// Only tag-chip filtering is exposed on the main summary page (it
+	// drives both the visible-accounts list AND the chart's history series
+	// via `filterKey`). Search, broker filter, sort, and tag editing live
+	// on the dedicated /brokerage/accounts page.
 	let acctTagInclude = $state<Set<string>>(new Set());
 	let acctTagExclude = $state<Set<string>>(new Set());
-	// Editing state: which account row's tag chips are being edited.
-	let editingTagsAccountId = $state<string | null>(null);
-	let tagDraftInput = $state('');
 
-	let holdQuery = $state('');
-	let holdSortKey = $state<string | null>('total_market_value');
-	let holdSortDir = $state<SortDir>('desc');
-	let holdCashFilter = $state<'all' | 'cash' | 'non-cash'>('all');
-
-	let txnQuery = $state('');
-	let txnSortKey = $state<string | null>('trade_date');
-	let txnSortDir = $state<SortDir>('desc');
-	let txnBrokerFilter = $state<Set<string>>(new Set());
-
-	// ── Helpers ───────────────────────────────────────────────────────────
-	function fmtCurrency(n: number | null | undefined): string {
-		if (n === null || n === undefined) return '—';
-		const sign = n < 0 ? '-' : '';
-		return `${sign}$${Math.abs(n).toLocaleString('en-US', {
-			minimumFractionDigits: 2,
-			maximumFractionDigits: 2
-		})}`;
+	// Allocation segments derived from `by_broker`, sorted by value desc.
+	type AllocSeg = { broker: string; value: number; pct: number; color: string; label: string };
+	function allocationSegments(byBroker: Record<string, number>): AllocSeg[] {
+		const total = Object.values(byBroker).reduce((s, v) => s + v, 0);
+		if (total <= 0) return [];
+		return Object.entries(byBroker)
+			.map(([broker, value]) => ({
+				broker,
+				value,
+				pct: value / total,
+				color: brokerColor(broker),
+				label: brokerDisplayName(broker)
+			}))
+			.sort((a, b) => b.value - a.value);
 	}
 
-	function fmtPct(n: number): string {
-		return `${(n * 100).toFixed(1)}%`;
+	// Compute three deltas (30d / YTD / inception) from the history series.
+	// Returns null when fewer than two points exist.
+	type Delta = { period: string; abs: number; pct: number | null } | null;
+	function findReferencePoint(
+		points: { as_of: string; balance_total: number }[],
+		predicate: (d: Date) => boolean
+	): { as_of: string; balance_total: number } | null {
+		// Pick the LAST historical point that satisfies the predicate (closest
+		// to "today" while still meeting the cutoff). Returns null if none.
+		for (let i = points.length - 1; i >= 0; i--) {
+			if (predicate(new Date(points[i].as_of))) return points[i];
+		}
+		return null;
 	}
 
-	function fmtQty(n: number | null | undefined): string {
-		if (n === null || n === undefined) return '—';
-		return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
-	}
+	function computeDeltas(
+		points: { as_of: string; balance_total: number }[],
+		latest: { balance_total: number } | null
+	): { d30: Delta; ytd: Delta; inception: Delta } {
+		if (!latest || points.length < 2) {
+			return { d30: null, ytd: null, inception: null };
+		}
+		const now = new Date();
+		const cutoff30 = new Date(now);
+		cutoff30.setDate(cutoff30.getDate() - 30);
+		const yearStart = new Date(now.getFullYear(), 0, 1);
 
-	function amountClass(n: number | null | undefined): string {
-		if (n === null || n === undefined) return '';
-		return n >= 0 ? 'pos' : 'neg';
+		// Historical points exclude the synthetic "today" — slice so the
+		// reference can never be the same point as `latest`.
+		const hist = points.slice(0, -1);
+		const ref30 = findReferencePoint(hist, (d) => d <= cutoff30);
+		const refYtd = findReferencePoint(hist, (d) => d <= yearStart) ?? hist[0];
+		const refInception = hist[0];
+
+		const v = latest.balance_total;
+		// When `ref.balance_total === 0` the absolute delta is still
+		// well-defined (e.g. portfolio went from $0 → $100k); only the
+		// percentage is undefined. Return `pct: null` instead of dropping
+		// the whole delta — the template renders "—" for null pct.
+		const mk = (period: string, ref: { balance_total: number; as_of: string } | null): Delta => {
+			if (!ref) return null;
+			const abs = v - ref.balance_total;
+			const pct = ref.balance_total === 0 ? null : abs / ref.balance_total;
+			return { period, abs, pct };
+		};
+		return {
+			d30: mk('30 days', ref30),
+			ytd: mk('YTD', refYtd),
+			inception: mk('All time', refInception)
+		};
 	}
 
 	// ── Data loading ──────────────────────────────────────────────────────
+	// `initialError` only blanks the page on first-load failure. Refetch
+	// failures (toggling benchmark, switching recentDays, filter-driven
+	// history refetch, etc.) write to a per-endpoint map so a successful
+	// holdings refetch doesn't silently wipe a still-broken benchmark
+	// error. The visible `refetchError` string is the joined union.
+	let initialError = $state('');
+	let refetchErrors = $state<Record<string, string>>({});
+	let refetchError = $derived(Object.values(refetchErrors).join(' · '));
+
+	function setOpError(op: string, msg: string): void {
+		refetchErrors = { ...refetchErrors, [op]: msg };
+	}
+	function clearOpError(op: string): void {
+		if (!(op in refetchErrors)) return;
+		const next = { ...refetchErrors };
+		delete next[op];
+		refetchErrors = next;
+	}
+
 	async function loadAll() {
 		loading = true;
-		error = '';
-		try {
-			const [nw, accts, holdings, txns, gl, integrity, history, missing] = await Promise.all([
-				fetchBrokerageNetWorth(),
-				fetchBrokerageAccounts(),
-				fetchBrokerageTopHoldings(topN),
-				fetchBrokerageRecentTransactions(recentDays),
-				fetchBrokerageRealizedGL(),
-				fetchBrokerageDataIntegrity(),
-				fetchBrokerageNetWorthHistory(),
-				fetchBrokerageMissingAccounts()
-			]);
-			netWorth = nw;
-			accounts = accts;
-			topHoldings = holdings;
-			recentTxns = txns;
-			realizedGl = gl;
-			dataIntegrity = integrity;
-			networthHistory = history;
-			missingAccounts = missing;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		} finally {
-			loading = false;
+		initialError = '';
+		// Promise.allSettled so a single broken endpoint doesn't blank the
+		// whole dashboard; degrade per-section instead.
+		const [nwR, acctR, holdR, txR, glR, intR, histR, missR] = await Promise.allSettled([
+			fetchBrokerageNetWorth(),
+			fetchBrokerageAccounts(),
+			fetchBrokerageTopHoldings(topN),
+			fetchBrokerageRecentTransactions(recentDays),
+			fetchBrokerageRealizedGL(),
+			fetchBrokerageDataIntegrity(),
+			fetchBrokerageNetWorthHistory(),
+			fetchBrokerageMissingAccounts()
+		]);
+		const errs: string[] = [];
+		if (nwR.status === 'fulfilled') netWorth = nwR.value;
+		else errs.push(`net worth: ${nwR.reason?.message ?? nwR.reason}`);
+		if (acctR.status === 'fulfilled') accounts = acctR.value;
+		else errs.push(`accounts: ${acctR.reason?.message ?? acctR.reason}`);
+		if (holdR.status === 'fulfilled') topHoldings = holdR.value;
+		else errs.push(`holdings: ${holdR.reason?.message ?? holdR.reason}`);
+		if (txR.status === 'fulfilled') recentTxns = txR.value;
+		else errs.push(`transactions: ${txR.reason?.message ?? txR.reason}`);
+		if (glR.status === 'fulfilled') realizedGl = glR.value;
+		else errs.push(`realized G/L: ${glR.reason?.message ?? glR.reason}`);
+		if (intR.status === 'fulfilled') dataIntegrity = intR.value;
+		else errs.push(`integrity: ${intR.reason?.message ?? intR.reason}`);
+		if (histR.status === 'fulfilled') networthHistory = histR.value;
+		else errs.push(`history: ${histR.reason?.message ?? histR.reason}`);
+		if (missR.status === 'fulfilled') missingAccounts = missR.value;
+		else errs.push(`missing: ${missR.reason?.message ?? missR.reason}`);
+
+		// Only block the entire page on a hard failure (every fetch failed
+		// AND we have nothing rendered yet). Otherwise surface per-section.
+		if (errs.length === 8 && !netWorth) {
+			initialError = errs.join('; ');
+		} else if (errs.length > 0) {
+			setOpError('initial', errs.join('; '));
+		} else {
+			clearOpError('initial');
 		}
+		loading = false;
 	}
 
 	async function reloadHoldings() {
 		try {
 			topHoldings = await fetchBrokerageTopHoldings(topN);
+			clearOpError('holdings');
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			setOpError('holdings', `holdings: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
 	async function reloadRecent() {
 		try {
 			recentTxns = await fetchBrokerageRecentTransactions(recentDays);
+			clearOpError('transactions');
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			setOpError(
+				'transactions',
+				`transactions: ${e instanceof Error ? e.message : String(e)}`
+			);
 		}
 	}
 
@@ -148,8 +250,12 @@
 		if (benchmarkOn && !benchmarkData) {
 			try {
 				benchmarkData = await fetchBrokerageBenchmarkComparison('SPY');
+				clearOpError('benchmark');
 			} catch (e) {
-				error = e instanceof Error ? e.message : String(e);
+				setOpError(
+					'benchmark',
+					`S&P comparison: ${e instanceof Error ? e.message : String(e)}`
+				);
 				benchmarkOn = false;
 			}
 		}
@@ -158,31 +264,19 @@
 	// Refetch the history series when the account filter changes. We pass the
 	// visible account_ids (those passing every active filter) to the API so
 	// the chart matches whatever the headline is summing.
-	let _lastFilterKey = '';
-	$effect(() => {
-		const ids = filteredAccounts.map((a) => a.account_id).sort();
-		const key = `${acctIsFiltered}|${ids.join(',')}`;
-		if (key === _lastFilterKey) return;
-		_lastFilterKey = key;
-		if (!accounts) return; // initial load handled by loadAll()
-		void refetchFilteredHistory(ids);
-	});
-
+	//
 	async function refetchFilteredHistory(ids: string[]): Promise<void> {
 		try {
 			if (!acctIsFiltered) {
 				networthHistory = await fetchBrokerageNetWorthHistory({});
-				return;
-			}
-			if (ids.length === 0) {
+			} else if (ids.length === 0) {
 				networthHistory = []; // empty filter → chart will render at $0
-				return;
+			} else {
+				networthHistory = await fetchBrokerageNetWorthHistory({ accountIds: ids });
 			}
-			// Route through the typed api.ts helper so we inherit its X-Api-Key
-			// forwarding, Content-Type defaults, and in-flight-dedup abort logic.
-			networthHistory = await fetchBrokerageNetWorthHistory({ accountIds: ids });
+			clearOpError('history');
 		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
+			setOpError('history', `history: ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
 
@@ -216,72 +310,15 @@
 				dataIntegrity.duplicate_transaction_groups > 0)
 	);
 
-	// ── Sort / filter / search helpers ────────────────────────────────────
-	function compareValues(a: unknown, b: unknown): number {
-		// Nulls/undefineds sort last regardless of direction
-		const aNull = a === null || a === undefined;
-		const bNull = b === null || b === undefined;
-		if (aNull && bNull) return 0;
-		if (aNull) return 1;
-		if (bNull) return -1;
-		if (typeof a === 'number' && typeof b === 'number') return a - b;
-		return String(a).localeCompare(String(b), undefined, { numeric: true });
-	}
+	// (Sort/filter/search helpers are imported from $lib/brokerage at the
+	// top of this file. Only `toggleSort` is page-specific because it
+	// closes over the per-table sort key/dir state.)
 
-	function applySort<T>(rows: T[], key: string | null, dir: SortDir): T[] {
-		if (!key || !dir) return rows;
-		const sorted = [...rows].sort((a, b) =>
-			compareValues((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])
-		);
-		return dir === 'desc' ? sorted.reverse() : sorted;
-	}
-
-	function matchesQuery(haystack: (string | null | undefined)[], needle: string): boolean {
-		if (!needle) return true;
-		const q = needle.toLowerCase();
-		return haystack.some((h) => h !== null && h !== undefined && h.toLowerCase().includes(q));
-	}
-
-	function nextSortDir(current: SortDir): SortDir {
-		// asc → desc → null → asc
-		if (current === 'asc') return 'desc';
-		if (current === 'desc') return null;
-		return 'asc';
-	}
-
-	function toggleSort(
-		key: string,
-		currentKey: string | null,
-		currentDir: SortDir
-	): { key: string | null; dir: SortDir } {
-		if (currentKey !== key) return { key, dir: 'asc' };
-		const next = nextSortDir(currentDir);
-		return { key: next ? key : null, dir: next };
-	}
-
-	function toggleSetMember<T>(set: Set<T>, value: T): Set<T> {
-		const next = new Set(set);
-		if (next.has(value)) next.delete(value);
-		else next.add(value);
-		return next;
-	}
-
-	function sortIndicator(key: string, currentKey: string | null, currentDir: SortDir): string {
-		if (currentKey !== key || !currentDir) return '';
-		return currentDir === 'asc' ? ' ▲' : ' ▼';
-	}
-
-	// ── Filtered + sorted accounts ────────────────────────────────────────
-	let acctBrokerOptions = $derived(
-		Array.from(new Set(withSnapshots.map((a) => a.broker))).sort()
-	);
-	let txnBrokerOptions = $derived(
-		Array.from(new Set((recentTxns ?? []).map((t) => t.broker))).sort()
-	);
-
+	// ── Filtered accounts (drives top-5 row-list AND chart history) ──────
+	// Sorted by market value desc by default — main page exposes only the
+	// tag-chip filter; full search/sort/edit live on /brokerage/accounts.
 	let filteredAccounts = $derived.by(() => {
 		const filtered = withSnapshots.filter((a) => {
-			if (acctBrokerFilter.size > 0 && !acctBrokerFilter.has(a.broker)) return false;
 			const tags = new Set(a.tags ?? []);
 			if (acctTagInclude.size > 0) {
 				for (const need of acctTagInclude) {
@@ -293,12 +330,9 @@
 					if (tags.has(block)) return false;
 				}
 			}
-			return matchesQuery(
-				[a.broker, a.account_number_masked, a.account_name, a.account_type, a.entity],
-				acctQuery
-			);
+			return true;
 		});
-		return applySort(filtered, acctSortKey, acctSortDir);
+		return applySort(filtered, 'market_value', 'desc');
 	});
 
 	let acctVisibleTotal = $derived(
@@ -307,12 +341,25 @@
 	let acctAllTotal = $derived(
 		withSnapshots.reduce((sum, a) => sum + (a.market_value ?? 0), 0)
 	);
-	let acctIsFiltered = $derived(
-		acctQuery.trim() !== '' ||
-			acctBrokerFilter.size > 0 ||
-			acctTagInclude.size > 0 ||
-			acctTagExclude.size > 0
+	let acctIsFiltered = $derived(acctTagInclude.size > 0 || acctTagExclude.size > 0);
+
+	// Refetch the chart's history series when the account filter changes.
+	// `untrack` reads `filteredAccounts` lazily so the effect only re-runs
+	// when `filterKey` (a coarse, normalized signature) actually changes —
+	// not on every transient mutation of the array reference. Declared
+	// after `filteredAccounts` to avoid use-before-declaration.
+	let filterKey = $derived(
+		`${acctIsFiltered}|${filteredAccounts
+			.map((a) => a.account_id)
+			.sort()
+			.join(',')}`
 	);
+	$effect(() => {
+		filterKey; // track normalized signature only
+		if (!accounts) return; // initial load handled by loadAll()
+		const ids = untrack(() => filteredAccounts.map((a) => a.account_id).sort());
+		void refetchFilteredHistory(ids);
+	});
 
 	// Tag universe: distinct tags from all accounts, sorted alphabetically.
 	let allTags = $derived.by(() => {
@@ -362,15 +409,6 @@
 		if (acctTagExclude.has(tag)) return 'exclude';
 		return 'neutral';
 	}
-
-	let filteredHoldings = $derived.by(() => {
-		const filtered = (topHoldings ?? []).filter((h) => {
-			if (holdCashFilter === 'cash' && !h.is_cash_sleeve) return false;
-			if (holdCashFilter === 'non-cash' && h.is_cash_sleeve) return false;
-			return matchesQuery([h.symbol, h.description], holdQuery);
-		});
-		return applySort(filtered, holdSortKey, holdSortDir);
-	});
 
 	// ── Net-worth history chart geometry ──────────────────────────────────
 	const CHART_W = 720;
@@ -516,132 +554,301 @@
 		};
 	});
 
-	let filteredTxns = $derived.by(() => {
-		const filtered = (recentTxns ?? []).filter((t) => {
-			if (txnBrokerFilter.size > 0 && !txnBrokerFilter.has(t.broker)) return false;
-			return matchesQuery(
-				[t.symbol, t.action, t.account_number_masked, t.broker],
-				txnQuery
-			);
-		});
-		return applySort(filtered, txnSortKey, txnSortDir);
+	// Allocation segments + deltas derived from the same data the headline uses.
+	// When a filter is active we recompute by_broker from the visible accounts so
+	// the bar matches the headline number.
+	let allocSegments = $derived.by(() => {
+		if (!netWorth) return [];
+		if (acctIsFiltered) {
+			const byBroker: Record<string, number> = {};
+			for (const a of filteredAccounts) {
+				byBroker[a.broker] = (byBroker[a.broker] ?? 0) + (a.market_value ?? 0);
+			}
+			return allocationSegments(byBroker);
+		}
+		return allocationSegments(netWorth.by_broker);
 	});
+
+	// ── Compare-account picker (helpers + derived lines) ────────────────
+	async function ensureAccountHistory(accountId: string): Promise<void> {
+		if (compareCache.has(accountId)) return;
+		try {
+			const series = await fetchBrokerageNetWorthHistory({ accountIds: [accountId] });
+			const next = new Map(compareCache);
+			next.set(accountId, series);
+			compareCache = next;
+			if (compareErrors.has(accountId)) {
+				const errs = new Set(compareErrors);
+				errs.delete(accountId);
+				compareErrors = errs;
+			}
+			clearOpError(`account-${accountId}`);
+		} catch (e) {
+			// Surface the failure on the per-account chip — distinct from the
+			// "today only" sparse-data state. Don't let it silently render an
+			// empty/missing line.
+			const errs = new Set(compareErrors);
+			errs.add(accountId);
+			compareErrors = errs;
+			setOpError(
+				`account-${accountId}`,
+				`account history: ${e instanceof Error ? e.message : String(e)}`
+			);
+		}
+	}
+
+	function toggleCompare(accountId: string): void {
+		const next = new Set(compareIds);
+		if (next.has(accountId)) next.delete(accountId);
+		else next.add(accountId);
+		compareIds = next;
+		if (next.has(accountId)) void ensureAccountHistory(accountId);
+	}
+
+	function clearCompare(): void {
+		compareIds = new Set();
+		compareErrors = new Set();
+	}
+
+	// Close the compare popover when the user clicks outside it. The
+	// `setTimeout(_, 0)` defers subscription past the current click that
+	// opened the popover so the toggle's own bubbling click doesn't
+	// immediately close us — works even if the toggle's `stopPropagation`
+	// is removed in a future refactor. Cleanup is automatic via the
+	// $effect return.
+	$effect(() => {
+		if (!compareOpen) return;
+		let onDocClick: (() => void) | null = null;
+		const t = setTimeout(() => {
+			onDocClick = () => (compareOpen = false);
+			document.addEventListener('click', onDocClick);
+		}, 0);
+		return () => {
+			clearTimeout(t);
+			if (onDocClick) document.removeEventListener('click', onDocClick);
+		};
+	});
+
+	// Focus the first checkbox in the compare popover when it opens — so
+	// keyboard users land inside the dialog rather than getting stuck on
+	// the trigger button. The setTimeout defers past the same tick where
+	// the popover element mounts.
+	$effect(() => {
+		if (!compareOpen || !comparePopEl) return;
+		const t = setTimeout(() => {
+			const first = comparePopEl?.querySelector<HTMLElement>('input[type=checkbox]');
+			first?.focus();
+		}, 0);
+		return () => clearTimeout(t);
+	});
+
+	// Scroll the inline error banner into view whenever it transitions
+	// from empty → present. The chart's compare toggle and the recent-
+	// activity day-selector both sit below the fold; without this, an
+	// error triggered there would render at the top of the page and the
+	// user would never see it. Honour `prefers-reduced-motion` — users
+	// who've opted out of OS-level animation should get an instant scroll
+	// instead of the smooth one (browsers don't apply the preference to
+	// `scrollIntoView` automatically).
+	$effect(() => {
+		if (!refetchError || !inlineErrorEl) return;
+		const reducedMotion =
+			typeof window !== 'undefined' &&
+			window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+		inlineErrorEl.scrollIntoView({
+			behavior: reducedMotion ? 'auto' : 'smooth',
+			block: 'nearest'
+		});
+	});
+
+	// Derived overlay lines for selected accounts. Each line aligns
+	// per-account history points against the main chart's x-positions by
+	// matching `as_of` strings — points without a match are skipped, and
+	// $0 / unfunded points create a gap (so accounts that came online
+	// later start partway across the timeline).
+	//
+	// `nonZeroPoints` lets the UI flag accounts whose backend history is
+	// effectively just today's PositionSnapshot — historical XLSX rows
+	// aren't yet linked to live account_ids, so per-account series are
+	// sparse for most accounts. The chip shows "(today only)" in that
+	// case rather than silently rendering an invisible single-dot line.
+	type CompareLine = {
+		id: string;
+		broker: string;
+		name: string;
+		color: string;
+		path: string;
+		nonZeroPoints: number;
+	};
+	let compareLines = $derived.by(() => {
+		if (!historyChart || historyChart.empty) return [] as CompareLine[];
+		const lines: CompareLine[] = [];
+		for (const id of compareIds) {
+			const series = compareCache.get(id);
+			if (!series || series.length === 0) continue;
+			const acct = (accounts ?? []).find((a) => a.account_id === id);
+			if (!acct) continue;
+			const seriesByDate = new Map(series.map((p) => [p.as_of, p.balance_total]));
+			const segments: string[] = [];
+			let pen = 'M';
+			let nonZero = 0;
+			historyChart.points.forEach((p, i) => {
+				const v = seriesByDate.get(p.as_of);
+				if (v === undefined || v <= 0) {
+					pen = 'M';
+					return;
+				}
+				const x = historyChart.xs[i];
+				const y = historyChart.yFor(v);
+				segments.push(`${pen} ${x.toFixed(1)} ${y.toFixed(1)}`);
+				pen = 'L';
+				nonZero++;
+			});
+			lines.push({
+				id,
+				broker: acct.broker,
+				name: acct.account_name ?? acct.account_number_masked,
+				color: brokerColor(acct.broker),
+				path: segments.join(' '),
+				nonZeroPoints: nonZero
+			});
+		}
+		return lines;
+	});
+
+	// True when at least one selected account has insufficient history
+	// (≤1 non-zero point). Drives the "today only" notice below the chart.
+	let compareSparse = $derived(compareLines.some((l) => l.nonZeroPoints <= 1));
+
+	let deltas = $derived.by(() => {
+		if (!historyChart || historyChart.empty || !historyChart.last) {
+			return { d30: null, ytd: null, inception: null };
+		}
+		return computeDeltas(historyChart.points, historyChart.last);
+	});
+
 </script>
 
 <svelte:head>
 	<title>Brokerage · Accounting</title>
+	<link rel="preconnect" href="https://fonts.googleapis.com" />
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 </svelte:head>
 
-<div class="page">
-	<header class="header">
-		<h1>Brokerage</h1>
-		<p class="sub">Phase 1 ingest visibility — net worth, holdings, transactions, realized G/L.</p>
-	</header>
+<div class="page brokerage">
+	<nav class="crumbs" aria-label="Breadcrumb">
+		<a href="/">Money</a>
+		<span class="sep">/</span>
+		<span>Brokerage</span>
+	</nav>
+
+	<h1 class="sr-only">Brokerage</h1>
 
 	{#if loading && !netWorth}
 		<div class="state">Loading…</div>
-	{:else if error}
-		<div class="state error">⚠ {error}</div>
+	{:else if initialError}
+		<div class="state error">⚠ {initialError}</div>
 	{:else if netWorth}
-		<!-- ── Net Worth ──────────────────────────────────────────────── -->
-		<section class="section networth">
-			<div class="headline">
-				<div class="label">Net Worth</div>
-				{#if acctIsFiltered}
-					<div class="value">{fmtCurrency(acctVisibleTotal)}</div>
-					<div class="meta filtered-meta">
-						Visible: {filteredAccounts.length} of {withSnapshots.length} accounts
-						<span class="separator">·</span>
-						All accounts: <strong>{fmtCurrency(acctAllTotal)}</strong>
-					</div>
-				{:else}
-					<div class="value">{fmtCurrency(netWorth.total)}</div>
-					{#if netWorth.as_of_min && netWorth.as_of_max}
-						<div class="meta">
-							{netWorth.as_of_min} … {netWorth.as_of_max}
+		{#if refetchError}
+			<div bind:this={inlineErrorEl} class="inline-error" role="alert">
+				⚠ Could not refresh: {refetchError}
+				<button type="button" class="inline-error-retry" onclick={() => (refetchErrors = {})}>Dismiss</button>
+			</div>
+		{/if}
+		<!-- ── Hero: Net Worth ───────────────────────────────────────── -->
+		<section class="section first hero">
+			<div class="hero-head">
+				<div>
+					<div class="hero-label">Net worth{acctIsFiltered ? ' · filtered' : ''}</div>
+					{#if acctIsFiltered}
+						<div class="hero-num">{fmtCurrencyNoCents(acctVisibleTotal)}</div>
+					{:else}
+						<div class="hero-num">{fmtCurrencyNoCents(netWorth.total)}</div>
+					{/if}
+				</div>
+				<div class="hero-deltas">
+					{#if deltas.d30}
+						<div class="delta">
+							<span class="delta-period">Last 30d</span>
+							<span class="delta-val {deltas.d30.abs >= 0 ? 'pos' : 'neg'}">
+								{fmtSignedCurrency(deltas.d30.abs)}
+								<span class="pct">{deltas.d30.pct === null ? '—' : fmtSignedPct(deltas.d30.pct)}</span>
+							</span>
 						</div>
 					{/if}
-				{/if}
+					{#if deltas.ytd}
+						<div class="delta">
+							<span class="delta-period">YTD</span>
+							<span class="delta-val {deltas.ytd.abs >= 0 ? 'pos' : 'neg'}">
+								{fmtSignedCurrency(deltas.ytd.abs)}
+								<span class="pct">{deltas.ytd.pct === null ? '—' : fmtSignedPct(deltas.ytd.pct)}</span>
+							</span>
+						</div>
+					{/if}
+					{#if deltas.inception}
+						<div class="delta">
+							<span class="delta-period">All time</span>
+							<span class="delta-val {deltas.inception.abs >= 0 ? 'pos' : 'neg'}">
+								{fmtSignedCurrency(deltas.inception.abs)}
+								<span class="pct">{deltas.inception.pct === null ? '—' : fmtSignedPct(deltas.inception.pct)}</span>
+							</span>
+						</div>
+					{/if}
+				</div>
 			</div>
-
-			<div class="brokers">
-				{#each Object.entries(netWorth.by_broker) as [broker, val] (broker)}
-					<div class="broker-card">
-						<div class="broker-name">{broker}</div>
-						<div class="broker-value">{fmtCurrency(val)}</div>
-					</div>
-				{/each}
-			</div>
-
+			{#if acctIsFiltered}
+				<div class="hero-meta">
+					Showing {filteredAccounts.length} of {withSnapshots.length} accounts
+					<span class="sep">·</span>
+					All accounts: <b>{fmtCurrencyNoCents(acctAllTotal)}</b>
+				</div>
+			{:else if netWorth.as_of_min && netWorth.as_of_max}
+				<div class="hero-meta">{netWorth.as_of_min} … {netWorth.as_of_max}</div>
+			{/if}
 		</section>
 
-		<!-- ── Net-worth history ─────────────────────────────────────── -->
+		<!-- ── Net-worth history (chart inside hero, design pattern) ─── -->
 		{#if historyChart}
-			<section class="section">
-				<div class="section-head">
-					<h2>Net Worth Over Time</h2>
-					<div class="history-summary">
-						{#if historyChart.first && historyChart.last}
-							<span class="muted">{historyChart.first.as_of} → {historyChart.last.as_of}</span>
-							<span class="separator">·</span>
-							<span class={historyChart.deltaPct >= 0 ? 'pos' : 'neg'}>
-								{historyChart.deltaPct >= 0 ? '+' : ''}{(historyChart.deltaPct * 100).toFixed(1)}%
-							</span>
-						{:else}
-							<span class="muted">No accounts match the current filter</span>
-						{/if}
-						{#if benchmarkOn && benchmarkData?.benchmark_pct !== null && benchmarkData?.benchmark_pct !== undefined}
-							<span class="separator">·</span>
-							<span class="muted">SPY:</span>
-							<span class={benchmarkData.benchmark_pct >= 0 ? 'pos' : 'neg'}>
-								{benchmarkData.benchmark_pct >= 0 ? '+' : ''}{(benchmarkData.benchmark_pct * 100).toFixed(1)}%
-							</span>
-						{/if}
-					</div>
-					<button
-						type="button"
-						class="chip"
-						class:active={benchmarkOn}
-						onclick={toggleBenchmark}
-					>
-						{benchmarkOn ? '✓ S&P 500' : 'Compare to S&P 500'}
-					</button>
-				</div>
+			<section class="section chart-section">
 				<svg class="history-chart" viewBox={`0 0 ${CHART_W} ${CHART_H + 30}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Net worth over time">
 					<defs>
 						<linearGradient id="history-fill" x1="0" y1="0" x2="0" y2="1">
-							<stop offset="0%" stop-color="#007aff" stop-opacity="0.18" />
-							<stop offset="100%" stop-color="#007aff" stop-opacity="0" />
+							<stop offset="0%" stop-color="var(--accent)" stop-opacity="0.16" />
+							<stop offset="100%" stop-color="var(--accent)" stop-opacity="0" />
 						</linearGradient>
 					</defs>
-					<!-- Y-axis dollar grid lines.
-					     Key by index, not value: pickAxisTicks can yield duplicate
-					     values when min == max (single-point series, flatlined
-					     filter). Duplicate keys throw each_key_duplicate, which
-					     halts subsequent reactive updates and is the root cause
-					     of the tag-chip click-bug — the filter handler succeeds,
-					     but the chart re-derive throws on re-render and Svelte
-					     stops processing the batch, so the chip class never
-					     updates. -->
+					<!-- Y-axis dollar gridlines.
+					     Key by index (not value): pickAxisTicks can yield
+					     duplicate values when min == max (e.g. flatlined
+					     filter), and Svelte's each_key_duplicate halts
+					     reactive updates — the same bug that surfaced as the
+					     tag-chip click freeze. -->
 					{#each historyChart.dollarTicks as tick, i (i)}
 						{@const y = historyChart.yFor(tick)}
-						<line x1={CHART_PAD_X} y1={y} x2={CHART_W - CHART_PAD_X} y2={y} stroke="#f0f0f2" stroke-width="1" />
-						<text x={CHART_PAD_X - 4} y={y + 3} text-anchor="end" font-size="10" fill="#6e6e73" font-family="-apple-system,Helvetica">{formatAxisDollars(tick)}</text>
+						<line x1={CHART_PAD_X} y1={y} x2={CHART_W - CHART_PAD_X} y2={y} stroke="var(--hairline-2)" stroke-width="1" />
+						<text x={CHART_PAD_X - 4} y={y + 3} text-anchor="end" font-size="10" fill="var(--ink-3)" font-family="Inter,system-ui">{formatAxisDollars(tick)}</text>
 					{/each}
 					<path d={historyChart.areaPath} fill="url(#history-fill)" />
-					<path d={historyChart.linePath} fill="none" stroke="#007aff" stroke-width="2" />
 					{#if benchmarkOn && historyChart.benchPath}
-						<path d={historyChart.benchPath} fill="none" stroke="#ff9500" stroke-width="2" stroke-dasharray="4 4" />
+						<path d={historyChart.benchPath} fill="none" stroke="var(--ink-3)" stroke-width="1.2" stroke-dasharray="3 3" opacity="0.6" />
 					{/if}
+					{#each compareLines as line (line.id)}
+						{#if line.nonZeroPoints > 1}
+							<path d={line.path} fill="none" stroke={line.color} stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round" opacity="0.85" />
+						{/if}
+					{/each}
+					<path d={historyChart.linePath} fill="none" stroke="var(--accent)" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" />
 					{#each historyChart.points as p, i (p.as_of)}
 						{@const isToday = historyChart.todayIdx === i}
+						{@const isHover = hoverHistoryIdx === i}
 						<circle
 							cx={historyChart.xs[i]}
 							cy={historyChart.ys[i]}
-							r={hoverHistoryIdx === i ? 6 : isToday ? 5 : 3}
-							fill={isToday ? '#047a04' : '#007aff'}
-							stroke={isToday ? '#fff' : 'none'}
-							stroke-width={isToday ? 1.5 : 0}
+							r={isHover ? 5 : isToday ? 3.5 : 0}
+							fill={isToday ? 'var(--pos)' : 'var(--accent)'}
+							stroke={isToday || isHover ? 'var(--bg)' : 'none'}
+							stroke-width={isToday || isHover ? 1.5 : 0}
 							class="history-dot"
 							onmouseenter={() => (hoverHistoryIdx = i)}
 							onmouseleave={() => (hoverHistoryIdx = null)}
@@ -652,39 +859,196 @@
 						{@const cx = historyChart.xs[hoverHistoryIdx]}
 						{@const cy = historyChart.ys[hoverHistoryIdx]}
 						{@const isToday = historyChart.todayIdx === hoverHistoryIdx}
-						<line x1={cx} y1={CHART_PAD_Y} x2={cx} y2={CHART_H - CHART_PAD_Y} stroke="#c7c7cc" stroke-dasharray="2 3" />
-						<g transform={`translate(${Math.min(cx + 8, CHART_W - 150)} ${Math.max(cy - 32, 0)})`}>
-							<rect x="0" y="0" width="140" height={isToday ? 50 : 40} rx="6" fill="#1d1d1f" />
-							<text x="8" y="16" fill="#fff" font-size="11">{p.as_of}{isToday ? ' · Live' : ''}</text>
-							<text x="8" y="32" fill="#fff" font-size="13" font-weight="600">{fmtCurrency(p.balance_total)}</text>
-							{#if isToday}<text x="8" y="46" fill="#a7d99e" font-size="10">live PositionSnapshot total</text>{/if}
+						<line x1={cx} y1={CHART_PAD_Y} x2={cx} y2={CHART_H - CHART_PAD_Y} stroke="var(--ink-3)" stroke-dasharray="2 3" opacity="0.55" />
+						<g transform={`translate(${Math.min(cx + 8, CHART_W - 160)} ${Math.max(cy - 32, 0)})`}>
+							<rect x="0" y="0" width="148" height={isToday ? 48 : 38} rx="6" fill="var(--ink)" />
+							<text x="8" y="15" fill="var(--bg)" font-size="11" font-family="Inter,system-ui">{p.as_of}{isToday ? ' · Live' : ''}</text>
+							<text x="8" y="30" fill="var(--bg)" font-size="13" font-weight="600" font-family="Inter,system-ui">{fmtCurrency(p.balance_total)}</text>
+							{#if isToday}<text x="8" y="44" fill="var(--accent-soft)" font-size="10" font-family="Inter,system-ui">live total</text>{/if}
 						</g>
 					{/if}
-					<!-- X-axis date ticks.
-					     Key by index: pickDateTicks can yield duplicate `idx`
-					     values when points.length is small (Math.round on a
-					     short series collapses multiple slots to the same
-					     index). Same root cause as dollarTicks above. -->
+					<!-- X-axis date ticks. Key by index — see dollarTicks note above. -->
 					{#each historyChart.dateTicks as tick, i (i)}
 						{@const x = historyChart.xs[tick.idx] ?? CHART_PAD_X}
-						<text x={x} y={CHART_H - 2} text-anchor="middle" font-size="10" fill="#6e6e73" font-family="-apple-system,Helvetica">{tick.label}</text>
+						<text x={x} y={CHART_H - 2} text-anchor="middle" font-size="10" fill="var(--ink-3)" font-family="Inter,system-ui">{tick.label}</text>
 					{/each}
 				</svg>
+				<div class="chart-controls">
+					<span class="chart-summary">
+						{#if historyChart.first && historyChart.last}
+							{historyChart.first.as_of} → {historyChart.last.as_of}
+						{:else}
+							No accounts match filter
+						{/if}
+					</span>
+					<button
+						type="button"
+						class="compare-toggle"
+						class:active={benchmarkOn}
+						onclick={toggleBenchmark}
+					>
+						<span class="dash-dot"></span>
+						{#if benchmarkOn && benchmarkData?.benchmark_pct !== null && benchmarkData?.benchmark_pct !== undefined}
+							S&P 500
+							<span class="compare-pct {benchmarkData.benchmark_pct >= 0 ? 'pos' : 'neg'}">
+								{fmtSignedPct(benchmarkData.benchmark_pct)} over period
+							</span>
+						{:else}
+							Compare to S&P 500
+						{/if}
+					</button>
+					<div class="acct-cmp">
+						<button
+							type="button"
+							class="acct-cmp-btn"
+							aria-haspopup="true"
+							aria-expanded={compareOpen}
+							onclick={(e) => {
+								e.stopPropagation();
+								compareOpen = !compareOpen;
+							}}
+						>
+							+ Compare account
+						</button>
+						{#if compareOpen}
+							<div
+								bind:this={comparePopEl}
+								class="acct-cmp-pop"
+								role="dialog"
+								aria-label="Select accounts to compare on the chart"
+								onclick={(e) => e.stopPropagation()}
+								onkeydown={(e) => {
+									if (e.key === 'Escape') {
+										compareOpen = false;
+										return;
+									}
+									// Focus trap: keep Tab/Shift-Tab cycling inside the
+									// dialog. A role="dialog" without a trap lets focus
+									// escape into the underlying page while the modal is
+									// still visible — WCAG 2.1 expects focus confinement.
+									if (e.key !== 'Tab' || !comparePopEl) return;
+									// Standard tabbable selector — broader than just
+									// checkboxes so the trap stays correct if a Clear /
+									// close button is added inside the popover later.
+									const focusable = Array.from(
+										comparePopEl.querySelectorAll<HTMLElement>(
+											'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+										)
+									);
+									if (focusable.length === 0) return;
+									const first = focusable[0];
+									const last = focusable[focusable.length - 1];
+									const active = document.activeElement as HTMLElement | null;
+									if (e.shiftKey && active === first) {
+										e.preventDefault();
+										last.focus();
+									} else if (!e.shiftKey && active === last) {
+										e.preventDefault();
+										first.focus();
+									}
+								}}
+								tabindex="-1"
+							>
+								{#each withSnapshots as a (a.account_id)}
+									<label>
+										<input
+											type="checkbox"
+											checked={compareIds.has(a.account_id)}
+											onchange={() => toggleCompare(a.account_id)}
+										/>
+										<span class="acct-cmp-row">
+											<span class="dot" style:background={brokerColor(a.broker)}></span>
+											<span class="name" title={a.account_name ?? a.account_number_masked}>
+												{a.account_name ?? a.account_number_masked}
+											</span>
+										</span>
+										<span class="val">{fmtCompactCurrency(a.market_value ?? 0)}</span>
+									</label>
+								{/each}
+							</div>
+						{/if}
+					</div>
+					{#if compareIds.size > 0}
+						<span class="acct-cmp-chips">
+							{#each Array.from(compareIds) as id (id)}
+								{@const a = (accounts ?? []).find((x) => x.account_id === id)}
+								{@const line = compareLines.find((l) => l.id === id)}
+								{@const failed = compareErrors.has(id)}
+								{@const sparse = !failed && (!line || line.nonZeroPoints <= 1)}
+								{#if a}
+									<span class="acct-chip" class:sparse class:failed>
+										<span class="dot" style:background={brokerColor(a.broker)}></span>
+										<span class="acct-chip-name">{a.account_name ?? a.account_number_masked}</span>
+										{#if failed}
+											<span class="acct-chip-note">failed</span>
+										{:else if sparse}
+											<span class="acct-chip-note">today only</span>
+										{/if}
+										<button
+											type="button"
+											class="x"
+											aria-label="Remove {a.account_name ?? a.account_number_masked}"
+											onclick={() => toggleCompare(id)}
+										>×</button>
+									</span>
+								{/if}
+							{/each}
+							<button type="button" class="acct-cmp-clear" onclick={clearCompare}>Clear</button>
+						</span>
+					{/if}
+				</div>
+				{#if compareSparse || compareErrors.size > 0}
+					<p class="compare-notice">
+						{#if compareErrors.size > 0}
+							⚠ Some accounts couldn't be loaded — chips marked "failed" can be
+							removed and re-added to retry. {#if compareSparse}Other accounts have no
+							historical balance data linked yet, so only "today only" appears.{/if}
+						{:else}
+							Per-account historical balance data isn't linked for the marked accounts —
+							lines render only for accounts with two or more historical snapshots.
+						{/if}
+					</p>
+				{/if}
+			</section>
+		{:else if !loading}
+			<section class="section chart-section">
+				<p class="muted" style="padding: 24px 0;">
+					Not enough net-worth history yet to draw a chart — at least two
+					historical snapshots are required. Once a second snapshot lands the
+					chart will appear automatically.
+				</p>
 			</section>
 		{/if}
 
-		<!-- ── Accounts ──────────────────────────────────────────────── -->
-		<section class="section">
-			<div class="section-head">
-				<h2>Accounts</h2>
-				<div class="table-controls">
-					<input
-						type="search"
-						class="search-input"
-						placeholder="Search accounts…"
-						bind:value={acctQuery}
-					/>
+		<!-- ── Allocation by broker ──────────────────────────────────── -->
+		{#if allocSegments.length > 0}
+			<section class="section">
+				<div class="sec-head">
+					<h2 class="sec-title">Allocation · by broker</h2>
 				</div>
+				<div class="alloc-bar" role="img" aria-label="Allocation by broker">
+					{#each allocSegments as seg (seg.broker)}
+						<div class="alloc-seg" style:width="{(seg.pct * 100).toFixed(2)}%" style:background={seg.color} title="{seg.label} {(seg.pct * 100).toFixed(1)}%"></div>
+					{/each}
+				</div>
+				<div class="alloc-legend">
+					{#each allocSegments as seg (seg.broker)}
+						<div class="alloc-item">
+							<span class="swatch" style:background={seg.color}></span>
+							<span class="name">{seg.label}</span>
+							<span class="val">{fmtCurrencyNoCents(seg.value)}</span>
+							<span class="pct">{(seg.pct * 100).toFixed(1)}%</span>
+						</div>
+					{/each}
+				</div>
+			</section>
+		{/if}
+
+		<!-- ── Accounts (summary: top 5 + filter chips drive chart) ─── -->
+		<section class="section">
+			<div class="sec-head">
+				<h2 class="sec-title">Accounts · {filteredAccounts.length} of {withSnapshots.length}</h2>
+				<a href="/brokerage/accounts" class="sec-link">All accounts · filter, group, tag <span class="arrow">→</span></a>
 			</div>
 
 			{#if allTags.length > 0}
@@ -698,6 +1062,11 @@
 							class:include={state === 'include'}
 							class:exclude={state === 'exclude'}
 							onclick={() => cycleTag(tag)}
+							aria-label="{tag}: {state === 'include'
+								? 'including'
+								: state === 'exclude'
+									? 'excluding'
+									: 'not filtered'} (click to cycle)"
 							title="Click to cycle: include → exclude → off"
 						>
 							{state === 'exclude' ? '−' : state === 'include' ? '+' : ''} {tag}
@@ -718,401 +1087,190 @@
 				</div>
 			{/if}
 
-			{#if acctBrokerOptions.length > 1}
-				<div class="filter-chips">
-					<span class="chip-label">Broker:</span>
-					{#each acctBrokerOptions as broker (broker)}
-						<button
-							type="button"
-							class="chip"
-							class:active={acctBrokerFilter.has(broker)}
-							onclick={() => (acctBrokerFilter = toggleSetMember(acctBrokerFilter, broker))}
-						>
-							{broker}
-						</button>
-					{/each}
-					{#if acctBrokerFilter.size > 0}
-						<button
-							type="button"
-							class="chip clear"
-							onclick={() => (acctBrokerFilter = new Set())}
-						>
-							Clear
-						</button>
-					{/if}
-				</div>
-			{/if}
-
-			<table class="data-table">
-				<thead>
-					<tr>
-						{#each [{ key: 'broker', label: 'Broker' }, { key: 'account_number_masked', label: 'Account' }, { key: 'account_type', label: 'Type' }] as col (col.key)}
-							<th class="sortable" onclick={() => {
-								const r = toggleSort(col.key, acctSortKey, acctSortDir);
-								acctSortKey = r.key;
-								acctSortDir = r.dir;
-							}}>{col.label}{sortIndicator(col.key, acctSortKey, acctSortDir)}</th>
-						{/each}
-						<th>Tags</th>
-						{#each [{ key: 'entity', label: 'Entity' }, { key: 'as_of', label: 'As of' }] as col (col.key)}
-							<th class="sortable" onclick={() => {
-								const r = toggleSort(col.key, acctSortKey, acctSortDir);
-								acctSortKey = r.key;
-								acctSortDir = r.dir;
-							}}>{col.label}{sortIndicator(col.key, acctSortKey, acctSortDir)}</th>
-						{/each}
-						<th class="num sortable" onclick={() => {
-							const r = toggleSort('market_value', acctSortKey, acctSortDir);
-							acctSortKey = r.key;
-							acctSortDir = r.dir;
-						}}>Market value{sortIndicator('market_value', acctSortKey, acctSortDir)}</th>
-					</tr>
-				</thead>
-				<tbody>
-					{#each filteredAccounts as a (a.account_id)}
-						<tr class:wrapper={a.is_plan_wrapper}>
-							<td>{a.broker}</td>
-							<td>
-								<a class="account-link" href={`/brokerage/accounts/${a.account_id}`} title={a.account_name ? `${a.account_name} (${a.account_number_masked})` : 'Open account detail'}>
-									{#if a.account_name}
-										{a.account_name}
-									{:else}
-										{a.account_number_masked}
-									{/if}
-								</a>
-								{#if a.is_plan_wrapper}
-									<span class="badge">wrapper</span>
-								{/if}
-							</td>
-							<td>{a.account_type}</td>
-							<td class="tags-cell">
-								{#if editingTagsAccountId === a.account_id}
-									<div class="tags-edit">
-										{#each a.tags ?? [] as tag (tag)}
-											<span class="tag-pill editing">
-												{tag}
-												<button
-													type="button"
-													class="tag-remove"
-													aria-label={`Remove ${tag}`}
-													onclick={async () => {
-														const next = (a.tags ?? []).filter((t) => t !== tag);
-														try {
-															await updateBrokerageAccountTags(a.account_id, next);
-															a.tags = next;
-														} catch (e) {
-															error = e instanceof Error ? e.message : String(e);
-														}
-													}}
-												>×</button>
-											</span>
-										{/each}
-										<input
-											type="text"
-											class="tag-input"
-											bind:value={tagDraftInput}
-											placeholder="add tag…"
-											onkeydown={async (e) => {
-												if (e.key !== 'Enter') return;
-												const draft = tagDraftInput.trim().toLowerCase();
-												if (!draft) return;
-												if ((a.tags ?? []).includes(draft)) return;
-												const next = [...(a.tags ?? []), draft].sort();
-												try {
-													await updateBrokerageAccountTags(a.account_id, next);
-													a.tags = next;
-													tagDraftInput = '';
-												} catch (err) {
-													error = err instanceof Error ? err.message : String(err);
-												}
-											}}
-										/>
-										<button
-											type="button"
-											class="tag-edit-done"
-											onclick={() => {
-												editingTagsAccountId = null;
-												tagDraftInput = '';
-											}}
-										>Done</button>
-									</div>
-								{:else}
-									<button
-										type="button"
-										class="tags-display"
-										onclick={() => {
-											editingTagsAccountId = a.account_id;
-											tagDraftInput = '';
-										}}
-										title="Click to edit tags"
-									>
-										{#each a.tags ?? [] as tag (tag)}
-											<span class="tag-pill">{tag}</span>
-										{/each}
-										{#if (a.tags ?? []).length === 0}
-											<span class="muted">+ add</span>
-										{/if}
-									</button>
-								{/if}
-							</td>
-							<td>{a.entity}</td>
-							<td>{a.as_of}</td>
-							<td class="num">{fmtCurrency(a.market_value)}</td>
-						</tr>
-					{/each}
-					{#if filteredAccounts.length === 0}
-						<tr><td colspan="7" class="muted empty">No accounts match the current filter.</td></tr>
-					{/if}
-				</tbody>
-			</table>
-
-		</section>
-
-		<!-- ── Top Holdings ──────────────────────────────────────────── -->
-		<section class="section">
-			<div class="section-head">
-				<h2>Top Holdings</h2>
-				<div class="table-controls">
-					<input
-						type="search"
-						class="search-input"
-						placeholder="Search holdings…"
-						bind:value={holdQuery}
-					/>
-					<label class="control">
-						Show top
-						<select bind:value={topN} onchange={reloadHoldings}>
-							<option value={5}>5</option>
-							<option value={10}>10</option>
-							<option value={25}>25</option>
-							<option value={50}>50</option>
-						</select>
-					</label>
-				</div>
-			</div>
-
-			<div class="filter-chips">
-				<span class="chip-label">Type:</span>
-				<button type="button" class="chip" class:active={holdCashFilter === 'all'} onclick={() => (holdCashFilter = 'all')}>All</button>
-				<button type="button" class="chip" class:active={holdCashFilter === 'non-cash'} onclick={() => (holdCashFilter = 'non-cash')}>Non-cash</button>
-				<button type="button" class="chip" class:active={holdCashFilter === 'cash'} onclick={() => (holdCashFilter = 'cash')}>Cash sleeves</button>
-			</div>
-
-			<table class="data-table">
-				<thead>
-					<tr>
-						<th class="sortable" onclick={() => {
-							const r = toggleSort('symbol', holdSortKey, holdSortDir);
-							holdSortKey = r.key;
-							holdSortDir = r.dir;
-						}}>Symbol / Description{sortIndicator('symbol', holdSortKey, holdSortDir)}</th>
-						<th class="num sortable" onclick={() => {
-							const r = toggleSort('total_quantity', holdSortKey, holdSortDir);
-							holdSortKey = r.key;
-							holdSortDir = r.dir;
-						}}>Quantity{sortIndicator('total_quantity', holdSortKey, holdSortDir)}</th>
-						<th class="num sortable" onclick={() => {
-							const r = toggleSort('total_market_value', holdSortKey, holdSortDir);
-							holdSortKey = r.key;
-							holdSortDir = r.dir;
-						}}>Market value{sortIndicator('total_market_value', holdSortKey, holdSortDir)}</th>
-						<th class="num sortable" onclick={() => {
-							const r = toggleSort('pct_of_net_worth', holdSortKey, holdSortDir);
-							holdSortKey = r.key;
-							holdSortDir = r.dir;
-						}}>% of net worth{sortIndicator('pct_of_net_worth', holdSortKey, holdSortDir)}</th>
-						<th class="num sortable" onclick={() => {
-							const r = toggleSort('account_count', holdSortKey, holdSortDir);
-							holdSortKey = r.key;
-							holdSortDir = r.dir;
-						}}># accounts{sortIndicator('account_count', holdSortKey, holdSortDir)}</th>
-					</tr>
-				</thead>
-				<tbody>
-					{#each filteredHoldings as h, i (h.symbol ?? h.description ?? `idx-${i}`)}
-						<tr class:cash={h.is_cash_sleeve}>
-							<td>
-								{#if h.is_cash_sleeve}
-									<strong>Cash</strong>
-								{:else if h.symbol}
-									<strong>{h.symbol}</strong>
-									{#if h.description}<span class="muted"> · {h.description}</span>{/if}
-								{:else}
-									<span class="muted">{h.description ?? '(unknown)'}</span>
-								{/if}
-							</td>
-							<td class="num">{fmtQty(h.total_quantity)}</td>
-							<td class="num">{fmtCurrency(h.total_market_value)}</td>
-							<td class="num">{fmtPct(h.pct_of_net_worth)}</td>
-							<td class="num">{h.account_count}</td>
-						</tr>
-					{/each}
-					{#if filteredHoldings.length === 0}
-						<tr><td colspan="5" class="muted empty">No holdings match the current filter.</td></tr>
-					{/if}
-				</tbody>
-			</table>
-		</section>
-
-		<!-- ── Recent Transactions ───────────────────────────────────── -->
-		<section class="section">
-			<div class="section-head">
-				<h2>
-					<button class="toggle" onclick={() => (showRecent = !showRecent)} aria-expanded={showRecent}>
-						{showRecent ? '▾' : '▸'} Recent Transactions
-					</button>
-				</h2>
-				{#if showRecent}
-					<label class="control">
-						Days
-						<select bind:value={recentDays} onchange={reloadRecent}>
-							<option value={7}>7</option>
-							<option value={14}>14</option>
-							<option value={30}>30</option>
-							<option value={90}>90</option>
-						</select>
-					</label>
-				{/if}
-			</div>
-			{#if showRecent}
-				{#if (recentTxns?.length ?? 0) === 0}
-					<p class="muted">None in the selected window.</p>
-				{:else}
-					<div class="table-controls inline">
-						<input
-							type="search"
-							class="search-input"
-							placeholder="Search transactions…"
-							bind:value={txnQuery}
-						/>
-					</div>
-					{#if txnBrokerOptions.length > 1}
-						<div class="filter-chips">
-							<span class="chip-label">Broker:</span>
-							{#each txnBrokerOptions as broker (broker)}
-								<button
-									type="button"
-									class="chip"
-									class:active={txnBrokerFilter.has(broker)}
-									onclick={() => (txnBrokerFilter = toggleSetMember(txnBrokerFilter, broker))}
-								>
-									{broker}
-								</button>
-							{/each}
-							{#if txnBrokerFilter.size > 0}
-								<button
-									type="button"
-									class="chip clear"
-									onclick={() => (txnBrokerFilter = new Set())}
-								>
-									Clear
-								</button>
-							{/if}
+			<div class="accounts-list">
+				{#each filteredAccounts.slice(0, 5) as a (a.account_id)}
+					<a class="a-row" href={`/brokerage/accounts/${a.account_id}`} title={a.account_name ?? a.account_number_masked}>
+						<span class="a-dot" style:background={brokerColor(a.broker)}></span>
+						<div class="a-info">
+							<div class="a-name">{a.account_name ?? a.account_number_masked}</div>
+							<div class="a-meta">
+								<span class="a-broker">{brokerDisplayName(a.broker)}</span>
+								{#each a.tags ?? [] as tag (tag)}<span class="a-tag">{tag}</span>{/each}
+							</div>
 						</div>
-					{/if}
-					<table class="data-table compact">
-						<thead>
-							<tr>
-								{#each [{ key: 'trade_date', label: 'Date' }, { key: 'broker', label: 'Broker' }, { key: 'account_number_masked', label: 'Account' }, { key: 'action', label: 'Action' }, { key: 'symbol', label: 'Symbol' }] as col (col.key)}
-									<th class="sortable" onclick={() => {
-										const r = toggleSort(col.key, txnSortKey, txnSortDir);
-										txnSortKey = r.key;
-										txnSortDir = r.dir;
-									}}>{col.label}{sortIndicator(col.key, txnSortKey, txnSortDir)}</th>
-								{/each}
-								<th class="num sortable" onclick={() => {
-									const r = toggleSort('quantity', txnSortKey, txnSortDir);
-									txnSortKey = r.key;
-									txnSortDir = r.dir;
-								}}>Qty{sortIndicator('quantity', txnSortKey, txnSortDir)}</th>
-								<th class="num sortable" onclick={() => {
-									const r = toggleSort('amount', txnSortKey, txnSortDir);
-									txnSortKey = r.key;
-									txnSortDir = r.dir;
-								}}>Amount{sortIndicator('amount', txnSortKey, txnSortDir)}</th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each filteredTxns as t, i (`${t.trade_date}-${t.account_number_masked}-${t.action}-${i}`)}
-								<tr>
-									<td>{t.trade_date}</td>
-									<td>{t.broker}</td>
-									<td>{t.account_number_masked}</td>
-									<td>{t.action}</td>
-									<td>{t.symbol ?? ''}</td>
-									<td class="num">{fmtQty(t.quantity)}</td>
-									<td class="num {amountClass(t.amount)}">{fmtCurrency(t.amount)}</td>
-								</tr>
-							{/each}
-							{#if filteredTxns.length === 0}
-								<tr><td colspan="7" class="muted empty">No transactions match the current filter.</td></tr>
-							{/if}
-						</tbody>
-					</table>
+						<div class="a-meta a-asof">As of {a.as_of}</div>
+						<div class="a-val">{fmtCurrencyNoCents(a.market_value ?? 0)}</div>
+					</a>
+				{/each}
+				{#if filteredAccounts.length > 5}
+					{@const restTotal = filteredAccounts.slice(5).reduce((s, a) => s + (a.market_value ?? 0), 0)}
+					<a href="/brokerage/accounts" class="a-more">
+						{filteredAccounts.length - 5} more accounts · {fmtCurrencyNoCents(restTotal)} · show all <span class="arrow">→</span>
+					</a>
+				{:else if filteredAccounts.length === 0}
+					<div class="empty-row">No accounts match the current filter.</div>
 				{/if}
+			</div>
+		</section>
+
+		<!-- ── Top Holdings (summary: top 5 row-list) ─────────────────── -->
+		<section class="section">
+			<div class="sec-head">
+				<h2 class="sec-title">Top holdings</h2>
+				<a href="/brokerage/holdings" class="sec-link">All holdings · search, sort <span class="arrow">→</span></a>
+			</div>
+
+			<div class="holdings-list">
+				{#each (topHoldings ?? []).slice(0, 5) as h, i (h.symbol ?? h.description ?? `idx-${i}`)}
+					{@const href = h.symbol && !h.is_cash_sleeve ? `/brokerage/holdings/${h.symbol}` : null}
+					<svelte:element
+						this={href ? 'a' : 'div'}
+						href={href}
+						class="h-row {h.is_cash_sleeve ? 'cash' : ''}"
+						title={h.description ?? h.symbol}
+					>
+						<span class="h-sym">
+							{#if h.is_cash_sleeve}Cash{:else}{h.symbol ?? '—'}{/if}
+						</span>
+						<span class="h-desc">
+							{#if h.description}{h.description}{/if}
+							{#if h.total_quantity}<span class="h-qty"> · {fmtQty(h.total_quantity)} sh</span>{/if}
+							{#if h.account_count > 1}<span class="h-qty"> · {h.account_count} accounts</span>{/if}
+						</span>
+						<span class="h-val">{fmtCurrencyNoCents(h.total_market_value)}</span>
+						<div class="h-bar"><div style:width="{Math.min(100, h.pct_of_net_worth * 100).toFixed(2)}%"></div></div>
+						<span class="h-pct">{fmtPct(h.pct_of_net_worth)}</span>
+					</svelte:element>
+				{/each}
+				{#if (topHoldings?.length ?? 0) === 0}
+					<div class="empty-row">No holdings yet.</div>
+				{/if}
+			</div>
+		</section>
+
+		<!-- ── Recent activity (summary: last 10 in window) ─────────── -->
+		<section class="section">
+			<div class="sec-head">
+				<h2 class="sec-title">Recent activity</h2>
+				<a href="/brokerage/transactions" class="sec-link">All transactions · search, filter <span class="arrow">→</span></a>
+			</div>
+			{#if (recentTxns?.length ?? 0) === 0}
+				<p class="muted">No transactions in the last {recentDays} days.</p>
+			{:else}
+				{@const recentNet = (recentTxns ?? []).reduce((s, t) => s + (t.amount ?? 0), 0)}
+				<div class="activity-summary">
+					Last {recentDays} days · {recentTxns?.length} transactions · net cash flow
+					<b class={recentNet >= 0 ? 'pos' : 'neg'}>{fmtSignedCurrencyExact(recentNet)}</b>
+				</div>
+				<table class="data-table compact">
+					<tbody>
+						{#each (recentTxns ?? []).slice(0, 10) as t, i (`${t.trade_date}-${t.account_number_masked}-${t.action}-${i}`)}
+							<tr>
+								<td class="tx-date">{t.trade_date}</td>
+								<td>
+									<span class="broker-cell">
+										<span class="broker-dot" style:background={brokerColor(t.broker)}></span>
+										{brokerDisplayName(t.broker)}
+									</span>
+								</td>
+								<td>{t.action} <span class="muted">····{t.account_number_masked.slice(-4)}</span></td>
+								<td>{t.symbol ?? '—'}</td>
+								<td class="num muted">{t.quantity ? fmtQty(t.quantity) : '—'}</td>
+								<td class="num {amountClass(t.amount)}">{fmtCurrency(t.amount)}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
 			{/if}
 		</section>
 
 		<!-- ── Realized G/L ─────────────────────────────────────────── -->
 		<section class="section">
-			<h2>
-				<button
-					class="toggle"
-					onclick={() => (showRealizedGL = !showRealizedGL)}
-					aria-expanded={showRealizedGL}
-				>
-					{showRealizedGL ? '▾' : '▸'} Realized G/L by Year
-				</button>
-			</h2>
+			<div class="sec-head">
+				<h2 class="sec-title">
+					<button
+						class="toggle"
+						onclick={() => (showRealizedGL = !showRealizedGL)}
+						aria-expanded={showRealizedGL}
+					>
+						{showRealizedGL ? '▾' : '▸'} Realized gains &amp; losses
+					</button>
+				</h2>
+				<a href="/brokerage/transactions?view=realized-gl" class="sec-link">Lots, wash-sale checks, 1099-B <span class="arrow">→</span></a>
+			</div>
 			{#if showRealizedGL && realizedGl}
-				<table class="data-table">
-					<thead>
-						<tr>
-							<th>Year</th>
-							<th class="num">Short-term</th>
-							<th class="num">Long-term</th>
-							<th class="num">Unknown</th>
-							<th class="num">Total</th>
-							<th class="num">Lots</th>
-						</tr>
-					</thead>
-					<tbody>
-						{#each realizedYears as year (year)}
-							{@const b = realizedGl.by_year[String(year)]}
-							<tr>
-								<td>{year}</td>
-								<td class="num {amountClass(b.short_term)}">{fmtCurrency(b.short_term)}</td>
-								<td class="num {amountClass(b.long_term)}">{fmtCurrency(b.long_term)}</td>
-								<td class="num {amountClass(b.unknown)}">{fmtCurrency(b.unknown)}</td>
-								<td class="num {amountClass(b.total)}">{fmtCurrency(b.total)}</td>
-								<td class="num">{b.lots}</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-				<div class="footer-note">
+				<div class="gl-grid">
+					{#each realizedYears.slice(0, 3) as year (year)}
+						{@const b = realizedGl.by_year[String(year)]}
+						{@const isYtd = year === new Date().getFullYear()}
+						<div class="gl-card">
+							<span class="gl-year">{year}{isYtd ? ' · YTD' : ''}</span>
+							<span class="gl-total {amountClass(b.total)}">{fmtSignedCurrencyExact(b.total)}</span>
+							<div class="gl-bd">
+								<span>ST &nbsp;<b>{fmtSignedCurrencyExact(b.short_term)}</b></span>
+								<span>LT &nbsp;<b>{fmtSignedCurrencyExact(b.long_term)}</b></span>
+								{#if b.unknown !== 0}
+									<span>? &nbsp;<b>{fmtSignedCurrencyExact(b.unknown)}</b></span>
+								{/if}
+								<span class="gl-lots">· {b.lots} lots</span>
+							</div>
+						</div>
+					{/each}
+				</div>
+				{#if realizedYears.length > 3}
+					<details class="gl-more">
+						<summary>{realizedYears.length - 3} earlier year{realizedYears.length - 3 === 1 ? '' : 's'} →</summary>
+						<table class="data-table">
+							<thead>
+								<tr>
+									<th>Year</th>
+									<th class="num">Short-term</th>
+									<th class="num">Long-term</th>
+									<th class="num">Unknown</th>
+									<th class="num">Total</th>
+									<th class="num">Lots</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each realizedYears.slice(3) as year (year)}
+									{@const b = realizedGl.by_year[String(year)]}
+									<tr>
+										<td>{year}</td>
+										<td class="num {amountClass(b.short_term)}">{fmtSignedCurrencyExact(b.short_term)}</td>
+										<td class="num {amountClass(b.long_term)}">{fmtSignedCurrencyExact(b.long_term)}</td>
+										<td class="num {amountClass(b.unknown)}">{fmtSignedCurrencyExact(b.unknown)}</td>
+										<td class="num {amountClass(b.total)}">{fmtSignedCurrencyExact(b.total)}</td>
+										<td class="num">{b.lots}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</details>
+				{/if}
+				<p class="gl-note">
 					{#if realizedGl.wash_sales.lots === 0}
-						<span class="muted"
-							>No wash sales in ingested data (1099-B substantiation not yet ingested).</span
-						>
+						<span class="ok">✓</span> No wash sales detected in ingested data.
+						<span style="opacity:0.7;">1099-B substantiation not yet ingested.</span>
 					{:else}
-						<strong>Wash sales:</strong>
+						<span class="warn">⚠</span> <strong>Wash sales:</strong>
 						{realizedGl.wash_sales.lots} lots, total disallowed loss
 						{fmtCurrency(realizedGl.wash_sales.total_disallowed_loss)}
 					{/if}
-				</div>
+				</p>
 			{/if}
 		</section>
 
 		<!-- ── Missing Accounts ─────────────────────────────────────── -->
 		{#if missingAccounts && missingAccounts.length > 0}
 			<section class="section missing-accounts">
-				<h2>
-					Missing Accounts
-					<span class="badge missing-badge">{missingAccounts.length}</span>
-				</h2>
-				<p class="muted missing-note">
-					Accounts you've marked active that haven't reported a fresh balance in 60+ days
+				<div class="sec-head">
+					<h2 class="sec-title">
+						Missing accounts
+						<span class="badge missing-badge">{missingAccounts.length}</span>
+					</h2>
+				</div>
+				<p class="missing-note">
+					Accounts marked active that haven't reported a fresh balance in 60+ days
 					(or never linked to a live account at all). Add a snapshot or close the account
 					to clear it.
 				</p>
@@ -1147,24 +1305,42 @@
 			</section>
 		{/if}
 
-		<!-- ── Data Integrity ───────────────────────────────────────── -->
-		<section class="section integrity" class:has-warnings={hasIntegrityWarnings}>
-			<h2>
-				<button
-					class="toggle"
-					onclick={() => (showIntegrity = !showIntegrity)}
-					aria-expanded={showIntegrity}
-				>
-					{showIntegrity ? '▾' : '▸'} Data Integrity
-					{#if hasIntegrityWarnings}<span class="warn-dot" aria-label="warnings present">⚠</span>{/if}
-				</button>
-			</h2>
-			{#if showIntegrity && dataIntegrity}
+		<!-- ── Data integrity (footer strip) ────────────────────────── -->
+		<div class="integrity" class:has-warnings={hasIntegrityWarnings}>
+			<div class="integrity-left">
+				<span class="integrity-mark" class:warn={hasIntegrityWarnings} aria-hidden="true">
+					{#if hasIntegrityWarnings}
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="2" x2="5" y2="6"/><circle cx="5" cy="8.2" r="0.6" fill="currentColor"/></svg>
+					{:else}
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="1.5,5.5 4,8 8.5,2.5"/></svg>
+					{/if}
+				</span>
+				<div>
+					{#if hasIntegrityWarnings}
+						<b>Data integrity warnings present</b>
+					{:else if dataIntegrity}
+						<b>All sources reconciled</b> · {dataIntegrity.accounts} accounts · {dataIntegrity.transactions.toLocaleString()} transactions
+					{:else}
+						<b>Status unknown</b>
+					{/if}
+				</div>
+			</div>
+			<button
+				type="button"
+				class="sec-link"
+				onclick={() => (showIntegrity = !showIntegrity)}
+				aria-expanded={showIntegrity}
+			>
+				{showIntegrity ? 'Hide details' : 'Data integrity report'} <span class="arrow">→</span>
+			</button>
+		</div>
+		{#if showIntegrity && dataIntegrity}
+			<section class="section integrity-detail">
 				<dl class="grid">
-					<dt>Accounts</dt><dd>{dataIntegrity.accounts}</dd>
-					<dt>Transactions</dt><dd>{dataIntegrity.transactions}</dd>
-					<dt>Position snapshots</dt><dd>{dataIntegrity.position_snapshots}</dd>
-					<dt>Realized lots</dt><dd>{dataIntegrity.realized_lots}</dd>
+					<dt>Accounts</dt><dd>{dataIntegrity.accounts.toLocaleString()}</dd>
+					<dt>Transactions</dt><dd>{dataIntegrity.transactions.toLocaleString()}</dd>
+					<dt>Position snapshots</dt><dd>{dataIntegrity.position_snapshots.toLocaleString()}</dd>
+					<dt>Realized lots</dt><dd>{dataIntegrity.realized_lots.toLocaleString()}</dd>
 				</dl>
 				{#if hasIntegrityWarnings}
 					<ul class="warnings">
@@ -1181,454 +1357,17 @@
 							<li>⚠ {dataIntegrity.suspect_symbols} suspect symbol row(s) (adapter-bug indicator)</li>
 						{/if}
 						{#if dataIntegrity.duplicate_position_groups > 0}
-							<li>
-								⚠ {dataIntegrity.duplicate_position_groups} duplicate position group(s) (adapter-bug
-								indicator)
-							</li>
+							<li>⚠ {dataIntegrity.duplicate_position_groups} duplicate position group(s) (adapter-bug indicator)</li>
 						{/if}
 						{#if dataIntegrity.duplicate_transaction_groups > 0}
-							<li>
-								⚠ {dataIntegrity.duplicate_transaction_groups} duplicate transaction group(s) (adapter-bug
-								indicator)
-							</li>
+							<li>⚠ {dataIntegrity.duplicate_transaction_groups} duplicate transaction group(s) (adapter-bug indicator)</li>
 						{/if}
 					</ul>
 				{:else}
 					<p class="muted">No data integrity warnings.</p>
 				{/if}
-			{/if}
-		</section>
+			</section>
+		{/if}
 	{/if}
 </div>
 
-<style>
-	.page {
-		max-width: 1200px;
-		margin: 0 auto;
-		padding: 24px;
-		font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
-		color: #1d1d1f;
-	}
-
-	.header h1 {
-		font-size: 32px;
-		font-weight: 600;
-		margin: 0 0 4px 0;
-	}
-	.header .sub {
-		color: #6e6e73;
-		margin: 0 0 24px 0;
-		font-size: 14px;
-	}
-
-	.state {
-		padding: 24px;
-		text-align: center;
-		color: #6e6e73;
-	}
-	.state.error {
-		color: #d70015;
-	}
-
-	.section {
-		background: #ffffff;
-		border: 1px solid #e5e5e7;
-		border-radius: 12px;
-		padding: 20px 24px;
-		margin-bottom: 16px;
-	}
-
-	.section h2 {
-		font-size: 18px;
-		font-weight: 600;
-		margin: 0 0 12px 0;
-	}
-
-	.section-head {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		margin-bottom: 12px;
-	}
-	.section-head h2 {
-		margin: 0;
-	}
-
-	.toggle {
-		background: none;
-		border: none;
-		padding: 0;
-		font: inherit;
-		cursor: pointer;
-		color: inherit;
-		text-align: left;
-	}
-
-	.warn-dot {
-		color: #ff9500;
-		margin-left: 6px;
-	}
-
-	.networth .headline {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		margin-bottom: 16px;
-	}
-	.networth .label {
-		font-size: 12px;
-		text-transform: uppercase;
-		color: #6e6e73;
-		letter-spacing: 0.04em;
-	}
-	.networth .value {
-		font-size: 40px;
-		font-weight: 600;
-		font-feature-settings: 'tnum' 1;
-		margin-top: 4px;
-	}
-	.networth .meta {
-		color: #6e6e73;
-		font-size: 12px;
-	}
-
-	.brokers {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-		gap: 12px;
-	}
-	.broker-card {
-		background: #f5f5f7;
-		border-radius: 8px;
-		padding: 12px 14px;
-	}
-	.broker-name {
-		font-size: 12px;
-		text-transform: capitalize;
-		color: #6e6e73;
-	}
-	.broker-value {
-		font-size: 20px;
-		font-weight: 600;
-		font-feature-settings: 'tnum' 1;
-		margin-top: 2px;
-	}
-
-	.data-table {
-		width: 100%;
-		border-collapse: collapse;
-		font-size: 14px;
-	}
-	.data-table thead th {
-		text-align: left;
-		font-weight: 500;
-		color: #6e6e73;
-		padding: 6px 8px;
-		border-bottom: 1px solid #e5e5e7;
-		font-size: 12px;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-	}
-	.data-table tbody td {
-		padding: 8px;
-		border-bottom: 1px solid #f0f0f2;
-		font-feature-settings: 'tnum' 1;
-	}
-	.data-table tr.wrapper {
-		background: #fafafc;
-	}
-	.data-table tr.cash {
-		background: #f9f9fb;
-	}
-	.data-table .num {
-		text-align: right;
-		font-variant-numeric: tabular-nums;
-	}
-
-	.data-table.compact tbody td {
-		padding: 4px 8px;
-	}
-
-	.muted {
-		color: #6e6e73;
-	}
-	.pos {
-		color: #047a04;
-	}
-	.neg {
-		color: #d70015;
-	}
-
-	.badge {
-		display: inline-block;
-		font-size: 11px;
-		background: #fff5e6;
-		color: #b35900;
-		padding: 1px 6px;
-		border-radius: 4px;
-		margin-left: 6px;
-	}
-
-	.footer-note {
-		margin-top: 8px;
-		font-size: 13px;
-	}
-
-	.control {
-		font-size: 13px;
-		color: #6e6e73;
-	}
-	.control select {
-		font: inherit;
-		padding: 2px 6px;
-		border-radius: 6px;
-		border: 1px solid #d2d2d7;
-		background: #fff;
-		margin-left: 4px;
-	}
-
-	.integrity .grid {
-		display: grid;
-		grid-template-columns: max-content 1fr;
-		gap: 4px 16px;
-		margin: 0;
-		font-size: 14px;
-	}
-	.integrity dt {
-		color: #6e6e73;
-	}
-	.integrity dd {
-		margin: 0;
-		font-feature-settings: 'tnum' 1;
-	}
-
-	.warnings {
-		margin: 12px 0 0;
-		padding-left: 20px;
-		color: #b35900;
-		font-size: 13px;
-	}
-
-	/* Table controls (search + dropdowns) */
-	.table-controls {
-		display: flex;
-		align-items: center;
-		gap: 12px;
-	}
-	.table-controls.inline {
-		margin-bottom: 8px;
-	}
-	.search-input {
-		font: inherit;
-		font-size: 13px;
-		padding: 4px 10px;
-		border: 1px solid #d2d2d7;
-		border-radius: 6px;
-		background: #fff;
-		min-width: 200px;
-	}
-	.search-input:focus {
-		outline: none;
-		border-color: #007aff;
-		box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
-	}
-
-	/* Filter chips */
-	.filter-chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 6px;
-		align-items: center;
-		margin: 4px 0 12px;
-	}
-	.chip-label {
-		font-size: 12px;
-		text-transform: uppercase;
-		letter-spacing: 0.04em;
-		color: #6e6e73;
-		margin-right: 4px;
-	}
-	.chip {
-		font: inherit;
-		font-size: 12px;
-		padding: 3px 10px;
-		border: 1px solid #d2d2d7;
-		border-radius: 999px;
-		background: #fff;
-		color: #1d1d1f;
-		cursor: pointer;
-		transition: background 0.1s, border-color 0.1s;
-	}
-	.chip:hover {
-		background: #f5f5f7;
-	}
-	.chip.active {
-		background: #007aff;
-		border-color: #007aff;
-		color: #fff;
-	}
-	.chip.clear {
-		color: #d70015;
-		border-color: #f0c0c4;
-	}
-
-	/* Sortable column headers */
-	.data-table thead th.sortable {
-		cursor: pointer;
-		user-select: none;
-	}
-	.data-table thead th.sortable:hover {
-		color: #1d1d1f;
-	}
-	.data-table tbody td.empty {
-		text-align: center;
-		padding: 16px;
-		font-style: italic;
-	}
-
-	/* Filtered headline meta */
-	.networth .meta.filtered-meta {
-		font-size: 13px;
-		color: #6e6e73;
-		margin-top: 6px;
-	}
-	.networth .meta.filtered-meta strong {
-		color: #1d1d1f;
-		font-feature-settings: 'tnum' 1;
-	}
-	.networth .meta .separator {
-		margin: 0 8px;
-		color: #c7c7cc;
-	}
-
-	/* Net-worth history chart */
-	.history-summary {
-		font-size: 13px;
-		color: #6e6e73;
-	}
-	.history-summary .separator {
-		margin: 0 8px;
-		color: #c7c7cc;
-	}
-	.history-chart {
-		width: 100%;
-		height: auto;
-		max-height: 240px;
-		display: block;
-		margin-top: 4px;
-	}
-	.history-dot {
-		cursor: pointer;
-		transition: r 0.1s;
-	}
-	/* Missing accounts panel */
-	.missing-accounts h2 {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-	}
-	.missing-badge {
-		background: #ff9500;
-		color: #fff;
-		font-size: 12px;
-		padding: 2px 8px;
-		border-radius: 999px;
-	}
-	.missing-note {
-		font-size: 13px;
-		margin: -6px 0 12px;
-	}
-
-	/* Tag chips: three-state (neutral / include / exclude) */
-	.chip.tag-chip.include {
-		background: #047a04;
-		border-color: #047a04;
-		color: #fff;
-	}
-	.chip.tag-chip.exclude {
-		background: #d70015;
-		border-color: #d70015;
-		color: #fff;
-	}
-
-	/* Tag pills inline in account rows */
-	.tags-cell {
-		max-width: 240px;
-	}
-	.tags-display {
-		background: none;
-		border: 1px dashed transparent;
-		border-radius: 6px;
-		padding: 2px 4px;
-		cursor: text;
-		display: inline-flex;
-		flex-wrap: wrap;
-		gap: 4px;
-		min-height: 22px;
-		font: inherit;
-		color: inherit;
-		text-align: left;
-	}
-	.tags-display:hover {
-		border-color: #d2d2d7;
-		background: #fafafc;
-	}
-	.tag-pill {
-		display: inline-block;
-		font-size: 11px;
-		padding: 1px 7px;
-		background: #f0f0f2;
-		color: #1d1d1f;
-		border-radius: 999px;
-		font-feature-settings: 'tnum' 0;
-	}
-	.tags-edit {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 4px;
-		align-items: center;
-	}
-	.tag-pill.editing {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-	}
-	.tag-remove {
-		background: none;
-		border: none;
-		color: #6e6e73;
-		cursor: pointer;
-		font-size: 14px;
-		padding: 0;
-		line-height: 1;
-	}
-	.tag-input {
-		font: inherit;
-		font-size: 11px;
-		padding: 1px 6px;
-		border: 1px solid #d2d2d7;
-		border-radius: 999px;
-		background: #fff;
-		min-width: 80px;
-	}
-	.tag-edit-done {
-		font: inherit;
-		font-size: 11px;
-		padding: 1px 8px;
-		border: 1px solid #1d1d1f;
-		border-radius: 999px;
-		background: #1d1d1f;
-		color: #fff;
-		cursor: pointer;
-	}
-
-	.account-link {
-		color: inherit;
-		text-decoration: none;
-		cursor: pointer;
-	}
-	.account-link:hover {
-		color: #007aff;
-		text-decoration: underline;
-	}
-</style>

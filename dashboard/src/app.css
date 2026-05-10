@@ -424,6 +424,22 @@ kbd {
 	clip: rect(0,0,0,0);
 	white-space: nowrap;
 }
+/* Reveal the .sr-only skip link when focused via Tab so keyboard users
+   can actually see and use it (the prior rule kept it permanently hidden
+   even on focus, making the skip-to-content affordance unusable). */
+.sr-only:focus {
+	position: static;
+	width: auto;
+	height: auto;
+	overflow: visible;
+	clip: auto;
+	white-space: normal;
+	background: var(--text, #111);
+	color: var(--bg, #fff);
+	padding: 6px 10px;
+	border-radius: 4px;
+	z-index: 9999;
+}
 
 /* ── Alert banners ──────────────────────────────────────────────────────── */
 .alert-banner {
@@ -448,4 +464,1256 @@ kbd {
 	background: var(--red-100);
 	color: var(--red-700);
 	border: 1px solid #fecaca;
+}
+
+/* ============================================================== */
+/* Brokerage redesign — shared across /brokerage/* pages */
+/* See .brokerage class on page wrappers. Tokens + primitives.   */
+/* ============================================================== */
+/* ─── Design tokens (scoped to .brokerage) ───────────────────── */
+.brokerage {
+	--bg: oklch(0.985 0.004 85);
+	--surface: oklch(0.995 0.003 85);
+	--surface-2: oklch(0.97 0.005 85);
+	--ink: oklch(0.22 0.008 85);
+	--ink-2: oklch(0.45 0.008 85);
+	--ink-3: oklch(0.62 0.008 85);
+	--hairline: oklch(0.9 0.005 85);
+	--hairline-2: oklch(0.94 0.004 85);
+	--accent: oklch(0.55 0.07 150);
+	--accent-soft: oklch(0.92 0.03 150);
+	--pos: oklch(0.52 0.08 150);
+	--neg: oklch(0.55 0.10 28);
+	--warn: oklch(0.65 0.13 55);
+
+	--br-etrade: oklch(0.55 0.10 295);
+	--br-schwab: oklch(0.62 0.10 240);
+	--br-vanguard: oklch(0.55 0.13 25);
+	--br-fidelity: oklch(0.55 0.10 150);
+	--br-fg_annuity: oklch(0.62 0.08 195);
+	--br-gsk_pension: oklch(0.65 0.13 55);
+	--br-nw_mutual: oklch(0.50 0.08 245);
+	--br-franklin_templeton: oklch(0.50 0.08 260);
+
+	--font: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+html.dark .brokerage {
+	--bg: oklch(0.18 0.006 85);
+	--surface: oklch(0.21 0.006 85);
+	--surface-2: oklch(0.23 0.006 85);
+	--ink: oklch(0.94 0.005 85);
+	--ink-2: oklch(0.72 0.005 85);
+	--ink-3: oklch(0.55 0.005 85);
+	--hairline: oklch(0.30 0.006 85);
+	--hairline-2: oklch(0.26 0.006 85);
+	--accent: oklch(0.78 0.08 150);
+	--accent-soft: oklch(0.32 0.04 150);
+	--pos: oklch(0.78 0.08 150);
+	--neg: oklch(0.72 0.11 28);
+	--warn: oklch(0.78 0.13 55);
+
+	--br-etrade: oklch(0.72 0.10 295);
+	--br-schwab: oklch(0.75 0.10 240);
+	--br-vanguard: oklch(0.70 0.13 25);
+	--br-fidelity: oklch(0.72 0.10 150);
+	--br-fg_annuity: oklch(0.75 0.08 195);
+	--br-gsk_pension: oklch(0.78 0.13 55);
+	--br-nw_mutual: oklch(0.70 0.08 245);
+	--br-franklin_templeton: oklch(0.70 0.08 260);
+}
+
+.brokerage {
+	max-width: 1180px;
+	margin: 0 auto;
+	padding: 28px 28px 80px;
+	background: var(--bg);
+	color: var(--ink);
+	font-family: var(--font);
+	font-size: 14px;
+	line-height: 1.5;
+	font-feature-settings: 'ss01', 'cv11';
+	font-variant-numeric: tabular-nums;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+/* ─── Crumbs ───────────────────────────────────────────────── */
+.brokerage .crumbs {
+	color: var(--ink-3);
+	font-size: 12.5px;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-bottom: 22px;
+}
+.brokerage .crumbs a {
+	color: inherit;
+	text-decoration: none;
+}
+.brokerage .crumbs a:hover {
+	color: var(--ink);
+}
+.brokerage .crumbs .sep {
+	opacity: 0.6;
+}
+
+/* ─── Loading / error ──────────────────────────────────────── */
+.brokerage .state {
+	padding: 24px;
+	text-align: center;
+	color: var(--ink-3);
+}
+.brokerage .state.error {
+	color: var(--neg);
+}
+
+/* ─── Section primitives ───────────────────────────────────── */
+.brokerage .section {
+	padding: 38px 0;
+	border-top: 1px solid var(--hairline);
+}
+.brokerage .section.first {
+	border-top: 0;
+	padding-top: 0;
+}
+.brokerage .sec-head {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	margin-bottom: 20px;
+	gap: 16px;
+	flex-wrap: wrap;
+}
+.brokerage .sec-title {
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--ink-3);
+	margin: 0;
+}
+.brokerage .sec-title .toggle {
+	background: none;
+	border: 0;
+	padding: 0;
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+	letter-spacing: inherit;
+	text-transform: inherit;
+}
+.brokerage .sec-title .toggle:hover {
+	color: var(--ink-2);
+}
+.brokerage .sec-link {
+	font-size: 13px;
+	color: var(--ink-2);
+	font-weight: 500;
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	padding: 4px 0;
+	background: none;
+	border: 0;
+	cursor: pointer;
+	font-family: inherit;
+}
+.brokerage .sec-link:hover {
+	color: var(--ink);
+}
+.brokerage .sec-link .arrow {
+	transition: transform 0.2s;
+}
+.brokerage .sec-link:hover .arrow {
+	transform: translateX(2px);
+}
+
+/* ─── Hero ─────────────────────────────────────────────────── */
+.brokerage .hero {
+	display: flex;
+	flex-direction: column;
+	gap: 18px;
+}
+.brokerage .hero-head {
+	display: flex;
+	align-items: flex-end;
+	justify-content: space-between;
+	gap: 24px;
+	flex-wrap: wrap;
+}
+.brokerage .hero-label {
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--ink-3);
+	margin-bottom: 6px;
+}
+.brokerage .hero-num {
+	font-size: 56px;
+	font-weight: 600;
+	letter-spacing: -0.025em;
+	line-height: 1.05;
+	color: var(--ink);
+}
+.brokerage .hero-deltas {
+	display: flex;
+	gap: 28px;
+	flex-wrap: wrap;
+}
+.brokerage .delta {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.brokerage .delta-period {
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--ink-3);
+}
+.brokerage .delta-val {
+	font-size: 15px;
+	font-weight: 500;
+	color: var(--ink);
+}
+.brokerage .delta-val.pos {
+	color: var(--pos);
+}
+.brokerage .delta-val.neg {
+	color: var(--neg);
+}
+.brokerage .delta-val .pct {
+	color: var(--ink-3);
+	margin-left: 6px;
+	font-weight: 400;
+}
+.brokerage .hero-meta {
+	font-size: 12.5px;
+	color: var(--ink-3);
+}
+.brokerage .hero-meta b {
+	color: var(--ink);
+	font-weight: 500;
+}
+.brokerage .hero-meta .sep {
+	margin: 0 8px;
+	opacity: 0.6;
+}
+
+/* ─── Chart section ─────────────────────────────────────────── */
+.brokerage .chart-section {
+	padding-top: 0;
+	border-top: 0;
+	padding-bottom: 38px;
+}
+.brokerage .history-chart {
+	width: 100%;
+	height: auto;
+	max-height: 280px;
+	display: block;
+}
+.brokerage .history-dot {
+	cursor: pointer;
+	transition: r 0.1s;
+}
+.brokerage .chart-controls {
+	display: flex;
+	align-items: center;
+	gap: 18px;
+	margin-top: 10px;
+	flex-wrap: wrap;
+}
+.brokerage .chart-summary {
+	font-size: 12px;
+	color: var(--ink-3);
+}
+.brokerage .compare-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 7px;
+	font-size: 12.5px;
+	color: var(--ink-2);
+	background: none;
+	border: 0;
+	font-family: inherit;
+	cursor: pointer;
+	padding: 4px 8px;
+	border-radius: 6px;
+	font-weight: 500;
+}
+.brokerage .compare-toggle:hover {
+	color: var(--ink);
+	background: var(--surface-2);
+}
+.brokerage .compare-toggle .dash-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--ink-3);
+	border: 1px dashed var(--ink-3);
+	opacity: 0.7;
+}
+.brokerage .compare-toggle.active .dash-dot {
+	opacity: 1;
+	border-color: var(--ink-2);
+	background: var(--ink-2);
+}
+.brokerage .compare-pct {
+	margin-left: 4px;
+	color: var(--ink);
+	font-weight: 500;
+}
+.brokerage .compare-pct.pos {
+	color: var(--pos);
+}
+.brokerage .compare-pct.neg {
+	color: var(--neg);
+}
+
+/* ─── Allocation bar ───────────────────────────────────────── */
+.brokerage .alloc-bar {
+	display: flex;
+	height: 10px;
+	width: 100%;
+	border-radius: 3px;
+	overflow: hidden;
+	background: var(--surface-2);
+}
+.brokerage .alloc-seg {
+	height: 100%;
+}
+.brokerage .alloc-legend {
+	display: grid;
+	grid-template-columns: repeat(4, 1fr);
+	gap: 14px 24px;
+	margin-top: 22px;
+}
+@media (max-width: 820px) {
+	.brokerage .alloc-legend {
+		grid-template-columns: repeat(2, 1fr);
+	}
+}
+.brokerage .alloc-item {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	font-size: 13px;
+	color: var(--ink-2);
+	border-top: 1px solid var(--hairline-2);
+	padding-top: 9px;
+	min-width: 0;
+}
+.brokerage .alloc-item .swatch {
+	width: 8px;
+	height: 8px;
+	border-radius: 2px;
+	flex-shrink: 0;
+	align-self: center;
+}
+.brokerage .alloc-item .name {
+	flex: 1;
+	color: var(--ink);
+	font-weight: 500;
+}
+.brokerage .alloc-item .val {
+	color: var(--ink-2);
+}
+.brokerage .alloc-item .pct {
+	color: var(--ink-3);
+	margin-left: 6px;
+	font-size: 12px;
+}
+
+/* ─── Tables (restyled to design hairlines) ────────────────── */
+.brokerage .data-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 13.5px;
+}
+.brokerage .data-table thead th {
+	text-align: left;
+	font-weight: 500;
+	color: var(--ink-3);
+	padding: 10px 8px;
+	border-bottom: 1px solid var(--hairline);
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+}
+.brokerage .data-table tbody td {
+	padding: 10px 8px;
+	border-bottom: 1px solid var(--hairline-2);
+	color: var(--ink);
+}
+.brokerage .data-table tbody tr:hover {
+	background: var(--surface-2);
+}
+.brokerage .data-table tr.wrapper td {
+	opacity: 0.7;
+}
+.brokerage .data-table tr.cash td {
+	color: var(--ink-2);
+}
+.brokerage .data-table .num {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+.brokerage .data-table.compact tbody td {
+	padding: 8px;
+}
+.brokerage .data-table thead th.sortable {
+	cursor: pointer;
+	user-select: none;
+}
+.brokerage .data-table thead th.sortable:hover {
+	color: var(--ink);
+}
+.brokerage .data-table tbody td.empty {
+	text-align: center;
+	padding: 24px;
+	color: var(--ink-3);
+	font-style: italic;
+}
+
+/* Broker cell with color dot */
+.brokerage .broker-cell {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+}
+.brokerage .broker-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 2px;
+	flex-shrink: 0;
+}
+
+/* Holdings pct bar inline */
+.brokerage .pct-row {
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+	justify-content: flex-end;
+	min-width: 110px;
+}
+.brokerage .pct-bar {
+	width: 60px;
+	height: 4px;
+	background: var(--surface-2);
+	border-radius: 2px;
+	overflow: hidden;
+}
+.brokerage .pct-bar > div {
+	height: 100%;
+	background: var(--ink-2);
+}
+
+/* ─── Helpers ──────────────────────────────────────────────── */
+.brokerage .muted {
+	color: var(--ink-3);
+}
+.brokerage .pos {
+	color: var(--pos);
+}
+.brokerage .neg {
+	color: var(--neg);
+}
+
+.brokerage .badge {
+	display: inline-block;
+	font-size: 10.5px;
+	font-weight: 600;
+	color: var(--ink-3);
+	background: transparent;
+	border: 1px solid var(--hairline);
+	padding: 0 5px;
+	border-radius: 3px;
+	line-height: 14px;
+	margin-left: 6px;
+}
+
+.brokerage .toggle {
+	background: none;
+	border: 0;
+	padding: 0;
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+	text-align: left;
+}
+
+/* ─── Table controls ──────────────────────────────────────── */
+.brokerage .table-controls {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	flex-wrap: wrap;
+}
+.brokerage .table-controls.inline {
+	margin-bottom: 8px;
+}
+.brokerage .search-input {
+	font: inherit;
+	font-size: 12.5px;
+	padding: 5px 10px;
+	border: 1px solid var(--hairline);
+	border-radius: 6px;
+	background: var(--surface);
+	color: var(--ink);
+	min-width: 200px;
+}
+.brokerage .search-input:focus {
+	outline: none;
+	border-color: var(--ink-3);
+	box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.brokerage .control {
+	font-size: 12.5px;
+	color: var(--ink-3);
+}
+.brokerage .control select {
+	font: inherit;
+	padding: 3px 8px;
+	border-radius: 6px;
+	border: 1px solid var(--hairline);
+	background: var(--surface);
+	color: var(--ink);
+	margin-left: 4px;
+}
+
+/* ─── Filter chips ─────────────────────────────────────────── */
+.brokerage .filter-chips {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	align-items: center;
+	margin: 4px 0 14px;
+}
+.brokerage .chip-label {
+	font-size: 11px;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	color: var(--ink-3);
+	margin-right: 4px;
+}
+.brokerage .chip {
+	font: inherit;
+	font-size: 12px;
+	padding: 3px 10px;
+	border: 1px solid var(--hairline);
+	border-radius: 999px;
+	background: var(--surface);
+	color: var(--ink);
+	cursor: pointer;
+	transition: background 0.1s, border-color 0.1s, color 0.1s;
+}
+.brokerage .chip:hover {
+	background: var(--surface-2);
+}
+.brokerage .chip.active {
+	background: var(--ink);
+	border-color: var(--ink);
+	color: var(--bg);
+}
+.brokerage .chip.clear {
+	color: var(--neg);
+	border-color: var(--hairline);
+}
+/* Three-state tag chips: include (sage) / exclude (clay) */
+.brokerage .chip.tag-chip.include {
+	background: var(--pos);
+	border-color: var(--pos);
+	color: var(--bg);
+}
+.brokerage .chip.tag-chip.exclude {
+	background: var(--neg);
+	border-color: var(--neg);
+	color: var(--bg);
+}
+
+/* ─── Tag inline editor (preserved from original) ──────────── */
+.brokerage .tags-cell {
+	max-width: 240px;
+}
+.brokerage .tags-display {
+	background: none;
+	border: 1px dashed transparent;
+	border-radius: 6px;
+	padding: 2px 4px;
+	cursor: text;
+	display: inline-flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	min-height: 22px;
+	font: inherit;
+	color: inherit;
+	text-align: left;
+}
+.brokerage .tags-display:hover {
+	border-color: var(--hairline);
+	background: var(--surface-2);
+}
+.brokerage .tag-pill {
+	display: inline-block;
+	font-size: 11px;
+	padding: 1px 7px;
+	background: var(--surface-2);
+	color: var(--ink);
+	border: 1px solid var(--hairline-2);
+	border-radius: 999px;
+}
+.brokerage .tags-edit {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	align-items: center;
+}
+.brokerage .tag-pill.editing {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+.brokerage .tag-remove {
+	background: none;
+	border: 0;
+	color: var(--ink-3);
+	cursor: pointer;
+	font-size: 14px;
+	padding: 0;
+	line-height: 1;
+}
+.brokerage .tag-input {
+	font: inherit;
+	font-size: 11px;
+	padding: 2px 6px;
+	border: 1px solid var(--hairline);
+	border-radius: 999px;
+	background: var(--surface);
+	color: var(--ink);
+	min-width: 80px;
+}
+.brokerage .tag-edit-done {
+	font: inherit;
+	font-size: 11px;
+	padding: 2px 8px;
+	border: 1px solid var(--ink);
+	border-radius: 999px;
+	background: var(--ink);
+	color: var(--bg);
+	cursor: pointer;
+}
+
+.brokerage .account-link {
+	color: inherit;
+	text-decoration: none;
+	font-weight: 500;
+}
+.brokerage .account-link:hover {
+	color: var(--ink-2);
+	text-decoration: underline;
+}
+
+/* ─── Realized G/L cards ───────────────────────────────────── */
+.brokerage .gl-grid {
+	display: grid;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 14px;
+	margin-bottom: 16px;
+}
+@media (max-width: 820px) {
+	.brokerage .gl-grid {
+		grid-template-columns: 1fr;
+	}
+}
+.brokerage .gl-card {
+	border: 1px solid var(--hairline);
+	border-radius: 10px;
+	padding: 18px 20px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	background: var(--surface);
+}
+.brokerage .gl-year {
+	font-size: 12px;
+	color: var(--ink-3);
+	font-weight: 500;
+	letter-spacing: 0.04em;
+}
+.brokerage .gl-total {
+	font-size: 24px;
+	font-weight: 600;
+	letter-spacing: -0.02em;
+	font-variant-numeric: tabular-nums;
+}
+.brokerage .gl-total.pos {
+	color: var(--pos);
+}
+.brokerage .gl-total.neg {
+	color: var(--neg);
+}
+.brokerage .gl-bd {
+	font-size: 12px;
+	color: var(--ink-3);
+	margin-top: 6px;
+	display: flex;
+	gap: 14px;
+	flex-wrap: wrap;
+}
+.brokerage .gl-bd b {
+	color: var(--ink-2);
+	font-weight: 500;
+}
+.brokerage .gl-lots {
+	opacity: 0.85;
+}
+.brokerage .gl-note {
+	font-size: 12.5px;
+	color: var(--ink-3);
+	margin: 12px 0 0;
+}
+.brokerage .gl-note .ok {
+	color: var(--pos);
+	margin-right: 5px;
+	font-weight: 600;
+}
+.brokerage .gl-note .warn {
+	color: var(--warn);
+	margin-right: 5px;
+	font-weight: 600;
+}
+.brokerage .gl-more {
+	margin-top: 10px;
+}
+.brokerage .gl-more summary {
+	font-size: 12.5px;
+	color: var(--ink-2);
+	cursor: pointer;
+	padding: 6px 0;
+	list-style: none;
+}
+.brokerage .gl-more summary::-webkit-details-marker {
+	display: none;
+}
+.brokerage .gl-more summary:hover {
+	color: var(--ink);
+}
+
+/* ─── Missing accounts ─────────────────────────────────────── */
+.brokerage .missing-accounts .sec-title {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+}
+.brokerage .missing-badge {
+	background: var(--warn);
+	color: var(--bg);
+	font-size: 11px;
+	padding: 1px 8px;
+	border-radius: 999px;
+	border: 0;
+}
+.brokerage .missing-note {
+	font-size: 12.5px;
+	color: var(--ink-3);
+	margin: -6px 0 14px;
+}
+
+/* ─── Data integrity strip ─────────────────────────────────── */
+.brokerage .integrity {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	margin-top: 24px;
+	padding: 16px 20px;
+	background: var(--surface-2);
+	border-radius: 10px;
+	font-size: 12.5px;
+	color: var(--ink-2);
+	gap: 12px;
+	flex-wrap: wrap;
+}
+.brokerage .integrity-left {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+}
+.brokerage .integrity-mark {
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	background: var(--accent-soft);
+	color: var(--pos);
+	display: grid;
+	place-items: center;
+	flex-shrink: 0;
+}
+.brokerage .integrity-mark.warn {
+	background: oklch(0.94 0.04 55);
+	color: var(--warn);
+}
+html.dark .brokerage .integrity-mark.warn {
+	background: oklch(0.32 0.06 55);
+}
+.brokerage .integrity b {
+	color: var(--ink);
+	font-weight: 500;
+}
+.brokerage .integrity-detail {
+	padding-top: 24px;
+}
+.brokerage .integrity-detail .grid {
+	display: grid;
+	grid-template-columns: max-content 1fr;
+	gap: 6px 16px;
+	margin: 0;
+	font-size: 13px;
+}
+.brokerage .integrity-detail dt {
+	color: var(--ink-3);
+}
+.brokerage .integrity-detail dd {
+	margin: 0;
+	color: var(--ink);
+}
+.brokerage .warnings {
+	margin: 14px 0 0;
+	padding-left: 20px;
+	color: var(--warn);
+	font-size: 13px;
+}
+
+/* ─── Mobile ───────────────────────────────────────────────── */
+@media (max-width: 820px) {
+	.brokerage {
+		padding: 20px 18px 60px;
+	}
+	.brokerage .hero-num {
+		font-size: 42px;
+	}
+	.brokerage .section {
+		padding: 28px 0;
+	}
+}
+
+/* ─── Compare-account picker ───────────────────────────────────── */
+.brokerage .acct-cmp {
+	position: relative;
+	display: inline-flex;
+	align-items: center;
+}
+.brokerage .acct-cmp-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	font-size: 12.5px;
+	color: var(--ink-2);
+	font-weight: 500;
+	padding: 4px 10px;
+	border-radius: 6px;
+	border: 1px dashed var(--hairline);
+	background: none;
+	font-family: inherit;
+	cursor: pointer;
+}
+.brokerage .acct-cmp-btn:hover {
+	color: var(--ink);
+	border-color: var(--ink-3);
+}
+.brokerage .acct-cmp-pop {
+	position: absolute;
+	top: calc(100% + 6px);
+	left: 0;
+	z-index: 20;
+	background: var(--surface);
+	border: 1px solid var(--hairline);
+	border-radius: 8px;
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+	padding: 6px;
+	width: 320px;
+	max-height: 320px;
+	overflow-y: auto;
+}
+html.dark .brokerage .acct-cmp-pop {
+	box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.brokerage .acct-cmp-pop label {
+	display: grid;
+	grid-template-columns: 14px 1fr auto;
+	align-items: center;
+	gap: 10px;
+	padding: 7px 8px;
+	border-radius: 5px;
+	cursor: pointer;
+	font-size: 13px;
+	color: var(--ink);
+}
+.brokerage .acct-cmp-pop label:hover {
+	background: var(--surface-2);
+}
+.brokerage .acct-cmp-pop input[type='checkbox'] {
+	accent-color: var(--accent);
+	margin: 0;
+}
+.brokerage .acct-cmp-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+}
+.brokerage .acct-cmp-row .dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 2px;
+	flex-shrink: 0;
+}
+.brokerage .acct-cmp-row .name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.brokerage .acct-cmp-pop label .val {
+	color: var(--ink-3);
+	font-size: 12px;
+	font-variant-numeric: tabular-nums;
+}
+.brokerage .acct-cmp-chips {
+	display: inline-flex;
+	gap: 6px;
+	flex-wrap: wrap;
+	align-items: center;
+}
+.brokerage .acct-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 3px 4px 3px 9px;
+	border-radius: 999px;
+	background: var(--surface-2);
+	font-size: 12px;
+	color: var(--ink);
+	max-width: 240px;
+}
+.brokerage .acct-chip .dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 2px;
+	flex-shrink: 0;
+}
+.brokerage .acct-chip-name {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.brokerage .acct-chip .x {
+	width: 16px;
+	height: 16px;
+	border-radius: 50%;
+	display: grid;
+	place-items: center;
+	color: var(--ink-3);
+	font-size: 11px;
+	background: none;
+	border: 0;
+	cursor: pointer;
+	font-family: inherit;
+	flex-shrink: 0;
+}
+.brokerage .acct-chip .x:hover {
+	background: var(--hairline);
+	color: var(--ink);
+}
+.brokerage .acct-cmp-clear {
+	font: inherit;
+	font-size: 12px;
+	padding: 3px 10px;
+	border: 1px solid var(--hairline);
+	border-radius: 999px;
+	background: var(--surface);
+	color: var(--ink-2);
+	cursor: pointer;
+}
+.brokerage .acct-cmp-clear:hover {
+	color: var(--ink);
+	background: var(--surface-2);
+}
+
+/* ─── Accounts row-list (summary on main page) ──────────────── */
+.brokerage .accounts-list {
+	display: flex;
+	flex-direction: column;
+}
+.brokerage .a-row {
+	display: grid;
+	grid-template-columns: 16px 1fr 130px 140px;
+	align-items: center;
+	gap: 18px;
+	padding: 12px 0;
+	border-top: 1px solid var(--hairline-2);
+	min-height: 38px;
+	color: inherit;
+	text-decoration: none;
+}
+.brokerage .a-row:first-child {
+	border-top: 0;
+}
+.brokerage .a-row:hover {
+	background: var(--surface-2);
+	margin: 0 -10px;
+	padding-left: 10px;
+	padding-right: 10px;
+}
+.brokerage .a-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 2px;
+}
+.brokerage .a-info {
+	min-width: 0;
+}
+.brokerage .a-name {
+	color: var(--ink);
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.brokerage .a-meta {
+	color: var(--ink-3);
+	font-size: 12px;
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	flex-wrap: wrap;
+}
+.brokerage .a-broker {
+	text-transform: capitalize;
+}
+.brokerage .a-tag {
+	display: inline-block;
+	font-size: 11px;
+	color: var(--ink-3);
+	padding: 0;
+	line-height: 1;
+}
+.brokerage .a-tag::before {
+	content: '·';
+	margin-right: 5px;
+	opacity: 0.5;
+}
+.brokerage .a-asof {
+	justify-content: flex-end;
+	white-space: nowrap;
+}
+.brokerage .a-val {
+	text-align: right;
+	color: var(--ink);
+	font-variant-numeric: tabular-nums;
+	font-weight: 500;
+}
+.brokerage .a-more {
+	padding: 14px 0 0;
+	border-top: 1px solid var(--hairline-2);
+	font-size: 13px;
+	color: var(--ink-2);
+	text-decoration: none;
+	display: block;
+}
+.brokerage .a-more:hover {
+	color: var(--ink);
+}
+.brokerage .a-more .arrow {
+	transition: transform 0.2s;
+	display: inline-block;
+}
+.brokerage .a-more:hover .arrow {
+	transform: translateX(2px);
+}
+.brokerage .empty-row {
+	padding: 16px 0;
+	color: var(--ink-3);
+	font-size: 13px;
+	font-style: italic;
+}
+
+/* ─── Holdings row-list (summary on main page) ──────────────── */
+.brokerage .holdings-list {
+	display: flex;
+	flex-direction: column;
+}
+.brokerage .h-row {
+	display: grid;
+	grid-template-columns: 92px 1fr 140px 70px 60px;
+	align-items: center;
+	gap: 18px;
+	padding: 10px 0;
+	border-top: 1px solid var(--hairline-2);
+	color: inherit;
+	text-decoration: none;
+}
+.brokerage .h-row:first-child {
+	border-top: 0;
+}
+.brokerage .h-row:hover {
+	background: var(--surface-2);
+	margin: 0 -10px;
+	padding-left: 10px;
+	padding-right: 10px;
+}
+.brokerage .h-row.cash {
+	color: var(--ink-2);
+}
+.brokerage .h-sym {
+	font-weight: 600;
+	color: var(--ink);
+	letter-spacing: -0.005em;
+}
+.brokerage .h-desc {
+	color: var(--ink-2);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 13px;
+}
+.brokerage .h-qty {
+	color: var(--ink-3);
+	font-variant-numeric: tabular-nums;
+}
+.brokerage .h-val {
+	text-align: right;
+	color: var(--ink);
+	font-variant-numeric: tabular-nums;
+	font-weight: 500;
+}
+.brokerage .h-pct {
+	text-align: right;
+	color: var(--ink-2);
+	font-variant-numeric: tabular-nums;
+	font-size: 12.5px;
+}
+.brokerage .h-bar {
+	height: 4px;
+	background: var(--surface-2);
+	border-radius: 2px;
+	overflow: hidden;
+}
+.brokerage .h-bar > div {
+	height: 100%;
+	background: var(--ink-2);
+}
+
+/* ─── Recent-activity summary ────────────────────────────────── */
+.brokerage .activity-summary {
+	font-size: 12.5px;
+	color: var(--ink-3);
+	margin-bottom: 14px;
+}
+.brokerage .activity-summary b {
+	font-weight: 500;
+}
+.brokerage .tx-date {
+	font-size: 12px;
+	color: var(--ink-3);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+/* ─── Compare-account: sparse data indicators ──────────────────── */
+.brokerage .acct-chip.sparse {
+	background: oklch(0.94 0.04 55);
+	color: oklch(0.40 0.04 55);
+}
+html.dark .brokerage .acct-chip.sparse {
+	background: oklch(0.30 0.05 55);
+	color: oklch(0.85 0.04 55);
+}
+.brokerage .acct-chip-note {
+	font-size: 10.5px;
+	font-weight: 500;
+	color: var(--warn);
+	margin-left: 2px;
+	white-space: nowrap;
+}
+.brokerage .compare-notice {
+	margin-top: 12px;
+	padding: 10px 14px;
+	background: oklch(0.96 0.03 55);
+	border: 1px solid oklch(0.88 0.05 55);
+	border-radius: 8px;
+	font-size: 12.5px;
+	color: oklch(0.35 0.04 55);
+}
+html.dark .brokerage .compare-notice {
+	background: oklch(0.25 0.05 55);
+	border-color: oklch(0.32 0.05 55);
+	color: oklch(0.85 0.04 55);
+}
+
+/* ─── Inline (non-blocking) error banner ───────────────────── */
+.brokerage .inline-error {
+	margin: 16px 0;
+	padding: 10px 14px;
+	background: oklch(0.96 0.03 28);
+	border: 1px solid oklch(0.85 0.05 28);
+	border-radius: 8px;
+	font-size: 12.5px;
+	color: oklch(0.40 0.06 28);
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+html.dark .brokerage .inline-error {
+	background: oklch(0.25 0.05 28);
+	border-color: oklch(0.32 0.06 28);
+	color: oklch(0.85 0.05 28);
+}
+.brokerage .inline-error-retry {
+	font: inherit;
+	font-size: 12px;
+	padding: 3px 10px;
+	border: 1px solid currentColor;
+	border-radius: 999px;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+	flex-shrink: 0;
+}
+.brokerage .inline-error-retry:hover {
+	background: currentColor;
+	color: var(--bg);
+}
+
+/* ─── Tag-save inline alert (next to editing row) ──────────── */
+.brokerage .tag-save-error {
+	font-size: 11px;
+	color: var(--neg);
+	display: inline-block;
+	padding: 2px 6px;
+	background: oklch(0.95 0.03 28);
+	border-radius: 4px;
+}
+html.dark .brokerage .tag-save-error {
+	background: oklch(0.28 0.05 28);
+}
+
+/* ─── Compare chip: failed-fetch state (distinct from sparse) ─ */
+.brokerage .acct-chip.failed {
+	background: oklch(0.94 0.05 28);
+	color: var(--neg);
+}
+html.dark .brokerage .acct-chip.failed {
+	background: oklch(0.30 0.06 28);
+	color: oklch(0.85 0.05 28);
+}
+.brokerage .acct-chip.failed .acct-chip-note {
+	color: var(--neg);
+	font-weight: 600;
+}
+
+/* ─── Page meta spacer (replaces inline style="margin-bottom:18px") ─ */
+.brokerage .brokerage-hero-meta-spacer {
+	margin-bottom: 18px;
 }

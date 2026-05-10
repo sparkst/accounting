@@ -1,5 +1,11 @@
 """Brokerage CSV adapter — imports E*Trade, Schwab, and Vanguard 1099-B CSV data.
 
+NOTE (2026-05-06): This adapter targets 1099-B annual tax CSV format and writes
+to the existing Transaction table. Phase 2 use case (taxable-event flow into P&L).
+Phase 1 net-worth/performance ingest uses the per-broker adapters at
+src/adapters/{fidelity,schwab,etrade,vanguard}_csv.py which write to the isolated
+brokerage_* tables. See proposals/brokerage-ingest/PLAN.md.
+
 REQ-ID: ADAPTER-BROK-001  Format-specific parsers for E*Trade, Schwab, Vanguard CSV formats.
 REQ-ID: ADAPTER-BROK-002  Tracks cost basis, short/long term classification in raw_data JSON.
 REQ-ID: ADAPTER-BROK-003  Imports wash sale adjustment data from 1099-B CSV data.

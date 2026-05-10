@@ -9,3 +9,25 @@ dashboard/.svelte-kit/
 dashboard/build/
 .qralph/
 accounting_test*
+
+# SQLite test artifacts created when a test passed a URL-style DB name to sqlite3
+*?cache=*
+
+# Financial / private business material — keep out of git
+/reports/
+/research/
+/cardinal_invoice_receipts/
+
+# Dev / debug artifacts
+/screenshots/
+/*.png
+/.playwright-mcp/
+/.qpipeline/
+/.qreview/
+/.qloop/
+/.superpowers/
+/.claude/worktrees/
+/--help
+
+# Shell-autocomplete copy artifact
+src/api/test_error_handlers*\(*\).py

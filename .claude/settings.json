@@ -1,5 +1,47 @@
 {
   "enabledPlugins": {
     "ui-ux-pro-max@ui-ux-pro-max-skill": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(echo \"$CLAUDE_TOOL_INPUT\" | grep -o '\"file_path\":\"[^\"]*\\.py\"' | head -1 | sed 's/\"file_path\":\"//;s/\"//'); if [ -n \"$file\" ] && [ -f \"$file\" ]; then /Users/travis/SGDrive/dev/accounting/.venv/bin/ruff check --fix --quiet \"$file\" 2>/dev/null; fi"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/travis/SGDrive/dev/accounting/.claude/hooks/mypy_on_edit.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/travis/SGDrive/dev/accounting/.claude/hooks/svelte_check_on_edit.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qiE 'sqlite3.*accounting\\.db.*(DELETE|DROP|UPDATE|INSERT|ALTER)'; then echo 'BLOCKED: Direct DB mutations on accounting.db are not allowed. Use the API or ORM layer.' >&2; exit 2; fi"
+          }
+        ]
+      }
+    ]
   }
 }

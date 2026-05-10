@@ -35,6 +35,6 @@ ignore_missing_imports = true
 exclude = ["dashboard/"]
 
 [tool.pytest.ini_options]
-testpaths = ["src"]
+testpaths = ["src", ".claude/hooks", ".claude/skills"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]

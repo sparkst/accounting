@@ -323,6 +323,13 @@ async def import_brokerage_csv(
 ) -> BrokerageCsvImportSummary:
     """Import a brokerage 1099-B CSV file.
 
+    NOTE (2026-05-06): This route handles ANNUAL 1099-B tax CSVs only,
+    flowing into the existing Transaction table for P&L. It is distinct
+    from the Phase 1 multi-broker net-worth/performance ingest run via
+    `python scripts/ingest-brokerage.py /path/to/accounts/`, which writes
+    to the isolated `account` / `brokerage_transaction` / `position_snapshot`
+    / `realized_gain_loss` tables. See proposals/brokerage-ingest/PLAN.md.
+
     Accepts CSV exports from E*Trade, Schwab, and Vanguard.  The brokerage
     format can be specified explicitly or auto-detected from the file header.
 

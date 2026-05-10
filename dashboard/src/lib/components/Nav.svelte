@@ -255,7 +255,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/tax', '/bno-filing'])}
+						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/brokerage', '/tax', '/bno-filing'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'money'}
 						data-trigger="money"
@@ -327,6 +327,18 @@
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
 									Cash Flow
+								</a>
+							</li>
+							<li role="none">
+								<a
+									href="/brokerage"
+									class="nav-dropdown-item"
+									role="menuitem"
+									aria-current={isActive('/brokerage') ? 'page' : undefined}
+									onclick={closeMobileMenu}
+									onkeydown={(e) => handleMenuKeydown(e, 'money')}
+								>
+									Brokerage
 								</a>
 							</li>
 							<li role="none">

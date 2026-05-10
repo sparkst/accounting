@@ -37,6 +37,7 @@ _REQUIRED_ENV: dict[Source, list[str]] = {
     Source.DEDUCTION_EMAIL: [],
     # Upload-only adapters — not part of the automated ingest loop
     Source.BROKERAGE_CSV: [],
+    Source.FIDELITY_CSV: [],
     Source.BANK_CSV: [],
     Source.PHOTO_RECEIPT: [],
 }

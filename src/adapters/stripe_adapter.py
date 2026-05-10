@@ -11,7 +11,7 @@ REQ-ID: ADAPTER-STRIPE-008  One-entity failure → PARTIAL_FAILURE; other entity
 REQ-ID: ADAPTER-STRIPE-009  Deduplication by source_hash; re-run creates no duplicates.
 REQ-ID: ADAPTER-STRIPE-010  IngestionLog entry created for every run.
 
-Environment variables in .env:
+Environment variables (via Doppler):
     STRIPE_API_KEY              — Platform API key (shared across both entities)
     STRIPE_ACCOUNT_SPARKRY      — Connected account ID for Sparkry AI LLC (acct_xxx)
     STRIPE_ACCOUNT_BLACKLINE    — Connected account ID for BlackLine MTB LLC (acct_xxx)
@@ -465,7 +465,7 @@ class StripeAdapter(BaseAdapter):
         if not key:
             raise OSError(
                 "STRIPE_API_KEY is not set. "
-                "Add it to your .env file or pass api_key= to StripeAdapter()."
+                "Add it to Doppler or pass api_key= to StripeAdapter()."
             )
 
         self._api_key = key

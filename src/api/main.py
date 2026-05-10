@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 
 from src.api.auth import require_api_key
 from src.api.routes.attachments import router as attachments_router
+from src.api.routes.brokerage import router as brokerage_router
 from src.api.routes.csv_import import router as csv_import_router
 from src.api.routes.health import router as health_router
 from src.api.routes.ingest import router as ingest_router
@@ -155,6 +156,7 @@ app.include_router(health_router, prefix="/api")
 _auth = [Depends(require_api_key)]
 
 app.include_router(attachments_router, prefix="/api", dependencies=_auth)
+app.include_router(brokerage_router, prefix="/api", dependencies=_auth)
 app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
 app.include_router(transactions_router, prefix="/api", dependencies=_auth)
 app.include_router(ingest_router, prefix="/api", dependencies=_auth)

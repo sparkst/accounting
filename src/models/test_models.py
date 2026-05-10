@@ -107,7 +107,9 @@ class TestSourceEnum:
     def test_all_adapters_present(self) -> None:
         assert {s.value for s in Source} == {
             "gmail_n8n", "stripe", "shopify",
-            "brokerage_csv", "bank_csv",
+            "brokerage_csv", "fidelity_csv", "schwab_csv", "etrade_csv",
+            "vanguard_csv",
+            "bank_csv",
             "photo_receipt", "deduction_email",
             "woocommerce_csv",
         }

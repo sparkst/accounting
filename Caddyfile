@@ -1,0 +1,22 @@
+# Accounting Dashboard — Caddy reverse proxy over Tailscale
+# Single HTTPS endpoint serving both dashboard and API
+# Travis accesses: https://macbook.ancon-cliff.ts.net
+
+macbook.ancon-cliff.ts.net {
+	# Static reports (for Jarvis to curl)
+	handle /reports/* {
+		root * /Users/travis/SGDrive/dev/accounting
+		file_server
+	}
+
+	# API requests → FastAPI (port 8000)
+	handle /api/* {
+		reverse_proxy localhost:8000
+	}
+
+	# Everything else → SvelteKit preview (port 5173)
+	handle {
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		reverse_proxy localhost:5173
+	}
+}

@@ -189,10 +189,14 @@ D1-T06 reads from this file when filling in the `id =` field of `wrangler.worker
 
 What M0h still requires:
 
-(a) **WAF rate-limiting rule on `/wealth/api/internal/*` (5 req/min per IP).** The CRM's existing rate-limit baseline is 20 req/min; tighten this single path. Steps via Cloudflare dashboard (Security → WAF → Rate limiting rules on the `sparkry.ai` zone):
-- Create rule "wealth-internal-ingest-ratelimit" with expression `http.host eq "internal.sparkry.ai" and starts_with(http.request.uri.path, "/wealth/api/internal/")`.
-- Period: 1 minute. Requests: 5. Action: Block. Duration: 10 seconds.
-- Screenshot the saved rule for SUBSTANTIATED evidence; commit to `docs/operational/m0h-evidence/wealth-ratelimit-rule.png` (also add to .gitignore-exempt list so the screenshot lands in the repo).
+(a) **WAF rate-limiting rule on `/wealth/api/internal/*`.** The `sparkry.ai` zone is on Cloudflare **Free plan** (1 rate-limit rule slot total) and live inspection at M0h showed no pre-existing rate-limit rule. So the original "tighten from 20 req/min baseline" framing is incorrect — there IS no baseline; we use the single Free-plan slot for the path-specific rule.
+
+Additionally, the **Free plan locks the rate-limit sampling period to 10 seconds** (1-minute periods are paid-tier only). The spec's "5 req/min" intent translates to **5 req per 10 seconds** (effective ~30 req/min ceiling). Rationale documented in `docs/operational/m0h-evidence/wealth-internal-ingest-ratelimit.md`: 5/10s allows the 4-sequential-POST importer flow to complete cleanly while still blocking credential-stuffing bursts.
+
+Steps via Cloudflare dashboard (Security → WAF → Rate limiting rules on the `sparkry.ai` zone):
+- Create rule `wealth-internal-ingest-ratelimit` with expression `(http.host eq "internal.sparkry.ai" and starts_with(http.request.uri.path, "/wealth/api/internal/"))`.
+- Period: **10 seconds** (Free-plan max). Requests: **5**. Characteristic: IP. Action: Block. Duration: 10 seconds.
+- Document rule state in `docs/operational/m0h-evidence/wealth-internal-ingest-ratelimit.md` (text-based evidence, since save_to_disk for dashboard screenshots is unreliable when the page contains login flows).
 
 (b) **Plaid redirect URI registration (sandbox + production dashboards).** Register `https://internal.sparkry.ai/wealth/desk/connections/oauth-return` in BOTH the Plaid sandbox dashboard AND the Plaid production dashboard. Sandbox changes are instant; production changes may require manual review with up to 24 hours lag. Completing both during M0 ensures both URIs are active by cutover time. Screenshot both dashboards showing the new URI in the allowed-redirect-URIs list (commit to `docs/operational/m0h-evidence/plaid-{sandbox,production}-redirect-uri.png`). Step 7h (in the cutover sequence) then only CONFIRMS the existing registrations are active — it does NOT add them.
 

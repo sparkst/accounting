@@ -19,17 +19,23 @@ Design spec: docs/superpowers/specs/2026-03-15-accounting-system-design.md §Bro
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import csv
 import hashlib
 import io
 import logging
+import os
+import sys
+import traceback
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.adapters.base import AdapterResult, BaseAdapter
 from src.models.enums import (
     Direction,
@@ -53,6 +59,18 @@ SCHWAB = "schwab"
 VANGUARD = "vanguard"
 
 SUPPORTED_BROKERAGES = (ETRADE, SCHWAB, VANGUARD)
+
+# Cloud-mode constants
+_CLOUD_INGEST_SOURCE = "brokerage-csv"
+"""Workers ingest slug for brokerage taxable-event rows."""
+
+_CLOUD_BATCH_SIZE = 100
+
+
+def _default_target() -> str:
+    """Return WEALTH_TARGET_DEFAULT env var, defaulting to 'local'."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
+
 
 # ---------------------------------------------------------------------------
 # Column mapping definitions
@@ -639,3 +657,209 @@ class BrokerageCsvAdapter(BaseAdapter):
                     session.rollback()
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# Cloud import
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CloudImportResult:
+    """Summary of a cloud-mode import run."""
+
+    imported: int = 0
+    dup_skipped: int = 0
+    errors: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.errors is None:
+            self.errors = []
+
+
+def import_csv_cloud(
+    path: Path,
+    *,
+    brokerage: str | None = None,
+) -> CloudImportResult:
+    """Parse a brokerage 1099-B CSV and POST rows to the Workers ingest endpoint.
+
+    Per-record error isolation: WealthClientError per-batch is caught, recorded
+    in ``result.errors``, and the batch continues.
+
+    Args:
+        path:      Path to the CSV file.
+        brokerage: One of 'etrade', 'schwab', 'vanguard'. When None, auto-detected.
+
+    Returns:
+        :class:`CloudImportResult` with counts and per-record errors.
+    """
+    result = CloudImportResult()
+    content = path.read_text(encoding="utf-8", errors="replace")
+
+    broker = brokerage or detect_brokerage(content)
+    if broker is None:
+        result.errors.append(
+            f"{path.name}: could not detect brokerage format; "
+            "pass --brokerage etrade|schwab|vanguard"
+        )
+        return result
+
+    try:
+        rows = parse_brokerage_csv(content, broker, path.name)
+    except ValueError as exc:
+        result.errors.append(f"{path.name}: {exc}")
+        return result
+
+    cloud_rows: list[dict[str, object]] = []
+    for row in rows:
+        source_id = _make_source_id(row.brokerage, row.date_sold, row.description, row.row_index)
+        cloud_rows.append(
+            {
+                "brokerage": row.brokerage,
+                "date_sold": row.date_sold,
+                "date_acquired": row.date_acquired,
+                "description": row.description,
+                "quantity": str(row.quantity) if row.quantity is not None else None,
+                "proceeds": str(row.proceeds) if row.proceeds is not None else None,
+                "cost_basis": str(row.cost_basis) if row.cost_basis is not None else None,
+                "wash_sale_loss": str(row.wash_sale_loss),
+                "gain_loss": str(row.gain_loss) if row.gain_loss is not None else None,
+                "is_long_term": row.is_long_term,
+                "covered": row.covered,
+                "source_id": source_id,
+                "source_file": path.name,
+            }
+        )
+
+    for batch_start in range(0, max(len(cloud_rows), 1), _CLOUD_BATCH_SIZE):
+        batch = cloud_rows[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+        if not batch:
+            break
+        try:
+            post_to_wealth({"rows": batch}, _CLOUD_INGEST_SOURCE)
+            result.imported += len(batch)
+        except WealthClientError as exc:
+            for cr in batch:
+                sid = str(cr.get("source_id", ""))[:8]
+                dsold = cr.get("date_sold", "")
+                result.errors.append(
+                    f"{sid}@{dsold}: cloud POST failed: {exc}"
+                )
+            logger.warning("brokerage_csv: cloud POST failed for batch: %s", exc)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m src.adapters.brokerage_csv",
+        description="Import brokerage 1099-B CSV into the Transaction table (local) "
+        "or Workers ingest endpoint (cloud).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser(
+        "import-csv",
+        help="Parse a brokerage 1099-B CSV and import transactions.",
+    )
+    s.add_argument("--file", required=True, help="Path to the brokerage CSV file.")
+    s.add_argument(
+        "--brokerage",
+        choices=list(SUPPORTED_BROKERAGES),
+        default=None,
+        help="Brokerage format. Auto-detected from content when omitted.",
+    )
+    s.add_argument(
+        "--target",
+        choices=["local", "cloud"],
+        default=None,
+        help="Destination: 'local' writes to SQLite Transaction table; "
+             "'cloud' POSTs to the Workers ingest endpoint. "
+             "Defaults to WEALTH_TARGET_DEFAULT env var, then 'local'.",
+    )
+    s.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually write to the DB (local) or cloud. Default is dry-run.",
+    )
+    return p
+
+
+def _print_summary(result: CloudImportResult | AdapterResult, dry_run: bool) -> None:
+    mode = "DRY RUN" if dry_run else "APPLIED"
+    print(f"=== brokerage_csv ({mode}) ===")
+    if isinstance(result, CloudImportResult):
+        print(f"  imported     : {result.imported}")
+        print(f"  errors       : {len(result.errors)}")
+        if result.errors:
+            print("  --- error detail ---")
+            for e in result.errors[:20]:
+                print(f"    * {e}")
+    else:
+        print(f"  processed    : {result.records_processed}")
+        print(f"  created      : {result.records_created}")
+        print(f"  skipped      : {result.records_skipped}")
+        print(f"  errors       : {len(result.errors)}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    if args.cmd != "import-csv":
+        return 2
+
+    dry_run = not args.apply
+    csv_path = Path(args.file)
+    target = args.target if args.target is not None else _default_target()
+
+    if dry_run:
+        content = csv_path.read_text(encoding="utf-8", errors="replace")
+        broker = args.brokerage or detect_brokerage(content)
+        if broker is None:
+            print(
+                f"could not detect brokerage format from {csv_path.name}; "
+                "pass --brokerage etrade|schwab|vanguard",
+                file=sys.stderr,
+            )
+            return 2
+        rows = parse_brokerage_csv(content, broker, csv_path.name)
+        print("=== brokerage_csv (DRY RUN) ===")
+        print(f"  brokerage    : {broker}")
+        print(f"  rows_parsed  : {len(rows)}")
+        return 0
+
+    if target == "cloud":
+        result = import_csv_cloud(csv_path, brokerage=args.brokerage)
+        _print_summary(result, dry_run=False)
+        return 0
+
+    try:
+        from src.db.connection import get_session  # late import to keep tests light
+    except ImportError as exc:  # pragma: no cover — environmental
+        print(f"cannot import DB session factory: {exc}", file=sys.stderr)
+        return 1
+
+    content = csv_path.read_text(encoding="utf-8", errors="replace")
+    adapter = BrokerageCsvAdapter(
+        csv_content=content,
+        filename=csv_path.name,
+        brokerage=args.brokerage,
+    )
+    with get_session() as session:
+        local_result = adapter.run(session)
+
+    _print_summary(local_result, dry_run=False)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover — exercised via CLI
+    try:
+        raise SystemExit(main())
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(1) from None

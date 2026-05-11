@@ -110,15 +110,48 @@ D1 is SQLite-compatible. The current schema ports near-1:1 — same tables, same
 
 **Alternative considered:** integer cents (like the CRM does for invoice amounts). Rejected — brokerage quantities have 8-decimal precision (fractional shares), which doesn't fit the cents model.
 
-### A4. Auth: Cloudflare Access + Google OAuth (shared with CRM)
+### A4. Auth: in-app Google OAuth + HMAC session cookie (shared with CRM)
 
-Decision: WEALTH_ALLOWED_EMAILS defaults to `travis@sparkry.com` only at launch (matches the hard constraint and REQ-WC-002). The Cloudflare Access zone policy retains the broader Travis+Amy allowlist; the in-app guard provides the Travis-only narrowing. A future tracked follow-up may add a second zone-level Access policy scoped to `/wealth/*` for defense-in-depth (see `Tracked follow-ups`).
+**Reconciliation (M0h sub-team 2026-05-11, 4/4 consensus):** The original draft of this section assumed Cloudflare Access was deployed at the zone level for `internal.sparkry.ai`. Live inspection during M0h showed CF Access has ZERO applications and ZERO policies configured for this account — the CRM authenticates entirely in-app via Google OAuth + an HMAC-signed session cookie. `Cf-Access-*` headers and the JWKS endpoint are not in play. This section is rewritten to ratify the live CRM auth pattern; the original CF Access design is moved to **TF-002** (deferred follow-up; can be layered on later as defense-in-depth without removing the in-app guard).
 
-In-app, Wealth reads the email claim from the validated JWT in `hooks.server.ts` — the JWT MUST be signature-verified against JWKS first, per the JWT validation subsection; the in-app guard NEVER reads the bare `Cf-Access-Authenticated-User-Email` header without JWT validation — and rejects any non-allowlisted user with a 404 (not 403 — a 403 would reveal the existence of the `/wealth/` feature to unauthorized users who are authenticated at the zone level; 404 is the correct response). The Workers backend does the same on every API route. This is defense in depth — Cloudflare Access should never let an unauthorized request through, but if the policy is misconfigured the app fails closed.
+**Live CRM auth boundary (the pattern Wealth reuses):**
+- `/api/auth/callback` (CRM): initiates Google OAuth, validates Google `userInfo.email` against the `ALLOWED_EMAILS` Pages secret (comma-separated list including Travis + Amy), and on match sets an HMAC-signed `session` cookie using `SESSION_SIGNING_KEY` (Pages secret). Sliding 7-day expiry.
+- `hooks.server.ts` (CRM): public paths (`/api/auth`, `/api/webhooks`, `/api/health`) bypass auth. For every other path, the handler reads the `session` cookie, validates its HMAC signature with `SESSION_SIGNING_KEY`, populates `event.locals.user`, and refreshes the cookie with a new 7-day expiry. Missing or invalid cookie → 302 redirect to `/api/auth/callback?action=login`.
 
-**KAT — header vs JWT claim:** forge the `Cf-Access-Authenticated-User-Email` header to `amycsparks@gmail.com` but supply a valid JWT for `travis@sparkry.com` → the guard accepts the request (200) using the JWT claim, not the forged header.
+**Wealth's additional gate.** Wealth routes (`/wealth/*` pages and `/wealth/api/brokerage/*` + `/wealth/desk/api/*` endpoints) ride the same session cookie. After the CRM-level `ALLOWED_EMAILS` check passes, `hooks.server.ts` performs a second per-path check:
 
-**JWT validation.** Trusting the `Cf-Access-Authenticated-User-Email` header alone is insufficient — a request that bypasses Cloudflare Access (e.g., via a `*.pages.dev` preview URL or a misconfigured bypass rule) can forge that header. The in-app guard MUST validate the `Cf-Access-Jwt-Assertion` header against the Cloudflare Access JWKS endpoint `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs` and only then accept the email claim from the decoded JWT. JWT validation MUST check ALL of the following claims: (a) `aud` claim contains the Application Audience Tag specific to the `internal.sparkry.ai/wealth` Access policy (this AUD tag is captured in M0h and stored as `CF_ACCESS_AUD_TAG` in accounting Doppler config); (b) `iss` claim equals `https://<team>.cloudflareaccess.com`; (c) `exp > now()` with 60-second clock-skew allowance; (d) `iat <= now() + 60s`. A Vitest KAT MUST be included: a JWT with a valid signature but the wrong `aud` MUST return 401. **JWKS caching strategy:** JWKS keys are cached using the Workers `cache` API (`caches.default.put/match`) ONLY — module-level variable caching is NOT permitted (it does not persist across isolate restarts and varies by edge node). On cache miss, the JWKS is fetched synchronously within the request handler before validation proceeds. `ctx.waitUntil(refreshJwks())` pre-warms the cache for the next request. Cache TTL MUST NOT exceed the `max-age` in the JWKS endpoint's `Cache-Control` response header; if the endpoint provides `max-age < 3600`, use that value; if no `Cache-Control` is present, cap at 1 hour. On JWKS fetch failure, the implementation MUST fail closed (return 401) — it MUST NOT fall back to header trust. **On JWT signature verification failure, the handler attempts a synchronous JWKS refresh (bypass cache, fetch fresh JWKS, retry signature verification once). If retry succeeds, update the cache. If retry fails, return 401. This single retry-on-failure pattern handles Cloudflare-side key rotation without locking out users for the cache TTL.** The decrypt MUST throw on an unrecognized version tag (no fall-through). REQ-WC-002 acceptance criteria include: (c) `*.pages.dev` preview URLs are covered by an Access policy (created in M0h, not DNS-blocked — the policy is the authoritative control); (d) JWT signature validation is implemented and tested — a forged-header request with no valid JWT returns 401; a request to `https://sparkry-crm.pages.dev/wealth/networth` with no JWT returns 401. The pre-cutover checklist verifies that Access covers Pages preview URLs AND the production zone.
+```typescript
+if (event.url.pathname.startsWith('/wealth/')) {
+  if (!isAllowedEmail(event.locals.user.email, event.platform.env.WEALTH_ALLOWED_EMAILS)) {
+    throw error(404);  // 404, not 403 — see below
+  }
+}
+```
+
+`WEALTH_ALLOWED_EMAILS` defaults to `travis@sparkry.com` only (set in M0f). Amy is authenticated at the CRM level but the wealth gate 404s her — a 404 (not 403) avoids revealing the existence of the `/wealth/` feature to authenticated-but-not-authorized users. Every Worker route handler in `(wealth)` also independently checks `WEALTH_ALLOWED_EMAILS` (defense in depth: even if `hooks.server.ts` is bypassed, the route fails closed).
+
+**Internal-ingest endpoint exception.** `/wealth/api/internal/*` (consumed only by the local Python importers) is added to `PUBLIC_PATHS` in `hooks.server.ts` (bypasses the session-cookie check). The route handler enforces both:
+- HTTP method MUST be POST; any other method returns 405 (defense against accidental browser hits or scanner probes).
+- `X-Internal-Key` header MUST `crypto.subtle.timingSafeEqual` the `WEALTH_INTERNAL_KEY` Pages secret. Missing/wrong header returns 401.
+
+This matches the pattern in the original spec (X-Internal-Key + rate limit) but without relying on CF Access bypass-route configuration. Pages preview URLs (`sparkry-crm.pages.dev/wealth/*`) are covered by the same hooks.server.ts guard — no separate CF Access policy needed.
+
+**KATs (replace the CF Access KATs):**
+- Unauthenticated request to `/wealth/networth` → 302 to `/api/auth/callback?action=login` (CRM redirect pattern).
+- Authenticated session cookie for `amycsparks@gmail.com` hitting `/wealth/networth` → 404 (Amy is allowlisted at CRM level via `ALLOWED_EMAILS` but rejected at wealth level via `WEALTH_ALLOWED_EMAILS`).
+- Authenticated session cookie for `travis@sparkry.com` hitting `/wealth/networth` → 200.
+- Forged `session` cookie with valid email but wrong HMAC signature → 302 to login (cookie deleted by `hooks.server.ts`).
+- POST to `/wealth/api/internal/ingest/brokerage-csv` with valid `X-Internal-Key` → 200.
+- GET to `/wealth/api/internal/ingest/brokerage-csv` → 405 (POST-only).
+- POST to `/wealth/api/internal/ingest/brokerage-csv` with wrong `X-Internal-Key` → 401.
+- Same as above against `sparkry-crm.pages.dev` preview URL → identical responses (cookie-level guard covers preview).
+
+**Why CF Access is deferred to TF-002:** the in-app guard is already the authoritative auth boundary for the CRM and has been live for ~2 weeks. Adding CF Access on top would introduce a second auth boundary with non-obvious precedence (debugging trap: a 401 could come from either CF Access or the cookie middleware). The Wealth migration's scope is "migrate brokerage to Cloudflare" — not "redesign the CRM's auth boundary." If a third-party access need or stricter trust boundary emerges later, CF Access can be layered on (TF-002).
+
+**Tracked follow-ups from sub-team:**
+- **TF-006:** `SESSION_SIGNING_KEY` rotation procedure (Skeptic flag: today there is no rotation story; a leak would compromise both CRM and Wealth simultaneously).
+- **TF-007:** Session-cookie HMAC validator pen-test (timing-side-channel, replay, expiry edge cases).
+- **TF-002 (existing):** Layer CF Access on top of in-app auth as defense-in-depth, when operational maturity warrants.
 
 ### A5. Plaid OAuth-return URL
 
@@ -352,9 +385,17 @@ Each REQ-ID maps to acceptance criteria, non-goals, and test seeds. The fresh `/
 - **Acceptance:** SvelteKit groups `(crm)` and `(wealth)` exist; ESLint rule `no-restricted-paths` blocks imports across groups; CI fails if either group transitively imports from the other; the rendered bundle for `/customers` does not include any module path matching `*/wealth/*`, and vice versa.
 - **Non-goals:** runtime sandboxing; the two groups still run in the same Workers/Pages process.
 
-### REQ-WC-002: Shared auth via Cloudflare Access + Travis-only in-app guard
-- **Acceptance:** every `/wealth/*` page and `/wealth/api/brokerage/*` + `/wealth/desk/api/*` endpoint requires a valid JWT (verified via JWKS) AND the JWT email claim matching `WEALTH_ALLOWED_EMAILS` Workers secret (default `travis@sparkry.com` only); missing/non-allowlisted returns 404; **a request authenticated as `amycsparks@gmail.com` to `/wealth/` returns 404** (not 403 — 404 avoids revealing the existence of the feature to non-authorized users authenticated at the zone level; explicit test). `hooks.server.ts` and every Worker route handler MUST: (a) parse `WEALTH_ALLOWED_EMAILS` (split by comma, trim whitespace, lowercase); (b) if the resulting list is empty or the env var is missing, fail closed with 500 and log 'WEALTH_ALLOWED_EMAILS misconfigured'; (c) compare the JWT email claim (lowercased) against the parsed list. Vitest: missing `WEALTH_ALLOWED_EMAILS` env → 500 (not 200, not 404). `/wealth/api/internal/*` is BYPASSED by Cloudflare Access (configured at zone level) and requires `X-Internal-Key` header matching `WEALTH_INTERNAL_KEY` Workers secret; missing/wrong header returns 401. (c) `*.pages.dev` preview URLs are covered by a CF Access policy (created in M0h); (d) JWT signature validation (`Cf-Access-Jwt-Assertion` verified against `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`) is implemented and tested — a forged-header request with no valid JWT returns 401; JWT validation checks `aud` (must equal the `CF_ACCESS_AUD_TAG` captured in M0h), `iss`, `exp` (with 60s clock-skew allowance), and `iat`.
-- **Non-goals:** browser-side session management; that's Cloudflare Access's job.
+### REQ-WC-002: Shared auth via CRM's in-app Google OAuth + Travis-only Wealth gate
+- **Note on reconciliation:** the original draft assumed Cloudflare Access JWKS validation. Live inspection at M0h showed CF Access is not configured. See A4 for full rationale; sub-team 4/4 consensus to reuse the CRM's in-app Google OAuth + HMAC session cookie pattern. CF Access deferred to TF-002.
+- **Acceptance:**
+  - Every `/wealth/*` page and `/wealth/api/brokerage/*` + `/wealth/desk/api/*` endpoint requires a valid HMAC-signed `session` cookie (validated by `SESSION_SIGNING_KEY` in `hooks.server.ts` per the existing CRM pattern) AND the session's email claim matching the `WEALTH_ALLOWED_EMAILS` Pages secret (default `travis@sparkry.com` only).
+  - Missing/invalid session cookie → 302 redirect to `/api/auth/callback?action=login` (same as the CRM's existing behavior).
+  - Valid session cookie for an email NOT in `WEALTH_ALLOWED_EMAILS` → **404** (not 403, not 200). Explicit test: a session cookie for `amycsparks@gmail.com` hitting `/wealth/networth` returns 404.
+  - `hooks.server.ts` and every Worker route handler in `(wealth)` MUST: (a) parse `WEALTH_ALLOWED_EMAILS` (split by comma, trim whitespace, lowercase); (b) if the resulting list is empty or the env var is missing, fail closed with 500 and log `WEALTH_ALLOWED_EMAILS misconfigured`; (c) compare the session's email claim (lowercased) against the parsed list. Vitest KAT: missing `WEALTH_ALLOWED_EMAILS` env → 500 (not 200, not 404).
+  - Pages preview URLs (`sparkry-crm.pages.dev/wealth/*`) are covered by the SAME `hooks.server.ts` guard — no separate Access policy needed because the cookie-level guard runs on the same handler regardless of host.
+  - `/wealth/api/internal/*` is added to `PUBLIC_PATHS` in `hooks.server.ts` (bypasses the session-cookie check). The route handler enforces: (a) HTTP method MUST be POST or returns 405; (b) `X-Internal-Key` header MUST `crypto.subtle.timingSafeEqual` `WEALTH_INTERNAL_KEY`; missing/wrong header returns 401.
+  - Defense in depth: every Worker route handler in `(wealth)` independently re-checks `event.locals.user.email` against `WEALTH_ALLOWED_EMAILS` (do not trust the hooks layer alone — the route handler is the last line of defense).
+- **Non-goals:** Cloudflare Access deployment (TF-002); browser-side session management beyond the cookie sliding-window pattern the CRM already implements.
 
 ### REQ-WC-003: D1 schema port preserves all CHECK + UNIQUE constraints
 - **Acceptance:** for every table being migrated (**account, brokerage_transaction, position_snapshot, realized_gain_loss, historical_price, account_balance_snapshot, expected_account, cost_basis_lot, account_tag, plaid_item, plaid_account_balance_snapshot, audit_events, ingestion_log** — 13 tables), every CHECK constraint and UNIQUE constraint in the SQLite schema has an equivalent in the D1 migration; a smoke test that violates each constraint asserts the D1 INSERT is rejected. CHECK constraints are declared inline in CREATE TABLE (not ALTER TABLE ADD CONSTRAINT, which D1 rejects). Enum value lists are hardcoded in the D1 migration file, NOT injected from any external source at migration time.
@@ -581,6 +622,20 @@ Implement `scripts/rotate-plaid-enc-key.ts` per A8 to walk D1 PlaidItem rows and
 ### TF-005: Plaid REST endpoint mapping (conditional on M0d-pre bundle-size result)
 
 M0d-pre measures the `plaid` npm SDK bundle size via `wrangler pages deploy --dry-run`. If the compressed bundle is >= 800 KB, the Plaid SDK is NOT used and this follow-up becomes active: define the direct Plaid REST endpoint mapping covering at minimum: `POST /link/token/create`, `POST /item/public_token/exchange`, `POST /accounts/balance/get`, `POST /item/remove` — all authenticated with `X-Plaid-Client-Id` and `X-Plaid-Secret` headers. Replace SDK references in PL-T02 with the REST adapter spec. Target date: same sprint as M0d-pre, since the decision gates PL-T02 implementation. If M0d-pre shows bundle < 800 KB, the SDK is used and TF-005 is closed without action.
+
+### TF-006: SESSION_SIGNING_KEY rotation procedure (target: cutover + 30 days)
+
+The Wealth migration's M0h sub-team reconciliation (2026-05-11) ratified the CRM's existing in-app Google OAuth + HMAC session cookie as the auth boundary for `/wealth/*` (replacing the original CF Access design). The Skeptic in that sub-team flagged: today there is no documented rotation story for `SESSION_SIGNING_KEY`. A leak of that Pages secret would compromise both CRM AND Wealth simultaneously (one signing key, two auth surfaces).
+
+Implement `scripts/rotate-session-signing-key.ts` (sparkry-crm repo) following a two-key overlap pattern similar to REQ-WC-019's `WEALTH_INTERNAL_KEY` rotation: (a) generate new key; (b) write `{previous_key, rotated_at_epoch_ms}` to WEALTH_KV (or a parallel `SESSION_KV` if rotation surface should stay isolated from wealth) with a 30-minute expiry (long enough for active sessions to refresh organically); (c) update the Pages secret; (d) the `parseSessionCookie` helper validates the cookie HMAC against BOTH keys during the overlap window; (e) after 30 minutes, the old key is unconditionally rejected; existing cookies must be re-signed via the next request's sliding-window refresh.
+
+Target date: cutover + 30 days. Defer-OK reason: ratified auth is unchanged from CRM's existing pattern (~2 weeks live without incident); rotation is a hygiene investment, not a vulnerability remediation.
+
+### TF-007: Session-cookie HMAC validator pen-test (target: cutover + 30 days)
+
+Companion to TF-006 from the same M0h sub-team. The Skeptic flagged: the session-cookie validator in `parseSessionCookie` (`sparkry-crm/src/lib/server/auth`) is ~2 weeks old and unaudited. Acceptance: a pen-test pass covering timing-side-channel resistance (use `timingSafeEqual` not `===`), replay attack defense (cookie tied to user-agent fingerprint or a server-side nonce), expiry edge cases (expired-but-not-yet-deleted cookies, future-dated `iat`), and HMAC algorithm choice review (HS256 vs HS384 — favor HS256 with a 32-byte key per OWASP). Document findings in `docs/operational/session-cookie-pentest-2026-XX.md`. Block this follow-up only if a P0/P1 finding emerges; default outcome is "validated as-is."
+
+Target date: cutover + 30 days, aligned with TF-006.
 
 ---
 

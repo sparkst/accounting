@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import re
 import sys
 import traceback
@@ -45,6 +46,7 @@ from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.adapters._shared.result import BaseImportResult
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
@@ -58,6 +60,14 @@ SOURCE_TAG = "fg_pdf"
 """Value written to ``account_balance_snapshot.source``."""
 
 ADAPTER_NAME = "fg_pdf"
+
+# Cloud target — uses the xlsx-snapshot ingest path (AccountBalanceSnapshot rows).
+_CLOUD_INGEST_SOURCE = "xlsx-snapshot"
+
+
+def _default_target() -> str:
+    """Return the effective target from ``WEALTH_TARGET_DEFAULT`` env (default 'local')."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
 """Identifier written to ``ingestion_log.source``."""
 
 BROKER = Broker.FG_ANNUITY.value
@@ -357,6 +367,65 @@ def _file_mtime_date(path: Path) -> date:
     return datetime.fromtimestamp(ts, tz=UTC).date()
 
 
+# ── Cloud-mode ───────────────────────────────────────────────────────────────
+
+
+def import_pdf_cloud(
+    path: Path,
+    *,
+    as_of: date | None = None,
+) -> ImportResult:
+    """Parse an F&G PDF and POST one AccountBalanceSnapshot row to Workers.
+
+    Amount sign convention: balance is a positive monetary value (asset value).
+    """
+    result = ImportResult()
+
+    try:
+        text = pdftotext_layout(path)
+    except (FileNotFoundError, RuntimeError) as exc:
+        result.errors.append(f"{path.name}: pdftotext failed: {exc}")
+        return result
+
+    fallback = as_of or _file_mtime_date(path)
+
+    try:
+        flavor = detect_template(text)
+        if flavor == "annual":
+            contract, snap_as_of, balance = extract_annual_statement(text)
+            if as_of is not None:
+                snap_as_of = as_of
+        else:
+            contract, snap_as_of, balance = extract_portal_screen(text, fallback)
+    except ValueError as exc:
+        result.errors.append(f"{path.name}: {exc}")
+        return result
+
+    raw_account_name = f"F&G Annuity {contract}"
+    result.distinct_accounts = [contract]
+    row_hash = _row_hash(contract, snap_as_of, balance)
+
+    payload_row = {
+        "raw_account_name": raw_account_name,
+        "as_of": snap_as_of.isoformat(),
+        "balance": str(quantize_balance(balance)),
+        "source": SOURCE_TAG,
+        "source_row_hash": row_hash,
+    }
+    try:
+        post_to_wealth({"rows": [payload_row]}, _CLOUD_INGEST_SOURCE)
+        result.imported = 1
+        result.unmatched = 1
+    except WealthClientError as exc:
+        label = f"{contract}@{snap_as_of.isoformat()}"
+        result.errors.append(f"{label}: cloud POST error — {exc}")
+        logger.error(
+            "fg_pdf cloud POST error: %s — %s", label, type(exc).__name__,
+        )
+
+    return result
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -372,9 +441,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--file", required=True, help="Path to the PDF.")
     s.add_argument(
+        "--target",
+        choices=["local", "cloud"],
+        default=None,
+        help=(
+            "Where to write rows: 'local' (SQLite) or 'cloud' (Workers ingest API). "
+            "Default: WEALTH_TARGET_DEFAULT env var (fallback 'local')."
+        ),
+    )
+    s.add_argument(
         "--apply",
         action="store_true",
-        help="Actually write to the live DB. Default is dry-run.",
+        help="Actually write to the live DB (local) or POST to Workers (cloud). Default is dry-run.",
     )
     s.add_argument(
         "--as-of",
@@ -415,11 +493,17 @@ def main(argv: list[str] | None = None) -> int:
 
     path = Path(args.file)
     dry_run = not args.apply
+    target = args.target if args.target is not None else _default_target()
 
     if dry_run:
         result = import_pdf(path, dry_run=True, as_of=as_of)
         _print_summary(result, dry_run=True)
         return 0
+
+    if target == "cloud":
+        result = import_pdf_cloud(path, as_of=as_of)
+        _print_summary(result, dry_run=False)
+        return 1 if result.errors else 0
 
     try:
         from src.db.connection import get_session  # late import keeps tests light
@@ -451,4 +535,5 @@ __all__ = [
     "extract_annual_statement",
     "extract_portal_screen",
     "import_pdf",
+    "import_pdf_cloud",
 ]

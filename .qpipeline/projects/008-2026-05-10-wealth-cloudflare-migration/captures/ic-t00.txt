@@ -1,0 +1,3 @@
+│ WEALTH_API_BASE                │
+│ WEALTH_INTERNAL_KEY            │
+│ WEALTH_TARGET_DEFAULT          │

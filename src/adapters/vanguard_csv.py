@@ -42,6 +42,7 @@ import argparse
 import csv as _csv
 import hashlib
 import logging
+import os
 import sys
 import traceback
 from dataclasses import dataclass
@@ -61,6 +62,7 @@ from src.adapters._shared.money import (
     quantize_shares,
 )
 from src.adapters._shared.result import BaseImportResult
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account, PositionSnapshot
 from src.models.enums import Broker, IngestionStatus
 
@@ -77,6 +79,15 @@ ADAPTER_NAME = "vanguard_csv"
 
 FLAVOR_BROKERAGE = "brokerage"
 FLAVOR_529 = "529"
+
+# Cloud target — uses the brokerage-csv ingest path per REQ-WC-012 spec.
+_CLOUD_INGEST_SOURCE = "brokerage-csv"
+_CLOUD_BATCH_SIZE = 100
+
+
+def _default_target() -> str:
+    """Return the effective target from ``WEALTH_TARGET_DEFAULT`` env (default 'local')."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
 
 # First two header tokens are enough to distinguish the flavors, and avoid
 # false positives on the transactions header (which also starts with
@@ -506,6 +517,107 @@ def _format_log_detail(result: ImportResult) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+# ── Cloud-mode ───────────────────────────────────────────────────────────────
+
+
+def import_positions_cloud(
+    path: Path,
+    *,
+    as_of: date | None = None,
+) -> ImportResult:
+    """Parse positions and POST rows to the Workers brokerage-csv endpoint.
+
+    Vanguard CSV uses the brokerage-csv ingest path per REQ-WC-012.
+    Amount sign convention is preserved: shares, price, market_value are
+    stored as positive quantities (not negated — brokerage data only).
+    """
+    result = ImportResult()
+    path = Path(path)
+    source_file = path.name
+    snap_date = _resolve_as_of(path, as_of)
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        result.errors.append(f"{source_file}: {exc}")
+        return result
+
+    blocks = split_blocks(text)
+    if not blocks:
+        result.errors.append(f"{source_file}: no blocks parsed")
+        return result
+
+    pos_header, pos_rows = blocks[0]
+    try:
+        flavor = detect_csv_flavor(pos_header)
+    except ValueError as exc:
+        result.errors.append(f"{source_file}: {exc}")
+        return result
+
+    if len(blocks) >= 2:
+        result.transactions_seen = sum(len(rows) for _, rows in blocks[1:])
+
+    parsed_rows: list[_PositionRow] = []
+    for idx, raw_row in enumerate(pos_rows, start=1):
+        cells = _row_to_dict(pos_header, raw_row)
+        try:
+            parsed = _parse_position(flavor, cells)
+        except (ValueError, InvalidOperation) as exc:
+            label = f"{source_file}:row{idx}"
+            result.errors.append(f"{label}: {exc}")
+            continue
+        parsed_rows.append(parsed)
+        result.parsed += 1
+
+    result.distinct_accounts = sorted({r.account_number for r in parsed_rows})
+
+    for batch_start in range(0, max(len(parsed_rows), 1), _CLOUD_BATCH_SIZE):
+        batch = parsed_rows[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+        if not batch:
+            break
+        payload_rows = [
+            {
+                "account_number": p.account_number,
+                "symbol": p.symbol,
+                "description": p.description,
+                "shares": str(quantize_shares(p.shares)),
+                "price": str(quantize_balance(p.price)),
+                "market_value": str(quantize_balance(p.market_value)),
+                "as_of": snap_date.isoformat(),
+                "source_file": source_file,
+                "source": SOURCE_TAG,
+                "source_row_hash": _row_hash(
+                    account_number=p.account_number,
+                    symbol=p.symbol,
+                    shares=p.shares,
+                    price=p.price,
+                    market_value=p.market_value,
+                    as_of=snap_date,
+                ),
+                "raw_data": p.raw,
+            }
+            for p in batch
+        ]
+        try:
+            post_to_wealth({"rows": payload_rows}, _CLOUD_INGEST_SOURCE)
+            result.imported += len(batch)
+        except WealthClientError as exc:
+            for p in batch:
+                label = (
+                    f"{source_file}:{p.account_number}:"
+                    f"{p.symbol or p.description or '-'}"
+                )
+                err_msg = f"{label}: cloud POST error — {exc}"
+                result.errors.append(err_msg)
+                logger.error(
+                    "vanguard_csv cloud POST error: %s — %s",
+                    label,
+                    type(exc).__name__,
+                )
+
+    return result
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -524,6 +636,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     s.add_argument("--file", required=True, help="Path to the CSV.")
+    s.add_argument(
+        "--target",
+        choices=["local", "cloud"],
+        default=None,
+        help=(
+            "Where to write rows: 'local' (SQLite) or 'cloud' (Workers ingest API). "
+            "Default: WEALTH_TARGET_DEFAULT env var (fallback 'local')."
+        ),
+    )
     s.add_argument(
         "--apply",
         action="store_true",
@@ -563,6 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     dry_run = not args.apply
+    target = args.target if args.target is not None else _default_target()
     as_of: date | None = None
     if args.as_of:
         try:
@@ -588,6 +710,11 @@ def main(argv: list[str] | None = None) -> int:
                                           as_of=as_of)
         _print_summary(result, dry_run=True)
         return 0
+
+    if target == "cloud":
+        result = import_positions_cloud(path, as_of=as_of)
+        _print_summary(result, dry_run=False)
+        return 1 if result.errors else 0
 
     try:
         from src.db.connection import get_session  # late import
@@ -619,5 +746,6 @@ __all__ = [
     "SOURCE_TAG",
     "detect_csv_flavor",
     "import_positions",
+    "import_positions_cloud",
     "split_blocks",
 ]

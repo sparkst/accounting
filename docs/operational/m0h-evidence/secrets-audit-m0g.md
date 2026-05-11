@@ -5,9 +5,9 @@
 | Surface | Provisioned | Required | Notes |
 |---|---|---|---|
 | Cloudflare Pages (`sparkry-crm`) | 9/9 | 9 | All REQ-WC-019 Pages secrets present |
-| Cloudflare Worker (`sparkry-crm-cron`) | 8/10 | 10 | SENTRY_DSN + R2_BACKUP_WRITE_TOKEN missing — pre-cutover blockers, not team-lead blockers |
+| Cloudflare Worker (`sparkry-crm-cron`) | 10/10 | 10 | All present (closed by SENTRY_DSN + R2_BACKUP_WRITE_TOKEN provisioning 2026-05-11 16:00 PT) |
 | Doppler `accounting/dev` | 4/4 | 4 | WEALTH_*, PLAID_FERNET_KEY |
-| Doppler `accounting/prd` | 1/1 | 1 | PLAID_TOKEN_ENC_KEY_MIGRATION (migration script mirror) |
+| Doppler `accounting/prd` | 3/1 | 1 | PLAID_TOKEN_ENC_KEY_MIGRATION + SENTRY_DSN + R2_BACKUP_WRITE_TOKEN (mirrored per CRM backup-vault convention) |
 
 ## Pages secrets (9/9)
 
@@ -25,7 +25,7 @@
 
 Additional CRM-related Pages secrets present (not REQ-WC-019 scope): `ALLOWED_EMAILS`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `RESEND_WEBHOOK_SECRET`, `SENTRY_DSN`, `SESSION_SIGNING_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`.
 
-## Cron Worker secrets (8/10)
+## Cron Worker secrets (10/10)
 
 ```
 ✓ PLAID_CLIENT_ID
@@ -36,8 +36,8 @@ Additional CRM-related Pages secrets present (not REQ-WC-019 scope): `ALLOWED_EM
 ✓ TWELVE_DATA_API_KEY
 ✓ WEALTH_INTERNAL_KEY
 ✓ RESEND_API_KEY
-✗ SENTRY_DSN  (user action: retrieve from Sentry dashboard or copy from Pages value)
-✗ R2_BACKUP_WRITE_TOKEN  (user action: generate CF API token with R2 WRITE-only permission scoped to sparkry-crm-backups/wealth/*)
+✓ SENTRY_DSN  (provisioned 2026-05-11, mirrored to accounting/prd)
+✓ R2_BACKUP_WRITE_TOKEN  (provisioned 2026-05-11, mirrored to accounting/prd; Cloudflare User Token starting with cfut_)
 ```
 
 ## Doppler accounting/dev (4/4)
@@ -72,6 +72,6 @@ Both missing secrets MUST be provisioned BEFORE the pre-cutover checklist gate a
 
 ## Pre-cutover blockers still pending
 
-- SENTRY_DSN on `sparkry-crm-cron` (operator action: retrieve from Sentry dashboard or from the CRM Pages secrets via dashboard "reveal" UI; provision via `printf '%s' "$SENTRY_DSN" | wrangler secret put SENTRY_DSN --name sparkry-crm-cron`).
-- R2_BACKUP_WRITE_TOKEN on `sparkry-crm-cron` (operator action: generate CF API token at dash.cloudflare.com/profile/api-tokens with permission "Workers R2 Storage:Edit" scoped to bucket `sparkry-crm-backups`, prefix `wealth/`; provision via `wrangler secret put`).
-- R2_BACKUP_PRUNE_TOKEN on a SEPARATE prune-cron handler (per REQ-WC-018 two-token split). This handler doesn't exist yet — it will be created by crm/workers-brokerage as part of BR-T06. The prune token can be generated alongside the write token at the same time.
+(All REQ-WC-019 secrets are now provisioned. Only the deferred two-token-split secret remains.)
+
+- R2_BACKUP_PRUNE_TOKEN on a SEPARATE prune-cron handler (per REQ-WC-018 two-token split). This handler doesn't exist yet — it will be created by crm/workers-brokerage as part of BR-T06. The prune token (LIST + DELETE, scoped to bucket `sparkry-crm-backups` prefix `wealth/`) can be generated when BR-T06 implementation begins. Tracked in the BR-T06 task description and the pre-cutover checklist.

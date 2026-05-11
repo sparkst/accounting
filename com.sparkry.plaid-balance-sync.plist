@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sparkry.plaid-balance-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/doppler</string>
+    <string>run</string>
+    <string>--</string>
+    <string>/Users/travis/SGDrive/dev/accounting/.venv/bin/python</string>
+    <string>-m</string>
+    <string>scripts.plaid_balance_sync</string>
+    <string>--apply</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/travis/SGDrive/dev/accounting</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/Users/travis/SGDrive/dev/accounting/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- 02:07 daily. Off-peak; Plaid's institution backends are calmer. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>7</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.plaid-balance-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.plaid-balance-sync.error.log</string>
+</dict>
+</plist>

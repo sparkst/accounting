@@ -62,6 +62,9 @@ class Account(Base):
 
     __table_args__ = (
         UniqueConstraint("broker", "account_number", name="uq_account_broker_number"),
+        UniqueConstraint(
+            "plaid_item_id", "plaid_account_id", name="uq_account_plaid_link"
+        ),
         CheckConstraint(
             f"broker IN ('{_BROKER_VALUES}')",
             name="ck_account_broker",
@@ -104,6 +107,13 @@ class Account(Base):
         String(64), nullable=True, comment="Free-text — e.g. 'Aiden', 'Emerson'"
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # REQ-025: Plaid linkage. NULL when account is CSV/XLSX-only. UNIQUE on
+    # (plaid_item_id, plaid_account_id) at the table-args level prevents two
+    # Account rows pointing at the same Plaid account.
+    plaid_item_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("plaid_item.id"), nullable=True
+    )
+    plaid_account_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=_now, onupdate=_now

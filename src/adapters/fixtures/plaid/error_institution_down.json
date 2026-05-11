@@ -1,0 +1,7 @@
+{
+  "error_type": "INSTITUTION_ERROR",
+  "error_code": "INSTITUTION_DOWN",
+  "error_message": "the institution is unable to process this request at this time. please try again later.",
+  "display_message": null,
+  "request_id": "req_test_inst_down"
+}

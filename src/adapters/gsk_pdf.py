@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import re
 import sys
 import traceback
@@ -40,6 +41,7 @@ from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.adapters._shared.result import BaseImportResult
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
@@ -63,6 +65,15 @@ GSK_ACCOUNT_NUMBER = "GSK_PENSION"
 
 GSK_RAW_ACCOUNT_NAME = "GSK Cash Balance Pension Plan"
 """Audit string preserved on every snapshot row."""
+
+_CLOUD_INGEST_SOURCE = "xlsx-snapshot"
+"""Workers ingest slug — GSK snapshots are AccountBalanceSnapshot rows."""
+
+
+def _default_target() -> str:
+    """Return WEALTH_TARGET_DEFAULT env var, defaulting to 'local'."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
+
 
 # Single regex on the layout text. The PDF uses month names like
 # "May 7, 2026" and dollar amounts with comma thousands separators.
@@ -265,6 +276,66 @@ def import_pdf(
     return result
 
 
+# ── Cloud import ─────────────────────────────────────────────────────────────
+
+
+def import_pdf_cloud(
+    path: Path,
+    *,
+    as_of: date | None = None,
+) -> ImportResult:
+    """Parse a GSK PDF and POST the snapshot to the Workers ingest endpoint.
+
+    Does NOT require a DB session — all writes go to the cloud Worker.
+    Idempotency is enforced by the Worker (source_row_hash UNIQUE constraint).
+
+    Args:
+        path:  Path to the PDF.
+        as_of: Override the as-of date extracted from the PDF.
+
+    Returns:
+        :class:`ImportResult` with counts and per-record errors.
+    """
+    result = ImportResult()
+    record_label = f"{GSK_ACCOUNT_NUMBER}@{path.name}"
+
+    try:
+        text = pdftotext_layout(path)
+        extracted_as_of, balance = extract_closing_balance(text)
+    except Exception as exc:  # noqa: BLE001 — per-record isolation
+        result.errors.append(f"{record_label}: {exc}")
+        logger.warning("gsk_pdf: extraction failed for %s: %s", path, exc, exc_info=True)
+        return result
+
+    snap_as_of = as_of if as_of is not None else extracted_as_of
+    result.parsed = 1
+    result.distinct_accounts = [GSK_ACCOUNT_NUMBER]
+
+    row_hash = _row_hash(GSK_ACCOUNT_NUMBER, snap_as_of, balance)
+
+    payload: dict[str, object] = {
+        "rows": [
+            {
+                "raw_account_name": GSK_RAW_ACCOUNT_NAME,
+                "as_of": snap_as_of.isoformat(),
+                "balance": str(quantize_balance(balance)),
+                "source": SOURCE_TAG,
+                "source_row_hash": row_hash,
+            }
+        ]
+    }
+
+    try:
+        post_to_wealth(payload, _CLOUD_INGEST_SOURCE)
+        result.imported += 1
+        result.matched += 1
+    except WealthClientError as exc:
+        result.errors.append(f"{record_label}: cloud POST failed: {exc}")
+        logger.warning("gsk_pdf: cloud POST failed for %s: %s", record_label, exc)
+
+    return result
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -277,9 +348,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("import-pdf", help="Parse one PDF and (optionally) write a snapshot.")
     s.add_argument("--file", required=True, help="Path to the GSK PDF.")
     s.add_argument(
+        "--target",
+        choices=["local", "cloud"],
+        default=None,
+        help="Destination: 'local' writes to SQLite; 'cloud' POSTs to the Workers ingest endpoint. "
+             "Defaults to WEALTH_TARGET_DEFAULT env var, then 'local'.",
+    )
+    s.add_argument(
         "--apply",
         action="store_true",
-        help="Actually write to the live DB. Default is dry-run.",
+        help="Actually write to the live DB (local) or cloud. Default is dry-run.",
     )
     s.add_argument(
         "--as-of",
@@ -312,6 +390,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dry_run = not args.apply
     pdf = Path(args.file)
+    target = args.target if args.target is not None else _default_target()
 
     as_of: date | None = None
     if args.as_of:
@@ -324,6 +403,11 @@ def main(argv: list[str] | None = None) -> int:
     if dry_run:
         result = import_pdf(pdf, dry_run=True, as_of=as_of)
         _print_summary(result, dry_run=True)
+        return 0
+
+    if target == "cloud":
+        result = import_pdf_cloud(pdf, as_of=as_of)
+        _print_summary(result, dry_run=False)
         return 0
 
     try:
@@ -356,4 +440,5 @@ __all__ = [
     "ImportResult",
     "extract_closing_balance",
     "import_pdf",
+    "import_pdf_cloud",
 ]

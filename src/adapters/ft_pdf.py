@@ -21,6 +21,7 @@ import argparse
 import csv
 import hashlib
 import logging
+import os
 import re
 import sys
 import traceback
@@ -37,6 +38,7 @@ from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.adapters._shared.result import BaseImportResult
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
@@ -55,6 +57,16 @@ ADAPTER_NAME: Final[str] = "ft_pdf"
 FT_BROKER: Final[str] = Broker.FRANKLIN_TEMPLETON.value
 FT_ACCOUNT_NUMBER: Final[str] = "8291"
 FT_RAW_ACCOUNT_NAME: Final[str] = "Franklin Templeton — Templeton Growth Fund 8291"
+
+_CLOUD_INGEST_SOURCE: Final[str] = "xlsx-snapshot"
+"""Workers ingest slug — FT snapshots are AccountBalanceSnapshot rows."""
+
+_CLOUD_BATCH_SIZE: Final[int] = 100
+
+
+def _default_target() -> str:
+    """Return WEALTH_TARGET_DEFAULT env var, defaulting to 'local'."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
 
 # YYYY-MM-DD.pdf, anchored. The portal screen-grab and any other ad-hoc PDFs
 # in the directory will not match and are reported as errors.
@@ -299,6 +311,75 @@ def import_statements(
     return result
 
 
+# ── Cloud import ─────────────────────────────────────────────────────────────
+
+
+def import_statements_cloud(directory: Path) -> ImportResult:
+    """Walk ``directory`` for ``*.pdf`` statements and POST snapshots to the cloud.
+
+    Does NOT require a DB session — all writes go to the Workers ingest endpoint.
+    Per-file error isolation: parse failures append to ``result.errors`` and the
+    batch continues. Network errors are also isolated per-batch.
+
+    Args:
+        directory: Path containing the ``*.pdf`` statements.
+
+    Returns:
+        :class:`ImportResult` with counts and per-record errors.
+    """
+    result = ImportResult()
+    directory = Path(directory)
+
+    pdf_paths = sorted(directory.glob("*.pdf"))
+    result.files_seen = len(pdf_paths)
+
+    # Parse every PDF up front (cheap, no network calls). Collect (path, as_of,
+    # balance) for the POST loop; collect per-file errors as we go.
+    parsed: list[tuple[Path, date, Decimal]] = []
+    for pdf_path in pdf_paths:
+        try:
+            as_of, balance = _parse_one_pdf(pdf_path)
+        except ValueError as exc:
+            result.errors.append(f"{pdf_path.name}: {exc}")
+            logger.info("ft_pdf: skipping %s: %s", pdf_path.name, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001 — per-record isolation
+            result.errors.append(f"{pdf_path.name}: {exc}")
+            logger.warning(
+                "ft_pdf: failed to parse %s: %s", pdf_path.name, exc, exc_info=True
+            )
+            continue
+        parsed.append((pdf_path, as_of, balance))
+
+    # Batch-POST to the cloud endpoint.
+    rows = [
+        {
+            "raw_account_name": FT_RAW_ACCOUNT_NAME,
+            "as_of": as_of.isoformat(),
+            "balance": str(quantize_balance(balance)),
+            "source": SOURCE_TAG,
+            "source_row_hash": _row_hash(FT_ACCOUNT_NUMBER, as_of, balance),
+        }
+        for _pdf_path, as_of, balance in parsed
+    ]
+
+    for batch_start in range(0, max(len(rows), 1), _CLOUD_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+        if not batch:
+            break
+        try:
+            post_to_wealth({"rows": batch}, _CLOUD_INGEST_SOURCE)
+            result.imported += len(batch)
+            result.matched += len(batch)
+        except WealthClientError as exc:
+            for row in batch:
+                label = f"{row['as_of']}@{row['source_row_hash'][:8]}"
+                result.errors.append(f"{label}: cloud POST failed: {exc}")
+            logger.warning("ft_pdf: cloud POST failed for batch: %s", exc)
+
+    return result
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -316,9 +397,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--dir", required=True, help="Directory containing FT *.pdf files.")
     s.add_argument(
+        "--target",
+        choices=["local", "cloud"],
+        default=None,
+        help="Destination: 'local' writes to SQLite; 'cloud' POSTs to the Workers ingest endpoint. "
+             "Defaults to WEALTH_TARGET_DEFAULT env var, then 'local'.",
+    )
+    s.add_argument(
         "--apply",
         action="store_true",
-        help="Actually write to the live DB. Default is dry-run.",
+        help="Actually write to the live DB (local) or cloud. Default is dry-run.",
     )
     return p
 
@@ -346,10 +434,16 @@ def main(argv: list[str] | None = None) -> int:
 
     directory = Path(args.dir)
     dry_run = not args.apply
+    target = args.target if args.target is not None else _default_target()
 
     if dry_run:
         result = import_statements(directory, dry_run=True, session=None)
         _print_summary(result, dry_run=True)
+        return 0
+
+    if target == "cloud":
+        result = import_statements_cloud(directory)
+        _print_summary(result, dry_run=False)
         return 0
 
     try:
@@ -383,5 +477,6 @@ __all__ = [
     "count_csv_transactions",
     "extract_portfolio_overview",
     "import_statements",
+    "import_statements_cloud",
     "parse_statement_filename",
 ]

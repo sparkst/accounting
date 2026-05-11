@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import sys
 import traceback
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from sqlalchemy.orm import Session
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.result import BaseImportResult
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account
 from src.models.enums import Broker, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
@@ -59,6 +61,15 @@ ADAPTER_NAME = "nw_mutual_xlsx"
 
 SHEET_NAME = "Life Insurance"
 NW_MUTUAL_BROKER = Broker.NW_MUTUAL.value
+
+# Cloud target — uses the xlsx-snapshot ingest path (AccountBalanceSnapshot rows).
+_CLOUD_INGEST_SOURCE = "xlsx-snapshot"
+_CLOUD_BATCH_SIZE = 100
+
+
+def _default_target() -> str:
+    """Return the effective target from ``WEALTH_TARGET_DEFAULT`` env (default 'local')."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
 
 # Sentinel string NW Mutual writes for policies with no cash value (term-only).
 _NA_MARKERS = frozenset({"N/A", "n/a", "NA", "na", "--", "-"})
@@ -324,6 +335,88 @@ def import_balances(
     return result
 
 
+# ── Cloud-mode ───────────────────────────────────────────────────────────────
+
+
+def import_balances_cloud(
+    path: Path,
+    *,
+    as_of: date | None = None,
+) -> ImportResult:
+    """Parse NW Mutual XLSX and POST balance-snapshot rows to Workers.
+
+    Amount sign convention: balance (net_accum_value) is a positive monetary
+    value (whole-life cash value). N/A policies are still skipped (warnings).
+    """
+    result = ImportResult()
+    path = Path(path)
+
+    if as_of is None:
+        try:
+            as_of = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).date()
+        except OSError as exc:
+            result.errors.append(f"stat failed for {path.name}: {exc}")
+            return result
+
+    try:
+        rows = parse_workbook(path)
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"parse_workbook failed: {exc}")
+        return result
+
+    result.parsed = len(rows)
+    result.distinct_accounts = sorted({r["policy_number"] for r in rows})
+
+    writable: list[dict[str, Any]] = []
+    for row in rows:
+        if row["net_accum_value"] is None:
+            result.warnings.append(
+                f"policy {row['policy_number']}: "
+                "Net Accumulated Value is N/A — skipped"
+            )
+            continue
+        if row["net_accum_value"] is _PARSE_ERROR:
+            result.errors.append(
+                f"policy {row['policy_number']}: "
+                "Net Accumulated Value could not be parsed"
+            )
+            continue
+        writable.append(row)
+
+    for batch_start in range(0, max(len(writable), 1), _CLOUD_BATCH_SIZE):
+        batch = writable[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+        if not batch:
+            break
+        payload_rows = []
+        for row in batch:
+            policy_number = row["policy_number"]
+            insured = row["insured"]
+            balance: Decimal = row["net_accum_value"]
+            raw_account_name = f"NW Mutual {insured} {policy_number}".strip()
+            row_hash = _row_hash(policy_number, as_of, balance)
+            payload_rows.append({
+                "raw_account_name": raw_account_name,
+                "as_of": as_of.isoformat(),
+                "balance": str(quantize_balance(balance)),
+                "source": SOURCE_TAG,
+                "source_row_hash": row_hash,
+            })
+        try:
+            post_to_wealth({"rows": payload_rows}, _CLOUD_INGEST_SOURCE)
+            result.imported += len(batch)
+        except WealthClientError as exc:
+            for row in batch:
+                label = f"policy {row['policy_number']}@{as_of.isoformat()}"
+                result.errors.append(f"{label}: cloud POST error — {exc}")
+                logger.error(
+                    "nw_mutual_xlsx cloud POST error: %s — %s",
+                    label,
+                    type(exc).__name__,
+                )
+
+    return result
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -339,9 +432,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--file", required=True, help="Path to the XLSX workbook.")
     s.add_argument(
+        "--target",
+        choices=["local", "cloud"],
+        default=None,
+        help=(
+            "Where to write rows: 'local' (SQLite) or 'cloud' (Workers ingest API). "
+            "Default: WEALTH_TARGET_DEFAULT env var (fallback 'local')."
+        ),
+    )
+    s.add_argument(
         "--apply",
         action="store_true",
-        help="Actually write to the live DB. Default is dry-run.",
+        help="Actually write to the live DB (local) or POST to Workers (cloud). Default is dry-run.",
     )
     s.add_argument(
         "--as-of",
@@ -385,11 +487,17 @@ def main(argv: list[str] | None = None) -> int:
         as_of = date.fromisoformat(args.as_of)
 
     dry_run = not args.apply
+    target = args.target if args.target is not None else _default_target()
 
     if dry_run:
         result = import_balances(file_path, dry_run=True, as_of=as_of)
         _print_summary(result, dry_run=True)
         return 0
+
+    if target == "cloud":
+        result = import_balances_cloud(file_path, as_of=as_of)
+        _print_summary(result, dry_run=False)
+        return 1 if result.errors else 0
 
     try:
         from src.db.connection import get_session  # late import to keep tests light
@@ -419,5 +527,6 @@ __all__ = [
     "NW_MUTUAL_BROKER",
     "SOURCE_TAG",
     "import_balances",
+    "import_balances_cloud",
     "parse_workbook",
 ]

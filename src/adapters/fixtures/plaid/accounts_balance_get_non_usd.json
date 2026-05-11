@@ -1,0 +1,30 @@
+{
+  "accounts": [
+    {
+      "account_id": "plaid_acct_cad_0001",
+      "balances": {
+        "available": 1000.00,
+        "current": 1000.00,
+        "iso_currency_code": "CAD",
+        "limit": null,
+        "unofficial_currency_code": null
+      },
+      "mask": "9999",
+      "name": "Canadian Checking",
+      "official_name": "CANADIAN CHECKING",
+      "subtype": "checking",
+      "type": "depository"
+    }
+  ],
+  "item": {
+    "available_products": ["balance"],
+    "billed_products": ["balance"],
+    "consent_expiration_time": null,
+    "error": null,
+    "institution_id": "ins_99",
+    "item_id": "plaid_item_cad_xyz",
+    "update_type": "background",
+    "webhook": ""
+  },
+  "request_id": "req_balance_cad_test"
+}

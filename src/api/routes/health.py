@@ -12,22 +12,26 @@ GET /api/health — Returns:
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func as sa_func
-from collections.abc import Generator
-
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import Session
 
+from src.adapters.plaid_client import RELINK_REQUIRED_CODES as _PLAID_TERMINAL_ERROR_CODES
 from src.db.connection import SessionLocal
 from src.models.enums import Source, TransactionStatus
 from src.models.ingestion_log import IngestionLog
 from src.models.llm_usage import LLMUsageLog
+from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
 from src.utils.staleness import compute_source_freshness
+
+# REQ-027: an active Plaid Item that hasn't synced in >48h is "stale" — surface in health.
+PLAID_STALE_THRESHOLD = timedelta(hours=48)
 
 router = APIRouter(tags=["health"])
 
@@ -114,6 +118,61 @@ def get_db() -> Generator[Session, None, None]:
         session.close()
 
 
+def _compute_plaid_stale_items(
+    session: Session, *, now: datetime
+) -> list[PlaidStaleItemOut]:
+    """Return active Plaid Items needing attention.
+
+    An item is surfaced when EITHER:
+      - last_sync_status='error' AND last_error is a terminal code (re-link needed), OR
+      - last_sync_at is None (never synced) or older than PLAID_STALE_THRESHOLD.
+
+    Placeholders (item_id starts with 'placeholder_') are excluded.
+    """
+    try:
+        items = (
+            session.query(PlaidItem)
+            .filter(
+                PlaidItem.status == "active",
+                ~PlaidItem.item_id.like("placeholder_%"),
+            )
+            .all()
+        )
+    except sa_exc.SQLAlchemyError:
+        # Best-effort: do not let a Plaid query break the rest of /api/health.
+        # Log so a real schema drift / connection error is still investigable.
+        import logging as _logging
+
+        _logging.getLogger(__name__).exception("plaid stale-item query failed")
+        return []
+
+    out: list[PlaidStaleItemOut] = []
+    threshold_dt = now - PLAID_STALE_THRESHOLD
+    for item in items:
+        terminal_error = (
+            item.last_sync_status == "error"
+            and (item.last_error or "") in _PLAID_TERMINAL_ERROR_CODES
+        )
+        is_stale = item.last_sync_at is None or item.last_sync_at < threshold_dt
+        if terminal_error:
+            reason = "error"
+        elif is_stale:
+            reason = "stale"
+        else:
+            continue
+        out.append(
+            PlaidStaleItemOut(
+                item_id=item.id,
+                institution_name=item.institution_name,
+                last_sync_at=item.last_sync_at,
+                last_sync_status=item.last_sync_status,
+                last_error=item.last_error,
+                reason=reason,
+            )
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Response schemas
 # ---------------------------------------------------------------------------
@@ -178,6 +237,17 @@ class LLMUsageOut(BaseModel):
     estimated_cost_usd: float
 
 
+class PlaidStaleItemOut(BaseModel):
+    """A Plaid Item that needs user attention (REQ-027)."""
+
+    item_id: str
+    institution_name: str
+    last_sync_at: datetime | None
+    last_sync_status: str | None
+    last_error: str | None
+    reason: str  # "stale" (>48h no sync) | "error" (terminal Plaid error)
+
+
 class HealthResponse(BaseModel):
     """Full health check response."""
 
@@ -190,6 +260,7 @@ class HealthResponse(BaseModel):
     needs_review_count: int
     checked_at: datetime
     llm_usage: LLMUsageOut
+    plaid_stale_items: list[PlaidStaleItemOut] = []
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +368,9 @@ def get_health(session: Session = Depends(get_db)) -> HealthResponse:  # noqa: B
             estimated_cost_usd=float(llm_rows.cost),
         )
 
+        # ── Plaid stale-Item check (REQ-027) ─────────────────────────────────
+        plaid_stale = _compute_plaid_stale_items(session, now=now)
+
         return HealthResponse(
             ok=True,
             source_freshness=freshness_out,
@@ -307,6 +381,7 @@ def get_health(session: Session = Depends(get_db)) -> HealthResponse:  # noqa: B
             needs_review_count=needs_review,
             checked_at=now,
             llm_usage=llm_usage,
+            plaid_stale_items=plaid_stale,
         )
     finally:
         session.close()

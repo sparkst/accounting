@@ -62,6 +62,11 @@ def _configure_sqlite(
     cursor.execute("PRAGMA synchronous=NORMAL")
     # Give concurrent writers up to 5 seconds before raising "database is locked".
     cursor.execute("PRAGMA busy_timeout=5000")
+    # REQ-025: zero freed pages on UPDATE/DELETE so encrypted Plaid access
+    # tokens overwritten with the REVOKED sentinel don't linger as recoverable
+    # bytes in the database file (or its SGDrive backup). Write-amplification
+    # cost is negligible for this single-user workload.
+    cursor.execute("PRAGMA secure_delete=ON")
     cursor.close()
 
 

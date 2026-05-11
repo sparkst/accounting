@@ -9,9 +9,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Production system deployed locally via launchd + Caddy reverse proxy, accessible at `https://macbook.ancon-cliff.ts.net`. All core features implemented: transaction ingestion, classification, invoicing, tax exports, reconciliation, and dashboard.
 
 **Design spec:** `docs/superpowers/specs/2026-03-15-accounting-system-design.md`
-**Requirements:** `requirements/current.md` (≈40 REQ-IDs)
+**Requirements:** `requirements/current.md` (≈45 REQ-IDs incl. REQ-WC-001..019)
 
-Most recent shipped scope: brokerage Phase 3 — net-worth-over-time chart with date/dollar axes, S&P 500 buy-and-hold overlay, per-holding pages, account tags with three-state filter chips, missing-accounts panel, XLSX historical import.
+Most recent shipped scope: **Plaid Phase 1** (REQ-025..029, commit `36ea4b7`): item lifecycle, daily balance sync via launchd, stale-Item alerting, reconciliation summary, AuditEvent entity-mode extension.
+
+**Current scope:** **Wealth → Cloudflare migration** in execute phase (REQ-WC-001..019 + REQ-WC-013a). M0 orchestrator prerequisites complete (commits `0917c73`..`3092c68`); 7 team-lead worktrees pending. Targets brokerage+Plaid at `https://internal.sparkry.ai/wealth/*` on Cloudflare Workers+D1+Pages with cash-basis register staying local.
+
+**Migration spec:** `docs/superpowers/specs/2026-05-10-wealth-cloudflare-migration.md`
+**Migration runbook:** `docs/superpowers/plans/2026-05-10-wealth-cloudflare-migration-runbook.md`
 
 ---
 
@@ -129,7 +134,14 @@ rm data/accounting.snapshot.db
 - **Amount validation**: split line items must sum to parent total
 - **Reconciliation vs dedup**: Stripe/Shopify payouts matching bank deposits are reconciliation pairs, not duplicates
 - **FastAPI binds to 127.0.0.1:8000** (localhost only)
-- **Secrets managed via Doppler** — never use `.env` files. Keys: `STRIPE_API_KEY`, `STRIPE_RESTRICTED_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `STRIPE_ACCOUNT_TRAVIS_PERSONAL`, `RESEND_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `N8N_WEBHOOK_SECRET`, `API_KEY`
+- **Secrets managed via Doppler** — never use `.env` files.
+
+  Active Doppler configs:
+  - `accounting/dev` — local importers + FastAPI runtime. Pass via `doppler run --project accounting --config dev`.
+  - `accounting/prd` — off-Cloudflare backup vault for CRM-shared secrets (per `sparkry-crm/CLAUDE.md` convention). Also holds `PLAID_TOKEN_ENC_KEY_MIGRATION` (read by the wealth-migration script at cutover) and the SENTRY_DSN + R2_BACKUP_WRITE_TOKEN mirrors.
+  - `accounting/stg`, `accounting/dev_personal` — staging / personal contexts.
+
+  Keys in `accounting/dev`: `STRIPE_API_KEY`, `STRIPE_RESTRICTED_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `STRIPE_ACCOUNT_TRAVIS_PERSONAL`, `RESEND_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `N8N_WEBHOOK_SECRET`, `API_KEY`, `PLAID_CLIENT_ID`, `PLAID_SANDBOX_SECRET`, `PLAID_PRODUCTION_SECRET`, `PLAID_ENV`, **`PLAID_FERNET_KEY`** (renamed from `PLAID_TOKEN_ENC_KEY` at wealth-migration M0c — see `src/utils/plaid_crypto.py` for the legacy-name fallback), `WEALTH_API_BASE`, `WEALTH_INTERNAL_KEY`, `WEALTH_TARGET_DEFAULT`.
 
 ---
 
@@ -146,20 +158,30 @@ rm data/accounting.snapshot.db
 ## File Layout
 
 ```
-requirements/        — PRD with REQ-IDs
+requirements/        — PRD with REQ-IDs (incl. REQ-WC-001..019 + REQ-WC-013a for wealth migration)
 src/adapters/        — One adapter per data source (tests co-located as test_*.py)
+src/adapters/plaid_*.py — Plaid client, balance-sync adapter, fixtures (REQ-025..028)
 src/classification/  — 3-tier classification engine
-src/models/          — SQLAlchemy models (Transaction, VendorRule, Invoice, etc.)
+src/models/          — SQLAlchemy models (Transaction, VendorRule, Invoice, PlaidItem, PlaidAccountBalanceSnapshot, etc.)
 src/db/              — Schema, Alembic migrations, connection
 src/api/             — FastAPI routes for dashboard
+src/api/routes/plaid.py — Plaid lifecycle + reconciliation (REQ-025/028)
 src/invoicing/       — Invoice generation, PDF rendering, email, payment links
 src/tax_docs/        — Tax document intake and processing
 src/utils/           — Reconciliation engine and shared helpers
+src/utils/plaid_crypto.py — Fernet AES; reads PLAID_FERNET_KEY (preferred) or PLAID_TOKEN_ENC_KEY (legacy fallback)
 src/export/          — Tax export formatters (FreeTaxUSA, B&O)
 src/reports/         — Weekly P&L report generator
 scripts/             — Operational scripts (backup, deduction-scan, auto-confirm, ingest-brokerage)
+scripts/plaid_balance_sync.py — Daily Plaid balance sync; invoked by com.sparkry.plaid-balance-sync.plist
 dashboard/           — SvelteKit frontend (built with vite, served via vite preview)
-data/                — SQLite DB, CSV drop zone (GITIGNORED)
+dashboard/src/routes/admin/connections/ — Plaid Link UI + OAuth-return handler
+data/                — SQLite DB, CSV drop zone (GITIGNORED). Pre-migration snapshots at `accounting.pre-wealth-migration-<ts>.db`.
+tests/fixtures/{brokerage,plaid}-golden/ — M0j pre-cutover JSON snapshots for wealth-migration step 7g comparison
+docs/superpowers/specs/ — Architectural specs (wealth-Cloudflare-migration, plaid-phase-1, ...)
+docs/superpowers/plans/ — Execution runbooks
+docs/operational/    — Operator evidence (M0h WAF + Plaid registration receipts)
+.qpipeline/          — qpipeline state directory (GITIGNORED): project checkpoints, kv-ids.txt, results
 ```
 
 ---

@@ -1,0 +1,60 @@
+{
+  "accounts": [
+    {
+      "account_id": "plaid_acct_chase_checking_0001",
+      "balances": {
+        "available": 4523.18,
+        "current": 4523.18,
+        "iso_currency_code": "USD",
+        "limit": null,
+        "unofficial_currency_code": null
+      },
+      "mask": "0123",
+      "name": "Chase Total Checking",
+      "official_name": "CHASE TOTAL CHECKING",
+      "subtype": "checking",
+      "type": "depository"
+    },
+    {
+      "account_id": "plaid_acct_chase_savings_0002",
+      "balances": {
+        "available": 12500.00,
+        "current": 12500.00,
+        "iso_currency_code": "USD",
+        "limit": null,
+        "unofficial_currency_code": null
+      },
+      "mask": "9876",
+      "name": "Chase Premier Savings",
+      "official_name": "CHASE PREMIER SAVINGS",
+      "subtype": "savings",
+      "type": "depository"
+    },
+    {
+      "account_id": "plaid_acct_chase_card_0003",
+      "balances": {
+        "available": 4500.00,
+        "current": 583.45,
+        "iso_currency_code": "USD",
+        "limit": 5000.00,
+        "unofficial_currency_code": null
+      },
+      "mask": "4567",
+      "name": "Chase Sapphire Preferred",
+      "official_name": "CHASE SAPPHIRE PREFERRED CARD",
+      "subtype": "credit card",
+      "type": "credit"
+    }
+  ],
+  "item": {
+    "available_products": ["balance", "investments", "transactions"],
+    "billed_products": ["balance"],
+    "consent_expiration_time": null,
+    "error": null,
+    "institution_id": "ins_3",
+    "item_id": "plaid_item_chase_xyz",
+    "update_type": "background",
+    "webhook": ""
+  },
+  "request_id": "req_balance_mixed_test"
+}

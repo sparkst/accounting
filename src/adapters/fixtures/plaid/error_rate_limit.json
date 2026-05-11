@@ -1,0 +1,7 @@
+{
+  "error_type": "RATE_LIMIT_EXCEEDED",
+  "error_code": "RATE_LIMIT_EXCEEDED",
+  "error_message": "rate limit exceeded for client_id. please reduce your request rate.",
+  "display_message": null,
+  "request_id": "req_test_rate_limit"
+}

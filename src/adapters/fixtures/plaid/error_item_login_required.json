@@ -1,0 +1,7 @@
+{
+  "error_type": "ITEM_ERROR",
+  "error_code": "ITEM_LOGIN_REQUIRED",
+  "error_message": "the login details of this item have changed (credentials, MFA, or required user action) and a user login is required to update this information.",
+  "display_message": "The provided credentials were not correct. Please try again.",
+  "request_id": "req_test_login_required"
+}

@@ -1164,3 +1164,129 @@ export async function fetchBrokerageAccountDetail(
 		`/brokerage/accounts/${encodeURIComponent(accountId)}/detail`
 	);
 }
+
+// ───── Plaid Phase 1 — admin/connections ─────────────────────────────
+
+export interface PlaidLinkTokenResponse {
+	link_token: string;
+	state_nonce: string;
+	expires_at: string;
+}
+
+export interface PlaidExchangePayload {
+	public_token: string;
+	state_nonce: string;
+	institution_id: string;
+	institution_name: string;
+}
+
+export interface PlaidAccountFromExchange {
+	account_id: string;
+	mask?: string | null;
+	name?: string | null;
+	official_name?: string | null;
+	type?: string | null;
+	subtype?: string | null;
+	balances?: {
+		available?: number | null;
+		current?: number | null;
+		iso_currency_code?: string | null;
+	};
+}
+
+export interface PlaidExchangeResponse {
+	item_id: string;
+	plaid_item_id: string;
+	accounts: PlaidAccountFromExchange[];
+}
+
+export interface PlaidItemSummary {
+	id: string;
+	item_id: string;
+	institution_id: string;
+	institution_name: string;
+	status: string;
+	last_sync_at: string | null;
+	last_sync_status: string | null;
+	last_error: string | null;
+	mapped_account_count: number;
+}
+
+export interface PlaidReconciliationRow {
+	account_id: string;
+	account_name: string | null;
+	snapshot_date: string;
+	plaid_account_type: string;
+	plaid_total: number;
+	computed_total: number | null;
+	delta: number | null;
+	delta_pct: number | null;
+	exceeds_threshold: boolean;
+}
+
+export interface PlaidMapAccountsPayload {
+	item_id: string;
+	mappings: Array<{
+		plaid_account_id: string;
+		account_id?: string;
+		create_new?: {
+			broker: string;
+			account_number: string;
+			account_name?: string | null;
+			account_type: string;
+			entity?: string;
+			tax_sheltered?: boolean;
+		};
+	}>;
+}
+
+export async function plaidCreateLinkToken(): Promise<PlaidLinkTokenResponse> {
+	return request<PlaidLinkTokenResponse>('/plaid/link-token', { method: 'POST' });
+}
+
+export async function plaidExchangePublicToken(
+	payload: PlaidExchangePayload
+): Promise<PlaidExchangeResponse> {
+	return request<PlaidExchangeResponse>('/plaid/exchange', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(payload)
+	});
+}
+
+export async function plaidMapAccounts(
+	payload: PlaidMapAccountsPayload
+): Promise<{ mappings: Array<{ plaid_account_id: string; account_id: string }> }> {
+	return request('/plaid/map-accounts', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(payload)
+	});
+}
+
+export async function plaidDisconnect(
+	plaidItemId: string
+): Promise<{ status: string; item_id: string; accounts_unmapped: number; plaid_remove_called: boolean }> {
+	return request(`/plaid/disconnect/${encodeURIComponent(plaidItemId)}`, { method: 'POST' });
+}
+
+export async function plaidRelink(plaidItemId: string): Promise<PlaidLinkTokenResponse> {
+	return request<PlaidLinkTokenResponse>(`/plaid/relink/${encodeURIComponent(plaidItemId)}`, {
+		method: 'POST'
+	});
+}
+
+export async function plaidListItems(): Promise<PlaidItemSummary[]> {
+	return request<PlaidItemSummary[]>('/plaid/items');
+}
+
+export async function plaidSyncNow(
+	itemId?: string
+): Promise<unknown> {
+	const qs = itemId ? `?item_id=${encodeURIComponent(itemId)}` : '';
+	return request(`/plaid/sync-now${qs}`, { method: 'POST' });
+}
+
+export async function plaidReconciliationSummary(): Promise<PlaidReconciliationRow[]> {
+	return request<PlaidReconciliationRow[]>('/plaid/reconciliation/summary');
+}

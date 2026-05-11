@@ -1,0 +1,45 @@
+{
+  "accounts": [
+    {
+      "account_id": "plaid_acct_vanguard_brk_0001",
+      "balances": {
+        "available": null,
+        "current": 184250.42,
+        "iso_currency_code": "USD",
+        "limit": null,
+        "unofficial_currency_code": null
+      },
+      "mask": "4242",
+      "name": "Vanguard Brokerage",
+      "official_name": "VANGUARD BROKERAGE ACCOUNT",
+      "subtype": "brokerage",
+      "type": "brokerage"
+    },
+    {
+      "account_id": "plaid_acct_vanguard_ira_0002",
+      "balances": {
+        "available": null,
+        "current": 412900.18,
+        "iso_currency_code": "USD",
+        "limit": null,
+        "unofficial_currency_code": null
+      },
+      "mask": "5151",
+      "name": "Vanguard Roth IRA",
+      "official_name": "VANGUARD ROTH IRA",
+      "subtype": "roth",
+      "type": "investment"
+    }
+  ],
+  "item": {
+    "available_products": ["balance", "investments"],
+    "billed_products": ["balance"],
+    "consent_expiration_time": null,
+    "error": null,
+    "institution_id": "ins_15",
+    "item_id": "plaid_item_vanguard_xyz",
+    "update_type": "background",
+    "webhook": ""
+  },
+  "request_id": "req_balance_brk_test"
+}

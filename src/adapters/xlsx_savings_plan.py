@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import logging
+import os
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.enums import IngestionStatus
 from src.models.history import AccountBalanceSnapshot, CostBasisLot, HistoricalPrice
 from src.models.ingestion_log import IngestionLog  # noqa: F401 — re-exported for test compat
@@ -96,6 +98,25 @@ SKIP_NAMES: frozenset[str] = frozenset(
         "Annual",
     )
 )
+
+# ── Cloud-target constants ────────────────────────────────────────────────────
+
+_CLOUD_INGEST_SOURCE_BALANCES = "xlsx-snapshot"
+"""Workers ingest slug for account-balance-snapshot rows (REQ-WC-012)."""
+
+_CLOUD_INGEST_SOURCE_PRICES = "historical-prices"
+"""Workers ingest slug for historical-price rows (REQ-WC-012)."""
+
+_CLOUD_INGEST_SOURCE_LOTS = "cost-basis-lot"
+"""Workers ingest slug for cost-basis-lot rows (REQ-WC-012)."""
+
+_CLOUD_BATCH_SIZE = 100
+"""Max rows per POST to the Workers endpoint (REQ-WC-012: 100 rows max)."""
+
+
+def _default_target() -> str:
+    """Return the effective target from ``WEALTH_TARGET_DEFAULT`` env (default 'local')."""
+    return os.environ.get("WEALTH_TARGET_DEFAULT", "local") or "local"
 
 
 # ── Result dataclass ─────────────────────────────────────────────────────────
@@ -764,6 +785,208 @@ def import_cost_basis_lots(
     return result
 
 
+# ── Cloud-mode helpers ───────────────────────────────────────────────────────
+
+
+def _post_balances_cloud(
+    rows: list[tuple[str, date, Decimal]],
+    result: ImportResult,
+) -> None:
+    """POST account-balance-snapshot rows to the Workers endpoint.
+
+    Batches in chunks of ``_CLOUD_BATCH_SIZE``. Per-batch errors are recorded
+    in ``result.errors`` and the batch continues (per-record error isolation).
+
+    Amount sign convention: balance values are stored as-is (positive amounts).
+    """
+    for batch_start in range(0, max(len(rows), 1), _CLOUD_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+        if not batch:
+            break
+        payload_rows = [
+            {
+                "raw_account_name": name,
+                "as_of": as_of.isoformat(),
+                "balance": str(balance.quantize(_MONEY_QUANT)),
+                "source": SOURCE_TAG,
+                "source_row_hash": _row_hash(name, as_of, balance),
+            }
+            for name, as_of, balance in batch
+        ]
+        try:
+            post_to_wealth({"rows": payload_rows}, _CLOUD_INGEST_SOURCE_BALANCES)
+            result.imported += len(batch)
+        except WealthClientError as exc:
+            for name, as_of, _ in batch:
+                label = f"{name}@{as_of.isoformat()}"
+                err_msg = f"{label}: cloud POST error — {exc}"
+                result.errors.append(err_msg)
+                logger.error(
+                    "xlsx_savings_plan:balances cloud POST error: %s — %s",
+                    label,
+                    type(exc).__name__,
+                )
+
+
+def _post_prices_cloud(
+    rows: list[tuple[str, date, Decimal]],
+    result: ImportResult,
+) -> None:
+    """POST historical-price rows to the Workers endpoint.
+
+    Prices are stored at scale 8 (quantity precision) per the D1 schema.
+    """
+    _PRICE_QUANT = Decimal("0.00000001")
+    for batch_start in range(0, max(len(rows), 1), _CLOUD_BATCH_SIZE):
+        batch = rows[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+        if not batch:
+            break
+        payload_rows = [
+            {
+                "symbol": symbol,
+                "trade_date": trade_date.isoformat(),
+                "close": str(close.quantize(_PRICE_QUANT)),
+                "source": PRICES_SOURCE_TAG,
+            }
+            for symbol, trade_date, close in batch
+        ]
+        try:
+            post_to_wealth({"rows": payload_rows}, _CLOUD_INGEST_SOURCE_PRICES)
+            result.imported += len(batch)
+        except WealthClientError as exc:
+            for symbol, trade_date, _ in batch:
+                label = f"{symbol}@{trade_date.isoformat()}"
+                err_msg = f"{label}: cloud POST error — {exc}"
+                result.errors.append(err_msg)
+                logger.error(
+                    "xlsx_savings_plan:prices cloud POST error: %s — %s",
+                    label,
+                    type(exc).__name__,
+                )
+
+
+# ── Cloud-mode top-level import functions ─────────────────────────────────────
+
+
+def import_account_balances_cloud(file_path: str) -> ImportResult:
+    """Parse the Account Summary sheet and POST rows to the Workers endpoint."""
+    result = ImportResult()
+    wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
+    if SHEET_NAME not in wb.sheetnames:
+        result.errors.append(f"workbook missing sheet '{SHEET_NAME}'")
+        return result
+    ws = wb[SHEET_NAME]
+    date_cols = _read_header_dates(ws)
+    if not date_cols:
+        result.errors.append("no date columns found in header row")
+        return result
+    rows = _iter_snapshot_rows(ws, date_cols)
+    result.distinct_accounts = sorted({name for name, _, _ in rows})
+    result.unmatched = len(rows)
+    _post_balances_cloud(rows, result)
+    return result
+
+
+def import_historical_prices_cloud(file_path: str) -> ImportResult:
+    """Parse the Historical Prices sheet and POST rows to the Workers endpoint."""
+    result = ImportResult()
+    wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
+    if PRICES_SHEET_NAME not in wb.sheetnames:
+        result.errors.append(f"workbook missing sheet '{PRICES_SHEET_NAME}'")
+        return result
+    ws = wb[PRICES_SHEET_NAME]
+    date_cols = _read_price_date_columns(ws)
+    if not date_cols:
+        result.errors.append("no date columns found in Historical Prices row 3")
+        return result
+    rows = _iter_price_rows(ws, date_cols)
+    result.distinct_accounts = sorted({sym for sym, _, _ in rows})
+    result.unmatched = len(rows)
+    _post_prices_cloud(rows, result)
+    return result
+
+
+def import_cost_basis_lots_cloud(file_path: str) -> ImportResult:
+    """Parse lot sheets and POST rows to the Workers endpoint.
+
+    Processes TD Ameritrade and Sharebuilder lot sheets, preserving the
+    per-sheet source_tag so the Workers endpoint can track provenance.
+    """
+    result = ImportResult()
+    wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
+    found_any = False
+
+    sheet_configs = [
+        (TD_LOTS_SHEET_NAME, _TD_HEADER_ROW, TD_LOTS_SOURCE_TAG, TD_RAW_ACCOUNT_NAME),
+        (SB_LOTS_SHEET_NAME, _SB_HEADER_ROW, SB_LOTS_SOURCE_TAG, SB_RAW_ACCOUNT_NAME),
+    ]
+
+    for sheet_name, header_row, source_tag, raw_account_name in sheet_configs:
+        if sheet_name not in wb.sheetnames:
+            continue
+        found_any = True
+        ws = wb[sheet_name]
+        lots = _iter_lot_rows(ws, start_row=header_row + 1)
+        # Track distinct symbols.
+        seen = set(result.distinct_accounts)
+        for lot in lots:
+            seen.add(lot.symbol)
+        result.distinct_accounts = sorted(seen)
+        result.unmatched += len(lots)
+
+        # Compute per-lot hash with the correct source_tag for each sheet.
+        enriched: list[tuple[_LotRow, str]] = [
+            (lot, _lot_row_hash(
+                lot.symbol, lot.open_date, lot.quantity,
+                lot.cost_per_share, lot.cost_total, source_tag, lot.row_idx,
+            ))
+            for lot in lots
+        ]
+
+        for batch_start in range(0, max(len(enriched), 1), _CLOUD_BATCH_SIZE):
+            batch = enriched[batch_start : batch_start + _CLOUD_BATCH_SIZE]
+            if not batch:
+                break
+            payload_rows = [
+                {
+                    "raw_account_name": raw_account_name,
+                    "symbol": lot.symbol,
+                    "security_name": lot.security_name,
+                    "quantity": str(lot.quantity.quantize(_QTY_QUANT)),
+                    "open_date": lot.open_date.isoformat(),
+                    "cost_per_share": str(lot.cost_per_share.quantize(_QTY_QUANT)),
+                    "cost_total": str(lot.cost_total.quantize(_MONEY_QUANT)),
+                    "wash_sale_adj": (
+                        str(lot.wash_sale_adj.quantize(_MONEY_QUANT))
+                        if lot.wash_sale_adj is not None
+                        else None
+                    ),
+                    "source": source_tag,
+                    "source_row_hash": row_hash,
+                }
+                for lot, row_hash in batch
+            ]
+            try:
+                post_to_wealth({"rows": payload_rows}, _CLOUD_INGEST_SOURCE_LOTS)
+                result.imported += len(batch)
+            except WealthClientError as exc:
+                for lot, _ in batch:
+                    label = f"{lot.symbol}@{lot.open_date.isoformat()}:row{lot.row_idx}"
+                    err_msg = f"{label}: cloud POST error — {exc}"
+                    result.errors.append(err_msg)
+                    logger.error(
+                        "xlsx_savings_plan:lots cloud POST error: %s — %s",
+                        label,
+                        type(exc).__name__,
+                    )
+
+    if not found_any:
+        result.errors.append(
+            f"workbook missing both '{TD_LOTS_SHEET_NAME}' and '{SB_LOTS_SHEET_NAME}'"
+        )
+    return result
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -787,7 +1010,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         s.add_argument(
             "--apply",
             action="store_true",
-            help="Actually write to the live DB. Default is dry-run.",
+            help="Actually write to the live DB (local target) or POST to Workers (cloud target). Default is dry-run.",
+        )
+        s.add_argument(
+            "--target",
+            choices=["local", "cloud"],
+            default=None,
+            help=(
+                "Where to write rows: 'local' (SQLite) or 'cloud' (Workers ingest API). "
+                "Default: WEALTH_TARGET_DEFAULT env var (fallback 'local')."
+            ),
         )
     return p
 
@@ -818,6 +1050,13 @@ _CMD_DISPATCH = {
 }
 
 
+_CLOUD_DISPATCH = {
+    "import-balances": (import_account_balances_cloud, "xlsx_savings_plan:balances"),
+    "import-prices": (import_historical_prices_cloud, "xlsx_savings_plan:prices"),
+    "import-lots": (import_cost_basis_lots_cloud, "xlsx_savings_plan:lots"),
+}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     if args.cmd not in _CMD_DISPATCH:
@@ -825,13 +1064,21 @@ def main(argv: list[str] | None = None) -> int:
 
     func, label = _CMD_DISPATCH[args.cmd]
     dry_run = not args.apply
+    target = args.target if args.target is not None else _default_target()
 
     if dry_run:
         result = func(args.file, dry_run=True, session=None)
         _print_summary(result, dry_run=True, label=label)
         return 0
 
-    # Live apply — open a session against the configured DB.
+    # Cloud target — POST rows to Workers instead of writing to SQLite.
+    if target == "cloud":
+        cloud_func, cloud_label = _CLOUD_DISPATCH[args.cmd]
+        result = cloud_func(args.file)
+        _print_summary(result, dry_run=False, label=cloud_label)
+        return 1 if result.errors else 0
+
+    # Local apply — open a session against the configured DB.
     try:
         from src.db.connection import get_session  # late import to keep tests light
     except ImportError as exc:  # pragma: no cover — environmental
@@ -863,6 +1110,9 @@ __all__ = [
     "TD_LOTS_SOURCE_TAG",
     "TD_RAW_ACCOUNT_NAME",
     "import_account_balances",
+    "import_account_balances_cloud",
     "import_cost_basis_lots",
+    "import_cost_basis_lots_cloud",
     "import_historical_prices",
+    "import_historical_prices_cloud",
 ]

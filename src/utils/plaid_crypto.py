@@ -1,9 +1,17 @@
 """Fernet symmetric encryption helpers for Plaid access tokens.
 
 REQ-025: Plaid access_tokens are stored encrypted-at-rest in
-``plaid_item.access_token_encrypted``. The encryption key
-(``PLAID_TOKEN_ENC_KEY``, base64-urlsafe Fernet key) is held in Doppler and
-must NEVER be written to disk in plaintext.
+``plaid_item.access_token_encrypted``. The encryption key (base64-urlsafe
+Fernet key) is held in Doppler and must NEVER be written to disk in plaintext.
+
+The env var is ``PLAID_FERNET_KEY`` (preferred, post-wealth-Cloudflare
+migration M0c rename). For backwards compatibility during the migration
+window, ``PLAID_TOKEN_ENC_KEY`` is also accepted; if both are set,
+``PLAID_FERNET_KEY`` wins. After the wealth migration cutover closes,
+``PLAID_TOKEN_ENC_KEY`` in the local accounting/dev Doppler config will be
+gone — the local Python only ever talks to Fernet ciphertexts; the AES-GCM
+``PLAID_TOKEN_ENC_KEY`` used by the Workers backend lives in Workers Pages
+secrets, not the local environment.
 
 Threat model: compromise of the SQLite DB alone does not expose tokens unless
 Doppler is also compromised. Compromise of Doppler alone does not expose tokens
@@ -21,7 +29,8 @@ import os
 
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
-_ENV_VAR = "PLAID_TOKEN_ENC_KEY"
+_PRIMARY_ENV_VAR = "PLAID_FERNET_KEY"
+_LEGACY_ENV_VAR = "PLAID_TOKEN_ENC_KEY"
 
 
 class PlaidCryptoError(RuntimeError):
@@ -33,7 +42,7 @@ class PlaidCryptoError(RuntimeError):
 
 
 class MissingKeyError(PlaidCryptoError):
-    """Raised when ``PLAID_TOKEN_ENC_KEY`` is not present in the environment."""
+    """Raised when neither ``PLAID_FERNET_KEY`` nor ``PLAID_TOKEN_ENC_KEY`` is set."""
 
 
 class InvalidCiphertextError(PlaidCryptoError):
@@ -47,19 +56,26 @@ class InvalidCiphertextError(PlaidCryptoError):
 def _load_keys() -> list[str]:
     """Read keys from env. Comma-separated for MultiFernet rotation windows.
 
+    Looks for ``PLAID_FERNET_KEY`` first (the post-M0c name), then falls back
+    to ``PLAID_TOKEN_ENC_KEY`` (the pre-M0c name) so the local Python keeps
+    working during the wealth migration's M0c → cutover transition.
+
     The FIRST key in the list is the active (encryption) key. Subsequent keys
     are decryption-only fallbacks during rotation. Trailing/leading whitespace
     is stripped per-key so accidental spaces in Doppler do not break Fernet.
     """
-    raw = os.environ.get(_ENV_VAR)
+    raw = os.environ.get(_PRIMARY_ENV_VAR) or os.environ.get(_LEGACY_ENV_VAR)
     if not raw:
         raise MissingKeyError(
-            f"{_ENV_VAR} is not set. Configure it in Doppler "
-            "(Fernet.generate_key().decode()) before encrypting Plaid tokens."
+            f"Neither {_PRIMARY_ENV_VAR} nor {_LEGACY_ENV_VAR} is set. "
+            "Configure one in Doppler (Fernet.generate_key().decode()) before "
+            "encrypting Plaid tokens."
         )
     keys = [k.strip() for k in raw.split(",") if k.strip()]
     if not keys:
-        raise MissingKeyError(f"{_ENV_VAR} is set but empty after parsing.")
+        raise MissingKeyError(
+            f"Plaid Fernet key env var is set but empty after parsing."
+        )
     return keys
 
 
@@ -69,14 +85,14 @@ def _multi_fernet() -> MultiFernet:
         return MultiFernet([Fernet(k.encode("utf-8")) for k in keys])
     except (ValueError, TypeError) as exc:
         raise PlaidCryptoError(
-            f"{_ENV_VAR} is not a valid Fernet key (expected base64-urlsafe 32 bytes)."
+            f"Plaid Fernet key is not valid (expected base64-urlsafe 32 bytes)."
         ) from exc
 
 
 def encrypt_token(plaintext: str) -> str:
     """Encrypt a Plaid access_token with the active key. Returns ciphertext (str).
 
-    The active key is the FIRST entry in ``PLAID_TOKEN_ENC_KEY`` (comma-separated).
+    The active key is the FIRST entry in the comma-separated key list.
     """
     if not isinstance(plaintext, str):
         raise PlaidCryptoError("encrypt_token expects a str")
@@ -87,7 +103,7 @@ def encrypt_token(plaintext: str) -> str:
 def decrypt_token(ciphertext: str) -> str:
     """Decrypt a Plaid access_token. Raises ``InvalidCiphertextError`` on mismatch.
 
-    Tries each key in ``PLAID_TOKEN_ENC_KEY`` in order; succeeds on the first
+    Tries each key in the comma-separated list in order; succeeds on the first
     match. This is the standard MultiFernet rotation pattern.
     """
     if not isinstance(ciphertext, str):

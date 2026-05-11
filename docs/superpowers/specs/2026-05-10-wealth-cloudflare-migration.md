@@ -679,6 +679,46 @@ Implement `scripts/rotate-session-signing-key.ts` (sparkry-crm repo) following a
 
 Target date: cutover + 30 days. Defer-OK reason: ratified auth is unchanged from CRM's existing pattern (~2 weeks live without incident); rotation is a hygiene investment, not a vulnerability remediation.
 
+### TF-008: Wealth data enrichment — dividends, earnings, news (target: cutover + 30-60 days)
+
+User intent (M0h discussion 2026-05-11): Travis wants a richer "operator dashboard" view of his holdings — dividend dates, ex-div dates, upcoming earnings, splits, and news headlines per held symbol. Twelve Data Free covers EOD prices and intraday quotes but not these enrichments.
+
+**Scope (post-cutover phase):**
+
+1. **`yahoo-finance2` (npm) for dividends/earnings/splits.** Unofficial wrapper around Yahoo Finance public endpoints (~50 KB compressed bundle, runs on Workers). Wired through the same pluggable data-source adapter pattern that hosts Twelve Data today. New endpoints in `crm/workers-brokerage`:
+   - `GET /wealth/api/brokerage/dividends?symbol=...` — recent + upcoming dividend payouts (ex-div date, pay date, amount).
+   - `GET /wealth/api/brokerage/earnings?symbol=...` — upcoming earnings date + estimate.
+   - `GET /wealth/api/brokerage/splits?symbol=...` — historical splits.
+   - Cron at `"0 11 * * *"` (11:00 UTC daily) refreshes a `symbol_calendar` D1 table for every symbol in `position_snapshot` so the dashboard doesn't pay round-trip latency per page load.
+   - **Reliability caveat:** `yahoo-finance2` is unofficial; Yahoo can rate-limit or break it without notice. Treat the source as best-effort; cache aggressively; fall back to a "data unavailable" UI rather than a 5xx.
+
+2. **Tavily for news per held symbol.** Daily cron at `"0 13 * * *"` (13:00 UTC) iterates top-10 holdings by market value, queries Tavily for `"{company name} stock news"` with `time_range=day`, writes results to a new `news_item(id UUID PK, symbol, headline, url, source, published_at, fetched_at, summary)` D1 table. Free-tier budget (1,000 credits/month) covers 10 symbols × 30 days = 300/month, comfortable headroom. Dashboard renders a `/wealth/news` tab grouped by symbol.
+
+3. **Pluggable data-source adapter architecture.** Introduce `src/lib/server/wealth/data-sources/` with the interface:
+   ```typescript
+   interface PriceSource { quote(symbol: string): Promise<Quote>; ... }
+   interface DividendSource { dividends(symbol: string): Promise<Dividend[]>; ... }
+   interface NewsSource { news(query: string, lookback: string): Promise<NewsItem[]>; ... }
+   ```
+   Sources: `twelve-data.ts` (existing, prices), `yahoo-finance2.ts` (dividends/earnings/splits), `tavily.ts` (news). Each source self-reports a `healthCheck()` and degrades gracefully. Adding a future source (Polygon, Alpha Vantage Premium, IEX) is a one-file change.
+
+4. **D1 tables:**
+   - `symbol_calendar(symbol PK, next_dividend_ex_date, next_dividend_pay_date, next_dividend_amount, next_earnings_date, next_earnings_estimate, fetched_at, source)` — UPDATE/DELETE permitted (refresh cache, like `live_quote`).
+   - `news_item(id UUID PK, symbol, headline, url UNIQUE, source, published_at, fetched_at, summary)` — append-only with no-delete trigger; old items pruned by a separate cron (>180 days). The UNIQUE(url) constraint prevents duplicate insertions from idempotent cron re-runs.
+
+**Why deferred (not in this migration):**
+- Adds ~15-20 SP to a migration already at ~87 SP; would stretch the critical path by ~1 day.
+- yahoo-finance2 reliability risk is best evaluated in a follow-up phase rather than as a cutover dependency.
+- The pluggable adapter pattern is the right architecture but is deferrable because the current migration only needs one source (Twelve Data).
+
+**Acceptance for TF-008 closure:**
+- Both crons green for 3 consecutive days, writing to `symbol_calendar` and `news_item` for every active symbol.
+- Dashboard `/wealth/news` tab renders the latest 50 items.
+- Dashboard per-holding pages show "Next dividend: $X on YYYY-MM-DD" and "Earnings: YYYY-MM-DD" badges.
+- Adapter pattern documented in `docs/architecture/wealth-data-sources.md`; adding a hypothetical 4th source (e.g., Polygon) requires zero changes outside that one new adapter file.
+
+Target review date: cutover + 30 to 60 days. Defer further if Travis Phase 2 Plaid (transactions/investments) lands first and consumes the slot.
+
 ### TF-007: Session-cookie HMAC validator pen-test (target: cutover + 30 days)
 
 Companion to TF-006 from the same M0h sub-team. The Skeptic flagged: the session-cookie validator in `parseSessionCookie` (`sparkry-crm/src/lib/server/auth`) is ~2 weeks old and unaudited. Acceptance: a pen-test pass covering timing-side-channel resistance (use `timingSafeEqual` not `===`), replay attack defense (cookie tied to user-agent fingerprint or a server-side nonce), expiry edge cases (expired-but-not-yet-deleted cookies, future-dated `iat`), and HMAC algorithm choice review (HS256 vs HS384 — favor HS256 with a 32-byte key per OWASP). Document findings in `docs/operational/session-cookie-pentest-2026-XX.md`. Block this follow-up only if a P0/P1 finding emerges; default outcome is "validated as-is."

@@ -137,7 +137,7 @@
 </script>
 
 <svelte:head>
-	<title>All Accounts · Brokerage</title>
+	<title>All Accounts · Wealth</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
 	<link
@@ -150,7 +150,7 @@
 	<nav class="crumbs" aria-label="Breadcrumb">
 		<a href="/">Money</a>
 		<span class="sep">/</span>
-		<a href="/brokerage">Brokerage</a>
+		<a href="/wealth">Wealth</a>
 		<span class="sep">/</span>
 		<span>Accounts</span>
 	</nav>
@@ -286,7 +286,7 @@
 							<td>
 								<a
 									class="account-link"
-									href={`/brokerage/accounts/${a.account_id}`}
+									href={`/wealth/accounts/${a.account_id}`}
 									title={a.account_name
 										? `${a.account_name} (${a.account_number_masked})`
 										: 'Open account detail'}

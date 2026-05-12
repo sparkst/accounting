@@ -111,7 +111,7 @@
 </script>
 
 <svelte:head>
-	<title>All Transactions · Brokerage</title>
+	<title>All Transactions · Wealth</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
 	<link
@@ -124,7 +124,7 @@
 	<nav class="crumbs" aria-label="Breadcrumb">
 		<a href="/">Money</a>
 		<span class="sep">/</span>
-		<a href="/brokerage">Brokerage</a>
+		<a href="/wealth">Wealth</a>
 		<span class="sep">/</span>
 		<span>Transactions</span>
 	</nav>
@@ -166,7 +166,7 @@
 			{/if}
 
 			<div class="activity-summary">
-				Last {days} days · {filteredTxns.length} transactions · net cash flow (brokerage)
+				Last {days} days · {filteredTxns.length} transactions · net cash flow (wealth)
 				<b class={netSum >= 0 ? 'pos' : 'neg'}>{fmtSignedCurrencyExact(netSum)}</b>
 			</div>
 

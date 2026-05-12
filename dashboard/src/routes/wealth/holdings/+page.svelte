@@ -74,7 +74,7 @@
 </script>
 
 <svelte:head>
-	<title>All Holdings · Brokerage</title>
+	<title>All Holdings · Wealth</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
 	<link
@@ -87,7 +87,7 @@
 	<nav class="crumbs" aria-label="Breadcrumb">
 		<a href="/">Money</a>
 		<span class="sep">/</span>
-		<a href="/brokerage">Brokerage</a>
+		<a href="/wealth">Wealth</a>
 		<span class="sep">/</span>
 		<span>Holdings</span>
 	</nav>
@@ -181,7 +181,7 @@
 								{#if h.is_cash_sleeve}
 									<strong>Cash</strong>
 								{:else if h.symbol}
-									<a class="account-link" href={`/brokerage/holdings/${h.symbol}`}
+									<a class="account-link" href={`/wealth/holdings/${h.symbol}`}
 										><strong>{h.symbol}</strong></a
 									>
 									{#if h.description}<span class="muted"> · {h.description}</span>{/if}

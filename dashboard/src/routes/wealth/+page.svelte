@@ -87,7 +87,7 @@
 	// Only tag-chip filtering is exposed on the main summary page (it
 	// drives both the visible-accounts list AND the chart's history series
 	// via `filterKey`). Search, broker filter, sort, and tag editing live
-	// on the dedicated /brokerage/accounts page.
+	// on the dedicated /wealth/accounts page.
 	let acctTagInclude = $state<Set<string>>(new Set());
 	let acctTagExclude = $state<Set<string>>(new Set());
 
@@ -316,7 +316,7 @@
 
 	// ── Filtered accounts (drives top-5 row-list AND chart history) ──────
 	// Sorted by market value desc by default — main page exposes only the
-	// tag-chip filter; full search/sort/edit live on /brokerage/accounts.
+	// tag-chip filter; full search/sort/edit live on /wealth/accounts.
 	let filteredAccounts = $derived.by(() => {
 		const filtered = withSnapshots.filter((a) => {
 			const tags = new Set(a.tags ?? []);
@@ -730,7 +730,7 @@
 </script>
 
 <svelte:head>
-	<title>Brokerage · Accounting</title>
+	<title>Wealth · Accounting</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com" />
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -740,10 +740,10 @@
 	<nav class="crumbs" aria-label="Breadcrumb">
 		<a href="/">Money</a>
 		<span class="sep">/</span>
-		<span>Brokerage</span>
+		<span>Wealth</span>
 	</nav>
 
-	<h1 class="sr-only">Brokerage</h1>
+	<h1 class="sr-only">Wealth</h1>
 
 	{#if loading && !netWorth}
 		<div class="state">Loading…</div>
@@ -1048,7 +1048,7 @@
 		<section class="section">
 			<div class="sec-head">
 				<h2 class="sec-title">Accounts · {filteredAccounts.length} of {withSnapshots.length}</h2>
-				<a href="/brokerage/accounts" class="sec-link">All accounts · filter, group, tag <span class="arrow">→</span></a>
+				<a href="/wealth/accounts" class="sec-link">All accounts · filter, group, tag <span class="arrow">→</span></a>
 			</div>
 
 			{#if allTags.length > 0}
@@ -1089,7 +1089,7 @@
 
 			<div class="accounts-list">
 				{#each filteredAccounts.slice(0, 5) as a (a.account_id)}
-					<a class="a-row" href={`/brokerage/accounts/${a.account_id}`} title={a.account_name ?? a.account_number_masked}>
+					<a class="a-row" href={`/wealth/accounts/${a.account_id}`} title={a.account_name ?? a.account_number_masked}>
 						<span class="a-dot" style:background={brokerColor(a.broker)}></span>
 						<div class="a-info">
 							<div class="a-name">{a.account_name ?? a.account_number_masked}</div>
@@ -1104,7 +1104,7 @@
 				{/each}
 				{#if filteredAccounts.length > 5}
 					{@const restTotal = filteredAccounts.slice(5).reduce((s, a) => s + (a.market_value ?? 0), 0)}
-					<a href="/brokerage/accounts" class="a-more">
+					<a href="/wealth/accounts" class="a-more">
 						{filteredAccounts.length - 5} more accounts · {fmtCurrencyNoCents(restTotal)} · show all <span class="arrow">→</span>
 					</a>
 				{:else if filteredAccounts.length === 0}
@@ -1117,12 +1117,12 @@
 		<section class="section">
 			<div class="sec-head">
 				<h2 class="sec-title">Top holdings</h2>
-				<a href="/brokerage/holdings" class="sec-link">All holdings · search, sort <span class="arrow">→</span></a>
+				<a href="/wealth/holdings" class="sec-link">All holdings · search, sort <span class="arrow">→</span></a>
 			</div>
 
 			<div class="holdings-list">
 				{#each (topHoldings ?? []).slice(0, 5) as h, i (h.symbol ?? h.description ?? `idx-${i}`)}
-					{@const href = h.symbol && !h.is_cash_sleeve ? `/brokerage/holdings/${h.symbol}` : null}
+					{@const href = h.symbol && !h.is_cash_sleeve ? `/wealth/holdings/${h.symbol}` : null}
 					<svelte:element
 						this={href ? 'a' : 'div'}
 						href={href}
@@ -1152,7 +1152,7 @@
 		<section class="section">
 			<div class="sec-head">
 				<h2 class="sec-title">Recent activity</h2>
-				<a href="/brokerage/transactions" class="sec-link">All transactions · search, filter <span class="arrow">→</span></a>
+				<a href="/wealth/transactions" class="sec-link">All transactions · search, filter <span class="arrow">→</span></a>
 			</div>
 			{#if (recentTxns?.length ?? 0) === 0}
 				<p class="muted">No transactions in the last {recentDays} days.</p>
@@ -1196,7 +1196,7 @@
 						{showRealizedGL ? '▾' : '▸'} Realized gains &amp; losses
 					</button>
 				</h2>
-				<a href="/brokerage/transactions?view=realized-gl" class="sec-link">Lots, wash-sale checks, 1099-B <span class="arrow">→</span></a>
+				<a href="/wealth/transactions?view=realized-gl" class="sec-link">Lots, wash-sale checks, 1099-B <span class="arrow">→</span></a>
 			</div>
 			{#if showRealizedGL && realizedGl}
 				<div class="gl-grid">

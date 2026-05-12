@@ -112,12 +112,12 @@
 </script>
 
 <svelte:head>
-	<title>{symbol} · Brokerage</title>
+	<title>{symbol} · Wealth</title>
 </svelte:head>
 
 <div class="page">
 	<header class="header">
-		<a class="back" href="/brokerage">‹ Brokerage</a>
+		<a class="back" href="/wealth">‹ Wealth</a>
 		<h1>{symbol}</h1>
 		{#if history}
 			<p class="sub">{history.security_name ?? ''}</p>

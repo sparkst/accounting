@@ -160,12 +160,12 @@
 </script>
 
 <svelte:head>
-	<title>{titleName || 'Account'} · Brokerage</title>
+	<title>{titleName || 'Account'} · Wealth</title>
 </svelte:head>
 
 <div class="page">
 	<header class="header">
-		<a class="back" href="/brokerage">‹ Back to brokerage</a>
+		<a class="back" href="/wealth">‹ Wealth</a>
 		{#if detail}
 			<h1>{titleName}</h1>
 			<p class="sub">

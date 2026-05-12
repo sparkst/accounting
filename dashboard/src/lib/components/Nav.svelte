@@ -255,7 +255,7 @@
 				<li class="nav-group">
 					<button
 						class="nav-link nav-group-trigger"
-						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/brokerage', '/tax', '/bno-filing'])}
+						class:nav-group-active={isGroupActive(['/invoices', '/ar-aging', '/financials', '/cashflow', '/wealth', '/tax', '/bno-filing'])}
 						aria-haspopup="menu"
 						aria-expanded={openGroup === 'money'}
 						data-trigger="money"
@@ -331,14 +331,14 @@
 							</li>
 							<li role="none">
 								<a
-									href="/brokerage"
+									href="/wealth"
 									class="nav-dropdown-item"
 									role="menuitem"
-									aria-current={isActive('/brokerage') ? 'page' : undefined}
+									aria-current={isActive('/wealth') ? 'page' : undefined}
 									onclick={closeMobileMenu}
 									onkeydown={(e) => handleMenuKeydown(e, 'money')}
 								>
-									Brokerage
+									Wealth
 								</a>
 							</li>
 							<li role="none">

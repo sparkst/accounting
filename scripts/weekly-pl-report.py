@@ -31,47 +31,7 @@ os.chdir(PROJECT_ROOT)
 from src.db.connection import SessionLocal, init_db
 from src.models.transaction import Transaction
 from src.models.enums import TransactionStatus
-from src.models.plaid import PlaidItem
 from sqlalchemy import func
-
-
-# Plaid error codes that require user action (re-link). REQ-027.
-# Single source of truth lives in src.adapters.plaid_client.RELINK_REQUIRED_CODES;
-# imported here to keep dashboard, health API, and email alert in lock-step.
-from src.adapters.plaid_client import RELINK_REQUIRED_CODES as PLAID_TERMINAL_ERROR_CODES_FOR_ALERT
-
-
-def _check_plaid_stale_items(session) -> list[str]:  # type: ignore[no-untyped-def]
-    """Return one display line per Plaid Item needing re-link.
-
-    A row qualifies when status='active' AND last_sync_status='error' AND
-    last_error is in the terminal-error allow-list. Transient errors
-    (INSTITUTION_DOWN, RATE_LIMIT_EXCEEDED) are excluded — they'll resolve
-    on their own.
-    """
-    from sqlalchemy import exc as sa_exc
-    import logging as _logging
-
-    try:
-        stale = (
-            session.query(PlaidItem)
-            .filter(
-                PlaidItem.status == "active",
-                PlaidItem.last_sync_status == "error",
-                PlaidItem.last_error.in_(PLAID_TERMINAL_ERROR_CODES_FOR_ALERT),
-            )
-            .order_by(PlaidItem.institution_name)
-            .all()
-        )
-    except sa_exc.SQLAlchemyError:
-        # Best-effort — never break the weekly report on a Plaid query error.
-        # Log so a real schema drift is investigable rather than silently lost.
-        _logging.getLogger(__name__).exception("weekly P&L plaid query failed")
-        return []
-    return [
-        f"  • {item.institution_name} ({item.last_error}) — last sync {item.last_sync_at}"
-        for item in stale
-    ]
 
 
 def generate_report() -> str:
@@ -176,13 +136,8 @@ def generate_report() -> str:
             Transaction.status == TransactionStatus.AUTO_CLASSIFIED.value,
         ).scalar() or 0
 
-        # --- Plaid stale-Item check (REQ-027) ---
-        plaid_stale_lines = _check_plaid_stale_items(session)
-
         if anomalies:
             flag = anomalies[0]  # most important anomaly
-        elif plaid_stale_lines:
-            flag = f"🔌 {len(plaid_stale_lines)} Plaid connection(s) need re-link"
         elif needs_review > 0:
             flag = f"⚠️ {needs_review} transactions need review"
         elif auto_classified > 10:
@@ -204,12 +159,6 @@ def generate_report() -> str:
         # Append additional anomalies (beyond the first which is in the flag)
         if len(anomalies) > 1:
             lines.append("Alerts: " + " | ".join(anomalies[1:3]))
-
-        # Plaid section: only emitted when there's something to report.
-        if plaid_stale_lines:
-            lines.append("")
-            lines.append("Plaid connections needing attention:")
-            lines.extend(plaid_stale_lines)
 
         return "\n".join(lines)
 

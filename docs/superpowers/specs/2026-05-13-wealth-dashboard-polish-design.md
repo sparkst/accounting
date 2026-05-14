@@ -595,10 +595,19 @@ Empty-year case: returns all zeros with `lot_count: 0`, `coverage_warnings: []`.
      if (platform?.env?.WEALTH_KV) {
        const existing = await platform.env.WEALTH_KV.get(lockKey);
        if (existing) {
-         // 202 body is distinct from all 200 shapes — client checks response.status === 202
-         return json({ status: 'in_progress' }, { status: 202 });
+         // Application-layer 30s business rule: parse timestamp stored in lock value.
+         // If acquired < 30s ago → 202 in_progress. If ≥ 30s → stale, overwrite below.
+         const elapsed = Date.now() - parseInt(existing, 10);
+         if (isNaN(elapsed) || elapsed < 30_000) {
+           // 202 body is distinct from all 200 shapes — client checks response.status === 202
+           return json({ status: 'in_progress' }, { status: 202 });
+         }
+         // Stale lock — fall through to overwrite below.
        }
-       await platform.env.WEALTH_KV.put(lockKey, '1', { expirationTtl: RATE_LIMIT_TTL_S });
+       // expirationTtl must be ≥ 60 (Cloudflare KV minimum). Value is acquisition
+       // timestamp so application layer can compute elapsed time without relying
+       // solely on KV TTL (which is eventually consistent). §6.4 step 2.
+       await platform.env.WEALTH_KV.put(lockKey, String(Date.now()), { expirationTtl: 60 });
        kvAvailable = true;
      } else {
        console.warn(JSON.stringify({ endpoint: 'repriced-today', step: 'kv-unavailable',
@@ -1149,13 +1158,13 @@ All new browser-facing routes use `requireWealthAccess(event)`. `repriced-today`
 **Corrected design — lock acquired first, deleted on completion:**
 
 1. On entry: acquire KV lock `repriced:lock:<sha256(email)>` (full 64 hex chars). If lock already set → return HTTP 202 `{status: 'in_progress'}` immediately. No polling inside the Worker.
-2. If not locked: set lock (TTL = `RATE_LIMIT_TTL_S = 30s` as a safety backstop); proceed with budget pre-check and fetch.
+2. If not locked: set lock with `expirationTtl: 60` (KV enforces a 60-second minimum TTL — see Cloudflare KV docs). The lock VALUE is the epoch-ms acquisition timestamp (e.g. `"1715640000000"`), not `'1'`. This allows the application layer to enforce a 30-second business rule: on lock-read, parse the timestamp, and if `now() - timestamp < 30000ms` treat as in_progress; if elapsed ≥ 30s the lock is considered stale and the new request may overwrite it. KV TTL = 60s serves as safety cleanup only. Proceed with budget pre-check and fetch.
 3. **On successful completion:** DELETE the KV lock key immediately (do not wait for TTL). This allows the client's 5s re-poll to succeed: the second call arrives at T+5s; the lock was deleted at T+16.5s (after the Worker completed), so the second call proceeds with the next batch.
 4. **Budget exhaustion (graceful exit):** DELETE the KV lock before returning the `quota_exhausted` HTTP 200 response. Budget exhaustion is NOT an error — no cooldown is needed. The client's next poll should be allowed to proceed immediately (it will re-check the budget and return `quota_exhausted` again if still exhausted, or proceed if budget has reset at UTC midnight).
-5. **On error** (Twelve Data failure, D1 write failure): Do NOT delete the lock — let the 30s TTL serve as a cooldown after failures. This prevents a tight retry loop on persistent errors.
+5. **On error** (Twelve Data failure, D1 write failure): Do NOT delete the lock — let the 60s KV TTL serve as a safety cleanup after failures. The application-layer 30s business rule acts as the effective cooldown: any retry arriving within 30s of the failed acquisition timestamp sees 202 in_progress. After 30s, the lock is treated as stale (overwritable). After 60s, KV itself cleans up. This prevents tight retry loops on persistent errors while bounding the maximum stall to 60s.
 6. Client banner: on 202 response, wait `CLIENT_RETRY_MS` (5s from `src/lib/wealth-constants.ts`), then re-issue the POST.
 
-Rate-limit clock skew (WEALTH_KV TTLs are eventually consistent): acceptable for a 30s backstop TTL. Documented in the route comment.
+Rate-limit clock skew (WEALTH_KV TTLs are eventually consistent): acceptable for a 60s cleanup TTL + 30s application-layer business rule. The timestamp-in-value approach is immune to KV TTL drift. Documented in the route comment.
 
 ### 6.5 Security / abuse
 
@@ -1226,7 +1235,9 @@ export const REPRICED_TODAY_BATCH_SIZE = 3;         // Max symbols per repriced-
 export const REQUEST_INTERVAL_MS = 7500;            // Math.ceil(60_000 / 8) — Twelve Data 8 req/min sliding window
 export const STALENESS_MARKET_OPEN_MS = 5 * 60_000; // 5 min (in market hours)
 export const STALENESS_OFF_HOURS_MS = 24 * 3_600_000; // 24 h (outside market hours)
-export const RATE_LIMIT_TTL_S = 30;                 // KV lock backstop TTL seconds
+// Note: RATE_LIMIT_TTL_S removed — KV expirationTtl is hardcoded to 60 (KV
+// minimum). The 30s business rule is enforced via the timestamp stored in the
+// lock value (application layer), not via KV TTL. See §6.4 step 2.
 export const MAX_ACCOUNT_OVERLAYS = 16;
 export const MAX_SYMBOL_OVERLAYS = 5;
 export const MAX_BENCHMARKS = 3;

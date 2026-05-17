@@ -550,13 +550,14 @@ Empty-year case: returns all zeros with `lot_count: 0`, `coverage_warnings: []`.
   "refreshed":    12,
   "skipped":      3,
   "errors":       0,
+  "aborted":      false,
   "latest_as_of": "2026-05-13T20:31:00Z",
   "stale_symbols": [],
   "error_code":   null
 }
 ```
 
-`latest_as_of` is `null` when `refreshed === 0`. `error_code` is `null` when no error; set to `'quota_exhausted'`, `'db_error'`, or other string on degraded paths. `stale_symbols` is always present — an array of symbol strings that still need refreshing. The client uses `stale_symbols.length === 0` as the polling termination condition.
+`latest_as_of` is `null` when `refreshed === 0`. `aborted` is `true` only when the 25s wall-clock cap fired this invocation (else `false`). `error_code` is `null` on success, else exactly one of `'quota_exhausted'` (shared budget pool exhausted), `'fetch_error'` (all failures were Twelve Data network/HTTP), `'db_error'` (all failures were D1 writes), or `'partial_error'` (mixed fetch + D1 failures) on degraded 200 paths. `stale_symbols` is always present — an array of symbol strings that still need refreshing. The client uses `stale_symbols.length === 0` as the polling termination condition.
 
 **Success-path `stale_symbols` value (normative, L2-FIN-002 / L2-FIN-009):** on a successful HTTP 200 (`error_code === null`), `stale_symbols` MUST be the subset of this invocation's originally-stale list that was NOT successfully refreshed this call: `stale_symbols = staleSymbols.filter(s => !successfullyRefreshed.has(s))`. Because at most `REPRICED_TODAY_BATCH_SIZE` (3) symbols are processed per call, when more than 3 symbols were stale this array is non-empty and the client MUST keep polling (it is not done). It is `[]` only when every originally-stale symbol is now fresh. (`quota_exhausted` → `stale_symbols = staleSymbols`; `db_error` → `stale_symbols = remaining`; both already specified in failure-modes.)
 
@@ -860,7 +861,7 @@ type ChartState = {
 };
 ```
 
-**Persistence (SSR-safe):** sessionStorage keys `wd:nw:range`, `wd:nw:accounts`, `wd:nw:benchmarks`, `wd:nw:overlays`. Read in `onMount` only (not during SSR). Default on first visit: `range='all'`, no accounts, no benchmarks, no overlays. The chart renders with default state on first SSR pass and updates client-side in `onMount` — no layout flash because the chart data fetch is also triggered on mount. `RangeSelector` renders the selected button client-only after mount (using `{#if mounted}`). Test: navigate to /wealth with sessionStorage `wd:nw:range = '3y'`, reload, assert 3y button is selected and chart shows 3y data without 1y flicker.
+**Persistence (SSR-safe):** sessionStorage keys `wd:nw:range`, `wd:nw:accounts`, `wd:nw:benchmarks`, `wd:nw:overlays`. Read in `onMount` only (not during SSR). **Client first-visit default: `range='1Y'`** (no accounts, no benchmarks, no overlays). This is the authoritative client default and intentionally differs from the *server* API default (`'all'`, kept for backward-compat with no-`range` callers — see Query params note). Rationale (L3-CMP-003): a first-visit `'all'` render triggered a Svelte 5 `effect_update_depth_exceeded` reactive loop on large all-history datasets; `'1Y'` is the validated hotfix shipped to production (a one-time sessionStorage migration clears any legacy cached `'All'`). Do NOT "restore" `'all'` as the client default without first eliminating the all-history reactive-loop regression. The chart renders with default state on first SSR pass and updates client-side in `onMount` — no layout flash because the chart data fetch is also triggered on mount. `RangeSelector` renders the selected button client-only after mount (using `{#if mounted}`). Test: navigate to /wealth with sessionStorage `wd:nw:range = '3y'`, reload, assert 3y button is selected and chart shows 3y data without 1y flicker.
 
 **Chart library (resolved — §8.1 closed):** The existing `/wealth` chart is hand-rolled SVG (confirmed in `+page.svelte:731-859` — raw `<svg>` paths, no chart library import). This approach is retained. Secondary y-axis is implemented in `chart-geometry.ts` as a pure TypeScript module:
 

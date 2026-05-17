@@ -27,7 +27,12 @@ accounting_test*
 /.qloop/
 /.superpowers/
 /.claude/worktrees/
+/.claude/scheduled_tasks.lock
+/phase-outputs/
 /--help
 
 # Shell-autocomplete copy artifact
 src/api/test_error_handlers*\(*\).py
+
+# qescalate cross-repo symlink (decision-profile lives in cardinal-health)
+/brand-and-style

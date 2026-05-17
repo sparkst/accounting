@@ -10,7 +10,7 @@
        Backfill script is incremental: existing (symbol, date) rows are skipped. -->
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/doppler</string>
+    <string>/opt/homebrew/bin/doppler</string>
     <string>run</string>
     <string>--</string>
     <string>/Users/travis/SGDrive/dev/accounting/.venv/bin/python3</string>

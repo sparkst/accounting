@@ -1,0 +1,67 @@
+{
+  "$schema_version": "1.0.0",
+  "description": "Council composition rules. The select-council.py tool consults this to build the per-call manifest.",
+  "always_include": [
+    {
+      "role": "travis-persona",
+      "persona_file": ".claude/skills/qescalate/personas/travis-persona.md",
+      "required_for_convergence": true,
+      "notes": "Convergence requires Travis-persona to be in the majority."
+    },
+    {
+      "role": "skeptic",
+      "persona_file": ".claude/skills/qescalate/personas/devils-advocate.md",
+      "required_for_convergence": false,
+      "notes": "Always-on contrarian. Surfaces failure modes the rest of the council might miss."
+    }
+  ],
+  "include_when_audience_in": {
+    "audience_values": ["public", "client-facing"],
+    "members": [
+      {
+        "role": "customer",
+        "persona_file": ".claude/skills/qescalate/personas/customer-icp.md",
+        "notes": "Voice of the ICP. Pulls archetype from brand-and-style/voice-brand-os/icp-profile.md."
+      }
+    ]
+  },
+  "domain_specialists": {
+    "engineering": [
+      {"role": "security-reviewer", "subagent_type": "security-reviewer", "trigger": "draft_payload contains code OR domain matches"},
+      {"role": "code-quality-auditor", "subagent_type": "code-quality-auditor", "trigger": "draft_payload contains code"},
+      {"role": "pe-reviewer", "subagent_type": "PE-Reviewer", "trigger": "architecture or pattern question"}
+    ],
+    "sales": [
+      {"role": "strategic-advisor", "subagent_type": "strategic-advisor", "trigger": "any"},
+      {"role": "finance-consultant", "subagent_type": "finance-consultant", "trigger": "involves pricing or financial commitment"},
+      {"role": "legal-expert", "subagent_type": "legal-expert", "trigger": "involves contract or IP"}
+    ],
+    "client-relationship": [
+      {"role": "strategic-advisor", "subagent_type": "strategic-advisor", "trigger": "any"},
+      {"role": "ux-tester", "subagent_type": "ux-tester", "trigger": "involves a deliverable"}
+    ],
+    "content": [
+      {"role": "fact-checker", "subagent_type": "fact-checker", "trigger": "contains factual claims"},
+      {"role": "ux-designer", "subagent_type": "ux-designer", "trigger": "any"}
+    ],
+    "finance": [
+      {"role": "finance-consultant", "subagent_type": "finance-consultant", "trigger": "any"}
+    ],
+    "strategy": [
+      {"role": "strategic-advisor", "subagent_type": "strategic-advisor", "trigger": "any"},
+      {"role": "pm", "subagent_type": "pm", "trigger": "any"}
+    ],
+    "operations": [
+      {"role": "code-quality-auditor", "subagent_type": "code-quality-auditor", "trigger": "involves tooling or process changes"}
+    ],
+    "communication": [
+      {"role": "fact-checker", "subagent_type": "fact-checker", "trigger": "contains factual claims"},
+      {"role": "legal-expert", "subagent_type": "legal-expert", "trigger": "outbound to external party"}
+    ],
+    "personal": []
+  },
+  "max_council_size": 6,
+  "max_council_size_notes": "Above 6, debate overhead exceeds value. If domain pulls in more, prune by 'trigger' specificity — keep specialists whose triggers match the proposal text; drop generic ones.",
+  "min_council_size": 3,
+  "min_council_size_notes": "At minimum: Travis-persona + skeptic + 1 domain specialist OR customer. Below 3, prefer to skip the council and escalate directly."
+}

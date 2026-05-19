@@ -104,7 +104,7 @@ The nightly cron keeps its insert-or-ignore double-run protection unchanged; onl
 
 **Idempotent / no-op:** zero eligible Items → `200 {refreshed_items:0,skipped_items:N,errors:0,aborted:false,error_code:null}`; no KV key written; no `ingestion_log` row.
 
-**Observability:** per Item that called Plaid → one `ingestion_log` row (`source='plaid_login_refresh'`, `records_processed`=accounts written, `status`='success' on full/partial success or 'error' on per-Item exception after retry). One `audit_events` row per non-idempotent run: `entity_type='plaid_login_refresh_run'`, `entity_id`=crypto.randomUUID(), `field_changed='run'`, `new_value`=JSON `{refreshed_items,skipped_items,errors,aborted}`, `changed_by='system:plaid_login_refresh'`.
+**Observability:** per Item that called Plaid → one `ingestion_log` row (`source='plaid_login_refresh'`, `records_processed`=accounts written, `status`='success' on full/partial success or 'error' on per-Item exception after retry). One `audit_events` row per non-idempotent run: `entity_type='plaid_login_refresh_run'`, `entity_id`=sha256(operator email) hex, `field_changed='run'`, `new_value`=JSON `{refreshed_items,skipped_items,errors,aborted}`, `changed_by='system:plaid_login_refresh'`. (stable pseudonymous operator correlator — not random — so runs are traceable to the triggering operator without storing the raw email; acceptable for the single-operator threat model)
 
 **Response** `{refreshed_items,skipped_items,errors,aborted,error_code}`; `error_code` ∈ {null,'partial_error','db_error','fetch_error'} mirroring REQ-WD-008.
 

@@ -27,7 +27,7 @@ import bisect
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal
 
@@ -43,8 +43,13 @@ from src.analytics.classify import (
     classify,
 )
 from src.models.brokerage import BrokerageTransaction, PositionSnapshot
-from src.models.enums import CashFlowType
+from src.models.enums import BrokerageTxStatus, CashFlowType
 from src.models.history import CostBasisLot, HistoricalPrice
+
+# REJECTED rows are soft-deleted: never feed them into analytics. Used by
+# every BrokerageTransaction query in this module to honour the CLAUDE.md
+# "Never delete transactions — use status: rejected to exclude" rule.
+_NON_REJECTED = BrokerageTransaction.status != BrokerageTxStatus.REJECTED.value
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
 
@@ -167,11 +172,16 @@ def _mv_at(snap_idx: _SnapIndex, price_idx: _PriceIndex, target_date: date) -> D
     return total
 
 
-def _load_transactions_for_scope(
+def load_transactions_for_scope(
     session: Session, scope: Scope
 ) -> list[BrokerageTransaction]:
-    """Load BrokerageTransactions relevant to scope."""
-    stmt = select(BrokerageTransaction)
+    """Load non-rejected BrokerageTransactions relevant to scope.
+
+    Public so callers (e.g., API endpoints, the auto-pair candidate generator)
+    can apply the same scope/REJECTED filter as the analytics engine without
+    reaching into a private symbol.
+    """
+    stmt = select(BrokerageTransaction).where(_NON_REJECTED)
     if isinstance(scope, AccountScope):
         stmt = stmt.where(BrokerageTransaction.account_id == scope.account_id)
     elif isinstance(scope, PositionScope):
@@ -180,6 +190,10 @@ def _load_transactions_for_scope(
         if scope.account_id is not None:
             stmt = stmt.where(BrokerageTransaction.account_id == scope.account_id)
     return list(session.execute(stmt).scalars())
+
+
+# Back-compat alias for older callers; will be removed once the API switches.
+_load_transactions_for_scope = load_transactions_for_scope
 
 
 def _load_snapshots_for_scope(
@@ -366,23 +380,67 @@ def _brentq(
 # ── TWR ───────────────────────────────────────────────────────────────────────
 
 
+@dataclass
+class TwrResult:
+    """REQ-PERF-007 output: both raw cumulative and annualized TWR.
+
+    ``raw`` is always the chain-linked Modified-Dietz cumulative return for
+    the window (no annualization).  ``annualized`` is ``None`` when the window
+    is < 30 days (annualizing very short windows is misleading per spec §9.4);
+    otherwise it is the ``(1 + raw) ** (365/days) − 1`` annualized rate.
+
+    Callers that want a single Decimal (the legacy contract) can use
+    ``time_weighted_return`` which returns ``annualized`` when present and
+    ``raw`` otherwise.
+    """
+
+    raw: Decimal
+    annualized: Decimal | None
+
+
+def time_weighted_return_breakdown(
+    daily_values: list[DailyPoint],
+    cash_flows: list[CashFlow],
+    period_starts: list[date],
+) -> TwrResult:
+    """REQ-PERF-007: return BOTH raw and annualized TWR.
+
+    Modified-Dietz monthly chain-link. ``cash_flows`` must use the *portfolio*
+    sign convention (positive = inflow / deposit), not the XIRR convention.
+    """
+    raw, annualized = _twr_components(daily_values, cash_flows, period_starts)
+    return TwrResult(raw=raw, annualized=annualized)
+
+
 def time_weighted_return(
     daily_values: list[DailyPoint],
     cash_flows: list[CashFlow],
     period_starts: list[date],
 ) -> Decimal:
-    """REQ-PERF-007: Modified-Dietz monthly chain-linked TWR.
+    """REQ-PERF-007: Modified-Dietz monthly chain-linked TWR (legacy API).
 
-    ``period_starts`` defines period boundaries. Each period i spans
-    ``[period_starts[i], period_starts[i+1] − 1 day]`` except the last, which
-    ends at ``daily_values[-1].date``.
+    Returns annualized value for windows ≥ 30 days, raw otherwise — the
+    historical behaviour. Prefer ``time_weighted_return_breakdown`` for new
+    callers that want both numbers.
+    """
+    raw, annualized = _twr_components(daily_values, cash_flows, period_starts)
+    return annualized if annualized is not None else raw
 
-    Returns Decimal with 6 fractional digits. Annualizes when total window
-    ≥ 30 days: ``(1 + TWR)^(365/days) − 1``. Skips periods where V_begin == 0
-    (no invested capital yet).
+
+def _twr_components(
+    daily_values: list[DailyPoint],
+    cash_flows: list[CashFlow],
+    period_starts: list[date],
+) -> tuple[Decimal, Decimal | None]:
+    """Internal: compute (raw, annualized) Modified-Dietz TWR.
+
+    Annualized is None for windows < 30 days. Skips periods where ``V_begin``
+    is zero (no invested capital yet) or ``denom`` is zero (would div-zero).
+    Guards against ``raw ≤ -1`` in the annualization step to avoid raising
+    ValueError on a >100% loss.
     """
     if not daily_values or not period_starts:
-        return Decimal("0.000000")
+        return Decimal("0.000000"), None
 
     mv_by_date: dict[date, Decimal] = {dp.date: dp.market_value for dp in daily_values}
     sorted_dp_dates: list[date] = sorted(mv_by_date.keys())
@@ -438,17 +496,22 @@ def time_weighted_return(
         any_computed = True
 
     if not any_computed:
-        return Decimal("0.000000")
+        return Decimal("0.000000"), None
 
     twr_raw = chain - Decimal("1")
+    raw_q = twr_raw.quantize(Decimal("0.000001"))
 
     window_days = (last_dp_date - period_starts[0]).days
     if window_days >= 30:
         twr_float = float(twr_raw)
+        # Guard against a > 100% loss: (1 + r) <= 0 makes the power expression
+        # raise. Annualized return is undefined in that case; return None.
+        if 1.0 + twr_float <= 0:
+            return raw_q, None
         annualized = Decimal(str((1.0 + twr_float) ** (365.0 / window_days) - 1.0))
-        return annualized.quantize(Decimal("0.000001"))
+        return raw_q, annualized.quantize(Decimal("0.000001"))
 
-    return twr_raw.quantize(Decimal("0.000001"))
+    return raw_q, None
 
 
 # ── XIRR / MWR ────────────────────────────────────────────────────────────────
@@ -497,14 +560,16 @@ def tracked_value_at(session: Session, target_date: date) -> TrackedCoverage:
 
     Tracked accounts: those with at least one non-``none`` ``cash_flow_type``
     BrokerageTransaction within 365 days ending on ``target_date`` (proxy for
-    "we have transaction-level detail"). ``tracked_begin_date`` is the earliest
-    non-``none`` tx date across tracked accounts.
+    "we have transaction-level detail"). REJECTED rows are excluded.
+    ``tracked_begin_date`` is the earliest non-``none`` tx date across tracked
+    accounts.
     """
     cutoff = target_date - timedelta(days=365)
 
     stmt_tracked = (
         select(BrokerageTransaction.account_id)
         .where(
+            _NON_REJECTED,
             BrokerageTransaction.cash_flow_type != CashFlowType.NONE.value,
             BrokerageTransaction.trade_date >= cutoff,
             BrokerageTransaction.trade_date <= target_date,
@@ -513,15 +578,16 @@ def tracked_value_at(session: Session, target_date: date) -> TrackedCoverage:
     )
     tracked_ids: set[str] = {row[0] for row in session.execute(stmt_tracked)}
 
-    all_snaps: list[PositionSnapshot] = list(
-        session.execute(select(PositionSnapshot)).scalars()
-    )
+    # Date pre-filter at the DB layer. ``PositionSnapshot.as_of`` is a
+    # datetime; we want all snapshots dated on or before ``target_date``, so
+    # compare against the end of that day to avoid string-comparison surprises
+    # in SQLite (where datetime is ISO-string-stored).
+    cutoff_dt = datetime.combine(target_date, datetime.max.time())
+    snap_stmt = select(PositionSnapshot).where(PositionSnapshot.as_of <= cutoff_dt)
+    all_snaps: list[PositionSnapshot] = list(session.execute(snap_stmt).scalars())
 
     latest: dict[tuple[str, str | None], PositionSnapshot] = {}
     for snap in all_snaps:
-        snap_date: date = snap.as_of.date()
-        if snap_date > target_date:
-            continue
         key = (snap.account_id, snap.symbol)
         existing = latest.get(key)
         if existing is None or snap.as_of > existing.as_of:
@@ -545,6 +611,7 @@ def tracked_value_at(session: Session, target_date: date) -> TrackedCoverage:
     tracked_begin_date: date | None = None
     if tracked_ids:
         stmt_begin = select(BrokerageTransaction.trade_date).where(
+            _NON_REJECTED,
             BrokerageTransaction.account_id.in_(list(tracked_ids)),
             BrokerageTransaction.cash_flow_type != CashFlowType.NONE.value,
         )

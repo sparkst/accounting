@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 from src.models.audit_event import AuditEvent  # noqa: E402
 from src.models.brokerage import BrokerageTransaction  # noqa: E402
-from src.models.enums import CanonicalAction  # noqa: E402
+from src.models.enums import BrokerageTxStatus, CanonicalAction  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,9 @@ def find_candidates(session: Session) -> list[CandidatePair]:
     stmt = (
         select(BrokerageTransaction)
         .where(
+            # Rejected transactions are soft-deleted: never surface them as
+            # pairing candidates (CLAUDE.md never-delete rule).
+            BrokerageTransaction.status != BrokerageTxStatus.REJECTED.value,
             BrokerageTransaction.canonical_action.in_(_TRANSFER_LIKE),
             BrokerageTransaction.paired_transaction_id.is_(None),
         )

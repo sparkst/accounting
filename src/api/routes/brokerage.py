@@ -28,7 +28,6 @@ from src.analytics.performance import (
     CashFlow,
     money_weighted_return,
     principal_growth_series,
-    time_weighted_return,
     tracked_value_at,
 )
 from src.db.connection import SessionLocal
@@ -42,7 +41,7 @@ from src.models.brokerage import (
     PositionSnapshot,
     RealizedGainLoss,
 )
-from src.models.enums import CashFlowType, GainLossTerm
+from src.models.enums import BrokerageTxStatus, CanonicalAction, CashFlowType, GainLossTerm
 from src.models.history import (
     AccountBalanceSnapshot,
     AccountTag,
@@ -1622,7 +1621,7 @@ class PerformanceSummary(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     twr: Decimal
-    twr_annualized: Decimal
+    twr_annualized: Decimal | None
     xirr: Decimal | None
     benchmark_twr: Decimal | None
     current_value: Decimal
@@ -1775,6 +1774,83 @@ def _month_period_starts(start: date, end: date) -> list[date]:
     return starts
 
 
+def _filtered_portfolio_series(
+    session: Session,
+    account_ids: list[str],
+    start: date,
+    end: date,
+    view: PerfView,
+) -> list[Any]:
+    """Sum per-account principal/growth series across an account_ids filter.
+
+    Non-overlapping accounts means the sum equals the would-be portfolio
+    series restricted to that filter — same MV, same principal accumulation.
+    """
+    summed: dict[date, dict[str, Decimal]] = {}
+    for acct_id in account_ids:
+        per_acct = principal_growth_series(
+            session, AccountScope(acct_id), start, end, view=view
+        )
+        for dp in per_acct:
+            bucket = summed.setdefault(
+                dp.date,
+                {
+                    "market_value": Decimal("0"),
+                    "principal": Decimal("0"),
+                    "growth": Decimal("0"),
+                },
+            )
+            bucket["market_value"] += dp.market_value
+            bucket["principal"] += dp.principal
+            bucket["growth"] += dp.growth
+
+    from src.analytics.performance import DailyPoint  # noqa: PLC0415
+
+    return [
+        DailyPoint(
+            date=d,
+            market_value=v["market_value"],
+            principal=v["principal"],
+            growth=v["growth"],
+        )
+        for d, v in sorted(summed.items())
+    ]
+
+
+def _build_brokerage_cash_flows(
+    txs: list[BrokerageTransaction],
+    scope: Scope,
+    start: date,
+    end: date,
+) -> list[CashFlow]:
+    """Build cash flows from external_* txs using the *brokerage* sign.
+
+    Sign convention: positive = inflow to portfolio (deposit), negative =
+    outflow (withdrawal). This matches ``BrokerageTransaction.amount`` directly
+    and is the convention Modified-Dietz TWR expects in its denominator
+    (``v_begin + Σ CF × weight``).
+    """
+    from src.analytics.classify import ClassifyError, classify  # noqa: PLC0415
+
+    flows: list[CashFlow] = []
+    for tx in txs:
+        if tx.amount is None:
+            continue
+        if not (start <= tx.trade_date <= end):
+            continue
+        try:
+            cft = classify(tx, scope)
+        except ClassifyError:
+            # An unclassifiable row is a data-integrity issue, not a runtime
+            # crash; skip it and let the per-row error isolation pattern
+            # surface in logs elsewhere.
+            continue
+        if cft not in (CashFlowType.EXTERNAL_IN, CashFlowType.EXTERNAL_OUT):
+            continue
+        flows.append(CashFlow(date=tx.trade_date, amount=Decimal(str(tx.amount))))
+    return flows
+
+
 def _build_external_cash_flows(
     txs: list[BrokerageTransaction],
     scope: Scope,
@@ -1783,29 +1859,16 @@ def _build_external_cash_flows(
 ) -> list[CashFlow]:
     """Build XIRR cash flows from external_* txs within [start, end].
 
-    Sign convention (per CashFlow docstring): negative = investor paid in
+    Sign convention (per ``CashFlow`` docstring): negative = investor paid in
     (i.e., money flowed INTO the portfolio — brokerage amount positive →
-    XIRR amount negated). Positive = investor received.
+    XIRR amount negated). Positive = investor received. Internally wraps
+    :func:`_build_brokerage_cash_flows` and flips the sign so the two
+    helpers stay in lockstep.
     """
-    flows: list[CashFlow] = []
-    from src.analytics.classify import classify  # local import to avoid cycle
-
-    for tx in txs:
-        if tx.amount is None:
-            continue
-        if not (start <= tx.trade_date <= end):
-            continue
-        try:
-            cft = classify(tx, scope)
-        except Exception:  # noqa: BLE001 - skip unclassifiable rows
-            continue
-        if cft not in (CashFlowType.EXTERNAL_IN, CashFlowType.EXTERNAL_OUT):
-            continue
-        amt = Decimal(str(tx.amount))
-        # Brokerage amount sign: positive = cash entering portfolio (deposit).
-        # XIRR convention: deposits are negative cash flows from the investor.
-        flows.append(CashFlow(date=tx.trade_date, amount=-amt))
-    return flows
+    return [
+        CashFlow(date=cf.date, amount=-cf.amount)
+        for cf in _build_brokerage_cash_flows(txs, scope, start, end)
+    ]
 
 
 def _benchmark_twr(
@@ -1858,7 +1921,17 @@ def _scope_summary(
     start: date,
     end: date,
 ) -> dict[str, Any]:
-    """Compute TWR / XIRR / benchmark / current_value / principal / growth."""
+    """Compute TWR / XIRR / benchmark / current_value / principal / growth.
+
+    ``twr`` is the raw (un-annualized) chain-linked return; ``twr_annualized``
+    is the same value scaled to a one-year basis for windows ≥ 30 days, or
+    ``None`` for shorter windows (per spec §9.4 — annualizing a sub-30-day
+    return is misleading).
+    """
+    from src.analytics.performance import (  # noqa: PLC0415 - avoid import cycle
+        time_weighted_return_breakdown,
+    )
+
     if series:
         current_value = series[-1].market_value
         total_principal = series[-1].principal
@@ -1869,20 +1942,27 @@ def _scope_summary(
         total_growth = Decimal("0")
 
     period_starts = _month_period_starts(start, end)
-    twr = time_weighted_return(series, [], period_starts) if series else Decimal("0.000000")
+    # Modified-Dietz needs portfolio-signed cash flows (positive = inflow).
+    brokerage_flows = _build_brokerage_cash_flows(txs, scope, start, end)
+    if series:
+        twr_result = time_weighted_return_breakdown(series, brokerage_flows, period_starts)
+        twr_raw = twr_result.raw
+        twr_ann = twr_result.annualized
+    else:
+        twr_raw = Decimal("0.000000")
+        twr_ann = None
 
-    cash_flows = _build_external_cash_flows(txs, scope, start, end)
-    # Terminal value at XIRR convention: positive = investor receives.
-    # Current market value at end_date is a positive terminal inflow.
+    # XIRR uses investor-signed cash flows (deposits negative).
+    xirr_flows = _build_external_cash_flows(txs, scope, start, end)
     mwr = (
-        money_weighted_return(cash_flows, current_value, end) if cash_flows else None
+        money_weighted_return(xirr_flows, current_value, end) if xirr_flows else None
     )
 
     benchmark = _benchmark_twr(session, "SPY", start, end)
 
     return {
-        "twr": twr,
-        "twr_annualized": twr,
+        "twr": twr_raw,
+        "twr_annualized": twr_ann,
         "xirr": mwr,
         "benchmark_twr": benchmark,
         "current_value": current_value,
@@ -2010,18 +2090,41 @@ def performance_account(
 def performance_portfolio(
     start_date: date | None = Query(None),  # noqa: B008
     end_date: date | None = Query(None),  # noqa: B008
+    account_ids: list[str] | None = Query(None, max_length=50),  # noqa: B008
     view: PerfView = Query("outside_money"),  # noqa: B008
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
-    """REQ-PERF-012: portfolio-wide principal/growth + tracked coverage."""
+    """REQ-PERF-012: portfolio-wide principal/growth + tracked coverage.
+
+    ``account_ids`` filters the underlying transactions and snapshots to the
+    given set; tracked-coverage numbers still reflect the entire portfolio so
+    the "Tracked $X of $Y" comparison stays meaningful across filter changes.
+    """
     end = end_date or _today()
     start = start_date or (end - timedelta(days=365))
     scope: Scope = PortfolioScope()
 
-    series = principal_growth_series(session, scope, start, end, view=view)
-    from src.analytics.performance import _load_transactions_for_scope  # noqa: PLC0415
+    if account_ids:
+        # Compute the principal/growth series and txs scoped to the filter by
+        # iterating per-account and summing. Sum-of-account-series equals
+        # portfolio-scope series when accounts are non-overlapping (which they
+        # are: an account belongs to exactly one (entity, broker, account#)).
+        series = _filtered_portfolio_series(session, account_ids, start, end, view)
+        txs: list[BrokerageTransaction] = []
+        for acct_id in account_ids:
+            from src.analytics.performance import (  # noqa: PLC0415
+                load_transactions_for_scope,
+            )
 
-    txs = _load_transactions_for_scope(session, scope)
+            txs.extend(load_transactions_for_scope(session, AccountScope(acct_id)))
+    else:
+        series = principal_growth_series(session, scope, start, end, view=view)
+        from src.analytics.performance import (  # noqa: PLC0415
+            load_transactions_for_scope,
+        )
+
+        txs = load_transactions_for_scope(session, scope)
+
     summary = _scope_summary(session, scope, txs, series, start, end)
 
     coverage = tracked_value_at(session, end)
@@ -2133,18 +2236,28 @@ def performance_periods(
         if not series:
             continue
         period_starts = _month_period_starts(p_start, end)
-        twr = time_weighted_return(series, [], period_starts)
 
-        from src.analytics.performance import (  # noqa: PLC0415
-            _load_transactions_for_scope,
+        from src.analytics.performance import (  # noqa: PLC0415 - avoid cycle
+            load_transactions_for_scope,
+            time_weighted_return_breakdown,
         )
 
-        txs = _load_transactions_for_scope(session, s_scope)
-        cash_flows = _build_external_cash_flows(txs, s_scope, p_start, end)
+        txs = load_transactions_for_scope(session, s_scope)
+        brokerage_flows = _build_brokerage_cash_flows(txs, s_scope, p_start, end)
+        twr_result = time_weighted_return_breakdown(
+            series, brokerage_flows, period_starts
+        )
+        # Period grid surfaces a single TWR number; for windows >= 30 days
+        # the annualized rate is the natural comparison against SPY/QQQ
+        # (which are also annualized in _benchmark_twr), otherwise the raw
+        # period return is shown.
+        twr = twr_result.annualized if twr_result.annualized is not None else twr_result.raw
+
+        xirr_flows = _build_external_cash_flows(txs, s_scope, p_start, end)
         terminal = series[-1].market_value if series else Decimal("0")
         mwr = (
-            money_weighted_return(cash_flows, terminal, end)
-            if cash_flows
+            money_weighted_return(xirr_flows, terminal, end)
+            if xirr_flows
             else None
         )
 
@@ -2191,6 +2304,13 @@ def pair_action(
             detail="paired_transaction_id is required for both confirm and reject",
         )
 
+    # Self-pair guard (security finding): cannot pair a transaction with itself.
+    if tx_id == body.paired_transaction_id:
+        raise HTTPException(
+            status_code=422,
+            detail="A transaction cannot be paired with itself",
+        )
+
     tx_b = (
         session.query(BrokerageTransaction)
         .filter(BrokerageTransaction.id == body.paired_transaction_id)
@@ -2202,13 +2322,80 @@ def pair_action(
             detail=f"Unknown paired transaction {body.paired_transaction_id!r}",
         )
 
-    if body.action == "reject":
-        from scripts.auto_pair_transfers import (  # noqa: PLC0415
-            reject_pair,
+    # Honour the never-delete rule: rejected rows can't be confirmed or rejected.
+    if (
+        tx_a.status == BrokerageTxStatus.REJECTED.value
+        or tx_b.status == BrokerageTxStatus.REJECTED.value
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="cannot pair a rejected transaction",
         )
+
+    if body.action == "reject":
+        from scripts.auto_pair_transfers import reject_pair  # noqa: PLC0415
 
         reject_pair(session, tx_a.id, tx_b.id)
         return {"rejected": True}
+
+    # ── Confirm-path validation ──────────────────────────────────────
+    # Both legs must be transfer-like canonical actions.
+    _TRANSFER_LIKE = (
+        CanonicalAction.TRANSFER.value,
+        CanonicalAction.JOURNAL.value,
+        CanonicalAction.EXCHANGE.value,
+    )
+    if (
+        tx_a.canonical_action not in _TRANSFER_LIKE
+        or tx_b.canonical_action not in _TRANSFER_LIKE
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Both transactions must have canonical_action in "
+                f"{_TRANSFER_LIKE} to be paired as a transfer"
+            ),
+        )
+    # Different accounts (an intra-account journal is not a portfolio transfer).
+    if tx_a.account_id == tx_b.account_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Both transactions must belong to different accounts",
+        )
+    # Opposite signs (one outflow, one inflow).
+    if tx_a.amount is not None and tx_b.amount is not None:
+        amt_a = Decimal(str(tx_a.amount))
+        amt_b = Decimal(str(tx_b.amount))
+        if amt_a == Decimal("0") or amt_b == Decimal("0") or amt_a * amt_b >= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="Paired transactions must have opposite-sign non-zero amounts",
+            )
+
+    # Reject re-pair when either leg is already paired with a different partner —
+    # silently abandoning the previous partner leaves a dangling pair.
+    if (
+        tx_a.paired_transaction_id is not None
+        and tx_a.paired_transaction_id != tx_b.id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"tx {tx_a.id!r} is already paired with "
+                f"{tx_a.paired_transaction_id!r}; reject that pair first"
+            ),
+        )
+    if (
+        tx_b.paired_transaction_id is not None
+        and tx_b.paired_transaction_id != tx_a.id
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"tx {tx_b.id!r} is already paired with "
+                f"{tx_b.paired_transaction_id!r}; reject that pair first"
+            ),
+        )
 
     # confirm path — idempotent
     already = (
@@ -2225,32 +2412,40 @@ def pair_action(
 
     old_a_paired = tx_a.paired_transaction_id
     old_b_paired = tx_b.paired_transaction_id
+    old_a_cft = tx_a.cash_flow_type
+    old_b_cft = tx_b.cash_flow_type
 
     tx_a.paired_transaction_id = tx_b.id
     tx_b.paired_transaction_id = tx_a.id
     tx_a.cash_flow_type = CashFlowType.INTERNAL.value
     tx_b.cash_flow_type = CashFlowType.INTERNAL.value
 
-    session.add(
-        AuditEvent(
-            entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
-            entity_id=tx_a.id,
-            field_changed="paired_transaction_id",
-            old_value=old_a_paired,
-            new_value=tx_b.id,
-            changed_by="human:pair_confirm",
+    for leg_id, other_id, old_paired, old_cft in (
+        (tx_a.id, tx_b.id, old_a_paired, old_a_cft),
+        (tx_b.id, tx_a.id, old_b_paired, old_b_cft),
+    ):
+        session.add(
+            AuditEvent(
+                entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
+                entity_id=leg_id,
+                field_changed="paired_transaction_id",
+                old_value=old_paired,
+                new_value=other_id,
+                changed_by="human:pair_confirm",
+            )
         )
-    )
-    session.add(
-        AuditEvent(
-            entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
-            entity_id=tx_b.id,
-            field_changed="paired_transaction_id",
-            old_value=old_b_paired,
-            new_value=tx_a.id,
-            changed_by="human:pair_confirm",
+        # Audit the cash_flow_type flip too — security review found the
+        # mutation was previously invisible in the audit trail.
+        session.add(
+            AuditEvent(
+                entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
+                entity_id=leg_id,
+                field_changed="cash_flow_type",
+                old_value=old_cft,
+                new_value=CashFlowType.INTERNAL.value,
+                changed_by="human:pair_confirm",
+            )
         )
-    )
     session.commit()
 
     return {

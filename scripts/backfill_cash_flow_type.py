@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 from src.analytics.classify import ClassifyError, PortfolioScope, classify  # noqa: E402
 from src.db.connection import SessionLocal  # noqa: E402
 from src.models.brokerage import BrokerageTransaction  # noqa: E402
-from src.models.enums import CashFlowType  # noqa: E402
+from src.models.enums import BrokerageTxStatus, CashFlowType  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,13 @@ def backfill(
     examined = 0
 
     # Stream rows so we don't load the whole table into memory.
-    stmt = select(BrokerageTransaction).execution_options(yield_per=batch_size)
+    # Skip REJECTED rows: they're soft-deleted and must not have their
+    # cash_flow_type silently overwritten (CLAUDE.md never-delete rule).
+    stmt = (
+        select(BrokerageTransaction)
+        .where(BrokerageTransaction.status != BrokerageTxStatus.REJECTED.value)
+        .execution_options(yield_per=batch_size)
+    )
     for tx in session.execute(stmt).scalars():
         examined += 1
         desired = _classify_one(tx)

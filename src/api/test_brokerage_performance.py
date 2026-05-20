@@ -528,3 +528,386 @@ def test_pair_confirm_idempotent(client: TestClient, session: Session) -> None:
         .count()
     )
     assert audit_count_after == audit_count_before
+
+
+# ── Review-loop fixes: numeric correctness, sign convention, pair guards ──
+
+
+def test_portfolio_endpoint_xirr_matches_positive_brokerage_amount(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-012 end-to-end XIRR sign check at portfolio scope.
+
+    Seeds a +10000 brokerage CONTRIBUTION (positive = cash entering portfolio)
+    and a $10823 market value one year later → XIRR should be ≈ +0.0823.
+    Catches any regression of the brokerage→XIRR sign flip in
+    _build_external_cash_flows. Uses portfolio endpoint because CONTRIBUTION
+    is only external_in at portfolio/account scope (not position scope —
+    documented asymmetry).
+    """
+    acct = _acct(session)
+    _tx(
+        session,
+        acct_id=acct.id,
+        action=CanonicalAction.CONTRIBUTION,
+        amount=Decimal("10000.00"),
+        trade_date=date(2025, 5, 20),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    _snap(
+        session,
+        acct_id=acct.id,
+        symbol=None,
+        as_of=datetime(2026, 5, 20),
+        qty=Decimal("0"),
+        market_value=Decimal("10823.00"),
+    )
+    with patch("src.api.routes.brokerage._today", return_value=date(2026, 5, 20)):
+        r = client.get(
+            "/api/brokerage/performance/portfolio"
+            "?start_date=2025-05-20&end_date=2026-05-20"
+        )
+    assert r.status_code == 200, r.text
+    xirr_str = r.json()["summary"]["xirr"]
+    assert xirr_str is not None, "XIRR must compute for portfolio with external_in"
+    xirr = Decimal(xirr_str)
+    # 10000 → 10823 over exactly 1 year ⇒ +8.23%
+    assert abs(xirr - Decimal("0.0823")) < Decimal("0.001"), f"xirr={xirr}"
+
+
+def test_portfolio_endpoint_passes_cash_flows_to_twr(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-007 / REQ-PERF-012: the endpoint MUST forward external cash
+    flows to ``time_weighted_return_breakdown`` — passing ``[]`` silently
+    degrades Modified-Dietz to ``(V_end−V_begin)/V_begin``.
+
+    We assert the contract by spying on ``time_weighted_return_breakdown`` and
+    checking the ``cash_flows`` argument is non-empty for a portfolio that has
+    an external_in tx in the window. This is the regression net for the bug
+    the financial-correctness reviewer caught.
+    """
+    acct = _acct(session)
+    _tx(
+        session,
+        acct_id=acct.id,
+        action=CanonicalAction.CONTRIBUTION,
+        amount=Decimal("1000"),
+        trade_date=date(2025, 8, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    _snap(
+        session,
+        acct_id=acct.id,
+        symbol=None,
+        as_of=datetime(2026, 5, 20),
+        qty=Decimal("0"),
+        market_value=Decimal("1100"),
+    )
+
+    seen_cash_flows: list[list[Any]] = []
+
+    from src.analytics import performance as perf_mod
+
+    real_fn = perf_mod.time_weighted_return_breakdown
+
+    def _spy(daily_values: Any, cash_flows: Any, period_starts: Any) -> Any:
+        seen_cash_flows.append(list(cash_flows))
+        return real_fn(daily_values, cash_flows, period_starts)
+
+    with (
+        patch.object(perf_mod, "time_weighted_return_breakdown", side_effect=_spy),
+        patch("src.api.routes.brokerage._today", return_value=date(2026, 5, 20)),
+    ):
+        r = client.get(
+            "/api/brokerage/performance/portfolio"
+            "?start_date=2025-05-20&end_date=2026-05-20"
+        )
+    assert r.status_code == 200, r.text
+    assert seen_cash_flows, "time_weighted_return_breakdown was never called"
+    # At least one call must have received a non-empty cash_flows list.
+    assert any(cfs for cfs in seen_cash_flows), (
+        "Endpoint passed empty cash_flows to time_weighted_return_breakdown — "
+        "Modified-Dietz weighting is being skipped (regression of the P0 fix)"
+    )
+
+
+def test_pair_confirm_self_pair_rejected(
+    client: TestClient, session: Session
+) -> None:
+    """Security: tx_id == paired_transaction_id must be rejected (422)."""
+    a = _acct(session, "acct-self")
+    tx = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("100"),
+        trade_date=date(2026, 1, 1),
+    )
+    r = client.post(
+        f"/api/brokerage/transactions/{tx.id}/pair",
+        json={"paired_transaction_id": tx.id, "action": "confirm"},
+    )
+    assert r.status_code == 422
+    assert "itself" in r.text.lower()
+
+
+def test_pair_confirm_rejects_same_account(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-014: paired transactions must be on different accounts."""
+    a = _acct(session, "acct-same", num="N-S")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("100"),
+        trade_date=date(2026, 1, 1),
+    )
+    tx_b = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-100"),
+        trade_date=date(2026, 1, 1),
+    )
+    r = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r.status_code == 422
+    assert "different accounts" in r.text.lower()
+
+
+def test_pair_confirm_rejects_non_transfer_action(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-014: paired transactions must have transfer/journal/exchange action."""
+    a = _acct(session, "acct-a", num="NA")
+    b = _acct(session, "acct-b", num="NB")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.BUY,
+        amount=Decimal("-100"),
+        trade_date=date(2026, 1, 1),
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.SELL,
+        amount=Decimal("100"),
+        trade_date=date(2026, 1, 1),
+    )
+    r = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r.status_code == 422
+    assert "transfer" in r.text.lower()
+
+
+def test_pair_confirm_rejects_same_sign_amounts(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-014: paired amounts must have opposite signs (one in, one out)."""
+    a = _acct(session, "acct-a", num="NA")
+    b = _acct(session, "acct-b", num="NB")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("100"),
+        trade_date=date(2026, 1, 1),
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("100"),  # same sign — both inflows
+        trade_date=date(2026, 1, 1),
+    )
+    r = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r.status_code == 422
+    assert "opposite-sign" in r.text.lower()
+
+
+def test_pair_confirm_409_when_re_pairing_dangling(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-014: confirming tx_a with tx_b when tx_a is already paired
+    to tx_c must 409 (else tx_c becomes a dangling pair)."""
+    a = _acct(session, "acct-A", num="NA")
+    b = _acct(session, "acct-B", num="NB")
+    c = _acct(session, "acct-C", num="NC")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("100"),
+        trade_date=date(2026, 1, 1),
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-100"),
+        trade_date=date(2026, 1, 1),
+    )
+    tx_c = _tx(
+        session,
+        acct_id=c.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-100"),
+        trade_date=date(2026, 1, 1),
+        paired_id=tx_a.id,  # tx_c already paired to tx_a
+    )
+    # Manually wire tx_a → tx_c too (preexisting confirmed pair)
+    session.expire_all()
+    tx_a_db = session.get(BrokerageTransaction, tx_a.id)
+    assert tx_a_db is not None
+    tx_a_db.paired_transaction_id = tx_c.id
+    session.commit()
+
+    r = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r.status_code == 409
+    assert "already paired" in r.text.lower()
+
+
+def test_pair_confirm_audits_cash_flow_type(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-014 / security review: cash_flow_type flip must be audited."""
+    a = _acct(session, "acct-x", num="NX")
+    b = _acct(session, "acct-y", num="NY")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("250"),
+        trade_date=date(2026, 1, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-250"),
+        trade_date=date(2026, 1, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_OUT,
+    )
+    r = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r.status_code == 200, r.text
+    cft_audits = (
+        session.query(AuditEvent)
+        .filter(AuditEvent.field_changed == "cash_flow_type")
+        .all()
+    )
+    # Two audit rows, one per leg
+    assert len(cft_audits) == 2
+    legs = {(a.entity_id, a.old_value, a.new_value) for a in cft_audits}
+    assert (tx_a.id, "external_in", "internal") in legs
+    assert (tx_b.id, "external_out", "internal") in legs
+
+
+def test_rejected_status_filter_in_classify_and_pair(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF + CLAUDE.md: rejected rows are excluded from analytics + pairing.
+
+    Verifies:
+    1. A rejected TRANSFER does NOT appear in unpaired-transfers candidates.
+    2. Attempting to pair a rejected transaction returns 409.
+    """
+    a = _acct(session, "acct-rj-a", num="RA")
+    b = _acct(session, "acct-rj-b", num="RB")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("300"),
+        trade_date=date(2026, 1, 1),
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-300"),
+        trade_date=date(2026, 1, 1),
+    )
+    # Reject tx_a
+    tx_a.status = BrokerageTxStatus.REJECTED.value
+    session.commit()
+
+    r1 = client.get("/api/brokerage/performance/unpaired-transfers")
+    assert r1.status_code == 200
+    assert r1.json() == {"candidates": []}
+
+    r2 = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r2.status_code == 409
+    assert "rejected" in r2.text.lower()
+
+
+def test_portfolio_account_ids_filter(
+    client: TestClient, session: Session
+) -> None:
+    """REQ-PERF-012: account_ids filter restricts series to those accounts."""
+    a = _acct(session, "acct-incl", num="NI")
+    b = _acct(session, "acct-excl", num="NE")
+    _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.CONTRIBUTION,
+        amount=Decimal("1000"),
+        trade_date=date(2025, 12, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.CONTRIBUTION,
+        amount=Decimal("9000"),
+        trade_date=date(2025, 12, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    _snap(
+        session,
+        acct_id=a.id,
+        symbol=None,
+        as_of=datetime(2026, 5, 20),
+        qty=Decimal("0"),
+        market_value=Decimal("1200"),
+    )
+    _snap(
+        session,
+        acct_id=b.id,
+        symbol=None,
+        as_of=datetime(2026, 5, 20),
+        qty=Decimal("0"),
+        market_value=Decimal("9100"),
+    )
+
+    with patch("src.api.routes.brokerage._today", return_value=date(2026, 5, 20)):
+        r_all = client.get("/api/brokerage/performance/portfolio")
+        r_filt = client.get(
+            f"/api/brokerage/performance/portfolio?account_ids={a.id}"
+        )
+    assert r_all.status_code == 200, r_all.text
+    assert r_filt.status_code == 200, r_filt.text
+    # Filtered total_principal includes only acct-incl (1000), full includes both (10000)
+    full_principal = Decimal(r_all.json()["summary"]["total_principal"])
+    filt_principal = Decimal(r_filt.json()["summary"]["total_principal"])
+    assert full_principal == Decimal("10000")
+    assert filt_principal == Decimal("1000")

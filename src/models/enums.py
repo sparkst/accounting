@@ -335,3 +335,18 @@ class BrokerageTxStatus(enum.StrEnum):
     IMPORTED = "imported"
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
+
+
+class CashFlowType(enum.StrEnum):
+    """Derived per-transaction classification used by performance analytics.
+
+    Same row may classify differently depending on the analytic *scope* —
+    portfolio, account, or position — so this column stores the portfolio-scope
+    classification (which is what the UI defaults show). Account/position
+    scopes are computed on the fly by ``src/analytics/classify.py``.
+    """
+
+    EXTERNAL_IN = "external_in"
+    EXTERNAL_OUT = "external_out"
+    INTERNAL = "internal"
+    NONE = "none"

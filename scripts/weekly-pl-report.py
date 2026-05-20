@@ -28,10 +28,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
-from src.db.connection import SessionLocal, init_db
-from src.models.transaction import Transaction
-from src.models.enums import TransactionStatus
 from sqlalchemy import func
+
+from src.db.connection import SessionLocal, init_db
+from src.models.enums import TransactionStatus
+from src.models.transaction import Transaction
 
 
 def generate_report() -> str:

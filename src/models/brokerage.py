@@ -33,6 +33,7 @@ from src.models.enums import (
     Broker,
     BrokerageTxStatus,
     CanonicalAction,
+    CashFlowType,
     Entity,
     GainLossTerm,
 )
@@ -53,6 +54,7 @@ _CANONICAL_ACTION_VALUES = "', '".join(c.value for c in CanonicalAction)
 _TERM_VALUES = "', '".join(t.value for t in GainLossTerm)
 _TX_STATUS_VALUES = "', '".join(s.value for s in BrokerageTxStatus)
 _ENTITY_VALUES = "', '".join(e.value for e in Entity)
+_CASH_FLOW_TYPE_VALUES = "', '".join(c.value for c in CashFlowType)
 
 
 class Account(Base):
@@ -150,6 +152,10 @@ class BrokerageTransaction(Base):
             f"status IN ('{_TX_STATUS_VALUES}')",
             name="ck_brokerage_tx_status",
         ),
+        CheckConstraint(
+            f"cash_flow_type IN ('{_CASH_FLOW_TYPE_VALUES}')",
+            name="ck_brokerage_tx_cash_flow_type",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
@@ -189,6 +195,17 @@ class BrokerageTransaction(Base):
         ForeignKey("brokerage_transaction.id"),
         nullable=True,
         comment="Links dividend ↔ reinvest pair",
+    )
+    cash_flow_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default=CashFlowType.NONE.value,
+        server_default=CashFlowType.NONE.value,
+        index=True,
+        comment=(
+            "Portfolio-scope CashFlowType: external_in | external_out | "
+            "internal | none. Recomputed on pairing changes."
+        ),
     )
     is_synthetic: Mapped[bool] = mapped_column(
         Boolean,

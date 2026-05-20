@@ -326,3 +326,93 @@ The summaries below are scan-aids; the spec is authoritative.
   - **Today-point (P1-D):** the "present-day total MUST NOT change" constraint applies to the **matched-account aggregate only** (today-point stays REQ-WD-003/008 positions×live_quote). A legacy single-symbol name (which by definition has no matched account and never participates in the live-quote path) uses `historical_price.close` (most-recent EOD, forward-filled if today is a non-trading day) for the today-date too — this is correct and does not move the canonical today total.
   - **No double-count (priority ladder):** for each account+date exactly one source contributes, in strict priority: a real snapshot for that date > reprice (shares×EOD) > carry-forward. Never summed. This ladder operates *within* the partition REQ-WD-009 already establishes (legacy-before-cutoff XOR matched-on/after-cutoff), so reprice/carry-forward of a legacy series is itself still gated by `unmatchedActiveAt` and contributes $0 on/after the cutoff.
 - Non-Goals: Plaid-based historical backfill (Plaid balance API is point-in-time/current only — out of scope and infeasible); linear/spline interpolation; reconstructing aggregate multi-holding legacy names that have no per-symbol share history (those stay carry-forward).
+
+---
+
+# Round 14 — Wealth performance measurement (TWR + MWR + principal/growth)
+
+> Round added 2026-05-20. Replaces the SPY/QQQ percentage overlay on `/wealth` (currently incoherent against a dollar net-worth line on a dual-axis chart) with two true return metrics plus a principal-vs-growth decomposition. Anchor design: `docs/superpowers/specs/2026-05-11-performance-measurement-design.md`. Reconciled with 2026-05-19 discussion deltas in `.qpipeline/projects/010-performance/IDEATION.md`.
+
+## REQ-PERF-001: `BrokerageTransaction.cash_flow_type` column + CashFlowType enum + CHECK
+- Acceptance: `CashFlowType(StrEnum)` in `src/models/enums.py` with values `external_in | external_out | internal | none`. `BrokerageTransaction.cash_flow_type` column: String(16), NOT NULL, server_default `'none'`. CHECK constraint `ck_brokerage_tx_cash_flow_type` matches the four enum VALUES (not member names — migration-reviewer rule). Alembic migration chains off `lmt0_wealth_pre_cutover` head; downgrade refuses if any non-`none` row remains.
+- Non-Goals: any other schema change; touching `Transaction` (main accounting register) — out of scope.
+
+## REQ-PERF-002: Cash-flow classification at three scopes
+- Acceptance: `src/analytics/classify.py::classify(tx, scope)` returns `CashFlowType` for every `CanonicalAction` × `{portfolio, account, position}` scope. Mapping table per design spec §3.2. Tests cover **every** `CanonicalAction` enum value at all three scopes (no silent default; unknown actions raise `ClassifyError`). Reinvest tests explicitly verify the portfolio-vs-position asymmetry (reinvest is `internal` at portfolio/account, `external_in` at position scope for that symbol).
+- Non-Goals: backfilling the column (T3 covers); UI surfacing of classifications.
+
+## REQ-PERF-003: Idempotent backfill of `cash_flow_type` on existing rows
+- Acceptance: `scripts/backfill_cash_flow_type.py` walks every `BrokerageTransaction`, calls `classify(tx, portfolio_scope)`, sets `cash_flow_type`. `--dry-run` is the default; `--apply` to write. Reports per-`CanonicalAction` counts and unchanged-vs-changed rows. Re-running with `--apply` is a no-op (idempotent). Per-row error isolation (one bad row never halts the batch).
+- Non-Goals: backfilling for account/position scopes (computed on read where needed).
+
+## REQ-PERF-004: Auto-pair candidate generator (review queue, NOT silent commit)
+- Acceptance: `scripts/auto_pair_transfers.py` finds candidate pairs across `TRANSFER`/`JOURNAL`/`EXCHANGE` rows where `(abs(amount_a) − abs(amount_b)) ≤ $0.01` AND `abs(date_a − date_b) ≤ 5 business days` AND `sign(amount_a) ≠ sign(amount_b)` AND `account_a.id ≠ account_b.id`. Does NOT set `paired_transaction_id` directly. Writes/refreshes a `transfer_pair_candidate` rowset (or returns JSON for UI consumption) with a confidence score (1.0 when only one match exists, lower when multiple candidates). Rejected pairs are remembered so subsequent runs don't re-surface them.
+- Non-Goals: silent automatic pairing; cross-broker reconciliation against bank statements.
+
+## REQ-PERF-005: Principal/growth series — outside-money view
+- Acceptance: `src/analytics/performance.py::principal_growth_series(session, scope, start, end, view='outside_money')` returns `list[DailyPoint]` where each `DailyPoint = (date, market_value, principal, growth)`. `principal(t)` = cumulative net `external_in − external_out` up to `t` for the scope. `growth(t) = market_value(t) − principal(t)`. Reinvested distributions do NOT add to principal at portfolio/account scope; they DO add to principal at position scope for that symbol (documented asymmetry). End-of-day convention for window-edge flows.
+- Non-Goals: linear interpolation; daily DB caching (deferred — see PLAN §F deferred list).
+
+## REQ-PERF-006: Principal/growth series — cost-basis view
+- Acceptance: same function, `view='cost_basis'`. `principal(t)` = sum of `cost_basis_total` across open `CostBasisLot` rows at time `t` for the scope. `growth(t) = market_value(t) − principal(t)` = unrealized gain. Reinvested lots DO add to principal (each reinvest creates a lot). Both views agree on `market_value(t)` for the same scope/date.
+- Non-Goals: tax-lot-level realized G/L breakdown (already covered by `realized-gl` endpoint).
+
+## REQ-PERF-007: Time-Weighted Return (Modified Dietz monthly)
+- Acceptance: `time_weighted_return(daily_values, cash_flows, period)` chain-links monthly Modified-Dietz sub-period returns. Annualizes per `(1 + TWR)^(365 / days) − 1` only when `days >= 30`. Returns Decimal with 6 fractional digits. Edge cases tested: empty position (sold all shares mid-window), single-deposit-no-time (returns Decimal("0")), negative TWR (lost money). Matches a hand-computed reference fixture to 4 decimals.
+- Non-Goals: daily-precision TWR (deferred); benchmark TWR computation (T9 covers separately).
+
+## REQ-PERF-008: Money-Weighted Return (XIRR via Brent's method)
+- Acceptance: `money_weighted_return(cash_flows, terminal_value, terminal_date)` solves XIRR using Brent's method (pure-Python implementation — no scipy dependency added) on bracket `[-0.99, 10.0]`, with bisection fallback. Returns `Decimal | None`. Returns `None` (not raise) on no-convergence, on single-deposit-no-time, and on identical-date all-flows. Matches Excel `XIRR` for a seeded 12-month fixture to 4 decimals. Negative-XIRR test (lost money) returns negative Decimal.
+- Non-Goals: alternative solvers; multi-currency XIRR.
+
+## REQ-PERF-009: Tracked-coverage helper + "Tracked %"
+- Acceptance: `tracked_value_at(session, date) → (tracked_value, total_value, tracked_account_ids)` where `tracked_value` is the sum of market_value across accounts whose `cash_flow_type` ledger has at least one non-`none` row in the past 365 days (proxy for "we have transaction-level detail"). `total_value` includes balance-only sources. `tracked_pct = tracked_value / total_value`. UI shows "Tracked: $X.XM of $Y.YM (NN%)" + footnote with `min(first_tx_date for tracked accounts)`.
+- Non-Goals: changing which accounts feed the dollar net-worth chart (balance-only still included there).
+
+## REQ-PERF-010: `GET /api/brokerage/performance/holding/{symbol}` endpoint
+- Acceptance: returns spec §5.1 shape `{symbol, view, series, summary}`. Query params: `start_date`, `end_date`, `account_ids[]` (optional filter), `view` (default `outside_money`). `summary` includes `twr`, `twr_annualized`, `xirr`, `benchmark_twr` (SPY over same window), `current_value`, `total_principal`, `total_growth`. 404 if symbol has no positions in any account.
+- Non-Goals: streaming responses; pagination of series.
+
+## REQ-PERF-011: `GET /api/brokerage/performance/account/{account_id}` endpoint
+- Acceptance: same JSON shape as REQ-PERF-010, scoped to one account_id (aggregated across all positions). 404 on unknown account. Honors `view`, `start_date`, `end_date`.
+- Non-Goals: per-account benchmark choice (SPY only for v1).
+
+## REQ-PERF-012: `GET /api/brokerage/performance/portfolio` endpoint
+- Acceptance: same JSON shape aggregated across all accounts. Honors `account_ids[]` tag-filter (existing tag mechanism). `summary` ADDITIONALLY includes `tracked_value`, `total_value`, `tracked_pct`, `tracked_begin_date` (REQ-PERF-009 output).
+- Non-Goals: caching; streaming.
+
+## REQ-PERF-013: `GET /api/brokerage/performance/periods` endpoint
+- Acceptance: returns `{rows: [{period, twr, mwr, spy, qqq}]}` for periods `1M`, `YTD`, `1Y`, `3Y`, `5Y`, `10Y`, `ITD`. Query params: `scope` ∈ `{portfolio, account, holding}`, `id` (account_id or symbol when scope ≠ portfolio). Periods that exceed the tracked-history window for the scope are **omitted** (not zeroed). SPY/QQQ from `historical_price` (REQ-WC-013 source) over the same window.
+- Non-Goals: custom periods; benchmark choice.
+
+## REQ-PERF-014: `POST /api/brokerage/transactions/{id}/pair` endpoint
+- Acceptance: body `{"paired_transaction_id": "...", "action": "confirm"|"reject"}`. On `confirm`: sets `paired_transaction_id` on both sides, recomputes `cash_flow_type` for both (becomes `internal`). On `reject`: clears `paired_transaction_id` if set, marks the pair as rejected so it doesn't re-surface in the review queue. Idempotent; returns updated transaction rows. Audit event created for both legs.
+- Non-Goals: bulk-confirm UI; cross-account-class pairing (only same-user accounts).
+
+## REQ-PERF-015: `GET /api/brokerage/performance/unpaired-transfers` review-queue feed
+- Acceptance: returns list of candidate transfer pairs from `transfer_pair_candidate` rowset (REQ-PERF-004 output). Each entry includes both transactions' full JSON, confidence score, and the reason it's a candidate (date/amount/sign match). Excludes pairs the user has rejected. Ordered by confidence desc.
+- Non-Goals: surfacing already-confirmed pairs.
+
+## REQ-PERF-016: `/wealth` page — replace SPY/QQQ overlay + KPI row + period table
+- Acceptance: the current dual-axis `Net worth $` vs `SPY/QQQ %` overlay is replaced. When SPY/QQQ overlay toggles are on, the net-worth line is **rebased** to its TWR-indexed cumulative-return percentage on the same % axis as SPY/QQQ (no more dual-axis incoherence). A KPI row above the chart shows `TWR · MWR · SPY · QQQ · Tracked %` for the **currently-selected time range**. A period table below the chart shows rows for `1M / YTD / 1Y / 3Y / 5Y / 10Y / ITD` × columns `TWR / MWR / SPY / QQQ`. Footnote shows `Tracked portfolio TWR begins YYYY-MM`.
+- Non-Goals: chart library change; mobile-specific layout (uses existing responsive container).
+
+## REQ-PERF-017: `/wealth/accounts/[id]` page — KPI row + period table (account scope)
+- Acceptance: same `PerformanceKpis` + `PeriodTable` components reused on the account-detail page, scoped to that account. Hits REQ-PERF-011 + REQ-PERF-013 (scope=account).
+- Non-Goals: per-account principal/growth chart (covered by holding page; account page keeps existing layout otherwise).
+
+## REQ-PERF-018: `/wealth/holdings/[symbol]` page — stacked-area decomposition + stat strip + view toggle
+- Acceptance: new stacked-area chart (principal bottom, growth top) using REQ-PERF-005/006 series. Stat strip above chart shows `TWR · XIRR · SPY TWR` over the selected window. Segmented control at chart corner toggles between `outside_money` (default) and `cost_basis` views; selection persists in localStorage. Hover tooltip shows all three numbers (market value, principal, growth).
+- Non-Goals: per-lot drill-down; downloadable chart.
+
+## REQ-PERF-019: Data-integrity page — transfer-pair review queue UI
+- Acceptance: existing data-integrity page gets a new "Transfer pairs to review (N)" section. Renders the REQ-PERF-015 feed in a table with both legs visible (date, account, amount, action) + confidence. Per-row Confirm and Reject buttons hit REQ-PERF-014. List refreshes after each action; counter in section header decrements.
+- Non-Goals: bulk-confirm; keyboard shortcuts (deferred).
+
+## REQ-PERF-020: Cloudflare wealth API port — performance endpoints + transfer-pair endpoints
+- Acceptance: the four GET endpoints (REQ-PERF-010..013) and two transfer-pair endpoints (REQ-PERF-014, REQ-PERF-015) are mirrored in the Cloudflare Workers backend at `internal.sparkry.ai/api/wealth/performance/*`. Same JSON shapes; D1-backed. CF-side classification implemented to match Python `classify()`; both have a shared golden-fixture test (same input → same output).
+- Non-Goals: porting the auto-pair script (CF can read the local-DB-produced candidates via the API/D1 sync the wealth-migration runbook describes; not a separate CF script).
+
+## REQ-PERF-021: Cloudflare wealth UI port — performance components on `internal.sparkry.ai/wealth/*`
+- Acceptance: `PerformanceKpis`, `PeriodTable`, `PrincipalGrowthChart` components ported to the Cloudflare Pages frontend. Wired into `/wealth`, `/wealth/accounts/[id]`, `/wealth/holdings/[symbol]`, and the data-integrity page on the CF deployment. Smoke tests pass for both local production (Tailscale) AND CF production.
+- Non-Goals: design changes from the local dashboard.

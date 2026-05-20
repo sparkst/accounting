@@ -23,14 +23,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.analytics.classify import AccountScope, PortfolioScope, PositionScope, Scope
+from src.analytics.performance import (
+    CashFlow,
+    money_weighted_return,
+    principal_growth_series,
+    time_weighted_return,
+    tracked_value_at,
+)
 from src.db.connection import SessionLocal
+from src.models.audit_event import (
+    ENTITY_TYPE_BROKERAGE_TRANSACTION,
+    AuditEvent,
+)
 from src.models.brokerage import (
     Account,
     BrokerageTransaction,
     PositionSnapshot,
     RealizedGainLoss,
 )
-from src.models.enums import GainLossTerm
+from src.models.enums import CashFlowType, GainLossTerm
 from src.models.history import (
     AccountBalanceSnapshot,
     AccountTag,
@@ -1581,3 +1593,725 @@ def holding_history(
         "value_series": value_series,
         "lots": lots,
     }
+
+
+# ── REQ-PERF-010..015: Performance API ─────────────────────────────────
+
+
+PerfView = Literal["outside_money", "cost_basis"]
+
+
+class DailyPointOut(BaseModel):
+    """One day of the principal/growth decomposition. Decimal-as-string."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    date: date
+    market_value: Decimal
+    principal: Decimal
+    growth: Decimal
+
+    @field_serializer("market_value", "principal", "growth")
+    def _ser(self, v: Decimal) -> str:
+        return str(v)
+
+
+class PerformanceSummary(BaseModel):
+    """Top-line metrics returned by holding/account/portfolio endpoints."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    twr: Decimal
+    twr_annualized: Decimal
+    xirr: Decimal | None
+    benchmark_twr: Decimal | None
+    current_value: Decimal
+    total_principal: Decimal
+    total_growth: Decimal
+    # Portfolio-only tracked-coverage fields (None elsewhere)
+    tracked_value: Decimal | None = None
+    total_value: Decimal | None = None
+    tracked_pct: Decimal | None = None
+    tracked_begin_date: date | None = None
+
+    @field_serializer(
+        "twr",
+        "twr_annualized",
+        "xirr",
+        "benchmark_twr",
+        "current_value",
+        "total_principal",
+        "total_growth",
+        "tracked_value",
+        "total_value",
+        "tracked_pct",
+    )
+    def _ser(self, v: Decimal | None) -> str | None:
+        return str(v) if v is not None else None
+
+
+class PerformanceResponse(BaseModel):
+    """Shape returned by /performance/holding, /account, /portfolio."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    symbol: str | None = None
+    account_id: str | None = None
+    view: PerfView
+    series: list[DailyPointOut]
+    summary: PerformanceSummary
+
+
+class PeriodRow(BaseModel):
+    """One row of the periods grid."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    period: str
+    twr: Decimal
+    mwr: Decimal | None
+    spy: Decimal | None
+    qqq: Decimal | None
+
+    @field_serializer("twr", "mwr", "spy", "qqq")
+    def _ser(self, v: Decimal | None) -> str | None:
+        return str(v) if v is not None else None
+
+
+class PeriodsResponse(BaseModel):
+    rows: list[PeriodRow]
+
+
+class BrokerageTransactionOut(BaseModel):
+    """Pydantic projection of a ``BrokerageTransaction`` row."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    id: str
+    account_id: str
+    trade_date: date
+    action: str
+    canonical_action: str
+    symbol: str | None = None
+    description: str | None = None
+    quantity: Decimal | None = None
+    amount: Decimal | None = None
+    paired_transaction_id: str | None = None
+    cash_flow_type: str
+
+    @field_serializer("quantity", "amount")
+    def _ser(self, v: Decimal | None) -> str | None:
+        return str(v) if v is not None else None
+
+    @classmethod
+    def from_orm_row(cls, tx: BrokerageTransaction) -> BrokerageTransactionOut:
+        return cls(
+            id=tx.id,
+            account_id=tx.account_id,
+            trade_date=tx.trade_date,
+            action=tx.action,
+            canonical_action=tx.canonical_action,
+            symbol=tx.symbol,
+            description=tx.description,
+            quantity=Decimal(str(tx.quantity)) if tx.quantity is not None else None,
+            amount=Decimal(str(tx.amount)) if tx.amount is not None else None,
+            paired_transaction_id=tx.paired_transaction_id,
+            cash_flow_type=tx.cash_flow_type,
+        )
+
+
+class PairActionRequest(BaseModel):
+    """Body for POST /transactions/{id}/pair."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paired_transaction_id: str | None = None
+    action: Literal["confirm", "reject"]
+
+
+class PairConfirmResponse(BaseModel):
+    tx_a: BrokerageTransactionOut
+    tx_b: BrokerageTransactionOut
+
+
+class PairRejectResponse(BaseModel):
+    rejected: bool
+
+
+class UnpairedCandidateRow(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    tx_a: BrokerageTransactionOut
+    tx_b: BrokerageTransactionOut
+    confidence: float
+    reason: str
+
+
+class UnpairedTransfersResponse(BaseModel):
+    candidates: list[UnpairedCandidateRow]
+
+
+# ── Helpers ────────────────────────────────────────────────────────────
+
+
+def _month_period_starts(start: date, end: date) -> list[date]:
+    """Return month-aligned period start dates for chain-linked TWR.
+
+    Always includes ``start``. Subsequent entries are the first-of-month after
+    ``start`` up through ``end``. ``time_weighted_return`` defines period i as
+    ``[starts[i], starts[i+1] - 1]`` so this yields monthly periods.
+    """
+    starts: list[date] = [start]
+    if start.month == 12:
+        cursor = date(start.year + 1, 1, 1)
+    else:
+        cursor = date(start.year, start.month + 1, 1)
+    while cursor <= end:
+        starts.append(cursor)
+        if cursor.month == 12:
+            cursor = date(cursor.year + 1, 1, 1)
+        else:
+            cursor = date(cursor.year, cursor.month + 1, 1)
+    return starts
+
+
+def _build_external_cash_flows(
+    txs: list[BrokerageTransaction],
+    scope: Scope,
+    start: date,
+    end: date,
+) -> list[CashFlow]:
+    """Build XIRR cash flows from external_* txs within [start, end].
+
+    Sign convention (per CashFlow docstring): negative = investor paid in
+    (i.e., money flowed INTO the portfolio — brokerage amount positive →
+    XIRR amount negated). Positive = investor received.
+    """
+    flows: list[CashFlow] = []
+    from src.analytics.classify import classify  # local import to avoid cycle
+
+    for tx in txs:
+        if tx.amount is None:
+            continue
+        if not (start <= tx.trade_date <= end):
+            continue
+        try:
+            cft = classify(tx, scope)
+        except Exception:  # noqa: BLE001 - skip unclassifiable rows
+            continue
+        if cft not in (CashFlowType.EXTERNAL_IN, CashFlowType.EXTERNAL_OUT):
+            continue
+        amt = Decimal(str(tx.amount))
+        # Brokerage amount sign: positive = cash entering portfolio (deposit).
+        # XIRR convention: deposits are negative cash flows from the investor.
+        flows.append(CashFlow(date=tx.trade_date, amount=-amt))
+    return flows
+
+
+def _benchmark_twr(
+    session: Session, symbol: str, start: date, end: date
+) -> Decimal | None:
+    """Return total return for ``symbol`` from start_close to end_close.
+
+    Uses the latest ``HistoricalPrice`` at or before each endpoint. Returns
+    ``None`` if either endpoint lacks a price. Annualizes for windows ≥ 30
+    days (same convention as ``time_weighted_return``).
+    """
+    start_row = (
+        session.query(HistoricalPrice)
+        .filter(
+            HistoricalPrice.symbol == symbol,
+            HistoricalPrice.trade_date <= start,
+        )
+        .order_by(HistoricalPrice.trade_date.desc())
+        .first()
+    )
+    end_row = (
+        session.query(HistoricalPrice)
+        .filter(
+            HistoricalPrice.symbol == symbol,
+            HistoricalPrice.trade_date <= end,
+        )
+        .order_by(HistoricalPrice.trade_date.desc())
+        .first()
+    )
+    if start_row is None or end_row is None:
+        return None
+    if Decimal(str(start_row.close)) == Decimal("0"):
+        return None
+    raw = (Decimal(str(end_row.close)) - Decimal(str(start_row.close))) / Decimal(
+        str(start_row.close)
+    )
+    window_days = (end - start).days
+    if window_days >= 30 and window_days > 0:
+        raw_f = float(raw)
+        ann = Decimal(str((1.0 + raw_f) ** (365.0 / window_days) - 1.0))
+        return ann.quantize(Decimal("0.000001"))
+    return raw.quantize(Decimal("0.000001"))
+
+
+def _scope_summary(
+    session: Session,
+    scope: Scope,
+    txs: list[BrokerageTransaction],
+    series: list[Any],
+    start: date,
+    end: date,
+) -> dict[str, Any]:
+    """Compute TWR / XIRR / benchmark / current_value / principal / growth."""
+    if series:
+        current_value = series[-1].market_value
+        total_principal = series[-1].principal
+        total_growth = series[-1].growth
+    else:
+        current_value = Decimal("0")
+        total_principal = Decimal("0")
+        total_growth = Decimal("0")
+
+    period_starts = _month_period_starts(start, end)
+    twr = time_weighted_return(series, [], period_starts) if series else Decimal("0.000000")
+
+    cash_flows = _build_external_cash_flows(txs, scope, start, end)
+    # Terminal value at XIRR convention: positive = investor receives.
+    # Current market value at end_date is a positive terminal inflow.
+    mwr = (
+        money_weighted_return(cash_flows, current_value, end) if cash_flows else None
+    )
+
+    benchmark = _benchmark_twr(session, "SPY", start, end)
+
+    return {
+        "twr": twr,
+        "twr_annualized": twr,
+        "xirr": mwr,
+        "benchmark_twr": benchmark,
+        "current_value": current_value,
+        "total_principal": total_principal,
+        "total_growth": total_growth,
+    }
+
+
+def _series_to_out(series: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "date": dp.date,
+            "market_value": dp.market_value,
+            "principal": dp.principal,
+            "growth": dp.growth,
+        }
+        for dp in series
+    ]
+
+
+# ── REQ-PERF-010: Per-holding ───────────────────────────────────────────
+
+
+@router.get(
+    "/brokerage/performance/holding/{symbol}",
+    response_model=PerformanceResponse,
+)
+def performance_holding(
+    symbol: str = Path(min_length=1, max_length=16, pattern=r"^[A-Za-z0-9.\-]+$"),
+    start_date: date | None = Query(None),  # noqa: B008
+    end_date: date | None = Query(None),  # noqa: B008
+    account_ids: list[str] | None = Query(None),  # noqa: B008
+    view: PerfView = Query("outside_money"),  # noqa: B008
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-PERF-010: per-holding principal/growth + summary."""
+    sym = symbol.upper()
+    # 404 if no positions for this symbol anywhere
+    has_position = (
+        session.query(PositionSnapshot)
+        .filter(func.upper(PositionSnapshot.symbol) == sym)
+        .first()
+    )
+    if has_position is None:
+        raise HTTPException(status_code=404, detail=f"Unknown symbol {sym!r}")
+
+    end = end_date or _today()
+    start = start_date or (end - timedelta(days=365))
+
+    # account_ids filter: when present, restrict to PositionScope per account
+    # and union; simpler path (and matches spec) is to use a single scope.
+    # For now we honour the (single) symbol scope and intersect series with
+    # account_ids by filtering the seeded txs/snapshots at scope level.
+    if account_ids and len(account_ids) == 1:
+        scope: Scope = PositionScope(symbol=sym, account_id=account_ids[0])
+    else:
+        scope = PositionScope(symbol=sym)
+
+    series = principal_growth_series(session, scope, start, end, view=view)
+
+    # Load txs for scope to compute XIRR. Filter by account_ids if multi.
+    from src.analytics.performance import (  # noqa: PLC0415
+        _load_transactions_for_scope,
+    )
+
+    txs = _load_transactions_for_scope(session, scope)
+    if account_ids and len(account_ids) > 1:
+        ids = set(account_ids)
+        txs = [t for t in txs if t.account_id in ids]
+
+    summary = _scope_summary(session, scope, txs, series, start, end)
+
+    return {
+        "symbol": sym,
+        "view": view,
+        "series": _series_to_out(series),
+        "summary": summary,
+    }
+
+
+# ── REQ-PERF-011: Per-account ───────────────────────────────────────────
+
+
+@router.get(
+    "/brokerage/performance/account/{account_id}",
+    response_model=PerformanceResponse,
+)
+def performance_account(
+    account_id: str = Path(min_length=1, max_length=64),
+    start_date: date | None = Query(None),  # noqa: B008
+    end_date: date | None = Query(None),  # noqa: B008
+    view: PerfView = Query("outside_money"),  # noqa: B008
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-PERF-011: per-account principal/growth + summary."""
+    acct = session.query(Account).filter(Account.id == account_id).first()
+    if acct is None:
+        raise HTTPException(status_code=404, detail=f"Unknown account {account_id!r}")
+
+    end = end_date or _today()
+    start = start_date or (end - timedelta(days=365))
+    scope: Scope = AccountScope(account_id=account_id)
+
+    series = principal_growth_series(session, scope, start, end, view=view)
+    from src.analytics.performance import _load_transactions_for_scope  # noqa: PLC0415
+
+    txs = _load_transactions_for_scope(session, scope)
+    summary = _scope_summary(session, scope, txs, series, start, end)
+
+    return {
+        "account_id": account_id,
+        "view": view,
+        "series": _series_to_out(series),
+        "summary": summary,
+    }
+
+
+# ── REQ-PERF-012: Portfolio ─────────────────────────────────────────────
+
+
+@router.get(
+    "/brokerage/performance/portfolio",
+    response_model=PerformanceResponse,
+)
+def performance_portfolio(
+    start_date: date | None = Query(None),  # noqa: B008
+    end_date: date | None = Query(None),  # noqa: B008
+    view: PerfView = Query("outside_money"),  # noqa: B008
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-PERF-012: portfolio-wide principal/growth + tracked coverage."""
+    end = end_date or _today()
+    start = start_date or (end - timedelta(days=365))
+    scope: Scope = PortfolioScope()
+
+    series = principal_growth_series(session, scope, start, end, view=view)
+    from src.analytics.performance import _load_transactions_for_scope  # noqa: PLC0415
+
+    txs = _load_transactions_for_scope(session, scope)
+    summary = _scope_summary(session, scope, txs, series, start, end)
+
+    coverage = tracked_value_at(session, end)
+    summary["tracked_value"] = coverage.tracked_value
+    summary["total_value"] = coverage.total_value
+    if coverage.total_value > Decimal("0"):
+        summary["tracked_pct"] = (
+            coverage.tracked_value / coverage.total_value
+        ).quantize(Decimal("0.000001"))
+    else:
+        summary["tracked_pct"] = Decimal("0.000000")
+    summary["tracked_begin_date"] = coverage.tracked_begin_date
+
+    return {
+        "view": view,
+        "series": _series_to_out(series),
+        "summary": summary,
+    }
+
+
+# ── REQ-PERF-013: Periods grid ──────────────────────────────────────────
+
+
+_PERIODS: tuple[tuple[str, int | None], ...] = (
+    ("1M", 30),
+    ("YTD", None),  # special-cased
+    ("1Y", 365),
+    ("3Y", 3 * 365),
+    ("5Y", 5 * 365),
+    ("10Y", 10 * 365),
+    ("ITD", None),  # special-cased
+)
+
+
+def _scope_window(
+    session: Session, scope: Scope
+) -> tuple[date | None, date | None]:
+    """Return (earliest_tx_date, latest_tx_date) for ``scope``, or (None, None).
+
+    For PortfolioScope the earliest date is ``tracked_begin_date`` (when
+    available) per spec; otherwise we use the earliest classified transaction.
+    """
+    from src.analytics.performance import _load_transactions_for_scope  # noqa: PLC0415
+
+    txs = _load_transactions_for_scope(session, scope)
+    if not txs:
+        return (None, None)
+    dates = [t.trade_date for t in txs]
+    return (min(dates), max(dates))
+
+
+@router.get("/brokerage/performance/periods", response_model=PeriodsResponse)
+def performance_periods(
+    scope: Literal["portfolio", "account", "holding"] = Query(...),  # noqa: B008
+    id: str | None = Query(None),  # noqa: B008
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-PERF-013: standard-period TWR/MWR/SPY/QQQ grid."""
+    if scope == "account":
+        if not id:
+            raise HTTPException(
+                status_code=422, detail="`id` (account_id) required for scope=account"
+            )
+        if session.query(Account).filter(Account.id == id).first() is None:
+            raise HTTPException(status_code=404, detail=f"Unknown account {id!r}")
+        s_scope: Scope = AccountScope(account_id=id)
+    elif scope == "holding":
+        if not id:
+            raise HTTPException(
+                status_code=422, detail="`id` (symbol) required for scope=holding"
+            )
+        sym = id.upper()
+        has_pos = (
+            session.query(PositionSnapshot)
+            .filter(func.upper(PositionSnapshot.symbol) == sym)
+            .first()
+        )
+        if has_pos is None:
+            raise HTTPException(status_code=404, detail=f"Unknown symbol {sym!r}")
+        s_scope = PositionScope(symbol=sym)
+    else:
+        s_scope = PortfolioScope()
+
+    end = _today()
+    earliest_data, _latest = _scope_window(session, s_scope)
+    # Portfolio override: use tracked_begin_date when populated.
+    if isinstance(s_scope, PortfolioScope):
+        cov = tracked_value_at(session, end)
+        if cov.tracked_begin_date is not None:
+            earliest_data = cov.tracked_begin_date
+
+    rows: list[dict[str, Any]] = []
+    for label, days in _PERIODS:
+        if label == "YTD":
+            p_start = date(end.year, 1, 1)
+        elif label == "ITD":
+            if earliest_data is None:
+                continue
+            p_start = earliest_data
+        else:
+            assert days is not None
+            p_start = end - timedelta(days=days)
+
+        # Omit periods whose start predates available data
+        if earliest_data is not None and p_start < earliest_data and label != "ITD":
+            continue
+
+        series = principal_growth_series(session, s_scope, p_start, end)
+        if not series:
+            continue
+        period_starts = _month_period_starts(p_start, end)
+        twr = time_weighted_return(series, [], period_starts)
+
+        from src.analytics.performance import (  # noqa: PLC0415
+            _load_transactions_for_scope,
+        )
+
+        txs = _load_transactions_for_scope(session, s_scope)
+        cash_flows = _build_external_cash_flows(txs, s_scope, p_start, end)
+        terminal = series[-1].market_value if series else Decimal("0")
+        mwr = (
+            money_weighted_return(cash_flows, terminal, end)
+            if cash_flows
+            else None
+        )
+
+        spy = _benchmark_twr(session, "SPY", p_start, end)
+        qqq = _benchmark_twr(session, "QQQ", p_start, end)
+
+        rows.append(
+            {
+                "period": label,
+                "twr": twr,
+                "mwr": mwr,
+                "spy": spy,
+                "qqq": qqq,
+            }
+        )
+
+    return {"rows": rows}
+
+
+# ── REQ-PERF-014: Pair confirm/reject ───────────────────────────────────
+
+
+@router.post(
+    "/brokerage/transactions/{tx_id}/pair",
+    response_model=PairConfirmResponse | PairRejectResponse,
+)
+def pair_action(
+    tx_id: str,
+    body: PairActionRequest,
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-PERF-014: confirm or reject a transfer-pair candidate."""
+    tx_a = (
+        session.query(BrokerageTransaction)
+        .filter(BrokerageTransaction.id == tx_id)
+        .first()
+    )
+    if tx_a is None:
+        raise HTTPException(status_code=404, detail=f"Unknown transaction {tx_id!r}")
+
+    if body.paired_transaction_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="paired_transaction_id is required for both confirm and reject",
+        )
+
+    tx_b = (
+        session.query(BrokerageTransaction)
+        .filter(BrokerageTransaction.id == body.paired_transaction_id)
+        .first()
+    )
+    if tx_b is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown paired transaction {body.paired_transaction_id!r}",
+        )
+
+    if body.action == "reject":
+        from scripts.auto_pair_transfers import (  # noqa: PLC0415
+            reject_pair,
+        )
+
+        reject_pair(session, tx_a.id, tx_b.id)
+        return {"rejected": True}
+
+    # confirm path — idempotent
+    already = (
+        tx_a.paired_transaction_id == tx_b.id
+        and tx_b.paired_transaction_id == tx_a.id
+        and tx_a.cash_flow_type == CashFlowType.INTERNAL.value
+        and tx_b.cash_flow_type == CashFlowType.INTERNAL.value
+    )
+    if already:
+        return {
+            "tx_a": BrokerageTransactionOut.from_orm_row(tx_a).model_dump(),
+            "tx_b": BrokerageTransactionOut.from_orm_row(tx_b).model_dump(),
+        }
+
+    old_a_paired = tx_a.paired_transaction_id
+    old_b_paired = tx_b.paired_transaction_id
+
+    tx_a.paired_transaction_id = tx_b.id
+    tx_b.paired_transaction_id = tx_a.id
+    tx_a.cash_flow_type = CashFlowType.INTERNAL.value
+    tx_b.cash_flow_type = CashFlowType.INTERNAL.value
+
+    session.add(
+        AuditEvent(
+            entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
+            entity_id=tx_a.id,
+            field_changed="paired_transaction_id",
+            old_value=old_a_paired,
+            new_value=tx_b.id,
+            changed_by="human:pair_confirm",
+        )
+    )
+    session.add(
+        AuditEvent(
+            entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
+            entity_id=tx_b.id,
+            field_changed="paired_transaction_id",
+            old_value=old_b_paired,
+            new_value=tx_a.id,
+            changed_by="human:pair_confirm",
+        )
+    )
+    session.commit()
+
+    return {
+        "tx_a": BrokerageTransactionOut.from_orm_row(tx_a).model_dump(),
+        "tx_b": BrokerageTransactionOut.from_orm_row(tx_b).model_dump(),
+    }
+
+
+# ── REQ-PERF-015: Unpaired transfer candidates ──────────────────────────
+
+
+def _candidate_reason(
+    amount_a: Decimal, amount_b: Decimal, date_a: date, date_b: date
+) -> str:
+    """Build human-readable explanation for a candidate pair."""
+    from scripts.auto_pair_transfers import _business_days_between  # noqa: PLC0415
+
+    diff = abs(abs(amount_a) - abs(amount_b))
+    bdays = _business_days_between(date_a, date_b)
+    return (
+        f"amount match within ${diff} ({amount_a} / {amount_b}), "
+        f"{bdays} business day{'' if bdays == 1 else 's'} apart"
+    )
+
+
+@router.get(
+    "/brokerage/performance/unpaired-transfers",
+    response_model=UnpairedTransfersResponse,
+)
+def unpaired_transfers(
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-PERF-015: list candidate transfer pairs awaiting human review."""
+    from scripts.auto_pair_transfers import find_candidates  # noqa: PLC0415
+
+    candidates = find_candidates(session)
+
+    rows: list[dict[str, Any]] = []
+    # Hydrate tx rows in batch
+    all_ids = {c.tx_a_id for c in candidates} | {c.tx_b_id for c in candidates}
+    if not all_ids:
+        return {"candidates": []}
+    by_id: dict[str, BrokerageTransaction] = {
+        tx.id: tx
+        for tx in session.query(BrokerageTransaction)
+        .filter(BrokerageTransaction.id.in_(list(all_ids)))
+        .all()
+    }
+    for c in candidates:
+        tx_a = by_id.get(c.tx_a_id)
+        tx_b = by_id.get(c.tx_b_id)
+        if tx_a is None or tx_b is None:
+            continue
+        rows.append(
+            {
+                "tx_a": BrokerageTransactionOut.from_orm_row(tx_a).model_dump(),
+                "tx_b": BrokerageTransactionOut.from_orm_row(tx_b).model_dump(),
+                "confidence": c.confidence,
+                "reason": _candidate_reason(
+                    c.amount_a, c.amount_b, c.date_a, c.date_b
+                ),
+            }
+        )
+    return {"candidates": rows}

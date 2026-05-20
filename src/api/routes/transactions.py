@@ -882,7 +882,7 @@ def patch_transaction(
 
         # ── Collect changes ───────────────────────────────────────────────────
         changes: dict[str, tuple[Any, Any]] = {}
-        patch_data = body.model_dump(exclude_none=True)
+        patch_data = body.model_dump(exclude_unset=True)
 
         for field_name in _PATCHABLE_FIELDS:
             if field_name not in patch_data:

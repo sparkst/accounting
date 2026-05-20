@@ -44,7 +44,7 @@ def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-PLAID_ITEM_STATUSES = ("active", "disconnected")
+PLAID_ITEM_STATUSES = ("active", "disconnected", "pending_oauth", "abandoned")
 PLAID_SYNC_STATUSES = ("ok", "error", "pending", "institution_down")
 PLAID_ACCOUNT_TYPES = (
     "depository",

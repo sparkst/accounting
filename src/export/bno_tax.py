@@ -100,8 +100,20 @@ def build_sparkry_bno_csv(
     """Build monthly B&O report CSV for Sparkry AI LLC.
 
     Columns: period, bo_classification, gross_revenue, tax_rate, estimated_bo_tax
-    12 data rows (one per month) + a totals row.
+    One row per classification per month + a totals row.
+
+    Raises:
+        HTTPException(422): When no transactions are provided.
     """
+    if len(transactions) == 0:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=422,
+            detail=f"NO TRANSACTIONS FOUND for Sparkry in {year}. "
+            "Cannot generate B&O report from empty data.",
+        )
+
     monthly = _aggregate_income_by_month(transactions, year)
 
     output = io.StringIO()
@@ -120,31 +132,36 @@ def build_sparkry_bno_csv(
     grand_revenue = Decimal("0")
     grand_tax = Decimal("0")
 
+    # Collect all classification codes across all months
+    all_codes: set[str] = set()
+    for m_data in monthly.values():
+        all_codes.update(m_data.keys())
+    # If no income at all, still emit 12 empty month rows
+    if not all_codes:
+        all_codes = {"ServiceOther"}
+
     for month_idx, name in enumerate(MONTH_NAMES, start=1):
         month_data = monthly[month_idx]
-        month_revenue = sum(month_data.values(), Decimal("0"))
-        # Use ServiceOther as primary classification for Sparkry (consulting/SaaS)
-        bo_code = "ServiceOther"
-        if month_data:
-            # Use the code with the highest revenue this month
-            bo_code = max(month_data, key=lambda k: month_data[k])
-        rate = BO_RATE.get(bo_code, Decimal("0.015"))
-        tax = month_revenue * rate
-
-        writer.writerow(
-            [
-                f"{year}-{month_idx:02d} ({name})",
-                BO_CLASSIFICATION.get(bo_code, (bo_code, bo_code))[1]
-                if bo_code in {c for c, _ in BO_CLASSIFICATION.values()}
-                else "Service and Other Activities",
-                bo_code,
-                f"{month_revenue:.2f}",
-                f"{rate * 100:.3f}%",
-                f"{tax:.2f}",
-            ]
-        )
-        grand_revenue += month_revenue
-        grand_tax += month_revenue * rate
+        for bo_code in sorted(all_codes):
+            amt = month_data.get(bo_code, Decimal("0"))
+            rate = BO_RATE.get(bo_code, Decimal("0.015"))
+            tax = amt * rate
+            _, classification_label = next(
+                (v for k, v in BO_CLASSIFICATION.items() if v[0] == bo_code),
+                (bo_code, bo_code),
+            )
+            writer.writerow(
+                [
+                    f"{year}-{month_idx:02d} ({name})",
+                    classification_label,
+                    bo_code,
+                    f"{amt:.2f}",
+                    f"{rate * 100:.3f}%",
+                    f"{tax:.2f}",
+                ]
+            )
+            grand_revenue += amt
+            grand_tax += tax
 
     writer.writerow(
         [
@@ -171,7 +188,19 @@ def build_blackline_bno_csv(
 
     BlackLine has mixed income (product sales = Retailing; events = ServiceOther).
     Separate B&O lines are written per classification code within each quarter.
+
+    Raises:
+        HTTPException(422): When no transactions are provided.
     """
+    if len(transactions) == 0:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=422,
+            detail=f"NO TRANSACTIONS FOUND for BlackLine in {year}. "
+            "Cannot generate B&O report from empty data.",
+        )
+
     monthly = _aggregate_income_by_month(transactions, year)
 
     # Roll up to quarters: {quarter: {bo_code: total}}

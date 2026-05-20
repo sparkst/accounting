@@ -66,7 +66,7 @@ IRS_LINE_MAPPING: dict[str, str] = {
     "OTHER_EXPENSE": "L27a",
 }
 
-INCOME_CATEGORIES = {"CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME"}
+INCOME_CATEGORIES = {"CONSULTING_INCOME", "SUBSCRIPTION_INCOME", "SALES_INCOME", "WHOLESALE_INCOME"}
 
 # Threshold: warn/block when unconfirmed fraction exceeds this
 UNCONFIRMED_WARN_THRESHOLD = 0.20
@@ -375,8 +375,8 @@ _HOME_OFFICE_DEDUCTION: dict[str, float] = {
 }
 
 # IRS standard mileage rate for business use
-_IRS_MILEAGE_RATE_CENTS = 70  # cents per mile (2025)
-_IRS_MILEAGE_RATE_YEAR = 2025
+_IRS_MILEAGE_RATE_CENTS = 72.5  # cents per mile (2026) — IRS Notice 2026-10
+_IRS_MILEAGE_RATE_YEAR = 2026
 
 
 # ---------------------------------------------------------------------------

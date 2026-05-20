@@ -20,18 +20,19 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
+from sqlalchemy import func
+
 from src.db.connection import SessionLocal, init_db
-from src.models.transaction import Transaction
 from src.models.audit_event import AuditEvent
 from src.models.enums import TransactionStatus
-from sqlalchemy import func
+from src.models.transaction import Transaction
 
 
 def main() -> None:
@@ -58,7 +59,7 @@ def main() -> None:
         )
 
         print(f"{'=' * 60}")
-        print(f"Auto-Confirm High-Confidence Transactions")
+        print("Auto-Confirm High-Confidence Transactions")
         print(f"{'=' * 60}")
         print(f"Threshold:    >= {args.threshold}")
         print(f"Mode:         {'COMMIT' if args.commit else 'DRY RUN'}")

@@ -26,11 +26,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.stripe_adapter import (
+    ACCOUNT_MODE_PERSONAL_MIXED,
+    ACCOUNT_MODE_STANDARD,
     STRIPE_API_VERSION,
+    UNEXPECTED_CHARGE_REVIEW_REASON,
     StripeAdapter,
     _classify_stripe_object,
     _fetch_all,
     _map_charge,
+    _map_charge_fee,
     _map_payout,
     _map_refund,
 )
@@ -70,6 +74,7 @@ def _fake_charge(
     customer: str | None = None,
     metadata: dict[str, str] | None = None,
     invoice: str | None = None,
+    balance_transaction: Any | None = None,
 ) -> MagicMock:
     metadata = metadata or {}
     m = MagicMock()
@@ -84,6 +89,7 @@ def _fake_charge(
     m.customer = customer
     m.metadata = metadata
     m.invoice = invoice
+    m.balance_transaction = balance_transaction
     m.get = lambda k, d=None: {
         "id": charge_id, "object": "charge", "amount": amount, "currency": currency,
         "created": created, "description": description, "status": status,
@@ -260,6 +266,217 @@ class TestMapCharge:
         tx = _map_charge(charge, Entity.SPARKRY)
         assert tx.raw_data is not None
         assert "id" in tx.raw_data or "ch_raw" in str(tx.raw_data)
+
+
+class TestPersonalMixedMode:
+    """REQ-ID: ADAPTER-STRIPE-012 — personal-mixed account mode flags
+    non-invoice charges via review_reason for human review."""
+
+    def test_subscription_charge_with_invoice_classifies_as_subscription(self) -> None:
+        charge = _fake_charge(
+            charge_id="ch_sub1",
+            description="Subscription update",
+            invoice="in_xyz",
+        )
+        result = _classify_stripe_object(charge, Entity.SPARKRY, ACCOUNT_MODE_PERSONAL_MIXED)
+        assert result["tax_category"] == TaxCategory.SUBSCRIPTION_INCOME
+        assert result["review_reason"] is None
+
+    def test_manual_invoice_charge_classifies_as_consulting(self) -> None:
+        charge = _fake_charge(
+            charge_id="ch_inv1",
+            description="Invoice for services",
+            invoice="in_manual",
+        )
+        result = _classify_stripe_object(charge, Entity.SPARKRY, ACCOUNT_MODE_PERSONAL_MIXED)
+        assert result["tax_category"] == TaxCategory.CONSULTING_INCOME
+        assert result["review_reason"] is None
+
+    def test_non_invoice_charge_is_flagged(self) -> None:
+        charge = _fake_charge(
+            charge_id="ch_oneoff",
+            description="Black Line MTB Apparel - Order 5980",
+            invoice=None,
+        )
+        result = _classify_stripe_object(charge, Entity.SPARKRY, ACCOUNT_MODE_PERSONAL_MIXED)
+        assert result["tax_category"] is None
+        assert result["review_reason"] == UNEXPECTED_CHARGE_REVIEW_REASON
+        assert result["direction"] == Direction.INCOME
+
+    def test_standard_mode_unchanged_for_non_invoice_charge(self) -> None:
+        """Regression guard: non-invoice charges on STANDARD accounts still
+        classify as SALES_INCOME and are NOT flagged with review_reason."""
+        charge = _fake_charge(charge_id="ch_pos", description="POS sale", invoice=None)
+        result = _classify_stripe_object(charge, Entity.BLACKLINE, ACCOUNT_MODE_STANDARD)
+        assert result["tax_category"] == TaxCategory.SALES_INCOME
+        assert result["review_reason"] is None
+
+    def test_map_charge_personal_mixed_sets_review_reason(self) -> None:
+        charge = _fake_charge(
+            charge_id="ch_flagged",
+            description="Random one-off",
+            invoice=None,
+        )
+        tx = _map_charge(charge, Entity.SPARKRY, ACCOUNT_MODE_PERSONAL_MIXED)
+        assert tx.review_reason == UNEXPECTED_CHARGE_REVIEW_REASON
+        assert tx.tax_category is None
+        assert tx.direction == Direction.INCOME.value
+        assert tx.entity == Entity.SPARKRY.value
+
+    def test_map_charge_standard_does_not_set_review_reason(self) -> None:
+        charge = _fake_charge(charge_id="ch_std", description="Ordinary sale")
+        tx = _map_charge(charge, Entity.SPARKRY)
+        assert tx.review_reason is None
+
+    def test_travis_personal_account_added_when_env_var_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
+        monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_sp")
+        monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_bl")
+        monkeypatch.setenv("STRIPE_ACCOUNT_TRAVIS_PERSONAL", "acct_travis")
+        adapter = StripeAdapter()
+        assert adapter._account_travis_personal == "acct_travis"
+
+    def test_travis_personal_account_omitted_when_env_var_absent(
+        self, adapter: StripeAdapter
+    ) -> None:
+        # `adapter` fixture only sets SPARKRY + BLACKLINE, not TRAVIS_PERSONAL.
+        assert adapter._account_travis_personal is None
+
+    def test_ingest_personal_mixed_flags_non_invoice_row(
+        self, monkeypatch: pytest.MonkeyPatch, session: Session
+    ) -> None:
+        """End-to-end: with the third account configured, a non-invoice charge
+        on it lands in the DB with a populated review_reason."""
+        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
+        monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_sp")
+        monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_bl")
+        monkeypatch.setenv("STRIPE_ACCOUNT_TRAVIS_PERSONAL", "acct_travis")
+        adapter = StripeAdapter()
+
+        sub_charge = _fake_charge(
+            charge_id="ch_travis_sub",
+            description="Subscription creation",
+            invoice="in_travis_sub",
+        )
+        anomaly_charge = _fake_charge(
+            charge_id="ch_travis_anomaly",
+            description="Black Line MTB Apparel - Order 9999",
+            invoice=None,
+        )
+
+        with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
+            def side_effect(client: Any, resource: str, entity: Any, **kw: Any) -> list[Any]:
+                acct = kw.get("stripe_account")
+                if acct == "acct_travis" and resource == "charges":
+                    return [sub_charge, anomaly_charge]
+                return []
+
+            mock_fetch.side_effect = side_effect
+            adapter.run(session)
+
+        rows = {
+            r.source_id: r
+            for r in session.query(Transaction).filter(
+                Transaction.source_id.in_(["ch_travis_sub", "ch_travis_anomaly"])
+            )
+        }
+        assert "ch_travis_sub" in rows
+        assert "ch_travis_anomaly" in rows
+        assert rows["ch_travis_sub"].tax_category == TaxCategory.SUBSCRIPTION_INCOME.value
+        assert rows["ch_travis_sub"].review_reason is None
+        assert rows["ch_travis_anomaly"].tax_category is None
+        assert rows["ch_travis_anomaly"].review_reason == UNEXPECTED_CHARGE_REVIEW_REASON
+        # Both get entity=sparkry (the third account rolls up into Sparkry)
+        assert rows["ch_travis_sub"].entity == Entity.SPARKRY.value
+        assert rows["ch_travis_anomaly"].entity == Entity.SPARKRY.value
+
+
+class TestMapChargeFee:
+    """REQ-ID: ADAPTER-STRIPE-011 — processing fee ingested as sibling expense row."""
+
+    def _charge_with_fee(self, fee_cents: int, charge_id: str = "ch_fee1") -> MagicMock:
+        charge = _fake_charge(charge_id=charge_id, amount=200000)
+        bt = MagicMock()
+        bt.id = f"txn_{charge_id}"
+        bt.fee = fee_cents
+        charge.balance_transaction = bt
+        return charge
+
+    def test_returns_none_when_no_balance_transaction(self) -> None:
+        charge = _fake_charge(charge_id="ch_nobt")
+        # _fake_charge's MagicMock will invent a balance_transaction attribute
+        # that is itself a MagicMock — simulate an unset attribute explicitly.
+        charge.balance_transaction = None
+        assert _map_charge_fee(charge, Entity.SPARKRY) is None
+
+    def test_returns_none_when_fee_zero(self) -> None:
+        charge = self._charge_with_fee(fee_cents=0)
+        assert _map_charge_fee(charge, Entity.SPARKRY) is None
+
+    def test_returns_none_when_balance_transaction_is_string_reference(self) -> None:
+        charge = _fake_charge(charge_id="ch_strref")
+        charge.balance_transaction = "txn_unexpanded"  # not expanded
+        assert _map_charge_fee(charge, Entity.SPARKRY) is None
+
+    def test_fee_transaction_is_negative_expense(self) -> None:
+        charge = self._charge_with_fee(fee_cents=5830, charge_id="ch_sp1")  # $58.30
+        fee_tx = _map_charge_fee(charge, Entity.SPARKRY)
+        assert fee_tx is not None
+        assert fee_tx.amount == Decimal("-58.30")
+        assert fee_tx.direction == Direction.EXPENSE.value
+        assert fee_tx.tax_category == TaxCategory.LEGAL_AND_PROFESSIONAL.value
+        assert fee_tx.entity == Entity.SPARKRY.value
+        assert fee_tx.source_id == "fee_ch_sp1"
+
+    def test_fee_source_hash_distinct_from_charge(self) -> None:
+        charge = self._charge_with_fee(fee_cents=2060, charge_id="ch_uniq")
+        charge_tx = _map_charge(charge, Entity.SPARKRY)
+        fee_tx = _map_charge_fee(charge, Entity.SPARKRY)
+        assert fee_tx is not None
+        assert fee_tx.source_hash != charge_tx.source_hash
+
+    def test_ingest_creates_charge_and_fee_rows(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        """End-to-end: a charge with a fee results in TWO rows in the DB."""
+        charge = self._charge_with_fee(fee_cents=5830, charge_id="ch_ingest_fee")
+
+        with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
+            def only_sparkry_charge(
+                client: Any, resource: str, entity: Any, **kw: Any
+            ) -> list[Any]:
+                if entity == Entity.SPARKRY and resource == "charges":
+                    return [charge]
+                return []
+
+            mock_fetch.side_effect = only_sparkry_charge
+            adapter.run(session)
+
+        rows = session.query(Transaction).filter(
+            Transaction.source_id.in_(["ch_ingest_fee", "fee_ch_ingest_fee"])
+        ).all()
+        assert len(rows) == 2
+        by_id = {r.source_id: r for r in rows}
+        assert by_id["ch_ingest_fee"].direction == Direction.INCOME.value
+        assert by_id["fee_ch_ingest_fee"].direction == Direction.EXPENSE.value
+        assert by_id["fee_ch_ingest_fee"].amount == Decimal("-58.30")
+
+    def test_ingest_requests_balance_transaction_expansion(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        """The charges fetch must request expand=['data.balance_transaction']."""
+        with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
+            mock_fetch.return_value = []
+            adapter.run(session)
+
+        charge_calls = [
+            c for c in mock_fetch.call_args_list if c.args[1] == "charges"
+        ]
+        assert charge_calls, "expected at least one charges fetch"
+        for c in charge_calls:
+            assert c.kwargs.get("expand") == ["data.balance_transaction"]
 
 
 class TestMapPayout:

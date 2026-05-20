@@ -911,3 +911,138 @@ def test_portfolio_account_ids_filter(
     filt_principal = Decimal(r_filt.json()["summary"]["total_principal"])
     assert full_principal == Decimal("10000")
     assert filt_principal == Decimal("1000")
+
+
+# ── Round 2 fixes ────────────────────────────────────────────────────────
+
+
+def test_principal_series_uses_live_classify_not_stored_column(
+    client: TestClient, session: Session
+) -> None:
+    """Round-2 P1-A: newly-imported rows (cash_flow_type='none' default) MUST
+    still contribute to portfolio principal — `_is_external_at_scope` must
+    rely on live `classify()` so the series and TWR/XIRR agree.
+    """
+    acct = _acct(session, "acct-fresh", num="NF")
+    # Simulate an import that landed BEFORE the backfill ran: the column is
+    # the default 'none' but the action is a real external_in.
+    _tx(
+        session,
+        acct_id=acct.id,
+        action=CanonicalAction.CONTRIBUTION,
+        amount=Decimal("4321"),
+        trade_date=date(2026, 4, 1),
+        cash_flow_type=CashFlowType.NONE,  # default — backfill hasn't run
+    )
+    _snap(
+        session,
+        acct_id=acct.id,
+        symbol=None,
+        as_of=datetime(2026, 5, 20),
+        qty=Decimal("0"),
+        market_value=Decimal("4500"),
+    )
+    with patch("src.api.routes.brokerage._today", return_value=date(2026, 5, 20)):
+        r = client.get(
+            "/api/brokerage/performance/portfolio"
+            "?start_date=2026-01-01&end_date=2026-05-20"
+        )
+    assert r.status_code == 200, r.text
+    summary = r.json()["summary"]
+    # Principal should include the un-backfilled contribution via live classify().
+    assert Decimal(summary["total_principal"]) == Decimal("4321")
+
+
+def test_pair_reject_undoes_previously_confirmed_pair(
+    client: TestClient, session: Session
+) -> None:
+    """Round-2 P1-B: reject of a confirmed pair must clear paired_transaction_id
+    AND restore cash_flow_type from sign. Otherwise the rows are locked as
+    INTERNAL forever even after the rejection audit is written.
+    """
+    a = _acct(session, "acct-undo-a", num="UA")
+    b = _acct(session, "acct-undo-b", num="UB")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("777"),
+        trade_date=date(2026, 4, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-777"),
+        trade_date=date(2026, 4, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_OUT,
+    )
+    # First confirm the pair
+    r1 = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "confirm"},
+    )
+    assert r1.status_code == 200, r1.text
+    session.expire_all()
+    a_db = session.get(BrokerageTransaction, tx_a.id)
+    assert a_db is not None
+    assert a_db.cash_flow_type == CashFlowType.INTERNAL.value
+    assert a_db.paired_transaction_id == tx_b.id
+
+    # Now reject — should undo
+    r2 = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "reject"},
+    )
+    assert r2.status_code == 200, r2.text
+    session.expire_all()
+    a_db = session.get(BrokerageTransaction, tx_a.id)
+    b_db = session.get(BrokerageTransaction, tx_b.id)
+    assert a_db is not None and b_db is not None
+    # paired_transaction_id cleared on both legs
+    assert a_db.paired_transaction_id is None
+    assert b_db.paired_transaction_id is None
+    # cash_flow_type restored from sign: +777 → external_in, -777 → external_out
+    assert a_db.cash_flow_type == CashFlowType.EXTERNAL_IN.value
+    assert b_db.cash_flow_type == CashFlowType.EXTERNAL_OUT.value
+
+
+def test_pair_reject_on_unconfirmed_pair_is_audit_only(
+    client: TestClient, session: Session
+) -> None:
+    """Reject path on a never-confirmed pair should write the rejection audit
+    but NOT touch the (still-unpaired) transactions.
+    """
+    a = _acct(session, "acct-only-a", num="OA")
+    b = _acct(session, "acct-only-b", num="OB")
+    tx_a = _tx(
+        session,
+        acct_id=a.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("99"),
+        trade_date=date(2026, 4, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_IN,
+    )
+    tx_b = _tx(
+        session,
+        acct_id=b.id,
+        action=CanonicalAction.TRANSFER,
+        amount=Decimal("-99"),
+        trade_date=date(2026, 4, 1),
+        cash_flow_type=CashFlowType.EXTERNAL_OUT,
+    )
+    r = client.post(
+        f"/api/brokerage/transactions/{tx_a.id}/pair",
+        json={"paired_transaction_id": tx_b.id, "action": "reject"},
+    )
+    assert r.status_code == 200
+    session.expire_all()
+    a_db = session.get(BrokerageTransaction, tx_a.id)
+    b_db = session.get(BrokerageTransaction, tx_b.id)
+    assert a_db is not None and b_db is not None
+    # Unchanged.
+    assert a_db.cash_flow_type == CashFlowType.EXTERNAL_IN.value
+    assert b_db.cash_flow_type == CashFlowType.EXTERNAL_OUT.value
+    assert a_db.paired_transaction_id is None
+    assert b_db.paired_transaction_id is None

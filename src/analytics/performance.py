@@ -102,12 +102,15 @@ def _find_le_idx(sorted_dates: list[date], target: date) -> int:
 
 
 def _is_external_at_scope(tx: BrokerageTransaction, scope: Scope) -> bool:
-    """Return True if tx is external_in or external_out at the given scope."""
-    if isinstance(scope, PortfolioScope):
-        return tx.cash_flow_type in (
-            CashFlowType.EXTERNAL_IN.value,
-            CashFlowType.EXTERNAL_OUT.value,
-        )
+    """Return True if tx is external_in or external_out at the given scope.
+
+    Always derives via ``classify()`` — even for ``PortfolioScope`` — so the
+    series stays consistent with on-the-fly callers (``_build_brokerage_cash_flows``
+    in the API layer). Reading the stored ``cash_flow_type`` column here used
+    to produce a divergence when newly-imported rows hadn't been re-backfilled
+    yet (default ``'none'`` masked their true classification on the principal
+    chart while the TWR/XIRR pipeline saw them as external).
+    """
     try:
         cft = classify(tx, scope)
     except ClassifyError:

@@ -2345,10 +2345,53 @@ def pair_action(
 
     if body.action == "reject":
         from scripts.auto_pair_transfers import reject_pair  # noqa: PLC0415
+        from src.analytics.classify import PortfolioScope, classify  # noqa: PLC0415
 
         # changed_by="human:pair_reject" distinguishes this API-originated
         # rejection from a script-originated one (round-2 security finding).
         reject_pair(session, tx_a.id, tx_b.id, changed_by="human:pair_reject")
+
+        # If this was a previously-confirmed pair (both sides linked to each
+        # other), break it: clear paired_transaction_id on both legs and
+        # restore cash_flow_type from the unpaired classification (round-2
+        # financial finding P1-B). Otherwise the pair stays "rejected" in
+        # the audit ledger but the rows still claim INTERNAL forever.
+        is_confirmed_pair = (
+            tx_a.paired_transaction_id == tx_b.id
+            and tx_b.paired_transaction_id == tx_a.id
+        )
+        if is_confirmed_pair:
+            for leg, other in ((tx_a, tx_b), (tx_b, tx_a)):
+                old_paired = leg.paired_transaction_id
+                old_cft = leg.cash_flow_type
+                leg.paired_transaction_id = None
+                # Recompute portfolio-scope classification once unpaired —
+                # transfer-like actions revert to external_in / external_out
+                # by amount sign (per classify._classify_transfer_like).
+                new_cft = classify(leg, PortfolioScope()).value
+                leg.cash_flow_type = new_cft
+                session.add(
+                    AuditEvent(
+                        entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
+                        entity_id=leg.id,
+                        field_changed="paired_transaction_id",
+                        old_value=old_paired,
+                        new_value=None,
+                        changed_by="human:pair_reject",
+                    )
+                )
+                session.add(
+                    AuditEvent(
+                        entity_type=ENTITY_TYPE_BROKERAGE_TRANSACTION,
+                        entity_id=leg.id,
+                        field_changed="cash_flow_type",
+                        old_value=old_cft,
+                        new_value=new_cft,
+                        changed_by="human:pair_reject",
+                    )
+                )
+                _ = other  # paired-side audit is captured by the other-leg iteration
+            session.commit()
         return {"rejected": True}
 
     # ── Confirm-path validation ──────────────────────────────────────

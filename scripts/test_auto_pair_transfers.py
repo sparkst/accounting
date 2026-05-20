@@ -182,11 +182,22 @@ class TestIsRejected:
             amount=Decimal("-100"), trade_date=date(2025, 1, 1))
 
         reject_pair(session, "tx1", "tx2")
-        reject_pair(session, "tx1", "tx2")
+        reject_pair(session, "tx1", "tx2")  # idempotent second call
 
+        # Two rows (one per leg) — symmetric audit per round-2 security
+        # finding. The is_rejected idempotency check stops the second call
+        # from doubling up to four rows.
         count = (
             session.query(AuditEvent)
             .filter(AuditEvent.field_changed == "transfer_pair_rejected")
             .count()
         )
-        assert count == 1
+        assert count == 2
+        # Both legs should have a row.
+        entity_ids = {
+            row.entity_id
+            for row in session.query(AuditEvent)
+            .filter(AuditEvent.field_changed == "transfer_pair_rejected")
+            .all()
+        }
+        assert entity_ids == {"tx1", "tx2"}

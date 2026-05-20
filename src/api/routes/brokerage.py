@@ -18,7 +18,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -1724,7 +1724,7 @@ class PairActionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    paired_transaction_id: str | None = None
+    paired_transaction_id: str | None = Field(default=None, min_length=1, max_length=64)
     action: Literal["confirm", "reject"]
 
 
@@ -1994,12 +1994,19 @@ def performance_holding(
     symbol: str = Path(min_length=1, max_length=16, pattern=r"^[A-Za-z0-9.\-]+$"),
     start_date: date | None = Query(None),  # noqa: B008
     end_date: date | None = Query(None),  # noqa: B008
-    account_ids: list[str] | None = Query(None),  # noqa: B008
+    account_ids: list[str] | None = Query(None, max_length=50),  # noqa: B008
     view: PerfView = Query("outside_money"),  # noqa: B008
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """REQ-PERF-010: per-holding principal/growth + summary."""
     sym = symbol.upper()
+    # Per-element length cap on account_ids: max_length on Query() caps the
+    # LIST count; individual string elements have no built-in upper bound.
+    # Enforce it manually before any DB filtering touches the values.
+    if account_ids and any(len(a) > 64 for a in account_ids):
+        raise HTTPException(
+            status_code=422, detail="account_id values must be ≤ 64 characters"
+        )
     # 404 if no positions for this symbol anywhere
     has_position = (
         session.query(PositionSnapshot)
@@ -2100,6 +2107,10 @@ def performance_portfolio(
     given set; tracked-coverage numbers still reflect the entire portfolio so
     the "Tracked $X of $Y" comparison stays meaningful across filter changes.
     """
+    if account_ids and any(len(a) > 64 for a in account_ids):
+        raise HTTPException(
+            status_code=422, detail="account_id values must be ≤ 64 characters"
+        )
     end = end_date or _today()
     start = start_date or (end - timedelta(days=365))
     scope: Scope = PortfolioScope()
@@ -2285,8 +2296,8 @@ def performance_periods(
     response_model=PairConfirmResponse | PairRejectResponse,
 )
 def pair_action(
-    tx_id: str,
-    body: PairActionRequest,
+    tx_id: str = Path(min_length=1, max_length=64),
+    body: PairActionRequest = Body(...),  # noqa: B008
     session: Session = Depends(get_db),  # noqa: B008
 ) -> dict[str, Any]:
     """REQ-PERF-014: confirm or reject a transfer-pair candidate."""
@@ -2335,7 +2346,9 @@ def pair_action(
     if body.action == "reject":
         from scripts.auto_pair_transfers import reject_pair  # noqa: PLC0415
 
-        reject_pair(session, tx_a.id, tx_b.id)
+        # changed_by="human:pair_reject" distinguishes this API-originated
+        # rejection from a script-originated one (round-2 security finding).
+        reject_pair(session, tx_a.id, tx_b.id, changed_by="human:pair_reject")
         return {"rejected": True}
 
     # ── Confirm-path validation ──────────────────────────────────────

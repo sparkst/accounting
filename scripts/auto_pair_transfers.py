@@ -193,19 +193,36 @@ def find_candidates(session: Session) -> list[CandidatePair]:
     return candidates
 
 
-def reject_pair(session: Session, tx_a_id: str, tx_b_id: str) -> None:
-    """Record that pair (tx_a_id, tx_b_id) was rejected. Idempotent."""
+def reject_pair(
+    session: Session,
+    tx_a_id: str,
+    tx_b_id: str,
+    *,
+    changed_by: str = "auto:transfer_pair",
+) -> None:
+    """Record that pair (tx_a_id, tx_b_id) was rejected. Idempotent.
+
+    ``changed_by`` distinguishes script-originated rejections (the default
+    ``"auto:transfer_pair"``) from API-originated ones; callers in
+    ``src/api/routes/brokerage.py`` should pass ``"human:pair_reject"`` so
+    forensic queries on the audit trail can tell which actor initiated the
+    decision.
+    """
     if is_rejected(session, tx_a_id, tx_b_id):
         return
-    evt = AuditEvent(
-        entity_type=ENTITY_TYPE_BROKERAGE_TX,
-        entity_id=tx_a_id,
-        field_changed=REJECTION_EVENT_TYPE,
-        old_value=None,
-        new_value=tx_b_id,
-        changed_by="auto:transfer_pair",
-    )
-    session.add(evt)
+    # Mirror the confirm path: one audit row per leg so a per-tx forensic
+    # query against either side surfaces the rejection.
+    for leg_id, other_id in ((tx_a_id, tx_b_id), (tx_b_id, tx_a_id)):
+        session.add(
+            AuditEvent(
+                entity_type=ENTITY_TYPE_BROKERAGE_TX,
+                entity_id=leg_id,
+                field_changed=REJECTION_EVENT_TYPE,
+                old_value=None,
+                new_value=other_id,
+                changed_by=changed_by,
+            )
+        )
     session.commit()
 
 

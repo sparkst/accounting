@@ -37,7 +37,6 @@ from sqlalchemy.orm import Session
 from src.analytics.classify import (
     AccountScope,
     ClassifyError,
-    PortfolioScope,
     PositionScope,
     Scope,
     classify,

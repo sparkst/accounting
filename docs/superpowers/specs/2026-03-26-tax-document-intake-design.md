@@ -31,7 +31,7 @@ Tax documents are assigned to one of the three existing entities:
 | Entity | Relevant Forms |
 |---|---|
 | Personal | 1099-NEC (freelance), 1099-INT, 1099-DIV, 1099-B, 1098, Property Tax |
-| Sparkry AI LLC | 1099-NEC (Cardinal Health), 1099-K, K-1 (from BlackLine) |
+| Sparkry LLC | 1099-NEC (Cardinal Health), 1099-K, K-1 (from BlackLine) |
 | BlackLine MTB LLC | 1099-K, potentially 1099-NEC |
 
 ---
@@ -237,7 +237,7 @@ Form        Payer                              Amount        IRS Line
 1098        US Bank                             $8,412.00   Schedule A / Line 8a
 Prop Tax    King County Assessor                $6,200.00   Schedule A / SALT
 
-═══ 2025 Tax Documents — Sparkry AI LLC ═══
+═══ 2025 Tax Documents — Sparkry LLC ═══
 ...
 ```
 

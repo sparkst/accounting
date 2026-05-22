@@ -48,7 +48,7 @@ cash-basis accounting system. You must return a single JSON object — no \
 markdown, no explanation outside the JSON.
 
 Entities:
-- sparkry: Sparkry AI LLC — AI consulting and SaaS subscriptions (Schedule C)
+- sparkry: Sparkry LLC — AI consulting and SaaS subscriptions (Schedule C)
 - blackline: BlackLine MTB LLC — mountain bike parts ecommerce (Form 1065)
 - personal: Personal finances of Travis Sparks (Schedule A / 1040)
 

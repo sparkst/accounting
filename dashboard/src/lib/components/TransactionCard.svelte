@@ -591,7 +591,7 @@
 			<label class="field-label" for="entity-{transaction.id}">Entity</label>
 			<select id="entity-{transaction.id}" bind:value={entity} class="field-select">
 				<option value="">— unassigned —</option>
-				<option value="sparkry">Sparkry AI LLC</option>
+				<option value="sparkry">Sparkry LLC</option>
 				<option value="blackline">BlackLine MTB LLC</option>
 				<option value="personal">Personal</option>
 			</select>

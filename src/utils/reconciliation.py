@@ -79,8 +79,11 @@ def _extract_last4(payment_method: str | None) -> str | None:
     return digits[-4:] if len(digits) >= 4 else None
 
 
-def _parse_date(iso: str) -> date:
-    return date.fromisoformat(iso)
+def _parse_date(iso: str) -> date | None:
+    try:
+        return date.fromisoformat(iso)
+    except (ValueError, TypeError):
+        return None
 
 
 def _month_key(iso: str) -> str:
@@ -224,7 +227,11 @@ def find_matches(
             linked_bank_id = _extract_recon_link(p.notes)
             linked_bank = next((b for b in banks if b.id == linked_bank_id), None)
             if linked_bank:
-                d_diff = abs((_parse_date(p.date) - _parse_date(linked_bank.date)).days)
+                p_date = _parse_date(p.date)
+                b_date = _parse_date(linked_bank.date)
+                if p_date is None or b_date is None:
+                    continue
+                d_diff = abs((p_date - b_date).days)
                 card_match = bool(
                     _extract_last4(p.payment_method)
                     and _extract_last4(p.payment_method) == _extract_last4(linked_bank.payment_method)
@@ -245,10 +252,17 @@ def find_matches(
     # Sort payouts by amount desc so larger amounts are matched first (fewer ambiguous ties)
     sorted_payouts = sorted(free_payouts, key=lambda t: _amount_abs(t), reverse=True)
 
+    # LIMITATION: Greedy matching — when multiple payouts share the same amount,
+    # the first payout processed claims the best bank match, which may not be
+    # globally optimal.  A future improvement could use the Hungarian algorithm
+    # for optimal bipartite matching.  Current tie-breaking: highest confidence
+    # first, then closest date (smallest diff wins).
     # For each payout, collect candidates then pick the best
     for payout in sorted_payouts:
         payout_amount = _amount_abs(payout)
         payout_date = _parse_date(payout.date)
+        if payout_date is None:
+            continue
         payout_last4 = _extract_last4(payout.payment_method)
 
         candidates: list[tuple[float, int, bool, Transaction]] = []
@@ -262,6 +276,8 @@ def find_matches(
                 continue
 
             bank_date = _parse_date(bank.date)
+            if bank_date is None:
+                continue
             diff = abs((payout_date - bank_date).days)
             if diff > date_window:
                 continue
@@ -275,9 +291,9 @@ def find_matches(
         if not candidates:
             continue
 
-        # Best candidate: highest confidence, then closest date
+        # Best candidate: highest confidence, then closest date (smallest diff wins)
         best_conf, best_diff, best_card, best_bank = max(
-            candidates, key=lambda c: (c[0], -c[1])
+            candidates, key=lambda c: (c[0], -c[1], c[2])
         )
 
         used_bank_ids.add(best_bank.id)

@@ -17,7 +17,7 @@ from typing import Any
 
 ENTITY_DISPLAY: dict[str, str] = {
     "personal": "Personal",
-    "sparkry": "Sparkry AI LLC",
+    "sparkry": "Sparkry LLC",
     "blackline": "BlackLine MTB LLC",
 }
 

@@ -607,7 +607,7 @@
 		<div class="entity-grid">
 			<div class="card entity-card entity-card-sparkry">
 				<div class="entity-header">
-					<span class="entity-pill entity-sparkry">Sparkry AI LLC</span>
+					<span class="entity-pill entity-sparkry">Sparkry LLC</span>
 				</div>
 				<dl class="entity-meta">
 					<dt>Tax Form</dt><dd>Schedule C</dd>

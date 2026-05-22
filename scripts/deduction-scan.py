@@ -13,17 +13,16 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from decimal import Decimal
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
+
 from src.db.connection import SessionLocal, init_db
-from src.models.transaction import Transaction
 from src.models.enums import TransactionStatus
-from sqlalchemy import func
+from src.models.transaction import Transaction
 
 
 def main() -> None:
@@ -92,7 +91,7 @@ def main() -> None:
             findings.append({
                 "category": "Home Office Deduction",
                 "status": "✅ CONFIGURED",
-                "detail": f"Home office deduction of $180 (simplified method, 6×6 room) is included in tax export. "
+                "detail": "Home office deduction of $180 (simplified method, 6×6 room) is included in tax export. "
                           "Consider actual method if rent/mortgage + utilities exceed $180.",
                 "est_savings": "Already captured ($180)",
             })
@@ -217,8 +216,8 @@ def main() -> None:
         print(f"\n{'=' * 65}")
         print(f"Missed deductions found: {len(missed)}")
         if missed:
-            print(f"Estimated potential tax savings: $3,000-15,000/yr")
-            print(f"\nACTION: Review the missed items above with Travis before Apr 15 filing.")
+            print("Estimated potential tax savings: $3,000-15,000/yr")
+            print("\nACTION: Review the missed items above with Travis before Apr 15 filing.")
         else:
             print("All common deductions captured! 🎉")
 

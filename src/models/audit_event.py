@@ -8,7 +8,7 @@ transaction. A CHECK constraint enforces exactly-one-of (transaction_id, entity_
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, Text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import Base
@@ -27,6 +27,9 @@ def _now() -> datetime:
 # for using a known constant.
 ENTITY_TYPE_PLAID_ITEM = "plaid_item"
 ENTITY_TYPE_ACCOUNT = "account"
+# Used by REQ-PERF-014/REQ-PERF-004 to record user-rejected transfer pair
+# candidates so the auto-pair script doesn't re-surface them.
+ENTITY_TYPE_BROKERAGE_TRANSACTION = "brokerage_transaction"
 
 
 class AuditEvent(Base):
@@ -94,15 +97,25 @@ class AuditEvent(Base):
 
     # ── Who / when ────────────────────────────────────────────────────────────
     changed_by: Mapped[str] = mapped_column(
-        String(8),
+        String(64),
         nullable=False,
-        comment="human | auto",
+        comment="human | auto | cron:<actor-name> | human:<email>",
     )
     changed_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
         default=_now,
         index=True,
+    )
+
+    # ── Cloudflare Workers cron metadata ──────────────────────────────────────
+    cf_scheduled_time: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment=(
+            "Unix epoch ms from Workers controller.scheduledTime for "
+            "cron-initiated rows; NULL for human-initiated rows."
+        ),
     )
 
     def __repr__(self) -> str:

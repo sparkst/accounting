@@ -104,7 +104,7 @@ class TestSendInvoiceEmail:
     def test_from_address(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
     ) -> None:
-        """From address is 'Sparkry AI LLC <orders@sparkry.ai>'."""
+        """From address is 'Sparkry LLC <orders@sparkry.ai>'."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
         send_invoice_email(
@@ -117,12 +117,12 @@ class TestSendInvoiceEmail:
         )
 
         params = mock_resend.Emails.send.call_args[0][0]
-        assert params["from"] == "Sparkry AI LLC <travis@sparkry.ai>"
+        assert params["from"] == "Sparkry LLC <travis@sparkry.ai>"
 
     def test_subject_format(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url
     ) -> None:
-        """Subject line follows 'Invoice {number} from Sparkry AI LLC' format."""
+        """Subject line follows 'Invoice {number} from Sparkry LLC' format."""
         mock_resend.Emails.send.return_value = {"id": "msg_123"}
 
         send_invoice_email(
@@ -135,7 +135,7 @@ class TestSendInvoiceEmail:
         )
 
         params = mock_resend.Emails.send.call_args[0][0]
-        assert params["subject"] == "Invoice 202604-001 from Sparkry AI LLC"
+        assert params["subject"] == "Invoice 202604-001 from Sparkry LLC"
 
     def test_html_contains_payment_link(
         self, mock_resend, invoice, line_items, customer, pdf_bytes, payment_link_url

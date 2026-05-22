@@ -1,5 +1,11 @@
 {
   "mcpServers": {
+    "mempalace": {
+      "type": "stdio",
+      "command": "/Users/travis/jarvis/.venv-mempalace/bin/python",
+      "args": ["-m", "mempalace.mcp_server", "--palace", "/Users/travis/.mempalace"],
+      "env": {}
+    },
     "stitch": {
       "type": "http",
       "url": "https://stitch.googleapis.com/mcp",

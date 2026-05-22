@@ -1,7 +1,7 @@
 [project]
 name = "accounting"
 version = "0.1.0"
-description = "Cash-basis accounting system for Sparkry AI LLC, BlackLine MTB LLC, and Personal"
+description = "Cash-basis accounting system for Sparkry LLC, BlackLine MTB LLC, and Personal"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0",
@@ -37,6 +37,6 @@ ignore_missing_imports = true
 exclude = ["dashboard/"]
 
 [tool.pytest.ini_options]
-testpaths = ["src", ".claude/hooks", ".claude/skills"]
+testpaths = ["src", "scripts", ".claude/hooks", ".claude/skills"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]

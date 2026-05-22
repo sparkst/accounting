@@ -13,7 +13,7 @@ REQ-ID: ADAPTER-STRIPE-010  IngestionLog entry created for every run.
 
 Environment variables (via Doppler):
     STRIPE_API_KEY              — Platform API key (shared across both entities)
-    STRIPE_ACCOUNT_SPARKRY      — Connected account ID for Sparkry AI LLC (acct_xxx)
+    STRIPE_ACCOUNT_SPARKRY      — Connected account ID for Sparkry LLC (acct_xxx)
     STRIPE_ACCOUNT_BLACKLINE    — Connected account ID for BlackLine MTB LLC (acct_xxx)
 
 Design spec: §Stripe Adapter
@@ -65,6 +65,27 @@ _RESOURCE_TYPES = ("charges", "payouts", "refunds")
 
 # DB commit frequency — reduces per-record fsync to per-batch
 BATCH_SIZE = 100
+
+# Account modes — how to classify charges on a given connected account.
+#
+# STANDARD       — dedicated business account (Sparkry/BlackLine). Every charge
+#                  is assumed legitimate business revenue and classified via
+#                  description/metadata (Substack → SUBSCRIPTION_INCOME, else
+#                  SALES_INCOME).
+# PERSONAL_MIXED — personal account where only subscription/invoice charges are
+#                  expected (e.g. Substack running on a personal Stripe). Any
+#                  charge without an ``invoice`` field is flagged via
+#                  ``review_reason`` so the user sees the anomaly instead of it
+#                  silently landing in the wrong bucket.
+ACCOUNT_MODE_STANDARD = "standard"
+ACCOUNT_MODE_PERSONAL_MIXED = "personal_mixed"
+
+# Review reason emitted when a charge on a PERSONAL_MIXED account is not tied
+# to an invoice. Kept as a module constant so tests can assert on it.
+UNEXPECTED_CHARGE_REVIEW_REASON = (
+    "Non-invoice charge on personal Stripe account — expected only "
+    "subscription or manual-invoice charges. Verify entity and category."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -128,29 +149,75 @@ def _is_substack(obj: Any) -> bool:
     )
 
 
-def _classify_stripe_object(obj: Any, entity: Entity) -> dict[str, Any]:
-    """Return classification fields (direction, tax_category) for a Stripe object."""
+def _classify_stripe_object(
+    obj: Any,
+    entity: Entity,
+    mode: str = ACCOUNT_MODE_STANDARD,
+) -> dict[str, Any]:
+    """Return classification fields for a Stripe object.
+
+    Returns a dict with keys:
+      - ``direction``: :class:`Direction` or ``None``
+      - ``tax_category``: :class:`TaxCategory` or ``None``
+      - ``review_reason``: ``str`` or ``None`` — populated when the charge
+        should be flagged for human review (only relevant in
+        ``PERSONAL_MIXED`` mode)
+
+    In ``STANDARD`` mode, behavior is unchanged from the dedicated-account
+    path. In ``PERSONAL_MIXED`` mode, charges lacking an ``invoice`` field are
+    flagged as anomalies — they're still inserted (we never drop data) but the
+    review queue will surface them.
+    """
     obj_type = getattr(obj, "object", None)
 
     if obj_type == "charge":
         direction = Direction.INCOME
+
+        if mode == ACCOUNT_MODE_PERSONAL_MIXED:
+            invoice_id = getattr(obj, "invoice", None)
+            if not invoice_id:
+                return {
+                    "direction": direction,
+                    "tax_category": None,
+                    "review_reason": UNEXPECTED_CHARGE_REVIEW_REASON,
+                }
+            desc = (getattr(obj, "description", None) or "").lower()
+            if "subscription" in desc or _is_substack(obj):
+                tax_category = TaxCategory.SUBSCRIPTION_INCOME
+            else:
+                tax_category = TaxCategory.CONSULTING_INCOME
+            return {
+                "direction": direction,
+                "tax_category": tax_category,
+                "review_reason": None,
+            }
+
+        # STANDARD mode (existing behavior)
         if _is_substack(obj):
             tax_category = TaxCategory.SUBSCRIPTION_INCOME
         else:
             tax_category = TaxCategory.SALES_INCOME
-        return {"direction": direction, "tax_category": tax_category}
+        return {
+            "direction": direction,
+            "tax_category": tax_category,
+            "review_reason": None,
+        }
 
     if obj_type == "payout":
-        return {"direction": Direction.TRANSFER, "tax_category": None}
+        return {"direction": Direction.TRANSFER, "tax_category": None, "review_reason": None}
 
     if obj_type == "refund":
-        return {"direction": Direction.EXPENSE, "tax_category": None}
+        return {"direction": Direction.EXPENSE, "tax_category": None, "review_reason": None}
 
     if obj_type == "invoice":
-        return {"direction": Direction.INCOME, "tax_category": TaxCategory.CONSULTING_INCOME}
+        return {
+            "direction": Direction.INCOME,
+            "tax_category": TaxCategory.CONSULTING_INCOME,
+            "review_reason": None,
+        }
 
     # Fallback
-    return {"direction": None, "tax_category": None}
+    return {"direction": None, "tax_category": None, "review_reason": None}
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +225,18 @@ def _classify_stripe_object(obj: Any, entity: Entity) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _map_charge(charge: Any, entity: Entity) -> Transaction:
-    """Map a Stripe Charge object to a Transaction."""
+def _map_charge(
+    charge: Any,
+    entity: Entity,
+    mode: str = ACCOUNT_MODE_STANDARD,
+) -> Transaction:
+    """Map a Stripe Charge object to a Transaction.
+
+    When ``mode`` is ``ACCOUNT_MODE_PERSONAL_MIXED`` and the charge is not
+    tied to an invoice, the resulting Transaction will carry a
+    ``review_reason`` explaining the anomaly so it surfaces in the review
+    queue for the user to classify manually.
+    """
     source_id = charge.id
     source_hash = compute_source_hash(Source.STRIPE.value, source_id)
 
@@ -169,9 +246,10 @@ def _map_charge(charge: Any, entity: Entity) -> Transaction:
     date = _ts_to_date(int(charge.created))
     description = getattr(charge, "description", None) or "Stripe charge"
 
-    classification = _classify_stripe_object(charge, entity)
+    classification = _classify_stripe_object(charge, entity, mode)
     direction: Direction | None = classification["direction"]
     tax_category: TaxCategory | None = classification["tax_category"]
+    review_reason: str | None = classification["review_reason"]
 
     return Transaction(
         source=Source.STRIPE.value,
@@ -186,7 +264,71 @@ def _map_charge(charge: Any, entity: Entity) -> Transaction:
         tax_category=tax_category.value if tax_category else None,
         status=TransactionStatus.NEEDS_REVIEW.value,
         confidence=0.8,  # Stripe data is high-confidence, but needs human confirmation
+        review_reason=review_reason,
         raw_data=_to_dict(charge),
+    )
+
+
+def _extract_charge_fee_cents(charge: Any) -> int:
+    """Return the processing fee in cents for a charge, or 0 if unavailable.
+
+    Works whether ``balance_transaction`` is an expanded object (has ``.fee``),
+    a plain dict, or unset/None (older ingests, unexpanded list responses, or
+    pending charges without a balance transaction yet).
+    """
+    bt = getattr(charge, "balance_transaction", None)
+    if bt is None:
+        return 0
+    if isinstance(bt, str):
+        return 0  # unexpanded reference — no fee data available
+    fee = getattr(bt, "fee", None)
+    if fee is None and isinstance(bt, dict):
+        fee = bt.get("fee")
+    try:
+        return int(fee) if fee else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _map_charge_fee(charge: Any, entity: Entity) -> Transaction | None:
+    """Map the processing fee on a Stripe Charge to its own expense Transaction.
+
+    Returns ``None`` when the charge has no balance_transaction or a zero fee
+    (e.g. POS-only charges, pending charges, or unexpanded list responses).
+    The returned row is a sibling to the charge row, linked via metadata.
+    """
+    fee_cents = _extract_charge_fee_cents(charge)
+    if fee_cents <= 0:
+        return None
+
+    charge_id = charge.id
+    fee_source_id = f"fee_{charge_id}"
+    source_hash = compute_source_hash(Source.STRIPE.value, fee_source_id)
+
+    amount = -Decimal(fee_cents) / Decimal(100)  # negative = expense
+    currency = (getattr(charge, "currency", "usd") or "usd").upper()
+    date = _ts_to_date(int(charge.created))
+    description = f"Stripe processing fee — {charge_id}"
+
+    raw = {"fee_for_charge": charge_id, "fee_cents": fee_cents}
+    bt = getattr(charge, "balance_transaction", None)
+    if bt is not None and not isinstance(bt, str):
+        raw["balance_transaction"] = _to_dict(bt) if hasattr(bt, "id") or hasattr(bt, "to_dict") else bt
+
+    return Transaction(
+        source=Source.STRIPE.value,
+        source_id=fee_source_id,
+        source_hash=source_hash,
+        date=date,
+        description=description,
+        amount=amount,
+        currency=currency,
+        entity=entity.value,
+        direction=Direction.EXPENSE.value,
+        tax_category=TaxCategory.LEGAL_AND_PROFESSIONAL.value,
+        status=TransactionStatus.NEEDS_REVIEW.value,
+        confidence=0.95,
+        raw_data=raw,
     )
 
 
@@ -337,6 +479,7 @@ def _ingest_entity(
     session: Session,
     result: AdapterResult,
     stripe_account: str | None = None,
+    mode: str = ACCOUNT_MODE_STANDARD,
 ) -> None:
     """Pull all resources for one entity and insert new Transaction rows.
 
@@ -347,6 +490,10 @@ def _ingest_entity(
 
     Per-record errors (bad data) are isolated: one bad record does not
     prevent subsequent records from being processed.
+
+    ``mode`` controls how charges are classified. See the module-level
+    ``ACCOUNT_MODE_*`` constants. Payouts, refunds, and fees behave the
+    same in all modes.
     """
     client = stripe.StripeClient(
         api_key,
@@ -354,16 +501,26 @@ def _ingest_entity(
     )
     entity_label = entity.value  # "sparkry" or "blackline"
 
-    # Mappers keyed by resource type
+    # Mappers keyed by resource type. Charges takes the mode; others don't.
+    def _charge_mapper(obj: Any, ent: Entity) -> Transaction:
+        return _map_charge(obj, ent, mode)
+
     mappers = {
-        "charges": _map_charge,
+        "charges": _charge_mapper,
         "payouts": _map_payout,
         "refunds": _map_refund,
     }
 
     for resource in _RESOURCE_TYPES:
+        # Expand balance_transaction on charges so we can capture the processing
+        # fee as a sibling transaction. Other resource types do not need expand.
+        fetch_kwargs: dict[str, Any] = {}
+        if resource == "charges":
+            fetch_kwargs["expand"] = ["data.balance_transaction"]
         try:
-            items = _fetch_all(client, resource, entity, stripe_account=stripe_account)
+            items = _fetch_all(
+                client, resource, entity, stripe_account=stripe_account, **fetch_kwargs
+            )
         except stripe.AuthenticationError as exc:
             msg = (
                 f"Authentication failed for entity '{entity_label}' "
@@ -386,37 +543,42 @@ def _ingest_entity(
         mapper = mappers[resource]
         pending = 0  # records staged since last commit
 
+        def _insert_with_dedup(tx: Transaction, label: str) -> bool:
+            """Insert tx unless an existing row has the same source_hash. Returns True if inserted."""
+            existing = (
+                session.query(Transaction)
+                .filter(Transaction.source_hash == tx.source_hash)
+                .first()
+            )
+            if existing is not None:
+                logger.debug("Skipping duplicate Stripe %s (entity=%s)", label, entity_label)
+                result.records_skipped += 1
+                return False
+            with session.begin_nested():
+                session.add(tx)
+            result.records_created += 1
+            logger.info(
+                "Ingested Stripe %s entity=%s amount=%s date=%s",
+                label, entity_label, tx.amount, tx.date,
+            )
+            return True
+
         for item in items:
             item_id = getattr(item, "id", repr(item))
             result.records_processed += 1
             try:
                 tx = mapper(item, entity)
+                if _insert_with_dedup(tx, f"{resource} {item_id}"):
+                    pending += 1
 
-                # Dedup check — UNIQUE constraint on source_hash is the safety net,
-                # but we check first to avoid spurious IntegrityError exceptions.
-                existing = (
-                    session.query(Transaction)
-                    .filter(Transaction.source_hash == tx.source_hash)
-                    .first()
-                )
-                if existing is not None:
-                    logger.debug(
-                        "Skipping duplicate Stripe %s %s (entity=%s)",
-                        resource, item_id, entity_label,
-                    )
-                    result.records_skipped += 1
-                    continue
-
-                # Savepoint: a flush failure rolls back only this record
-                with session.begin_nested():
-                    session.add(tx)
-
-                pending += 1
-                result.records_created += 1
-                logger.info(
-                    "Ingested Stripe %s %s entity=%s amount=%s date=%s",
-                    resource, item_id, entity_label, tx.amount, tx.date,
-                )
+                # For charges, also emit a sibling fee transaction when the
+                # expanded balance_transaction carries a non-zero fee.
+                if resource == "charges":
+                    fee_tx = _map_charge_fee(item, entity)
+                    if fee_tx is not None and _insert_with_dedup(
+                        fee_tx, f"charge_fee {item_id}"
+                    ):
+                        pending += 1
 
                 if pending >= BATCH_SIZE:
                     session.commit()
@@ -436,22 +598,31 @@ def _ingest_entity(
 
 
 class StripeAdapter(BaseAdapter):
-    """Ingests Stripe charges, payouts, and refunds for Sparkry AI LLC and
+    """Ingests Stripe charges, payouts, and refunds for Sparkry LLC and
     BlackLine MTB LLC via Stripe Connect.
 
-    Uses one platform API key and two connected account IDs:
-        ``STRIPE_API_KEY``             — Platform key (shared)
-        ``STRIPE_ACCOUNT_SPARKRY``     — Connected account for Sparkry AI LLC
-        ``STRIPE_ACCOUNT_BLACKLINE``   — Connected account for BlackLine MTB LLC
+    Uses one platform API key and up to three connected account IDs:
+        ``STRIPE_API_KEY``                  — Platform key (shared)
+        ``STRIPE_ACCOUNT_SPARKRY``          — Connected account for Sparkry LLC
+        ``STRIPE_ACCOUNT_BLACKLINE``        — Connected account for BlackLine MTB LLC
+        ``STRIPE_ACCOUNT_TRAVIS_PERSONAL``  — Travis's personal Stripe account that
+                                              processes Sparkry Substack subscriptions.
+                                              Runs in ``PERSONAL_MIXED`` mode: only
+                                              invoice/subscription charges are
+                                              auto-classified; anything else is
+                                              flagged via ``review_reason``.
 
     The platform key must be present at construction time. Connected account
     IDs are optional — if omitted, the adapter fetches from the platform
     account directly (useful for single-entity setups).
 
     Args:
-        api_key:           Override for testing; omit to read from env.
-        account_sparkry:   Connected account ID override; omit to read from env.
-        account_blackline: Connected account ID override; omit to read from env.
+        api_key:                 Override for testing; omit to read from env.
+        account_sparkry:         Connected account ID override; omit to read from env.
+        account_blackline:       Connected account ID override; omit to read from env.
+        account_travis_personal: Connected account ID override; omit to read from env.
+                                 Ingested as ``entity=sparkry`` in ``PERSONAL_MIXED``
+                                 mode.
     """
 
     def __init__(
@@ -459,6 +630,7 @@ class StripeAdapter(BaseAdapter):
         api_key: str | None = None,
         account_sparkry: str | None = None,
         account_blackline: str | None = None,
+        account_travis_personal: str | None = None,
     ) -> None:
         key = api_key or os.environ.get("STRIPE_API_KEY")
 
@@ -471,29 +643,43 @@ class StripeAdapter(BaseAdapter):
         self._api_key = key
         self._account_sparkry = account_sparkry or os.environ.get("STRIPE_ACCOUNT_SPARKRY")
         self._account_blackline = account_blackline or os.environ.get("STRIPE_ACCOUNT_BLACKLINE")
+        self._account_travis_personal = (
+            account_travis_personal or os.environ.get("STRIPE_ACCOUNT_TRAVIS_PERSONAL")
+        )
 
     @property
     def source(self) -> str:
         return Source.STRIPE.value
 
     def run(self, session: Session) -> AdapterResult:
-        """Execute a full ingestion pass for both entities.
+        """Execute a full ingestion pass across all configured connected accounts.
 
-        Processes Sparkry and BlackLine sequentially.  If one entity's API key
-        is invalid (``AuthenticationError``), the other entity is still processed
-        and the overall result is ``PARTIAL_FAILURE``.
+        Processes Sparkry, BlackLine, and (if configured) the personal-mixed
+        account sequentially. If one account's API key is invalid
+        (``AuthenticationError``), remaining accounts are still processed and
+        the overall result is ``PARTIAL_FAILURE``.
 
         After all processing, an ``IngestionLog`` entry is written.
         """
         result = AdapterResult(source=self.source)
 
-        entities = [
-            (Entity.SPARKRY, self._account_sparkry),
-            (Entity.BLACKLINE, self._account_blackline),
+        # Each tuple is (entity, connected_account_id_or_None, account_mode).
+        # The travis-personal account ingests into Sparkry but uses
+        # PERSONAL_MIXED so non-invoice charges are flagged for review.
+        accounts: list[tuple[Entity, str | None, str]] = [
+            (Entity.SPARKRY, self._account_sparkry, ACCOUNT_MODE_STANDARD),
+            (Entity.BLACKLINE, self._account_blackline, ACCOUNT_MODE_STANDARD),
         ]
+        if self._account_travis_personal:
+            accounts.append(
+                (Entity.SPARKRY, self._account_travis_personal, ACCOUNT_MODE_PERSONAL_MIXED)
+            )
 
-        for entity, acct_id in entities:
-            _ingest_entity(self._api_key, entity, session, result, stripe_account=acct_id)
+        for entity, acct_id, mode in accounts:
+            _ingest_entity(
+                self._api_key, entity, session, result,
+                stripe_account=acct_id, mode=mode,
+            )
 
         # Upgrade PARTIAL_FAILURE → FAILURE when nothing was created and there
         # were errors (e.g. both entities failed authentication).

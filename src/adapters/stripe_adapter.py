@@ -13,7 +13,7 @@ REQ-ID: ADAPTER-STRIPE-010  IngestionLog entry created for every run.
 
 Environment variables (via Doppler):
     STRIPE_API_KEY              — Platform API key (shared across both entities)
-    STRIPE_ACCOUNT_SPARKRY      — Connected account ID for Sparkry AI LLC (acct_xxx)
+    STRIPE_ACCOUNT_SPARKRY      — Connected account ID for Sparkry LLC (acct_xxx)
     STRIPE_ACCOUNT_BLACKLINE    — Connected account ID for BlackLine MTB LLC (acct_xxx)
 
 Design spec: §Stripe Adapter
@@ -598,12 +598,12 @@ def _ingest_entity(
 
 
 class StripeAdapter(BaseAdapter):
-    """Ingests Stripe charges, payouts, and refunds for Sparkry AI LLC and
+    """Ingests Stripe charges, payouts, and refunds for Sparkry LLC and
     BlackLine MTB LLC via Stripe Connect.
 
     Uses one platform API key and up to three connected account IDs:
         ``STRIPE_API_KEY``                  — Platform key (shared)
-        ``STRIPE_ACCOUNT_SPARKRY``          — Connected account for Sparkry AI LLC
+        ``STRIPE_ACCOUNT_SPARKRY``          — Connected account for Sparkry LLC
         ``STRIPE_ACCOUNT_BLACKLINE``        — Connected account for BlackLine MTB LLC
         ``STRIPE_ACCOUNT_TRAVIS_PERSONAL``  — Travis's personal Stripe account that
                                               processes Sparkry Substack subscriptions.

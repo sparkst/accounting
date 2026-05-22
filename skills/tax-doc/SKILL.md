@@ -51,7 +51,7 @@ Assign `entity` based on recipient name and form context:
 | Signal | Entity |
 |---|---|
 | Recipient is "Travis Sparks" (person) | `personal` |
-| Recipient is "Sparkry AI LLC" or "Sparkry" | `sparkry` |
+| Recipient is "Sparkry LLC" or "Sparkry" | `sparkry` |
 | Recipient is "BlackLine MTB LLC" or "BlackLine" | `blackline` |
 | Payer is "Cardinal Health" (1099-NEC) | `sparkry` |
 | K-1 from a partnership (issued TO Sparkry) | `sparkry` |
@@ -269,7 +269,7 @@ If any checklist item fails, flag it immediately with the mismatch details and d
 | Recipient / Payer | Entity |
 |---|---|
 | "Travis Sparks" (personal name) | `personal` |
-| "Sparkry AI LLC", "Sparkry" | `sparkry` |
+| "Sparkry LLC", "Sparkry" | `sparkry` |
 | "BlackLine MTB LLC", "BlackLine" | `blackline` |
 | Cardinal Health (payer on 1099-NEC) | `sparkry` |
 | Home mortgage / property at personal address | `personal` |

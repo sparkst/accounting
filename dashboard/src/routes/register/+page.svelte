@@ -548,7 +548,7 @@
 
 		<select bind:value={entityFilter} onchange={applyFilters} aria-label="Filter by entity">
 			<option value="">All entities</option>
-			<option value="sparkry">Sparkry AI LLC</option>
+			<option value="sparkry">Sparkry LLC</option>
 			<option value="blackline">BlackLine MTB LLC</option>
 			<option value="personal">Personal</option>
 		</select>

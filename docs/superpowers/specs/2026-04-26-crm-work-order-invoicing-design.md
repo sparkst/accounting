@@ -357,7 +357,7 @@ Each row: invoice number, customer, amount, status badge, date, delivery status 
 
 ### Offline Check
 
-No Stripe link generated. Invoice email includes mailing address and "Make checks payable to Sparkry AI LLC." Manual "Mark Paid" action on the invoice.
+No Stripe link generated. Invoice email includes mailing address and "Make checks payable to Sparkry LLC." Manual "Mark Paid" action on the invoice.
 
 ### CC Fee Logic
 
@@ -512,7 +512,7 @@ HTML invoice viewable in-browser (styled page), with "Download PDF" triggering b
 **Style:** Consistent with existing Fascinate invoices — clean, professional, Sparkry branding. Orange accent color (#F97316), clear typography, line item table with totals section.
 
 **Invoice includes:**
-- Sparkry AI LLC header + logo
+- Sparkry LLC header + logo
 - Business address + EIN
 - Bill-to: customer name, contact, address, tax ID (if set)
 - Invoice number, date, due date (displayed as date, not "Net 14")

@@ -1,6 +1,6 @@
 # CFO Review — Accounting System Gap Analysis
 
-**Reviewer:** Quark (acting as CFO for Sparkry AI LLC + BlackLine MTB LLC)
+**Reviewer:** Quark (acting as CFO for Sparkry LLC + BlackLine MTB LLC)
 **Date:** 2026-03-24
 **Scope:** Full system review — what does the CFO need to run the business?
 

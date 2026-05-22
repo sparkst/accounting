@@ -11,7 +11,7 @@
 ### Entity Colors (ALWAYS used for entity identification)
 | Entity | Color Name | Hex | Usage |
 |--------|-----------|-----|-------|
-| Sparkry AI LLC | Blue | `#1e40af` (bg: `#eff6ff`) | Badges, borders, row highlights |
+| Sparkry LLC | Blue | `#1e40af` (bg: `#eff6ff`) | Badges, borders, row highlights |
 | BlackLine MTB LLC | Purple | `#7c3aed` (bg: `#f5f3ff`) | Badges, borders, row highlights |
 | Personal | Slate | `#475569` (bg: `#f8fafc`) | Badges, borders, row highlights |
 

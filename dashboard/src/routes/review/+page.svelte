@@ -452,7 +452,7 @@
 
 			<select bind:value={entityFilter} aria-label="Filter by entity">
 				<option value="">All entities</option>
-				<option value="sparkry">Sparkry AI LLC</option>
+				<option value="sparkry">Sparkry LLC</option>
 				<option value="blackline">BlackLine MTB LLC</option>
 				<option value="personal">Personal</option>
 			</select>
@@ -515,7 +515,7 @@
 
 				<select bind:value={batchEntity} aria-label="Set entity for selection" class="batch-select">
 					<option value="">Entity…</option>
-					<option value="sparkry">Sparkry AI LLC</option>
+					<option value="sparkry">Sparkry LLC</option>
 					<option value="blackline">BlackLine MTB LLC</option>
 					<option value="personal">Personal</option>
 				</select>

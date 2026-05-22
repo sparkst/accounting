@@ -135,7 +135,7 @@ DOC_1099_K: dict = {
     "entity": Entity.SPARKRY.value,
     "payer_name": "Stripe Inc",
     "payer_ein": "26-0484878",
-    "recipient_name": "Sparkry AI LLC",
+    "recipient_name": "Sparkry LLC",
     "recipient_tin_last4": "1234",
     "amounts": {
         "box_1a_gross_amount": 48000.00,
@@ -152,7 +152,7 @@ DOC_K1: dict = {
     "entity": Entity.SPARKRY.value,
     "payer_name": "BlackLine MTB LLC",
     "payer_ein": "92-3456789",
-    "recipient_name": "Sparkry AI LLC",
+    "recipient_name": "Sparkry LLC",
     "recipient_tin_last4": "1234",
     "amounts": {
         "box_1_ordinary_income": 12000.00,

@@ -2,7 +2,7 @@
 
 ## Product Context
 Cash-basis accounting system for solo entrepreneur Travis Sparks managing 3 entities:
-- **Sparkry AI LLC** (single-member, Schedule C, monthly B&O)
+- **Sparkry LLC** (single-member, Schedule C, monthly B&O)
 - **BlackLine MTB LLC** (partnership, Form 1065 + K-1, quarterly B&O)
 - **Personal** (1040 Schedule A/D)
 

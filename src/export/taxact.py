@@ -1,7 +1,7 @@
 """TaxAct export module.
 
 Produces a print-friendly text summary aligned to Form 1065 (BlackLine MTB LLC)
-or Schedule C (Sparkry AI LLC) for manual entry in TaxAct Business.
+or Schedule C (Sparkry LLC) for manual entry in TaxAct Business.
 
 All public functions are pure: they accept a list of transaction dicts and
 return formatted strings — no I/O side-effects.

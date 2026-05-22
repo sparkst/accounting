@@ -92,7 +92,7 @@ The export code routes each `TaxCategory` enum value to one of three places: `SC
 | Wholesaling | Wholesaling | 0.00484 (0.484%) |
 
 **Filing cadence:**
-- **Sparkry AI LLC**: monthly (12 rows per year)
+- **Sparkry LLC**: monthly (12 rows per year)
 - **BlackLine MTB LLC**: quarterly (4 rows per year)
 
 **Flag any:**
@@ -127,7 +127,7 @@ WA DOR uploads must be filed against the correct account ID:
 
 | Entity | DOR Account ID |
 |---|---|
-| Sparkry AI LLC | 605-965-107 |
+| Sparkry LLC | 605-965-107 |
 | BlackLine MTB LLC | 605-922-410 |
 
 **Flag any:**

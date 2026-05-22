@@ -19,7 +19,7 @@ import resend
 
 _LOGO_PATH = Path(__file__).parent / "assets" / "sparkry-logo.png"
 
-FROM_ADDRESS = "Sparkry AI LLC <travis@sparkry.ai>"
+FROM_ADDRESS = "Sparkry LLC <travis@sparkry.ai>"
 
 _FONT_STACK = (
     "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
@@ -102,7 +102,7 @@ def _build_html(
 <td style="background-color: #ffffff; padding: 24px 32px; border-bottom: 1px solid #e5e5e5;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
 <tr>
-<td><img src="cid:sparkry-logo" alt="Sparkry AI LLC" width="160" style="display: block; height: auto;"></td>
+<td><img src="cid:sparkry-logo" alt="Sparkry LLC" width="160" style="display: block; height: auto;"></td>
 <td align="right" style="font-family: {f}; font-size: 14px; color: #86868b;">Invoice {safe_number}</td>
 </tr>
 </table>
@@ -189,7 +189,7 @@ Please find attached invoice <strong>{safe_number}</strong> for your review.
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
 <tr>
 <td style="font-family: {f}; font-size: 12px; color: #86868b; line-height: 1.5;">
-Sparkry AI LLC<br>
+Sparkry LLC<br>
 travis@sparkry.com<br>
 <br>
 A PDF copy of this invoice is attached for your records.
@@ -250,7 +250,7 @@ def _build_plain_text(
             f"Pay online: {payment_link_url}",
             "",
             "---",
-            "Sparkry AI LLC",
+            "Sparkry LLC",
             "travis@sparkry.com",
         ]
     )
@@ -273,7 +273,7 @@ def send_invoice_email(
 
     _validate_email(to_email)
 
-    subject = f"Invoice {invoice.invoice_number} from Sparkry AI LLC"
+    subject = f"Invoice {invoice.invoice_number} from Sparkry LLC"
     html_body = _build_html(invoice, line_items, customer, payment_link_url)
     plain_text = _build_plain_text(invoice, line_items, customer, payment_link_url)
 

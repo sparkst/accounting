@@ -7,7 +7,7 @@
 
 	// ── Entity selector ───────────────────────────────────────────────────────
 	const ENTITIES = [
-		{ value: 'sparkry', label: 'Sparkry AI LLC' },
+		{ value: 'sparkry', label: 'Sparkry LLC' },
 		{ value: 'blackline', label: 'BlackLine MTB LLC' },
 		{ value: 'personal', label: 'Personal' }
 	] as const;

@@ -280,7 +280,7 @@
 					type="button"
 					onclick={() => { selectedEntity = 'sparkry'; }}
 				>
-					<span class="entity-name">Sparkry AI LLC</span>
+					<span class="entity-name">Sparkry LLC</span>
 					<span class="entity-meta">Monthly · DOR {dorAccount('sparkry')}</span>
 				</button>
 				<button
@@ -312,7 +312,7 @@
 		<div class="card wizard-card">
 			<h2 class="wizard-step-title">Select filing period</h2>
 			<p class="wizard-hint">
-				{selectedEntity === 'sparkry' ? 'Sparkry AI LLC — Monthly filer' : 'BlackLine MTB LLC — Quarterly filer'}
+				{selectedEntity === 'sparkry' ? 'Sparkry LLC — Monthly filer' : 'BlackLine MTB LLC — Quarterly filer'}
 			</p>
 
 			<div class="period-fields">
@@ -361,7 +361,7 @@
 			<div class="summary-header">
 				<div>
 					<h2 class="wizard-step-title" style="margin-bottom: 2px;">
-						{selectedEntity === 'sparkry' ? 'Sparkry AI LLC' : 'BlackLine MTB LLC'}
+						{selectedEntity === 'sparkry' ? 'Sparkry LLC' : 'BlackLine MTB LLC'}
 					</h2>
 					<p class="summary-period">{periodLabel}</p>
 				</div>
@@ -477,7 +477,7 @@
 		<!-- Filing history -->
 		{#if filingHistory.length > 0}
 			<div class="card history-card">
-				<h3 class="history-title">Filing History — {selectedEntity === 'sparkry' ? 'Sparkry AI LLC' : 'BlackLine MTB LLC'}</h3>
+				<h3 class="history-title">Filing History — {selectedEntity === 'sparkry' ? 'Sparkry LLC' : 'BlackLine MTB LLC'}</h3>
 				<table class="history-table">
 					<thead>
 						<tr>

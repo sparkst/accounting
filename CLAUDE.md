@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> Cash-basis accounting system for Travis Sparks. Three entities: Sparkry AI LLC, BlackLine MTB LLC, Personal.
+> Cash-basis accounting system for Travis Sparks. Three entities: Sparkry LLC, BlackLine MTB LLC, Personal.
 
 ## Project Status
 
@@ -118,7 +118,7 @@ rm data/accounting.snapshot.db
 
 | Entity | Tax Form | B&O |
 |---|---|---|
-| Sparkry AI LLC (single-member) | Schedule C | Monthly |
+| Sparkry LLC (single-member) | Schedule C | Monthly |
 | BlackLine MTB LLC (partnership, Travis 100%) | Form 1065 + K-1 | Quarterly |
 | Personal | 1040 Schedule A, D | N/A |
 

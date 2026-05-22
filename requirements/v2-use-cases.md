@@ -91,7 +91,7 @@
 ## UC-004: Monthly Sparkry B&O Filing
 
 **Actor**: Travis
-**Goal**: File monthly Washington State B&O tax for Sparkry AI LLC
+**Goal**: File monthly Washington State B&O tax for Sparkry LLC
 **Frequency**: Monthly (due 25th of following month)
 **Precondition**: All Sparkry income for the month is confirmed in the register
 

@@ -6,7 +6,7 @@
 
 Sparkry LLC needs to generate, track, and reconcile invoices for consulting clients. Two active customers today with different billing models — the system should be extensible to future customers.
 
-**Entity:** Sparkry AI LLC (all invoicing is Sparkry)
+**Entity:** Sparkry LLC (all invoicing is Sparkry)
 **Dashboard location:** New "Invoices" tab in the navigation
 
 ---

@@ -2043,13 +2043,13 @@ export async function sendInvoiceEmail(resend: Resend, params: InvoiceEmailParam
 	const scheduledAt = new Date(Date.now() + 30_000).toISOString();
 
 	const paymentSection = paymentMethod === 'check'
-		? `<p>Please make checks payable to <strong>Sparkry AI LLC</strong> and mail to our business address.</p>`
+		? `<p>Please make checks payable to <strong>Sparkry LLC</strong> and mail to our business address.</p>`
 		: paymentLinkUrl
 			? `<p><a href="${paymentLinkUrl}" style="display:inline-block;background:#3b82f6;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:500;">Pay ${formattedTotal}</a></p>`
 			: '';
 
 	const result = await resend.emails.send({
-		from: 'Sparkry AI LLC <invoices@sparkry.ai>',
+		from: 'Sparkry LLC <invoices@sparkry.ai>',
 		to,
 		subject: `Invoice ${invoiceNumber} — ${formattedTotal}`,
 		scheduledAt,
@@ -2059,7 +2059,7 @@ export async function sendInvoiceEmail(resend: Resend, params: InvoiceEmailParam
 				<p>Hi,</p>
 				<p>Please find attached invoice <strong>${invoiceNumber}</strong> for <strong>${formattedTotal}</strong>, due <strong>${dueDate}</strong>.</p>
 				${paymentSection}
-				<p style="color:#64748b;font-size:13px;margin-top:24px;">Thank you for your business.<br/>Sparkry AI LLC</p>
+				<p style="color:#64748b;font-size:13px;margin-top:24px;">Thank you for your business.<br/>Sparkry LLC</p>
 			</div>
 		`
 	});

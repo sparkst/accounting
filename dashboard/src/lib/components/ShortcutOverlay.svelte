@@ -27,7 +27,7 @@
 			{ key: 'c', desc: 'Focus category dropdown' },
 		]},
 		{ section: 'Entity Quick-Select', items: [
-			{ key: '1', desc: 'Set entity to Sparkry AI LLC' },
+			{ key: '1', desc: 'Set entity to Sparkry LLC' },
 			{ key: '2', desc: 'Set entity to BlackLine MTB LLC' },
 			{ key: '3', desc: 'Set entity to Personal' },
 		]},

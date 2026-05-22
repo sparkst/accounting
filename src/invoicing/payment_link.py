@@ -34,7 +34,7 @@ def create_payment_link(invoice) -> PaymentLinkResult:
     }
 
     product = stripe.Product.create(
-        name=f"Sparkry AI LLC Invoice {invoice.invoice_number}",
+        name=f"Sparkry LLC Invoice {invoice.invoice_number}",
         metadata=metadata,
     )
 

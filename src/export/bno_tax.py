@@ -1,7 +1,7 @@
 """Washington State B&O Tax Report module.
 
 Produces CSV reports for:
-  - Sparkry AI LLC: monthly breakdown (12 rows, Jan–Dec) — B&O due monthly
+  - Sparkry LLC: monthly breakdown (12 rows, Jan–Dec) — B&O due monthly
   - BlackLine MTB LLC: quarterly breakdown (4 rows, Q1–Q4) — B&O due quarterly
 
 WA B&O classification codes:
@@ -97,7 +97,7 @@ def build_sparkry_bno_csv(
     transactions: list[dict[str, Any]],
     year: int,
 ) -> str:
-    """Build monthly B&O report CSV for Sparkry AI LLC.
+    """Build monthly B&O report CSV for Sparkry LLC.
 
     Columns: period, bo_classification, gross_revenue, tax_rate, estimated_bo_tax
     One row per classification per month + a totals row.

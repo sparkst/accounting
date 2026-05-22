@@ -56,7 +56,7 @@ class TestCreatePaymentLink:
         # Product created with correct name
         mock_stripe.Product.create.assert_called_once()
         product_kwargs = mock_stripe.Product.create.call_args
-        assert product_kwargs.kwargs["name"] == "Sparkry AI LLC Invoice 202604-001"
+        assert product_kwargs.kwargs["name"] == "Sparkry LLC Invoice 202604-001"
 
         # Price created with correct unit_amount and currency
         mock_stripe.Price.create.assert_called_once()

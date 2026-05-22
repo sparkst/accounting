@@ -6,7 +6,7 @@
 
 | Entity | Legal Structure | Tax Filing | B&O Frequency |
 |---|---|---|---|
-| Sparkry AI LLC | Single-member LLC | Schedule C (1040) | Monthly |
+| Sparkry LLC | Single-member LLC | Schedule C (1040) | Monthly |
 | BlackLine MTB LLC | Multi-member LLC (partnership) | Form 1065 + K-1 | Quarterly |
 | Personal | N/A | 1040 (Schedule A, D, etc.) | N/A |
 

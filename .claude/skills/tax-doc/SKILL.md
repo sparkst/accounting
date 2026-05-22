@@ -34,7 +34,7 @@ Pull these fields from the document:
 | Signal | Entity |
 |---|---|
 | Recipient is "Travis Sparks" | `personal` |
-| Recipient is "Sparkry AI LLC" | `sparkry` |
+| Recipient is "Sparkry LLC" | `sparkry` |
 | Recipient is "BlackLine MTB LLC" | `blackline` |
 | Payer is "Cardinal Health" | `sparkry` |
 | K-1 issued TO Sparkry | `sparkry` |

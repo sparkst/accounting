@@ -24,7 +24,7 @@ _PROMPT = (
     '{"vendor": "store/company name", "amount": 123.45, "date": "YYYY-MM-DD", '
     '"description": "what was purchased", '
     '"entity_hint": "sparkry or blackline or personal"}\n'
-    "For entity_hint: sparkry = Sparkry AI LLC (software, consulting, AI tools), "
+    "For entity_hint: sparkry = Sparkry LLC (software, consulting, AI tools), "
     "blackline = BlackLine MTB LLC (mountain bike apparel, ecommerce), "
     "personal = personal expense. "
     "amount should be the total paid. date in ISO format."

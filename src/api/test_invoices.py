@@ -27,6 +27,7 @@ import contextlib
 import decimal
 import uuid
 from collections.abc import Generator
+from datetime import date, timedelta
 from typing import Any
 from unittest.mock import patch
 
@@ -1253,8 +1254,10 @@ class TestSendInvoice:
             db_session, cust.id,
             invoice_number="SEND001",
             subtotal="500.00",
-            submitted_date="2026-04-24",
-            due_date="2026-05-15",
+            submitted_date=date.today().isoformat(),
+            # Future due date (relative to today) so a freshly-sent invoice
+            # stays 'sent' rather than being immediately flagged overdue.
+            due_date=(date.today() + timedelta(days=21)).isoformat(),
         )
 
         with (

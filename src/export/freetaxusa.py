@@ -139,18 +139,9 @@ def build_schedule_c_summary(
         home_office_deduction: Optional home office deduction amount (IRS simplified
             method). When > 0, appears as Line 30 in the expense section.
 
-    Raises:
-        HTTPException(422): When no transactions are provided.
+    Empty input yields a zero summary (a no-activity Schedule C is still a
+    valid filing) — callers must not require non-empty data.
     """
-    if len(transactions) == 0:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=422,
-            detail=f"NO TRANSACTIONS FOUND for {entity.upper()} in {year}. "
-            "Cannot generate Schedule C summary from empty data.",
-        )
-
     # Aggregate totals per tax_category
     totals: dict[str, Decimal] = {}
     for tx in transactions:

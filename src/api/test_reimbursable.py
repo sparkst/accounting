@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Generator
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import patch
@@ -367,12 +368,13 @@ class TestOverdueReimbursableFilter:
     def test_overdue_excludes_recent_reimbursables(self, client: TestClient) -> None:
         """REQ-ID: REIMB-007 — reimbursable within 30 days not returned."""
         with _TestSession() as s:
-            # 10 days ago — should NOT appear
+            # 10 days ago — should NOT appear (relative to today, not hardcoded,
+            # so the test stays valid as real time passes)
             _make_tx(
                 s,
                 description="Recent Expense",
                 direction=Direction.REIMBURSABLE.value,
-                date="2026-03-06",  # 10 days before 2026-03-16
+                date=(date.today() - timedelta(days=10)).isoformat(),
             )
 
         resp = client.get("/api/transactions?direction=reimbursable&overdue=true")
@@ -443,12 +445,12 @@ class TestOverdueReimbursableFilter:
                 direction=Direction.REIMBURSABLE.value,
                 date="2025-01-10",
             )
-            # Recent + unlinked — excluded
+            # Recent + unlinked — excluded (relative to today, not hardcoded)
             _make_tx(
                 s,
                 description="Recent Unlinked",
                 direction=Direction.REIMBURSABLE.value,
-                date="2026-03-10",
+                date=(date.today() - timedelta(days=10)).isoformat(),
             )
             # Non-reimbursable — excluded
             _make_tx(s, direction=Direction.EXPENSE.value, description="Just an Expense")

@@ -102,18 +102,9 @@ def build_sparkry_bno_csv(
     Columns: period, bo_classification, gross_revenue, tax_rate, estimated_bo_tax
     One row per classification per month + a totals row.
 
-    Raises:
-        HTTPException(422): When no transactions are provided.
+    Empty input yields a zero-filled report (a no-activity B&O return is still
+    a valid filing) — callers must not require non-empty data.
     """
-    if len(transactions) == 0:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=422,
-            detail=f"NO TRANSACTIONS FOUND for Sparkry in {year}. "
-            "Cannot generate B&O report from empty data.",
-        )
-
     monthly = _aggregate_income_by_month(transactions, year)
 
     output = io.StringIO()
@@ -189,18 +180,9 @@ def build_blackline_bno_csv(
     BlackLine has mixed income (product sales = Retailing; events = ServiceOther).
     Separate B&O lines are written per classification code within each quarter.
 
-    Raises:
-        HTTPException(422): When no transactions are provided.
+    Empty input yields a zero-filled report (a no-activity B&O return is still
+    a valid filing) — callers must not require non-empty data.
     """
-    if len(transactions) == 0:
-        from fastapi import HTTPException
-
-        raise HTTPException(
-            status_code=422,
-            detail=f"NO TRANSACTIONS FOUND for BlackLine in {year}. "
-            "Cannot generate B&O report from empty data.",
-        )
-
     monthly = _aggregate_income_by_month(transactions, year)
 
     # Roll up to quarters: {quarter: {bo_code: total}}

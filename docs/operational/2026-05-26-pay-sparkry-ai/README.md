@@ -25,15 +25,21 @@ npx wrangler d1 execute sparkry-crm-prod --remote \
 
 ## Slug enumeration incident
 
-If Cloudflare WAF logs show systematic slug-guessing from one IP range:
-1. Cloudflare dashboard → Security Events → filter on `pay.sparkry.ai`
-2. Escalate WAF action for the attacking IP from "managed challenge" to "block"
-3. Query click logs to check if any valid slug was hit from that IP bucket:
+Rate limiting is enforced **in-Worker** via the Workers Rate Limiting binding (REQ-PAY-072) —
+60 requests per 10 seconds per IP. This runs before D1 reads so floods don't burn D1 budget.
+The binding is configured in `wrangler.pay.toml` under `[[ratelimits]]` (free tier, no CF Pro required).
+
+To view rate-limit metrics: Cloudflare dashboard → Workers & Pages → sparkry-pay → Metrics tab.
+For structured log analysis: Workers → sparkry-pay → Logs (look for `status: 429` entries).
+
+If a sustained enumeration attack is observed:
+1. Tighten the in-Worker rate limit by editing `wrangler.pay.toml` → `[ratelimits.simple]` → lower `limit` or use `period = 10` (already set). Redeploy: `pnpm build:pay-worker && npx wrangler deploy --config wrangler.pay.toml`.
+2. Query click logs to check if any valid slug was hit from that IP bucket:
 ```bash
 npx wrangler d1 execute sparkry-crm-prod --remote \
   --command "SELECT slug, invoice_id, click_count, last_clicked_at FROM payment_link WHERE last_clicked_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-24 hours') ORDER BY last_clicked_at DESC LIMIT 50;"
 ```
-4. If a valid slug was hit from the attacker IP, consider manually revoking the affected slug and notifying the customer.
+3. If a valid slug was hit, consider manually revoking the affected slug (see Manual revoke section) and notifying the customer.
 
 ## Cookie domain audit
 

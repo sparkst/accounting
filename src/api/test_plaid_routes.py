@@ -194,6 +194,7 @@ def _make_account(
         ("GET", "/api/plaid/items"),
         ("POST", "/api/plaid/sync-now"),
         ("GET", "/api/plaid/reconciliation/summary"),
+        ("POST", "/api/plaid/items/some-id/sync-transactions"),
     ],
 )
 def test_auth_required_on_every_endpoint(
@@ -1016,3 +1017,24 @@ def test_exchange_rejects_non_printable_ascii_institution_name(
         },
     )
     assert resp.status_code == 422
+
+
+# ── Sync-transactions-now (REQ-PT-015) ──────────────────────────────────────
+
+
+def test_sync_transactions_now_rate_limited(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """POST /items/{id}/sync-transactions: first call 200, immediate second 429."""
+    import src.api.routes.plaid as plaid_routes_mod
+
+    # Isolate from balance sync-now limiter state.
+    plaid_routes_mod._tx_sync_now_last_call.clear()
+    item = _make_item(db)
+    plaid_client_mock.transactions_sync.return_value = SimpleNamespace(
+        added=[], modified=[], removed=[], next_cursor="c", has_more=False
+    )
+    r1 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
+    assert r1.status_code == 200
+    r2 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
+    assert r2.status_code == 429

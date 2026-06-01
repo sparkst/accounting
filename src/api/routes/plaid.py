@@ -72,6 +72,7 @@ RECONCILIATION_DELTA_ABS_THRESHOLD = Decimal("100.00")  # $100
 # In-memory rate limiter for /sync-now. Keyed by item_id → last-call timestamp.
 _SYNC_NOW_COOLDOWN_SECONDS = 60.0
 _sync_now_last_call: dict[str, float] = {}
+_tx_sync_now_last_call: dict[str, float] = {}
 
 
 def _now() -> datetime:
@@ -628,6 +629,39 @@ def sync_now(
         "status": result.status,
         "accounts_processed": result.accounts_processed,
         "accounts_failed": result.accounts_failed,
+        "error_code": result.error_code,
+    }
+
+
+@router.post("/items/{item_id}/sync-transactions")
+def sync_transactions_now(
+    item_id: str = Path(..., min_length=1),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Manual trigger of Plaid transactions sync for one Item. Rate-limited
+    1/min/item (REQ-PT-015)."""
+    from src.adapters.plaid_transactions import sync_one_item as _tx_sync_one
+
+    now = time.monotonic()
+    last = _tx_sync_now_last_call.get(item_id, 0.0)
+    if now - last < _SYNC_NOW_COOLDOWN_SECONDS:
+        wait = int(_SYNC_NOW_COOLDOWN_SECONDS - (now - last))
+        raise HTTPException(status_code=429, detail=f"sync cooldown active, retry in {wait}s")
+    _tx_sync_now_last_call[item_id] = now
+
+    item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="item not found")
+    client = _get_plaid_client()
+    result = _tx_sync_one(session, item, client=client)
+    session.commit()
+    return {
+        "status": result.status,
+        "added": result.added,
+        "modified": result.modified,
+        "removed": result.removed,
+        "failed": result.failed,
+        "superseded": result.superseded,
         "error_code": result.error_code,
     }
 

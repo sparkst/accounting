@@ -10,7 +10,7 @@ entity-stamp, CSV supersede, and CSV-skip (the register has no account FK).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -334,3 +334,30 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
         logger.exception("plaid tx per-item failure", extra={"plaid_item_id": item.id})
 
     return result
+
+
+@dataclass
+class TxBatchResult:
+    items: list[TxItemResult] = field(default_factory=list)
+    dry_run: bool = True
+
+    @property
+    def total_added(self) -> int:
+        return sum(i.added for i in self.items)
+
+
+def sync_all_active(session: Session, *, client: Any, dry_run: bool = True) -> TxBatchResult:
+    """Sync transactions for every active PlaidItem. DRY-RUN default."""
+    batch = TxBatchResult(dry_run=dry_run)
+    items = (
+        session.query(PlaidItem)
+        .filter(PlaidItem.status == "active", ~PlaidItem.item_id.like("placeholder_%"))
+        .all()
+    )
+    for item in items:
+        batch.items.append(sync_one_item(session, item, client=client))
+    if dry_run:
+        session.rollback()
+    else:
+        session.commit()
+    return batch

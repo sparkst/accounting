@@ -23,6 +23,7 @@ from src.adapters.plaid_transactions import (
     process_modified,
     process_removed,
     supersede_csv_rows,
+    sync_all_active,
     sync_one_item,
 )
 from src.classification.engine import ClassificationResult
@@ -305,3 +306,31 @@ def test_sync_one_item_per_row_isolation(db):
     assert result.failed == 1
     assert db.query(Transaction).filter_by(source_id="ok").count() == 1
     assert db.query(Transaction).filter_by(source_id="bad").count() == 0
+
+
+# ── Task 12 tests: sync_all_active batch driver, DRY-RUN default (REQ-PT-001) ──
+
+
+def test_sync_all_active_dry_run_rolls_back(db):
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="d1", account_id="acc_1")], has_more=False, next_cursor="c")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        batch = sync_all_active(db, client=client, dry_run=True)
+    assert batch.dry_run is True
+    assert db.query(Transaction).filter_by(source_id="d1").count() == 0
+
+
+def test_sync_all_active_apply_commits(db):
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="a1", account_id="acc_1")], has_more=False, next_cursor="c")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        sync_all_active(db, client=client, dry_run=False)
+    assert db.query(Transaction).filter_by(source_id="a1").count() == 1

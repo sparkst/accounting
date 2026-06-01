@@ -232,6 +232,30 @@ def test_make_transaction_unmapped_and_transfer_combines_review_reasons(db):
     )
 
 
+def test_make_transaction_mapped_transfer_low_confidence_combines_all_reasons(db):
+    """P3-001-CQ: when an account IS mapped but the txn is BOTH a Plaid
+    transfer-category AND the classifier's confidence is below threshold, the
+    transfer note must NOT clobber the classifier's low-confidence detail. The
+    operator needs all the signals — the transfer flag AND the tier+score detail.
+    """
+    pfc = SimpleNamespace(primary="TRANSFER_IN", detailed="TRANSFER_IN_DEPOSIT")
+    txn = _plaid_txn(transaction_id="triple1", personal_finance_category=pfc)
+    low_conf = _cls(confidence=0.42)
+    low_conf.review_reason = "Low confidence (0.42) from Tier 3 LLM: ambiguous merchant"
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=low_conf):
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="Chase ****1234")
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    # All three signals present (entity IS mapped, so no unmapped note).
+    assert "transfer-category" in tx.review_reason
+    assert "Low confidence (0.42) from Tier 3 LLM" in tx.review_reason
+    assert "account not mapped" not in tx.review_reason
+    assert tx.review_reason == (
+        "plaid: transfer-category — confirm transfer vs income; "
+        "Low confidence (0.42) from Tier 3 LLM: ambiguous merchant"
+    )
+
+
 # ── Task 5 tests: process_added upsert + idempotency (REQ-PT-002) ─────────────
 
 
@@ -532,6 +556,40 @@ def test_added_readded_skips_split_parent(db):
     assert counts.inserted == 0 and counts.reactivated == 0
     assert row.status == TransactionStatus.SPLIT_PARENT.value
     assert row.amount == original_amount
+
+
+def test_pending_posted_reconcile_skips_split_parent(db):
+    """P1-001-FIN / P2-001-TEST: the pending→posted reconcile path must NOT
+    overwrite a split_parent's amount. A human can split a still-pending charge
+    (status=split_parent); when Plaid posts the settled version with a different
+    amount, _apply_update would clobber the parent total and break the split-sum
+    invariant for the children. The centralized _apply_update guard refuses the
+    mutation, so the reconcile path leaves the parent untouched: amount unchanged,
+    status still split_parent, and source_id NOT promoted to the posted id."""
+    item, acct = _mapped(db)
+    pending = _plaid_txn(transaction_id="psp1", amount=500.00, pending=True)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [pending], account_index={"acc_1": acct})
+    prior = db.query(Transaction).filter_by(source_id="psp1").one()
+    # Human splits the still-pending charge into legs (parent becomes split_parent).
+    prior.status = TransactionStatus.SPLIT_PARENT.value
+    original_amount = prior.amount
+    db.commit()
+    # Plaid posts the settled version with a different amount, keyed off the
+    # pending id via pending_transaction_id.
+    posted = _plaid_txn(transaction_id="psppost1", amount=512.50, pending=False,
+                        pending_transaction_id="psp1")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        counts = process_added(db, item, [posted], account_index={"acc_1": acct})
+    db.refresh(prior)
+    # Parent untouched: amount, status, and source_id all unchanged.
+    assert prior.amount == original_amount
+    assert prior.status == TransactionStatus.SPLIT_PARENT.value
+    assert prior.source_id == "psp1"
+    # The posted txn was neither inserted as a duplicate nor reconciled onto the
+    # parent (a split parent must not be silently re-amounted).
+    assert counts.inserted == 0 and counts.reactivated == 0
+    assert db.query(Transaction).filter_by(source="plaid").count() == 1
 
 
 # ── Task 9 tests: fetch_all_pages (REQ-PT-001, REQ-PT-006) ───────────────────

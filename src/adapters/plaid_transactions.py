@@ -171,11 +171,17 @@ def make_transaction(
     # unmapped AND it's a transfer-category, an if/elif chain would drop the
     # transfer flag — an operator querying needs_review for transfer patterns
     # would miss these dual-condition rows. Concatenate instead (P3-002).
+    # Also preserve the classifier's low-confidence detail (the tier + score)
+    # rather than letting the entity/transfer note clobber it (P3-001-CQ): an
+    # operator triaging a mapped + transfer + low-confidence row needs all three
+    # signals, not just the transfer flag.
     reasons: list[str] = []
     if entity is None:
         reasons.append("account not mapped to an entity")
     if is_transfer_category:
         reasons.append("transfer-category — confirm transfer vs income")
+    if result.confidence < _AUTO_THRESHOLD and result.review_reason:
+        reasons.append(result.review_reason)
     if reasons:
         tx.review_reason = "plaid: " + "; ".join(reasons)
     return tx
@@ -189,13 +195,23 @@ def _existing_by_source_id(session: Session, source_id: str) -> Transaction | No
     )
 
 
-def _apply_update(session: Session, tx: Transaction, ptxn: Any) -> None:
+def _apply_update(session: Session, tx: Transaction, ptxn: Any) -> bool:
     """Refresh volatile fields from a modified/posted Plaid txn. Preserves human
     classification (entity/tax_category/direction are NOT touched here).
+
+    Returns False (no-op) if tx is a split_parent — overwriting a split parent's
+    amount would break the split-sum invariant (children no longer sum to
+    parent). Centralized guard so every caller (process_modified, the
+    pending→posted reconcile path, the readded reactivation path) is protected
+    uniformly; previously each call site needed its own guard and the reconcile
+    path was repeatedly found missing one. Returns True when the update applied.
 
     A material amount change (pending→posted settlement or a Plaid `modified`
     delta — tips/holds can differ) is audited so the register keeps a field-level
     trail of the automated mutation."""
+    if tx.status == TransactionStatus.SPLIT_PARENT.value:
+        logger.warning("plaid _apply_update skipped: split_parent row %s", tx.id)
+        return False
     fields = build_tx_fields(ptxn)
     old_amount = tx.amount
     new_amount = fields["amount"]
@@ -207,6 +223,7 @@ def _apply_update(session: Session, tx: Transaction, ptxn: Any) -> None:
     tx.date = fields["date"]
     tx.description = fields["description"]
     tx.raw_data = fields["raw_data"]
+    return True
 
 
 def process_modified(session: Session, modified: list[Any]) -> int:
@@ -218,13 +235,11 @@ def process_modified(session: Session, modified: list[Any]) -> int:
         row = _existing_by_source_id(session, ptxn.transaction_id)
         if row is None:
             continue
-        if row.status == TransactionStatus.SPLIT_PARENT.value:
-            # Updating a split parent's amount would break the split-sum
-            # invariant (children no longer sum to parent) — skip + warn,
-            # mirroring process_removed's split_parent guard.
-            logger.warning("plaid modified skipped: split_parent row %s", row.id)
+        # split_parent is refused centrally inside _apply_update (updating a
+        # split parent's amount would break the split-sum invariant — children no
+        # longer sum to parent). A no-op return must NOT be counted as a modify.
+        if not _apply_update(session, row, ptxn):
             continue
-        _apply_update(session, row, ptxn)
         session.flush()
         updated += 1
     return updated
@@ -358,12 +373,12 @@ def process_added(
     for ptxn in added:
         existing = _existing_by_source_id(session, ptxn.transaction_id)
         if existing is not None:
-            # Defensive split_parent guard, mirroring process_removed /
-            # process_modified. A split_parent wouldn't normally be REJECTED with
-            # reason plaid_removed (process_removed skips split parents), but if a
-            # rare double-event left one in any state that Plaid re-delivers,
-            # reactivating via _apply_update would overwrite the parent amount and
-            # break the split-sum invariant for its children. Skip + warn instead.
+            # Per-site split_parent guard, kept because it changes control flow:
+            # a split_parent must skip the ENTIRE existing-row block (including
+            # the plaid_removed reactivation branch below), not just the
+            # _apply_update call. _apply_update now also refuses split_parent
+            # centrally (defense-in-depth), but that alone wouldn't stop the
+            # status/review_reason flip + reactivated count here. Skip + warn.
             if existing.status == TransactionStatus.SPLIT_PARENT.value:
                 logger.warning(
                     "plaid readded skipped: split_parent row %s", existing.id
@@ -396,7 +411,15 @@ def process_added(
         if pending_id:
             prior = _existing_by_source_id(session, pending_id)
             if prior is not None:
-                _apply_update(session, prior, ptxn)
+                # _apply_update centrally refuses split_parent rows. If the prior
+                # pending row was split by a human, overwriting its amount would
+                # break the split-sum invariant — and promoting source_id while
+                # skipping the amount update would desync the id from the
+                # children. So if the update was a no-op (split_parent), leave the
+                # parent entirely untouched and skip this posted txn (the warning
+                # is already emitted inside _apply_update). A human reconciles.
+                if not _apply_update(session, prior, ptxn):
+                    continue
                 prior.source_id = ptxn.transaction_id
                 prior.source_hash = compute_source_hash(SOURCE, ptxn.transaction_id)
                 # Re-evaluate transfer-category on the POSTED txn. A pending that

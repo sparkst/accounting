@@ -39,6 +39,24 @@ from src.utils.dedup import compute_source_hash
 
 logger = logging.getLogger(__name__)
 
+
+def _is_plaid_owned(session: Session, payment_method: str | None) -> bool:
+    """True if a payment_method label belongs to a Plaid-linked account — bank CSV
+    must not re-ingest it (Plaid is sole source). REQ-PT-012."""
+    if not payment_method:
+        return False
+    from src.models.brokerage import Account
+    return (
+        session.query(Account.id)
+        .filter(
+            Account.payment_method == payment_method,
+            Account.plaid_item_id.isnot(None),
+        )
+        .first()
+        is not None
+    )
+
+
 # ---------------------------------------------------------------------------
 # Column mapping config
 # ---------------------------------------------------------------------------
@@ -475,8 +493,15 @@ class BankCsvAdapter(BaseAdapter):
                 ValueError(row_err.reason),
             )
 
+        # REQ-PT-012: check once whether this config's payment_method belongs to a
+        # Plaid-linked account. If so, skip all rows — Plaid is sole source.
+        plaid_owned = _is_plaid_owned(session, self._config.payment_method)
+
         for row in parse_result.rows:
             result.records_processed += 1
+            if plaid_owned:
+                result.records_skipped += 1
+                continue
             try:
                 self._process_row(row, session, result)
             except Exception as exc:

@@ -130,6 +130,7 @@ class CreateNewAccount(BaseModel):
     account_type: str
     entity: str = "personal"
     tax_sheltered: bool = False
+    payment_method: str | None = None
 
 
 class AccountMapping(BaseModel):
@@ -138,6 +139,7 @@ class AccountMapping(BaseModel):
         default=None, description="Map to existing Account. Mutually exclusive with create_new."
     )
     create_new: CreateNewAccount | None = None
+    payment_method: str | None = None
 
     @field_validator("create_new")
     @classmethod
@@ -387,6 +389,8 @@ def map_accounts(
             account = session.query(Account).filter_by(id=m.account_id).first()
             if account is None:
                 raise HTTPException(status_code=404, detail=f"account {m.account_id} not found")
+            if m.payment_method is not None:
+                account.payment_method = m.payment_method
         else:
             assert m.create_new is not None  # validator guarantees this
             account = Account(
@@ -396,6 +400,7 @@ def map_accounts(
                 account_type=m.create_new.account_type,
                 entity=m.create_new.entity,
                 tax_sheltered=m.create_new.tax_sheltered,
+                payment_method=m.create_new.payment_method,
             )
             session.add(account)
             session.flush()

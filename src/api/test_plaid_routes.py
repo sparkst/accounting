@@ -472,6 +472,67 @@ def test_map_accounts_writes_audit_per_mapping(
     assert audit.new_value == "p_acct_new"
 
 
+def test_map_accounts_persists_payment_method(
+    client: TestClient, db: Session
+) -> None:
+    """REQ-PT-017: create_new mapping with payment_method persists to Account.payment_method."""
+    item = _make_item(db)
+
+    resp = client.post(
+        "/api/plaid/map-accounts",
+        json={
+            "item_id": item.id,
+            "mappings": [
+                {
+                    "plaid_account_id": "acc_1",
+                    "create_new": {
+                        "broker": "chase",
+                        "account_number": "****1234",
+                        "account_name": "Sparkry Operating",
+                        "account_type": "checking",
+                        "entity": "sparkry",
+                        "tax_sheltered": False,
+                        "payment_method": "Chase ****1234",
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    db2 = _TestSession()
+    acct_after = db2.query(Account).filter_by(plaid_account_id="acc_1").one()
+    assert acct_after.payment_method == "Chase ****1234"
+
+
+def test_map_accounts_persists_payment_method_existing_account(
+    client: TestClient, db: Session
+) -> None:
+    """REQ-PT-017: mapping an existing account with payment_method sets Account.payment_method."""
+    item = _make_item(db)
+    acct = _make_account(db)
+    assert acct.payment_method is None
+
+    resp = client.post(
+        "/api/plaid/map-accounts",
+        json={
+            "item_id": item.id,
+            "mappings": [
+                {
+                    "plaid_account_id": "acc_2",
+                    "account_id": acct.id,
+                    "payment_method": "Chase ****5678",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    db2 = _TestSession()
+    acct_after = db2.query(Account).filter_by(id=acct.id).one()
+    assert acct_after.payment_method == "Chase ****5678"
+
+
 def test_map_accounts_validates_mutually_exclusive(client: TestClient, db: Session) -> None:
     item = _make_item(db)
     acct = _make_account(db)

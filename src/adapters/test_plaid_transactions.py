@@ -20,6 +20,7 @@ from src.adapters.plaid_transactions import (
     make_transaction,
     process_added,
     process_modified,
+    process_removed,
 )
 from src.classification.engine import ClassificationResult
 from src.models.base import Base
@@ -188,3 +189,21 @@ def test_modified_updates_amount_but_preserves_confirmed_classification(db):
     assert row.tax_category == "OFFICE_EXPENSE"
     assert row.entity == "blackline"
     assert row.status == "confirmed"
+
+
+# ── Task 8 tests: process_removed (REQ-PT-004) ───────────────────────────────
+
+
+def test_removed_marks_rejected_not_deleted(db):
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="r1")],
+                      account_index={"acc_1": acct})
+    process_removed(db, [{"transaction_id": "r1"}])
+    row = db.query(Transaction).filter_by(source_id="r1").one()  # still present
+    assert row.status == "rejected"
+    assert row.review_reason == "plaid_removed"
+
+
+def test_removed_unknown_id_is_noop(db):
+    assert process_removed(db, [{"transaction_id": "ghost"}]) == 0

@@ -110,6 +110,22 @@ def process_modified(session: Session, modified: list[Any]) -> int:
     return updated
 
 
+def process_removed(session: Session, removed: list[Any]) -> int:
+    """Plaid removed a txn (e.g. a settled pending). Mark rejected, never delete
+    (audit rule). No-op when already reconciled away or never seen."""
+    count = 0
+    for r in removed:
+        rid = r["transaction_id"] if isinstance(r, dict) else r.transaction_id
+        row = _existing_by_source_id(session, rid)
+        if row is None:
+            continue
+        row.status = "rejected"
+        row.review_reason = "plaid_removed"
+        session.flush()
+        count += 1
+    return count
+
+
 def process_added(
     session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
 ) -> int:

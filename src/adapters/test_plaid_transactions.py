@@ -73,3 +73,45 @@ def test_source_and_hash_stable():
     assert f["source_id"] == "txn_xyz"
     assert f["source_hash"] == compute_source_hash("plaid", "txn_xyz")
     assert f["raw_data"]["transaction_id"] == "txn_xyz"
+
+
+# ── Task 4 tests: make_transaction ────────────────────────────────────────────
+
+import unittest.mock as mock
+from src.classification.engine import ClassificationResult
+from src.models.enums import Direction, Entity, TaxCategory, TransactionStatus
+from src.adapters.plaid_transactions import make_transaction
+
+
+def _cls(confidence=0.95):
+    return ClassificationResult(
+        entity=Entity.PERSONAL, tax_category=TaxCategory.MEALS, direction=Direction.EXPENSE,
+        confidence=confidence, tier_used=1, reasoning="rule",
+        status=TransactionStatus.AUTO_CLASSIFIED, deductible_pct=0.5,
+    )
+
+
+def test_make_transaction_entity_from_account_overrides_classifier(db):
+    txn = _plaid_txn()
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        tx = make_transaction(txn, session=db, entity="sparkry", payment_method="Chase ****1234")
+    assert tx.entity == "sparkry"
+    assert tx.payment_method == "Chase ****1234"
+    assert tx.tax_category == TaxCategory.MEALS.value
+    assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
+
+
+def test_make_transaction_low_confidence_needs_review(db):
+    with mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls(confidence=0.4)):
+        tx = make_transaction(_plaid_txn(), session=db, entity="sparkry",
+                              payment_method="Chase ****1234")
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+
+
+def test_make_transaction_unmapped_account_null_entity(db):
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        tx = make_transaction(_plaid_txn(), session=db, entity=None, payment_method=None)
+    assert tx.entity is None
+    assert tx.payment_method is None
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value

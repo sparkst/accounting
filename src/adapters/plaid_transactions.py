@@ -85,14 +85,38 @@ def _existing_by_source_id(session: Session, source_id: str) -> Transaction | No
     )
 
 
+def _apply_update(tx: Transaction, ptxn: Any) -> None:
+    """Refresh volatile fields from a modified/posted Plaid txn. Preserves human
+    classification (entity/tax_category/direction are NOT touched here)."""
+    fields = build_tx_fields(ptxn)
+    tx.amount = fields["amount"]
+    tx.date = fields["date"]
+    tx.description = fields["description"]
+    tx.raw_data = fields["raw_data"]
+
+
 def process_added(
     session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
 ) -> int:
-    """Insert added txns; idempotent on (source, source_id). Returns inserted count."""
+    """Insert added txns; idempotent on (source, source_id). Returns inserted count.
+
+    Pending→posted reconcile: if a posted txn carries pending_transaction_id that
+    matches an existing row, we UPDATE that row in place (promoting source_id to
+    the posted id) rather than inserting a duplicate.
+    """
     inserted = 0
     for ptxn in added:
         if _existing_by_source_id(session, ptxn.transaction_id) is not None:
             continue
+        pending_id = getattr(ptxn, "pending_transaction_id", None)
+        if pending_id:
+            prior = _existing_by_source_id(session, pending_id)
+            if prior is not None:
+                _apply_update(prior, ptxn)
+                prior.source_id = ptxn.transaction_id
+                prior.source_hash = compute_source_hash(SOURCE, ptxn.transaction_id)
+                session.flush()
+                continue
         acct = account_index.get(ptxn.account_id)
         entity = acct.entity if acct else None
         pm = acct.payment_method if acct else None

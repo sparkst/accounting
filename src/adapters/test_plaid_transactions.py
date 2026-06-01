@@ -145,3 +145,20 @@ def test_added_inserts_one_row_idempotent(db):
     rows = db.query(Transaction).filter_by(source="plaid", source_id="t1").all()
     assert len(rows) == 1
     assert rows[0].entity == "sparkry"
+
+
+# ── Task 6 tests: pending→posted reconcile (REQ-PT-005) ──────────────────────
+
+
+def test_pending_then_posted_updates_in_place(db):
+    item, acct = _mapped(db)
+    pending = _plaid_txn(transaction_id="p1", amount=20.00, pending=True)
+    posted = _plaid_txn(transaction_id="post1", amount=22.50, pending=False,
+                        pending_transaction_id="p1")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [pending], account_index={"acc_1": acct})
+        process_added(db, item, [posted], account_index={"acc_1": acct})
+    rows = db.query(Transaction).filter_by(source="plaid").all()
+    assert len(rows) == 1
+    assert rows[0].source_id == "post1"
+    assert rows[0].amount == Decimal("-22.50")

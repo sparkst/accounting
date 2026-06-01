@@ -329,6 +329,63 @@ The summaries below are scan-aids; the spec is authoritative.
 
 ---
 
+# Plaid Phase 2 — Transactions Sync (REQ-PT-001..017)
+
+> Round added 2026-05-31. Builds on Plaid Phase 1 (REQ-025..029). Goal: auto-ingest Chase (and any Plaid-linked depository account) transactions into the cash-basis register via `/transactions/sync` so the register stays current with no manual bank-CSV step. Plaid becomes the **sole source of truth** for any account linked through it. Full design: `docs/superpowers/specs/2026-05-31-plaid-transactions-sync-design.md`. Implementation in `src/adapters/plaid_transactions.py` + `scripts/plaid_transactions_sync.py`.
+
+## REQ-PT-001: Cursor-based sync loop
+- Acceptance: sync engine calls `/transactions/sync` in a loop until `has_more=false`, processing `added`, `modified`, and `removed` arrays for each active, non-placeholder `PlaidItem`.
+
+## REQ-PT-002: Added — idempotent upsert
+- Acceptance: `added` upserts a register `Transaction` with `source="plaid"`, `source_id=<plaid transaction_id>`, `source_hash=compute_source_hash("plaid", transaction_id)`. Re-processing the same id is idempotent (no duplicate row).
+
+## REQ-PT-003: Modified — in-place update
+- Acceptance: `modified` updates the existing row's `amount`, `date`, `description`, pending flag, and `raw_data` in place.
+
+## REQ-PT-004: Removed — status rejected, never deleted
+- Acceptance: `removed` marks the existing row `status="rejected"` with `review_reason="plaid_removed"`. The row is never deleted (audit rule).
+
+## REQ-PT-005: Pending → posted reconcile
+- Acceptance: when a posted txn carries `pending_transaction_id` matching an existing register row, update that row in place (rewrite `source_id`/`source_hash` to the posted id, refresh amount/date/raw_data) instead of inserting. The pending id arriving in `removed` is then a no-op.
+
+## REQ-PT-006: Cursor persisted only after successful commit
+- Acceptance: `PlaidItem.cursor` is persisted **only** after a full successful page-loop + DB commit. A crash mid-sync re-fetches from the last good cursor; idempotency (REQ-PT-002) prevents duplicates.
+
+## REQ-PT-007: Per-row savepoint error isolation
+- Acceptance: per-row savepoint (`session.begin_nested()`): one failing transaction is logged to `result.errors` and skipped; the batch continues.
+
+## REQ-PT-008: Sign mapping at Plaid boundary
+- Acceptance: `db_amount = Decimal(str(-plaid_amount))`. Plaid `+` (outflow) → negative (expense); Plaid `−` (inflow) → positive (income). Quantized before hashing.
+
+## REQ-PT-009: Classification + metadata
+- Acceptance: each ingested row runs through the 3-tier classifier; `confidence < 0.7` → `status="needs_review"`. `description` = Plaid `merchant_name` else `name`. Full Plaid txn JSON stored in `raw_data`.
+
+## REQ-PT-010: Entity + payment_method inherited from mapped Account
+- Acceptance: entity is inherited from the mapped `Account.entity` (authoritative — overrides the classifier's entity guess). `payment_method` is stamped from `Account.payment_method` (the account's label, e.g. `"Chase ****1234"`). A txn for an unmapped Plaid account is ingested with `entity=NULL`, `payment_method=NULL`, `status="needs_review"`.
+
+## REQ-PT-011: First-sync CSV supersede (keyed on payment_method label)
+- Acceptance: after backfill, existing register rows where `source != "plaid"` AND `payment_method == <mapped account's label>` AND `date` is within Plaid's covered range are marked `status="rejected"`, `review_reason="superseded_by_plaid"`, audit-logged. Never deleted. A NULL/blank account label disables supersede for that account (logged).
+
+## REQ-PT-012: Sole-source enforcement — bank_csv skips Plaid-linked accounts
+- Acceptance: `bank_csv` skips rows whose config `payment_method` matches a "Plaid-owned" label — i.e. an `Account` row that has both a non-null `plaid_item_id` and that `payment_method`. Skipped rows are counted/reported in `AdapterResult`, not silently dropped.
+
+## REQ-PT-013: Human-edit preservation through modified/post-reconcile
+- Acceptance: if a row is `status="confirmed"` or has human edits, `modified`/post-reconcile refresh amount/date/raw_data but preserve human-set `entity`, `direction`, `tax_category`, `tax_subcategory`.
+
+## REQ-PT-014: Daily launchd job
+- Acceptance: daily launchd job `com.sparkry.plaid-transactions-sync.plist` runs `scripts/plaid_transactions_sync.py` (DRY-RUN default; `--apply` to commit). **NOT loaded yet** — gated on production Plaid (`PLAID_ENV=production` + `transactions` product approval) and Chase OAuth redirect setup (spec §9 prerequisites).
+
+## REQ-PT-015: Manual sync-now endpoint
+- Acceptance: manual `POST /api/plaid/items/{id}/sync-transactions`, rate-limited 1/min/item (reuses balance sync-now guard); auth-protected like all Plaid routes.
+
+## REQ-PT-016: Failure handling — cursor not advanced on error
+- Acceptance: `ITEM_LOGIN_REQUIRED` / stale-item conditions reuse Phase 1 alerting + relink; a failed sync sets `last_sync_status`/`last_error` and does not advance the cursor.
+
+## REQ-PT-017: Account.payment_method label column (Alembic migration)
+- Acceptance: `Account` gains a nullable `payment_method` label column (Alembic migration). `POST /map-accounts` accepts an optional `payment_method` per mapping; when creating/linking a depository account it should be set to the exact label the CSV imports used (so supersede matches history). The label is the join key for REQ-PT-010/011/012.
+
+---
+
 # Round 14 — Wealth performance measurement (TWR + MWR + principal/growth)
 
 > Round added 2026-05-20. Replaces the SPY/QQQ percentage overlay on `/wealth` (currently incoherent against a dollar net-worth line on a dual-axis chart) with two true return metrics plus a principal-vs-growth decomposition. Anchor design: `docs/superpowers/specs/2026-05-11-performance-measurement-design.md`. Reconciled with 2026-05-19 discussion deltas in `.qpipeline/projects/010-performance/IDEATION.md`.

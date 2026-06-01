@@ -15,10 +15,13 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
-from src.adapters.plaid_transactions import build_tx_fields, make_transaction
+from src.adapters.plaid_transactions import build_tx_fields, make_transaction, process_added
 from src.classification.engine import ClassificationResult
 from src.models.base import Base
+from src.models.brokerage import Account
 from src.models.enums import Direction, Entity, TaxCategory, TransactionStatus
+from src.models.plaid import PlaidItem
+from src.models.transaction import Transaction
 
 
 def _plaid_txn(**kw):
@@ -115,3 +118,30 @@ def test_make_transaction_unmapped_account_null_entity(db):
     assert tx.payment_method is None
     assert tx.status == TransactionStatus.NEEDS_REVIEW.value
     assert tx.review_reason == "plaid: account not mapped to an entity"
+
+
+# ── Task 5 tests: process_added upsert + idempotency (REQ-PT-002) ─────────────
+
+
+def _mapped(db, plaid_account_id="acc_1", entity="sparkry", pm="Chase ****1234"):
+    item = PlaidItem(item_id="it_1", institution_id="ins_56", institution_name="Chase",
+                     access_token_encrypted="REVOKED", status="active")
+    db.add(item)
+    db.flush()
+    acct = Account(broker="chase", account_number="****1234", account_name="Op",
+                   account_type="checking", entity=entity, payment_method=pm,
+                   plaid_item_id=item.id, plaid_account_id=plaid_account_id)
+    db.add(acct)
+    db.commit()
+    return item, acct
+
+
+def test_added_inserts_one_row_idempotent(db):
+    item, acct = _mapped(db)
+    txns = [_plaid_txn(transaction_id="t1", account_id="acc_1")]
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, txns, account_index={"acc_1": acct})
+        process_added(db, item, txns, account_index={"acc_1": acct})  # re-run
+    rows = db.query(Transaction).filter_by(source="plaid", source_id="t1").all()
+    assert len(rows) == 1
+    assert rows[0].entity == "sparkry"

@@ -16,7 +16,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.classification.engine import classify
+from src.models.brokerage import Account
 from src.models.enums import TransactionStatus
+from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
 from src.utils.dedup import compute_source_hash
 
@@ -73,3 +75,29 @@ def make_transaction(
     if entity is None:
         tx.review_reason = "plaid: account not mapped to an entity"
     return tx
+
+
+def _existing_by_source_id(session: Session, source_id: str) -> Transaction | None:
+    return (
+        session.query(Transaction)
+        .filter(Transaction.source == SOURCE, Transaction.source_id == source_id)
+        .first()
+    )
+
+
+def process_added(
+    session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
+) -> int:
+    """Insert added txns; idempotent on (source, source_id). Returns inserted count."""
+    inserted = 0
+    for ptxn in added:
+        if _existing_by_source_id(session, ptxn.transaction_id) is not None:
+            continue
+        acct = account_index.get(ptxn.account_id)
+        entity = acct.entity if acct else None
+        pm = acct.payment_method if acct else None
+        tx = make_transaction(ptxn, session=session, entity=entity, payment_method=pm)
+        session.add(tx)
+        session.flush()
+        inserted += 1
+    return inserted

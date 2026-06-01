@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sparkry.plaid-transactions-sync</string>
+
+  <!-- Wraps in `doppler run` so DATABASE_PATH and Plaid secrets are present.
+       Sync is idempotent: (source, source_id) unique constraint skips duplicates.
+       Run 30 min after balance sync (02:00) to avoid Plaid rate contention. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/doppler</string>
+    <string>run</string>
+    <string>--</string>
+    <string>/Users/travis/SGDrive/dev/accounting/.venv/bin/python3</string>
+    <string>-m</string>
+    <string>scripts.plaid_transactions_sync</string>
+    <string>--apply</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/travis/SGDrive/dev/accounting</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- Daily at 06:30 local time (30 min after balance sync at 02:00). -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>6</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.plaid-transactions-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/travis/Library/Logs/com.sparkry.plaid-transactions-sync.error.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

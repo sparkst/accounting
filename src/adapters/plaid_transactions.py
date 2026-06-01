@@ -10,6 +10,7 @@ entity-stamp, CSV supersede, and CSV-skip (the register has no account FK).
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -23,8 +24,9 @@ from src.adapters.plaid_client import (
     TerminalPlaidError,
 )
 from src.classification.engine import classify
+from src.models.audit_event import AuditEvent
 from src.models.brokerage import Account
-from src.models.enums import IngestionStatus, TransactionStatus
+from src.models.enums import ConfirmedBy, IngestionStatus, TransactionStatus
 from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
@@ -39,6 +41,25 @@ _AUTO_THRESHOLD = 0.7
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _audit_status_change(session: Session, tx: Transaction, old_status: str | None) -> None:
+    """Append a transaction-mode AuditEvent for an automated status flip.
+
+    Mirrors the canonical register-edit pattern in
+    src/api/routes/transactions.py::_create_audit_events (transaction_id set;
+    entity_id/entity_type NULL; field_changed='status'). changed_by is 'auto'
+    because the flip is performed by the Plaid sync job, not a human.
+    """
+    session.add(
+        AuditEvent(
+            transaction_id=tx.id,
+            field_changed="status",
+            old_value=str(old_status) if old_status is not None else None,
+            new_value=TransactionStatus.REJECTED.value,
+            changed_by=ConfirmedBy.AUTO.value,
+        )
+    )
 
 
 def build_tx_fields(plaid_txn: Any) -> dict[str, Any]:
@@ -132,8 +153,10 @@ def process_removed(session: Session, removed: list[Any]) -> int:
         row = _existing_by_source_id(session, rid)
         if row is None:
             continue
+        old_status = row.status
         row.status = "rejected"
         row.review_reason = "plaid_removed"
+        _audit_status_change(session, row, old_status)
         session.flush()
         count += 1
     return count
@@ -157,7 +180,11 @@ def fetch_all_pages(
     removed: list[Any] = []
     while True:
         req = _sync_request(access_token, cursor)
-        resp = call_with_retry(lambda r=req: client.transactions_sync(r))
+
+        def _do_sync(r: Any = req) -> Any:  # default-bind r to this loop's req
+            return client.transactions_sync(r)
+
+        resp = call_with_retry(_do_sync)
         added += list(resp.added)
         modified += list(resp.modified)
         removed += list(resp.removed)
@@ -188,8 +215,10 @@ def supersede_csv_rows(
         .all()
     )
     for row in rows:
+        old_status = row.status
         row.status = TransactionStatus.REJECTED.value
         row.review_reason = "superseded_by_plaid"
+        _audit_status_change(session, row, old_status)
     session.flush()
     return len(rows)
 
@@ -288,12 +317,25 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
         except Exception:
             result.failed += 1
 
+        # Supersede is keyed on the dates of THIS sync's added txns, grouped per
+        # account. A first sync that returns only modified/removed (no added)
+        # therefore performs no supersede — acceptable, since nothing new was
+        # ingested to supersede the CSV history against. Each account uses only
+        # its own added-txn date range so a multi-account Item can't widen one
+        # account's coverage with another account's dates.
         if first_sync and added:
-            dates = [str(t.date) for t in added]
+            dates_by_acct: dict[str, list[str]] = defaultdict(list)
+            for t in added:
+                dates_by_acct[t.account_id].append(str(t.date))
             for acct in accounts:
+                if not acct.plaid_account_id:
+                    continue
+                acct_dates = dates_by_acct.get(acct.plaid_account_id, [])
+                if not acct_dates:
+                    continue
                 result.superseded += supersede_csv_rows(
                     session, payment_method=acct.payment_method,
-                    covered_min=min(dates), covered_max=max(dates),
+                    covered_min=min(acct_dates), covered_max=max(acct_dates),
                 )
 
         item.cursor = next_cursor

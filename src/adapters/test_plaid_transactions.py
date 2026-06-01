@@ -15,7 +15,12 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
-from src.adapters.plaid_transactions import build_tx_fields, make_transaction, process_added
+from src.adapters.plaid_transactions import (
+    build_tx_fields,
+    make_transaction,
+    process_added,
+    process_modified,
+)
 from src.classification.engine import ClassificationResult
 from src.models.base import Base
 from src.models.brokerage import Account
@@ -162,3 +167,24 @@ def test_pending_then_posted_updates_in_place(db):
     assert len(rows) == 1
     assert rows[0].source_id == "post1"
     assert rows[0].amount == Decimal("-22.50")
+
+
+# ── Task 7 tests: process_modified (REQ-PT-003, REQ-PT-013) ──────────────────
+
+
+def test_modified_updates_amount_but_preserves_confirmed_classification(db):
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="m1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="m1").one()
+    row.status = "confirmed"
+    row.tax_category = "OFFICE_EXPENSE"
+    row.entity = "blackline"
+    db.commit()
+    process_modified(db, [_plaid_txn(transaction_id="m1", amount=11.5)])
+    db.refresh(row)
+    assert row.amount == Decimal("-11.50")
+    assert row.tax_category == "OFFICE_EXPENSE"
+    assert row.entity == "blackline"
+    assert row.status == "confirmed"

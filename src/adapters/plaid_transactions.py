@@ -95,6 +95,21 @@ def _apply_update(tx: Transaction, ptxn: Any) -> None:
     tx.raw_data = fields["raw_data"]
 
 
+def process_modified(session: Session, modified: list[Any]) -> int:
+    """Refresh volatile fields on existing rows (amount/date/description/raw_data).
+    Human classification on the row is preserved — _apply_update never touches
+    entity/tax_category/direction/status."""
+    updated = 0
+    for ptxn in modified:
+        row = _existing_by_source_id(session, ptxn.transaction_id)
+        if row is None:
+            continue
+        _apply_update(row, ptxn)
+        session.flush()
+        updated += 1
+    return updated
+
+
 def process_added(
     session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
 ) -> int:

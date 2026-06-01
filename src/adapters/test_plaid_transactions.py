@@ -22,6 +22,7 @@ from src.adapters.plaid_transactions import (
     process_added,
     process_modified,
     process_removed,
+    supersede_csv_rows,
 )
 from src.classification.engine import ClassificationResult
 from src.models.base import Base
@@ -229,3 +230,34 @@ def test_fetch_all_pages_concatenates_until_has_more_false(db):
     assert [t.transaction_id for t in added] == ["a", "b"]
     assert cursor == "c2"
     assert client.transactions_sync.call_count == 2
+
+
+# ── Task 10 tests: supersede_csv_rows (REQ-PT-011) ───────────────────────────
+
+
+def test_supersede_rejects_overlapping_csv_rows_only(db):
+    item, acct = _mapped(db, pm="Chase ****1234")
+    db.add(Transaction(source="bank_csv", source_id="c1", source_hash="h1", date="2026-03-15",
+                       description="x", amount=Decimal("-5"), currency="USD", entity="sparkry",
+                       status="confirmed", confidence=0.0, payment_method="Chase ****1234",
+                       raw_data={}))
+    db.add(Transaction(source="bank_csv", source_id="c2", source_hash="h2", date="2025-01-01",
+                       description="old", amount=Decimal("-5"), currency="USD", entity="sparkry",
+                       status="confirmed", confidence=0.0, payment_method="Chase ****1234",
+                       raw_data={}))
+    db.add(Transaction(source="bank_csv", source_id="c3", source_hash="h3", date="2026-03-15",
+                       description="other", amount=Decimal("-5"), currency="USD", entity="sparkry",
+                       status="confirmed", confidence=0.0, payment_method="Amex ****9999",
+                       raw_data={}))
+    db.commit()
+    n = supersede_csv_rows(db, payment_method="Chase ****1234",
+                           covered_min="2026-01-01", covered_max="2026-05-31")
+    assert n == 1
+    assert db.query(Transaction).filter_by(source_id="c1").one().status == "rejected"
+    assert db.query(Transaction).filter_by(source_id="c2").one().status == "confirmed"
+    assert db.query(Transaction).filter_by(source_id="c3").one().status == "confirmed"
+
+
+def test_supersede_noop_when_label_blank(db):
+    assert supersede_csv_rows(db, payment_method=None,
+                              covered_min="2026-01-01", covered_max="2026-05-31") == 0

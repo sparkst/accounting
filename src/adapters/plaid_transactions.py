@@ -154,6 +154,33 @@ def fetch_all_pages(
     return added, modified, removed, cursor
 
 
+def supersede_csv_rows(
+    session: Session, *, payment_method: str | None, covered_min: str, covered_max: str
+) -> int:
+    """Mark non-Plaid rows for this payment_method label, within Plaid's covered
+    date range, as rejected (superseded). Audit rule: never delete. A blank label
+    disables supersede (returns 0, logged)."""
+    if not payment_method:
+        logger.warning("plaid supersede skipped: account has no payment_method label")
+        return 0
+    rows = (
+        session.query(Transaction)
+        .filter(
+            Transaction.source != SOURCE,
+            Transaction.payment_method == payment_method,
+            Transaction.date >= covered_min,
+            Transaction.date <= covered_max,
+            Transaction.status != TransactionStatus.REJECTED.value,
+        )
+        .all()
+    )
+    for row in rows:
+        row.status = TransactionStatus.REJECTED.value
+        row.review_reason = "superseded_by_plaid"
+    session.flush()
+    return len(rows)
+
+
 def process_added(
     session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
 ) -> int:

@@ -10,22 +10,35 @@ entity-stamp, CSV supersede, and CSV-skip (the register has no account FK).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.adapters.plaid_client import (
+    PlaidErrorBase,
+    RetryablePlaidError,
+    TerminalPlaidError,
+)
 from src.classification.engine import classify
 from src.models.brokerage import Account
-from src.models.enums import TransactionStatus
+from src.models.enums import IngestionStatus, TransactionStatus
+from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
 from src.utils.dedup import compute_source_hash
+from src.utils.plaid_crypto import InvalidCiphertextError, decrypt_token
 
 logger = logging.getLogger(__name__)
 
 SOURCE = "plaid"
 _AUTO_THRESHOLD = 0.7
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def build_tx_fields(plaid_txn: Any) -> dict[str, Any]:
@@ -211,3 +224,113 @@ def process_added(
         session.flush()
         inserted += 1
     return inserted
+
+
+@dataclass
+class TxItemResult:
+    item_id: str
+    institution_name: str
+    status: str = "ok"          # 'ok' | 'error' | 'institution_down'
+    added: int = 0
+    modified: int = 0
+    removed: int = 0
+    failed: int = 0
+    superseded: int = 0
+    error_code: str | None = None
+
+
+def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemResult:
+    """Sync one Item's transactions. Caller owns the outer commit.
+
+    First sync (item.cursor is None) triggers CSV supersede. Cursor advances
+    ONLY after a clean page-loop, so a crash re-fetches from the last good
+    cursor (idempotent via source_hash)."""
+    result = TxItemResult(item_id=item.id, institution_name=item.institution_name)
+    pulled_at = _utcnow()
+    log_row = IngestionLog(source=f"plaid_tx:{item.institution_name}",
+                           status=IngestionStatus.SUCCESS.value, run_at=pulled_at)
+    session.add(log_row)
+    first_sync = item.cursor is None
+
+    accounts = session.query(Account).filter_by(plaid_item_id=item.id).all()
+    account_index = {a.plaid_account_id: a for a in accounts if a.plaid_account_id}
+
+    try:
+        try:
+            access_token = decrypt_token(item.access_token_encrypted)
+        except InvalidCiphertextError as exc:
+            raise TerminalPlaidError("INVALID_ACCESS_TOKEN",
+                                     message="cannot decrypt token") from exc
+
+        added, modified, removed, next_cursor = fetch_all_pages(
+            client, access_token, cursor=item.cursor
+        )
+
+        for ptxn in added:
+            try:
+                with session.begin_nested():
+                    result.added += process_added(session, item, [ptxn],
+                                                   account_index=account_index)
+            except Exception:
+                result.failed += 1
+                logger.exception("plaid tx added failure",
+                                 extra={"plaid_item_id": item.id,
+                                        "txn": getattr(ptxn, "transaction_id", "?")})
+        for ptxn in modified:
+            try:
+                with session.begin_nested():
+                    result.modified += process_modified(session, [ptxn])
+            except Exception:
+                result.failed += 1
+        try:
+            with session.begin_nested():
+                result.removed += process_removed(session, removed)
+        except Exception:
+            result.failed += 1
+
+        if first_sync and added:
+            dates = [str(t.date) for t in added]
+            for acct in accounts:
+                result.superseded += supersede_csv_rows(
+                    session, payment_method=acct.payment_method,
+                    covered_min=min(dates), covered_max=max(dates),
+                )
+
+        item.cursor = next_cursor
+        item.last_sync_at = pulled_at
+        item.last_sync_status = "ok"
+        item.last_error = None
+        log_row.records_processed = result.added + result.modified + result.removed
+        log_row.records_failed = result.failed
+        log_row.status = (IngestionStatus.PARTIAL_FAILURE.value if result.failed
+                          else IngestionStatus.SUCCESS.value)
+
+    except RetryablePlaidError as exc:
+        item.last_sync_status = ("institution_down"
+            if exc.error_code in ("INSTITUTION_DOWN", "INSTITUTION_NOT_RESPONDING") else "error")
+        item.last_error = exc.error_code
+        item.last_sync_at = pulled_at
+        log_row.status = IngestionStatus.FAILURE.value
+        log_row.retryable = True
+        log_row.error_detail = exc.error_code
+        result.status = item.last_sync_status
+        result.error_code = exc.error_code
+    except (TerminalPlaidError, PlaidErrorBase) as exc:
+        item.last_sync_status = "error"
+        item.last_error = exc.error_code
+        item.last_sync_at = pulled_at
+        log_row.status = IngestionStatus.FAILURE.value
+        log_row.error_detail = exc.error_code
+        result.status = "error"
+        result.error_code = exc.error_code
+    except Exception as exc:
+        item.last_sync_status = "error"
+        item.last_error = "UNEXPECTED"
+        item.last_sync_at = pulled_at
+        log_row.status = IngestionStatus.FAILURE.value
+        log_row.error_detail = f"unexpected: {type(exc).__name__}"
+        result.status = "error"
+        result.error_code = "UNEXPECTED"
+        logger.exception("plaid tx per-item failure", extra={"plaid_item_id": item.id})
+
+    return result

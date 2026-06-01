@@ -23,6 +23,7 @@ from src.adapters.plaid_transactions import (
     process_modified,
     process_removed,
     supersede_csv_rows,
+    sync_one_item,
 )
 from src.classification.engine import ClassificationResult
 from src.models.base import Base
@@ -261,3 +262,46 @@ def test_supersede_rejects_overlapping_csv_rows_only(db):
 def test_supersede_noop_when_label_blank(db):
     assert supersede_csv_rows(db, payment_method=None,
                               covered_min="2026-01-01", covered_max="2026-05-31") == 0
+
+
+# ── Task 11 tests: sync_one_item orchestration (REQ-PT-001,006,007,011,016) ──
+
+
+def test_sync_one_item_full_flow_first_sync_sets_cursor(db):
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="t1", account_id="acc_1")],
+                   next_cursor="cur1", has_more=False)
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.status == "ok"
+    assert result.added == 1
+    assert db.query(Transaction).filter_by(source="plaid", source_id="t1").count() == 1
+    db.refresh(item)
+    assert item.cursor == "cur1"
+
+
+def test_sync_one_item_per_row_isolation(db):
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="bad", account_id="acc_1"),
+                          _plaid_txn(transaction_id="ok", account_id="acc_1")],
+                   has_more=False, next_cursor="c")
+    ]
+    # classify raises only for the 'bad' txn (matched by description/source_id via the tx).
+    def _cls_side(tx, session):
+        if tx.source_id == "bad":
+            raise ValueError("boom")
+        return _cls()
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", side_effect=_cls_side):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.failed == 1
+    assert db.query(Transaction).filter_by(source_id="ok").count() == 1
+    assert db.query(Transaction).filter_by(source_id="bad").count() == 0

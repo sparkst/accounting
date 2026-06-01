@@ -10,8 +10,6 @@ entity-stamp, CSV supersede, and CSV-skip (the register has no account FK).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -26,10 +24,6 @@ logger = logging.getLogger(__name__)
 
 SOURCE = "plaid"
 _AUTO_THRESHOLD = 0.7
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def build_tx_fields(plaid_txn: Any) -> dict[str, Any]:

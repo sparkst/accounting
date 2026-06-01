@@ -6,6 +6,8 @@ Uses an in-memory SQLite so make_transaction can call the classifier
 
 from __future__ import annotations
 
+import unittest.mock as mock
+from collections.abc import Generator
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -13,8 +15,10 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
-from src.adapters.plaid_transactions import build_tx_fields
+from src.adapters.plaid_transactions import build_tx_fields, make_transaction
+from src.classification.engine import ClassificationResult
 from src.models.base import Base
+from src.models.enums import Direction, Entity, TaxCategory, TransactionStatus
 
 
 def _plaid_txn(**kw):
@@ -31,7 +35,7 @@ def _plaid_txn(**kw):
 
 
 @pytest.fixture
-def db() -> Session:
+def db() -> Generator[Session, None, None]:
     """Fresh in-memory SQLite with full schema and FK enforcement."""
     engine = create_engine("sqlite:///:memory:")
 
@@ -77,11 +81,6 @@ def test_source_and_hash_stable():
 
 # ── Task 4 tests: make_transaction ────────────────────────────────────────────
 
-import unittest.mock as mock
-from src.classification.engine import ClassificationResult
-from src.models.enums import Direction, Entity, TaxCategory, TransactionStatus
-from src.adapters.plaid_transactions import make_transaction
-
 
 def _cls(confidence=0.95):
     return ClassificationResult(
@@ -115,3 +114,4 @@ def test_make_transaction_unmapped_account_null_entity(db):
     assert tx.entity is None
     assert tx.payment_method is None
     assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    assert tx.review_reason == "plaid: account not mapped to an entity"

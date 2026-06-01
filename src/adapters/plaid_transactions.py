@@ -398,7 +398,12 @@ def process_added(
                 # pending. A human-confirmed, amount-adjusted row that Plaid later
                 # removed then re-added is an edge case where the human amount is
                 # overwritten — see P3-002 in the qloop R2 review.
-                _apply_update(session, existing, ptxn)
+                # _apply_update centrally refuses split_parent rows (returning
+                # False); the per-site guard above (line 382) already makes that
+                # path unreachable here, but we honour the contract uniformly so
+                # a future caller can rely on the bool without auditing each site.
+                if not _apply_update(session, existing, ptxn):
+                    continue
                 existing.status = TransactionStatus.NEEDS_REVIEW.value
                 existing.review_reason = "plaid_readded"
                 _audit_status_change(

@@ -389,6 +389,29 @@ def test_modified_amount_change_writes_audit_event(db):
     assert events[0].entity_id is None and events[0].entity_type is None
 
 
+def test_process_modified_unknown_id_is_noop(db):
+    """P2-002-TEST: process_modified on a source_id not in DB returns 0, no-op.
+    Mirrors test_removed_unknown_id_is_noop for the analogous removed path."""
+    result = process_modified(db, [_plaid_txn(transaction_id="ghost_mod")])
+    assert result == 0
+    assert db.query(Transaction).count() == 0
+
+
+def test_modified_same_amount_no_audit_event(db):
+    """P3-001-TEST: a modified event whose amount equals the stored row produces
+    NO AuditEvent for 'amount'. Guards _apply_update's `old != new` guard."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="sa1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="sa1").one()
+    before = db.query(AuditEvent).filter_by(field_changed="amount").count()
+    # Re-send the same amount — _apply_update must not audit.
+    process_modified(db, [_plaid_txn(transaction_id="sa1", amount=10.0)])
+    after = db.query(AuditEvent).filter_by(field_changed="amount").count()
+    assert after == before  # no new audit event
+
+
 # ── Task 8 tests: process_removed (REQ-PT-004) ───────────────────────────────
 
 
@@ -990,6 +1013,40 @@ def test_sync_one_item_removed_row_failure_holds_cursor(db):
     db.refresh(item)
     assert item.cursor is None
     assert result.status == "error"
+
+
+def test_first_sync_with_only_modified_skips_supersede(db):
+    """P3-002-TEST: first sync (item.cursor=None) returning only a modified event
+    (no added rows) must NOT attempt supersede. Guards the `if first_sync and
+    added:` short-circuit — a regression removing `and added` would incorrectly
+    invoke supersede_csv_rows with an empty date range."""
+    item, acct = _mapped(db, pm="Chase ****1234")
+    # Pre-seed a bank_csv row; it must survive untouched (supersede skipped).
+    db.add(Transaction(source="bank_csv", source_id="csv_keep", source_hash="hk",
+                       date="2026-03-15", description="x", amount=Decimal("-5"),
+                       currency="USD", entity="sparkry", status="confirmed",
+                       confidence=0.0, payment_method="Chase ****1234", raw_data={}))
+    # Seed a Plaid row so the modified event has a target.
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="mod_only", account_id="acc_1",
+                                            amount=10.0)],
+                      account_index={"acc_1": acct})
+    db.commit()
+    assert item.cursor is None  # confirm first sync
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(modified=[_plaid_txn(transaction_id="mod_only", amount=11.0)],
+                   has_more=False, next_cursor="cur_first")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    # No supersede occurred — the bank_csv row is unaffected.
+    assert result.superseded == 0
+    assert db.query(Transaction).filter_by(source_id="csv_keep").one().status == "confirmed"
+    # Cursor advances (no failures).
+    db.refresh(item)
+    assert item.cursor == "cur_first"
 
 
 def test_non_first_sync_does_not_supersede(db):

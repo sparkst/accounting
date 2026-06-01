@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from src.adapters.plaid_transactions import (
     build_tx_fields,
+    fetch_all_pages,
     make_transaction,
     process_added,
     process_modified,
@@ -207,3 +208,24 @@ def test_removed_marks_rejected_not_deleted(db):
 
 def test_removed_unknown_id_is_noop(db):
     assert process_removed(db, [{"transaction_id": "ghost"}]) == 0
+
+
+# ── Task 9 tests: fetch_all_pages (REQ-PT-001, REQ-PT-006) ───────────────────
+
+
+def _sync_resp(added=(), modified=(), removed=(), next_cursor="c1", has_more=False):
+    return SimpleNamespace(added=list(added), modified=list(modified),
+                           removed=list(removed), next_cursor=next_cursor, has_more=has_more)
+
+
+def test_fetch_all_pages_concatenates_until_has_more_false(db):
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="a")], next_cursor="c1", has_more=True),
+        _sync_resp(added=[_plaid_txn(transaction_id="b")], next_cursor="c2", has_more=False),
+    ]
+    added, modified, removed, cursor = fetch_all_pages(client, "tok", cursor=None)
+    assert [t.transaction_id for t in added] == ["a", "b"]
+    assert cursor == "c2"
+    assert client.transactions_sync.call_count == 2

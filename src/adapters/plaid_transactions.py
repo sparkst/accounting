@@ -126,6 +126,34 @@ def process_removed(session: Session, removed: list[Any]) -> int:
     return count
 
 
+def _sync_request(access_token: str, cursor: str | None) -> Any:
+    from plaid.model.transactions_sync_request import TransactionsSyncRequest
+    if cursor:
+        return TransactionsSyncRequest(access_token=access_token, cursor=cursor)
+    return TransactionsSyncRequest(access_token=access_token)
+
+
+def fetch_all_pages(
+    client: Any, access_token: str, *, cursor: str | None
+) -> tuple[list[Any], list[Any], list[Any], str]:
+    """Loop /transactions/sync until has_more is False. Returns
+    (added, modified, removed, next_cursor)."""
+    from src.adapters.plaid_client import call_with_retry
+    added: list[Any] = []
+    modified: list[Any] = []
+    removed: list[Any] = []
+    while True:
+        req = _sync_request(access_token, cursor)
+        resp = call_with_retry(lambda r=req: client.transactions_sync(r))
+        added += list(resp.added)
+        modified += list(resp.modified)
+        removed += list(resp.removed)
+        cursor = resp.next_cursor
+        if not resp.has_more:
+            break
+    return added, modified, removed, cursor
+
+
 def process_added(
     session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
 ) -> int:

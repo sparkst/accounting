@@ -165,6 +165,7 @@ class Source(enum.StrEnum):
     PHOTO_RECEIPT = "photo_receipt"
     DEDUCTION_EMAIL = "deduction_email"
     WOOCOMMERCE_CSV = "woocommerce_csv"
+    PLAID = "plaid"
 
 
 class VendorRuleSource(enum.StrEnum):
@@ -273,6 +274,7 @@ class Broker(enum.StrEnum):
     NW_MUTUAL = "nw_mutual"
     FG_ANNUITY = "fg_annuity"
     GSK_PENSION = "gsk_pension"
+    CHASE = "chase"
 
 
 class AccountType(enum.StrEnum):
@@ -294,6 +296,8 @@ class AccountType(enum.StrEnum):
     TOD = "tod"
     BROKERAGELINK = "brokeragelink"
     RSU = "rsu"
+    CHECKING = "checking"
+    SAVINGS = "savings"
     OTHER = "other"
 
 

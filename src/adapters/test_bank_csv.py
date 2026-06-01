@@ -34,7 +34,9 @@ from src.adapters.bank_csv import (
     parse_csv_bytes,
 )
 from src.models.base import Base
+from src.models.brokerage import Account
 from src.models.enums import Source, TransactionStatus
+from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
 from src.utils.dedup import compute_source_hash
 
@@ -718,3 +720,101 @@ class TestSourceHashStability:
         adapter_b = BankCsvAdapter(csv_b, config, filename="stmt.csv", dry_run=False)
         result_b = adapter_b.run(session)
         assert result_b.records_created == 1  # distinct description → distinct hash
+
+
+# ---------------------------------------------------------------------------
+# Tests — REQ-PT-012: bank_csv skips Plaid-owned payment_method
+# ---------------------------------------------------------------------------
+
+# Minimal single-row CSV for Plaid-skip tests
+_PLAID_SKIP_CSV = b"""Date,Description,Amount
+01/15/2025,Coffee Shop,-5.50
+"""
+
+_PLAID_SKIP_CSV_CONFIG_OWNED = BankCsvConfig(
+    bank_name="chase_plaid_owned",
+    date_column="Date",
+    date_format="%m/%d/%Y",
+    description_column="Description",
+    amount_column="Amount",
+    entity="sparkry",
+    payment_method="Chase ****1234",
+)
+
+_PLAID_SKIP_CSV_CONFIG_UNOWNED = BankCsvConfig(
+    bank_name="chase_not_plaid_owned",
+    date_column="Date",
+    date_format="%m/%d/%Y",
+    description_column="Description",
+    amount_column="Amount",
+    entity="sparkry",
+    payment_method="Chase ****9999",
+)
+
+
+class TestPlaidOwnedSkip:
+    """REQ-PT-012: bank_csv adapter must skip rows for Plaid-linked accounts."""
+
+    def _make_plaid_linked_account(self, session: Session) -> Account:
+        """Create a PlaidItem + Account with payment_method='Chase ****1234'."""
+        item = PlaidItem(
+            item_id="plaid_item_chase_test",
+            institution_id="ins_chase",
+            institution_name="Chase",
+            access_token_encrypted="enc_token",
+            status="active",
+        )
+        session.add(item)
+        session.flush()  # populate item.id
+
+        account = Account(
+            broker="chase",
+            account_number="1234",
+            account_type="checking",
+            entity="sparkry",
+            payment_method="Chase ****1234",
+            plaid_item_id=item.id,
+            plaid_account_id="acc_1",
+        )
+        session.add(account)
+        session.commit()
+        return account
+
+    def test_bank_csv_skips_plaid_owned_payment_method(self, session: Session):
+        """REQ-PT-012: rows are skipped (not created) when payment_method belongs
+        to a Plaid-linked Account. Plaid is sole source for that account."""
+        self._make_plaid_linked_account(session)
+
+        adapter = BankCsvAdapter(
+            _PLAID_SKIP_CSV,
+            _PLAID_SKIP_CSV_CONFIG_OWNED,
+            filename="chase_plaid.csv",
+            dry_run=False,
+        )
+        result = adapter.run(session)
+
+        assert result.records_created == 0, (
+            "No rows should be created for a Plaid-owned payment_method"
+        )
+        assert result.records_skipped >= 1, (
+            "Plaid-owned rows must be counted as skipped"
+        )
+
+    def test_bank_csv_ingests_when_payment_method_not_plaid_owned(
+        self, session: Session
+    ):
+        """Control: payment_method='Chase ****9999' has no Plaid-linked Account →
+        rows are created normally. The skip is specific to Plaid-owned labels."""
+        self._make_plaid_linked_account(session)  # links "Chase ****1234", not ****9999
+
+        adapter = BankCsvAdapter(
+            _PLAID_SKIP_CSV,
+            _PLAID_SKIP_CSV_CONFIG_UNOWNED,
+            filename="chase_other.csv",
+            dry_run=False,
+        )
+        result = adapter.run(session)
+
+        assert result.records_created >= 1, (
+            "Rows for a non-Plaid-owned payment_method must be created"
+        )

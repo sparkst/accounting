@@ -15,6 +15,7 @@ from src.models.brokerage import (
     PositionSnapshot,
     RealizedGainLoss,
 )
+import src.models.plaid  # noqa: F401 — registers PlaidItem so Account.plaid_item_id FK resolves
 from src.models.enums import (
     AccountType,
     Broker,
@@ -446,6 +447,22 @@ def test_brokerage_tx_status_rejects_bad_value(session: Session) -> None:
 
 
 # REQ-005a — cascade delete ---------------------------------------------------
+
+
+def test_account_has_payment_method_label(session: Session) -> None:
+    """REQ-PT-017: Account stores a payment_method label used as join key
+    for Plaid entity-stamp and CSV supersede/skip logic."""
+    acct = Account(
+        broker="chase",
+        account_number="****1234",
+        account_name="Sparkry Operating",
+        account_type="checking",
+        entity="sparkry",
+        payment_method="Chase ****1234",
+    )
+    session.add(acct)
+    session.commit()
+    assert acct.payment_method == "Chase ****1234"
 
 
 def test_account_delete_cascades(session: Session) -> None:

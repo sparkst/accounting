@@ -194,6 +194,7 @@ def _make_account(
         ("GET", "/api/plaid/items"),
         ("POST", "/api/plaid/sync-now"),
         ("GET", "/api/plaid/reconciliation/summary"),
+        ("POST", "/api/plaid/items/some-id/sync-transactions"),
     ],
 )
 def test_auth_required_on_every_endpoint(
@@ -228,6 +229,29 @@ def test_link_token_creates_placeholder_with_state_nonce(
     ph = db.query(PlaidItem).filter_by(state_nonce=body["state_nonce"]).one()
     assert ph.access_token_encrypted == "REVOKED"
     assert ph.item_id.startswith("placeholder_")
+
+
+def test_link_token_request_omits_invalid_balance_product(
+    client: TestClient, plaid_client_mock: MagicMock
+) -> None:
+    """REQ-025: ``balance`` must NOT be sent in ``required_if_supported_products``.
+
+    Plaid rejects it with HTTP 400 INVALID_PRODUCT — ``balance`` auto-initializes
+    whenever any other valid product (here ``transactions``) is requested. The
+    request-shape was never asserted before, so the real-API 400 slipped past the
+    mocked tests. Regression guard for the link-token 500.
+    """
+    plaid_client_mock.link_token_create.return_value = SimpleNamespace(
+        link_token="link-token-x"
+    )
+    resp = client.post("/api/plaid/link-token", json={})
+    assert resp.status_code == 200
+    req = plaid_client_mock.link_token_create.call_args[0][0]
+    payload = req.to_dict()
+    products = [str(p) for p in payload.get("products", [])]
+    assert "transactions" in products
+    req_if = [str(p) for p in (payload.get("required_if_supported_products") or [])]
+    assert "balance" not in req_if
 
 
 def test_exchange_rejects_missing_state_nonce(client: TestClient) -> None:
@@ -447,6 +471,67 @@ def test_map_accounts_writes_audit_per_mapping(
     audit = db2.query(AuditEvent).filter_by(entity_id=acct.id, entity_type="account").one()
     assert audit.field_changed == "plaid_link"
     assert audit.new_value == "p_acct_new"
+
+
+def test_map_accounts_persists_payment_method(
+    client: TestClient, db: Session
+) -> None:
+    """REQ-PT-017: create_new mapping with payment_method persists to Account.payment_method."""
+    item = _make_item(db)
+
+    resp = client.post(
+        "/api/plaid/map-accounts",
+        json={
+            "item_id": item.id,
+            "mappings": [
+                {
+                    "plaid_account_id": "acc_1",
+                    "create_new": {
+                        "broker": "chase",
+                        "account_number": "****1234",
+                        "account_name": "Sparkry Operating",
+                        "account_type": "checking",
+                        "entity": "sparkry",
+                        "tax_sheltered": False,
+                        "payment_method": "Chase ****1234",
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    db2 = _TestSession()
+    acct_after = db2.query(Account).filter_by(plaid_account_id="acc_1").one()
+    assert acct_after.payment_method == "Chase ****1234"
+
+
+def test_map_accounts_persists_payment_method_existing_account(
+    client: TestClient, db: Session
+) -> None:
+    """REQ-PT-017: mapping an existing account with payment_method sets Account.payment_method."""
+    item = _make_item(db)
+    acct = _make_account(db)
+    assert acct.payment_method is None
+
+    resp = client.post(
+        "/api/plaid/map-accounts",
+        json={
+            "item_id": item.id,
+            "mappings": [
+                {
+                    "plaid_account_id": "acc_2",
+                    "account_id": acct.id,
+                    "payment_method": "Chase ****5678",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    db2 = _TestSession()
+    acct_after = db2.query(Account).filter_by(id=acct.id).one()
+    assert acct_after.payment_method == "Chase ****5678"
 
 
 def test_map_accounts_validates_mutually_exclusive(client: TestClient, db: Session) -> None:
@@ -784,6 +869,9 @@ def test_sync_now_404_on_unknown_item(client: TestClient) -> None:
     plaid_routes_mod._sync_now_last_call.clear()
     resp = client.post("/api/plaid/sync-now?item_id=does-not-exist")
     assert resp.status_code == 404
+    # P2-004-SEC: the 404 must happen BEFORE the rate-limit write, so an unknown
+    # id neither consumes its cooldown slot nor grows the limiter dict.
+    assert "does-not-exist" not in plaid_routes_mod._sync_now_last_call
 
 
 def test_sync_now_rate_limited_to_one_per_minute_per_item(
@@ -932,3 +1020,45 @@ def test_exchange_rejects_non_printable_ascii_institution_name(
         },
     )
     assert resp.status_code == 422
+
+
+# ── Sync-transactions-now (REQ-PT-015) ──────────────────────────────────────
+
+
+def test_sync_transactions_now_rate_limited(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """POST /items/{id}/sync-transactions: first call 200, immediate second 429."""
+    import src.api.routes.plaid as plaid_routes_mod
+
+    # Isolate from balance sync-now limiter state.
+    plaid_routes_mod._tx_sync_now_last_call.clear()
+    item = _make_item(db)
+    plaid_client_mock.transactions_sync.return_value = SimpleNamespace(
+        added=[], modified=[], removed=[], next_cursor="c", has_more=False
+    )
+    r1 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
+    assert r1.status_code == 200
+    # First call actually ran the sync: body carries the expected result shape.
+    body = r1.json()
+    assert body["status"] == "ok"
+    # P2-002 / P3-004: 'reactivated' must be in the response so operators driving
+    # a manual sync see reinstated plaid_readded rows distinctly from fresh adds.
+    for key in ("added", "reactivated", "modified", "removed", "failed", "superseded"):
+        assert key in body
+    r2 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
+    assert r2.status_code == 429
+
+
+def test_sync_transactions_now_404_on_unknown_item(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """REQ-PT-015: unknown item_id → 404, and the 404 does NOT consume the
+    cooldown nor grow the limiter dict."""
+    import src.api.routes.plaid as plaid_routes_mod
+
+    plaid_routes_mod._tx_sync_now_last_call.clear()
+    resp = client.post("/api/plaid/items/nonexistent-id/sync-transactions")
+    assert resp.status_code == 404
+    # 404 happened before the rate-limiter write — id not recorded.
+    assert "nonexistent-id" not in plaid_routes_mod._tx_sync_now_last_call

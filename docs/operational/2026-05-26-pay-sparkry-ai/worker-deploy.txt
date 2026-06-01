@@ -1,0 +1,49 @@
+$ pnpm build:pay-worker
+dist-test/pay-worker.js  369.8kb
+⚡ Done in 567ms
+
+$ npx wrangler deploy --config wrangler.pay.toml
+ ⛅️ wrangler 4.85.0
+
+Total Upload: 470.96 KiB / gzip: 93.27 KiB
+Worker Startup Time: 19 ms
+Your Worker has access to the following bindings:
+Binding                                  Resource
+env.DB (sparkry-crm-prod)                D1 Database
+env.RATE_LIMITER (60 requests/10s)       Rate Limit
+
+Uploaded sparkry-pay (7.54 sec)
+Deployed sparkry-pay triggers (6.55 sec)
+  pay.sparkry.ai (custom domain)
+Current Version ID: 9acc2b28-089c-4b38-9fb0-e21f7f5196be
+
+# Verification curls
+$ curl -sI https://pay.sparkry.ai/healthz
+HTTP/2 200
+content-type: text/plain
+cache-control: no-store
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+content-security-policy: default-src 'none'
+referrer-policy: no-referrer
+x-content-type-options: nosniff
+x-frame-options: DENY
+
+$ curl -sI https://pay.sparkry.ai/
+HTTP/2 302
+location: https://sparkry.ai
+
+$ curl -s https://pay.sparkry.ai/robots.txt
+User-agent: *
+Disallow: /
+
+$ curl -sI https://pay.sparkry.ai/aaaaaaaa
+HTTP/2 404
+content-type: text/html; charset=utf-8
+cache-control: no-store
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+
+# Custom domain via wrangler.pay.toml routes block
+# (avoided manual dashboard Triggers → Add Custom Domain — replaced by config)
+routes = [
+  { pattern = "pay.sparkry.ai", custom_domain = true }
+]

@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> Cash-basis accounting system for Travis Sparks. Three entities: Sparkry LLC, BlackLine MTB LLC, Personal.
+> Cash-basis accounting system for Travis Sparks. Three entities: Sparkry LLC, BlackLine MTB Apparel LLC, Personal.
 
 ## Project Status
 
@@ -11,7 +11,7 @@ Production system deployed locally via launchd + Caddy reverse proxy, accessible
 **Design spec:** `docs/superpowers/specs/2026-03-15-accounting-system-design.md`
 **Requirements:** `requirements/current.md` (≈45 REQ-IDs incl. REQ-WC-001..019)
 
-Most recent shipped scope: **Wealth → Cloudflare migration** (REQ-WC-001..019 + REQ-WC-013a) — brokerage UI live at `https://internal.sparkry.ai/wealth/*` on Cloudflare Pages + D1, cash-basis register stays local. Plaid Phase 1 (REQ-025..029, commit `36ea4b7`) shipped earlier: item lifecycle, daily balance sync via launchd, stale-Item alerting, reconciliation summary, AuditEvent entity-mode extension.
+Most recent shipped scope: **Wealth → Cloudflare migration** (REQ-WC-001..019 + REQ-WC-013a) — brokerage UI live at `https://internal.sparkry.ai/wealth/*` on Cloudflare Pages + D1, cash-basis register stays local. Plaid Phase 1 (REQ-025..029, commit `36ea4b7`) shipped earlier: item lifecycle, daily balance sync via launchd, stale-Item alerting, reconciliation summary, AuditEvent entity-mode extension. **Plaid Phase 2** (REQ-PT-001..017) adds transaction ingestion into the register: adapter `src/adapters/plaid_transactions.py`, CLI `scripts/plaid_transactions_sync.py`, manual endpoint `POST /api/plaid/items/{id}/sync-transactions`. Plaid is **sole source of truth** per linked account — CSV supersede (`status="rejected"`, `review_reason="superseded_by_plaid"`) and `bank_csv` skip both key off the `payment_method` label (the register has no account FK). `/transactions/sync` is cursor-based; pending→posted reconcile keys off `pending_transaction_id`.
 
 **Current scope:** Maintenance. Local dashboard `/brokerage` route was renamed to `/wealth` on 2026-05-12 so local and prod both serve at the same URL.
 
@@ -119,7 +119,7 @@ rm data/accounting.snapshot.db
 | Entity | Tax Form | B&O |
 |---|---|---|
 | Sparkry LLC (single-member) | Schedule C | Monthly |
-| BlackLine MTB LLC (partnership, Travis 100%) | Form 1065 + K-1 | Quarterly |
+| BlackLine MTB Apparel LLC (2-partner LLC: Travis 100% vested + Emerson 0% vested profits interest; org. June 2025) | Form 1065 + K-1 (TaxAct Business) | Quarterly |
 | Personal | 1040 Schedule A, D | N/A |
 
 ---
@@ -174,6 +174,7 @@ src/export/          — Tax export formatters (FreeTaxUSA, B&O)
 src/reports/         — Weekly P&L report generator
 scripts/             — Operational scripts (backup, deduction-scan, auto-confirm, ingest-brokerage)
 scripts/plaid_balance_sync.py — Daily Plaid balance sync; invoked by com.sparkry.plaid-balance-sync.plist
+scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); invoked by com.sparkry.plaid-transactions-sync.plist (NOT loaded — see prerequisites above)
 dashboard/           — SvelteKit frontend (built with vite, served via vite preview)
 dashboard/src/routes/admin/connections/ — Plaid Link UI + OAuth-return handler
 data/                — SQLite DB, CSV drop zone (GITIGNORED). Pre-migration snapshots at `accounting.pre-wealth-migration-<ts>.db`.
@@ -212,6 +213,7 @@ Five launchd services behind a Caddy reverse proxy over Tailscale. API plist use
 | Caddy | `com.sparkry.caddy-accounting.plist` | 443 | HTTPS reverse proxy |
 | Backup | `com.sparkry.accounting-backup.plist` | — | Periodic SQLite backup (`scripts/backup.sh`) |
 | Weekly P&L | `com.sparkry.weekly-pl-report.plist` | — | Monday P&L email (`scripts/weekly-pl-report.py`) |
+| Plaid Transactions Sync | `com.sparkry.plaid-transactions-sync.plist` | — | Daily Plaid transaction sync (`scripts/plaid_transactions_sync.py --apply`). **NOT loaded yet** — gated on `PLAID_ENV=production` + `transactions` product approval + Chase OAuth redirect setup (spec §9 prerequisites). |
 
 ```bash
 # Restart a service after code changes

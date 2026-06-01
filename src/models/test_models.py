@@ -112,6 +112,7 @@ class TestSourceEnum:
             "bank_csv",
             "photo_receipt", "deduction_email",
             "woocommerce_csv",
+            "plaid",
         }
 
 
@@ -549,3 +550,15 @@ class TestCheckConstraints:
         tx.tax_category = TaxCategory.SUPPLIES.value
         constrained_session.add(tx)
         constrained_session.commit()  # must not raise
+
+
+def test_source_has_plaid_value():
+    from src.models.enums import Source
+    assert Source.PLAID.value == "plaid"
+
+
+def test_account_enums_admit_chase_checking():
+    from src.models.enums import AccountType, Broker
+    assert Broker.CHASE.value == "chase"
+    assert AccountType.CHECKING.value == "checking"
+    assert AccountType.SAVINGS.value == "savings"

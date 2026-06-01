@@ -72,6 +72,7 @@ RECONCILIATION_DELTA_ABS_THRESHOLD = Decimal("100.00")  # $100
 # In-memory rate limiter for /sync-now. Keyed by item_id → last-call timestamp.
 _SYNC_NOW_COOLDOWN_SECONDS = 60.0
 _sync_now_last_call: dict[str, float] = {}
+_tx_sync_now_last_call: dict[str, float] = {}
 
 
 def _now() -> datetime:
@@ -130,6 +131,7 @@ class CreateNewAccount(BaseModel):
     account_type: str
     entity: str = "personal"
     tax_sheltered: bool = False
+    payment_method: str | None = None
 
 
 class AccountMapping(BaseModel):
@@ -138,6 +140,7 @@ class AccountMapping(BaseModel):
         default=None, description="Map to existing Account. Mutually exclusive with create_new."
     )
     create_new: CreateNewAccount | None = None
+    payment_method: str | None = None
 
     @field_validator("create_new")
     @classmethod
@@ -276,8 +279,10 @@ def create_link_token(
     req = LinkTokenCreateRequest(
         user=LinkTokenCreateRequestUser(client_user_id=placeholder.id),
         client_name="Travis Accounting",
+        # ``balance`` is intentionally omitted: Plaid rejects it in any product
+        # field (INVALID_PRODUCT) because it auto-initializes whenever another
+        # product — here ``transactions`` — is requested.
         products=[Products("transactions")],
-        required_if_supported_products=[Products("balance")],
         additional_consented_products=[Products("investments")],
         country_codes=[CountryCode("US")],
         language="en",
@@ -385,6 +390,8 @@ def map_accounts(
             account = session.query(Account).filter_by(id=m.account_id).first()
             if account is None:
                 raise HTTPException(status_code=404, detail=f"account {m.account_id} not found")
+            if m.payment_method is not None:
+                account.payment_method = m.payment_method
         else:
             assert m.create_new is not None  # validator guarantees this
             account = Account(
@@ -394,6 +401,7 @@ def map_accounts(
                 account_type=m.create_new.account_type,
                 entity=m.create_new.entity,
                 tax_sheltered=m.create_new.tax_sheltered,
+                payment_method=m.create_new.payment_method,
             )
             session.add(account)
             session.flush()
@@ -586,6 +594,16 @@ def sync_now(
     Plaid happy — Balance is per-call billed in production.
     """
     cooldown_key = item_id or "*"
+    # Validate the item exists BEFORE recording the rate-limit timestamp, so an
+    # arbitrary/fabricated item_id can't (a) grow the in-memory limiter dict
+    # unbounded or (b) consume the cooldown window on a 404. Mirrors the guard
+    # in sync_transactions_now. The global ("*") path has no 404 and is unchanged.
+    item: PlaidItem | None = None
+    if item_id is not None:
+        item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
+        if item is None:
+            raise HTTPException(status_code=404, detail="item not found")
+
     now = time.monotonic()
     last = _sync_now_last_call.get(cooldown_key, 0.0)
     if now - last < _SYNC_NOW_COOLDOWN_SECONDS:
@@ -611,9 +629,12 @@ def sync_now(
                 for r in batch.items
             ]
         }
-    item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
-    if item is None:
-        raise HTTPException(status_code=404, detail="item not found")
+    # item is guaranteed non-None here: item_id is not None on this path and the
+    # 404 branch above returns if the lookup missed. An explicit guard (rather
+    # than `assert`, which python -O strips) narrows the type for mypy and stays
+    # safe under optimisation (P2-004).
+    if item is None:  # pragma: no cover - unreachable, narrowing guard
+        raise HTTPException(status_code=500, detail="internal: item unexpectedly None")
     result = sync_one_item(session, item, client=client)
     session.commit()
     return {
@@ -621,6 +642,44 @@ def sync_now(
         "status": result.status,
         "accounts_processed": result.accounts_processed,
         "accounts_failed": result.accounts_failed,
+        "error_code": result.error_code,
+    }
+
+
+@router.post("/items/{item_id}/sync-transactions")
+def sync_transactions_now(
+    item_id: str = Path(..., min_length=1),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Manual trigger of Plaid transactions sync for one Item. Rate-limited
+    1/min/item (REQ-PT-015)."""
+    from src.adapters.plaid_transactions import sync_one_item as _tx_sync_one
+
+    # Validate the item exists BEFORE recording the rate-limit timestamp, so an
+    # arbitrary/fabricated item_id can't (a) grow the in-memory limiter dict
+    # unbounded or (b) consume the cooldown window on a 404.
+    item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="item not found")
+
+    now = time.monotonic()
+    last = _tx_sync_now_last_call.get(item_id, 0.0)
+    if now - last < _SYNC_NOW_COOLDOWN_SECONDS:
+        wait = int(_SYNC_NOW_COOLDOWN_SECONDS - (now - last))
+        raise HTTPException(status_code=429, detail=f"sync cooldown active, retry in {wait}s")
+    _tx_sync_now_last_call[item_id] = now
+
+    client = _get_plaid_client()
+    result = _tx_sync_one(session, item, client=client)
+    session.commit()
+    return {
+        "status": result.status,
+        "added": result.added,
+        "reactivated": result.reactivated,
+        "modified": result.modified,
+        "removed": result.removed,
+        "failed": result.failed,
+        "superseded": result.superseded,
         "error_code": result.error_code,
     }
 

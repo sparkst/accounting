@@ -17,6 +17,7 @@ from sqlalchemy import engine_from_config, pool
 # ---------------------------------------------------------------------------
 from src.models.audit_event import AuditEvent  # noqa: F401
 from src.models.base import Base
+from src.models.plaid import PlaidItem, PlaidAccountBalanceSnapshot  # noqa: F401
 from src.models.brokerage import (  # noqa: F401
     Account,
     BrokerageTransaction,

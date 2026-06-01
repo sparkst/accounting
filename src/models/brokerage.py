@@ -116,6 +116,11 @@ class Account(Base):
         String(36), ForeignKey("plaid_item.id"), nullable=True
     )
     plaid_account_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payment_method: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+        comment="Label joining this account to register rows (e.g. 'Chase ****1234'). "
+                "Join key for Plaid entity-stamp, CSV supersede, and CSV-skip.",
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=_now, onupdate=_now

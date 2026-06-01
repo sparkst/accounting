@@ -78,9 +78,13 @@ def main(argv: list[str] | None = None) -> int:
             r.error_code or "-",
         )
     # Exit non-zero so launchd surfaces a failed/held-cursor sync to ops.
-    # Any per-row failure (cursor held) OR an item in an error state qualifies.
+    # Any per-row failure (cursor held) OR any item not in a clean state
+    # qualifies. A retryable INSTITUTION_DOWN sets status='institution_down'
+    # (not 'error') and holds the cursor, so a status=='error'-only check would
+    # exit 0 and leave ops blind to the held cursor — treat any non-ok status
+    # as a failure (REQ-PT-007).
     has_failures = batch.total_failed > 0 or any(
-        r.status == "error" for r in batch.items
+        r.status != "ok" for r in batch.items
     )
     return 1 if has_failures else 0
 

@@ -71,3 +71,21 @@ def test_main_returns_nonzero_on_error_status_item():
             total_removed=0, total_failed=0, total_superseded=0, dry_run=False,
         )
         assert cli.main([]) == 1
+
+
+def test_main_returns_nonzero_on_institution_down_item():
+    """P1-001 / REQ-PT-007: a retryable INSTITUTION_DOWN sets item status
+    'institution_down' (NOT 'error') and holds the cursor with failed==0. The
+    script must still exit non-zero so launchd surfaces the held-cursor sync —
+    a status=='error'-only check would exit 0 and leave ops blind."""
+    with mock.patch.object(cli, "sync_all_active") as sync, \
+         mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
+         mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
+        down_item = mock.Mock(status="institution_down", institution_name="Chase",
+                              added=0, reactivated=0, failed=0,
+                              error_code="INSTITUTION_DOWN")
+        sync.return_value = mock.Mock(
+            items=[down_item], total_added=0, total_reactivated=0, total_modified=0,
+            total_removed=0, total_failed=0, total_superseded=0, dry_run=False,
+        )
+        assert cli.main([]) == 1

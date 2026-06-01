@@ -214,6 +214,24 @@ def test_make_transaction_unmapped_account_null_entity(db):
     assert tx.review_reason == "plaid: account not mapped to an entity"
 
 
+def test_make_transaction_unmapped_and_transfer_combines_review_reasons(db):
+    """P3-002: when an account is BOTH unmapped (entity None) AND the txn is a
+    Plaid transfer-category, review_reason must surface BOTH signals — an
+    if/elif chain would silently drop the transfer flag so an operator querying
+    needs_review for transfer patterns would miss these rows."""
+    pfc = SimpleNamespace(primary="TRANSFER_IN", detailed="TRANSFER_IN_DEPOSIT")
+    txn = _plaid_txn(transaction_id="dual1", personal_finance_category=pfc)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        tx = make_transaction(txn, session=db, entity=None, payment_method=None)
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    assert "account not mapped to an entity" in tx.review_reason
+    assert "transfer-category" in tx.review_reason
+    assert tx.review_reason == (
+        "plaid: account not mapped to an entity; "
+        "transfer-category — confirm transfer vs income"
+    )
+
+
 # ── Task 5 tests: process_added upsert + idempotency (REQ-PT-002) ─────────────
 
 
@@ -256,6 +274,53 @@ def test_pending_then_posted_updates_in_place(db):
     assert len(rows) == 1
     assert rows[0].source_id == "post1"
     assert rows[0].amount == Decimal("-22.50")
+
+
+def test_pending_posted_as_transfer_demotes_to_needs_review(db):
+    """P3-001: a pending row that auto-classified (non-transfer PFC) but posts as
+    a Plaid TRANSFER-category settlement must be demoted to needs_review so a
+    real internal transfer doesn't slip through as auto_classified income."""
+    item, acct = _mapped(db)
+    pending = _plaid_txn(transaction_id="pp1", amount=20.00, pending=True)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [pending], account_index={"acc_1": acct})
+    prior = db.query(Transaction).filter_by(source_id="pp1").one()
+    # Simulate the pending having auto-classified (non-transfer at pending time).
+    prior.status = TransactionStatus.AUTO_CLASSIFIED.value
+    db.commit()
+    # dict-shaped PFC so raw_data (which stores to_dict) stays JSON-serializable;
+    # _is_plaid_transfer_category handles dict and object shapes alike.
+    pfc = {"primary": "TRANSFER_IN", "detailed": "TRANSFER_IN_ACCOUNT_TRANSFER"}
+    posted = _plaid_txn(transaction_id="ppost1", amount=20.00, pending=False,
+                        pending_transaction_id="pp1", personal_finance_category=pfc)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [posted], account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source="plaid").one()
+    assert row.source_id == "ppost1"
+    assert row.status == TransactionStatus.NEEDS_REVIEW.value
+    assert row.review_reason == "plaid: transfer-category — confirm transfer vs income"
+    # The status flip is audited.
+    events = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                            field_changed="status").all()
+    assert any(e.new_value == "needs_review" for e in events)
+
+
+def test_pending_posted_non_transfer_keeps_status(db):
+    """P3-001 negative: a pending→posted reconcile where the posted txn is NOT a
+    transfer-category must NOT touch the prior row's status (no spurious demote)."""
+    item, acct = _mapped(db)
+    pending = _plaid_txn(transaction_id="pn1", amount=20.00, pending=True)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [pending], account_index={"acc_1": acct})
+    prior = db.query(Transaction).filter_by(source_id="pn1").one()
+    prior.status = TransactionStatus.AUTO_CLASSIFIED.value
+    db.commit()
+    posted = _plaid_txn(transaction_id="pnpost1", amount=22.50, pending=False,
+                        pending_transaction_id="pn1")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [posted], account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source="plaid").one()
+    assert row.status == TransactionStatus.AUTO_CLASSIFIED.value
 
 
 # ── Task 7 tests: process_modified (REQ-PT-003, REQ-PT-013) ──────────────────
@@ -407,6 +472,10 @@ def test_sync_one_item_accumulates_reactivated(db):
     db.commit()
     assert result.reactivated == 1
     assert result.added == 0
+    # P2-001: records_processed must include reactivated rows (else a sync that
+    # only reactivates logs records_processed=0 and is invisible to ops).
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.records_processed == 1
 
 
 def test_removed_skips_split_parent(db):
@@ -440,6 +509,29 @@ def test_modified_skips_split_parent(db):
     db.refresh(row)
     assert row.amount == original_amount
     assert row.status == TransactionStatus.SPLIT_PARENT.value
+
+
+def test_added_readded_skips_split_parent(db):
+    """P2-005: process_added's reactivation path must skip a split_parent row.
+    Re-applying a Plaid re-delivered amount to a split parent would overwrite the
+    parent total and break the split-sum invariant for its children."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="spr1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="spr1").one()
+    row.status = TransactionStatus.SPLIT_PARENT.value
+    original_amount = row.amount
+    db.commit()
+    # Plaid re-delivers the same id as added with a different amount.
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        counts = process_added(db, item,
+                               [_plaid_txn(transaction_id="spr1", amount=99.0)],
+                               account_index={"acc_1": acct})
+    db.refresh(row)
+    assert counts.inserted == 0 and counts.reactivated == 0
+    assert row.status == TransactionStatus.SPLIT_PARENT.value
+    assert row.amount == original_amount
 
 
 # ── Task 9 tests: fetch_all_pages (REQ-PT-001, REQ-PT-006) ───────────────────
@@ -559,6 +651,13 @@ def test_sync_one_item_full_flow_first_sync_sets_cursor(db):
     assert db.query(Transaction).filter_by(source="plaid", source_id="t1").count() == 1
     db.refresh(item)
     assert item.cursor == "cur1"
+    # P2-003: the SUCCESS (no-failure) path must write a SUCCESS IngestionLog with
+    # the processed count and zero failures — guards against a silent regression
+    # that flips status to FAILURE or undercounts records_processed on a clean run.
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.SUCCESS.value
+    assert log.records_processed == 1
+    assert log.records_failed == 0
 
 
 def test_sync_one_item_per_row_isolation(db):
@@ -677,6 +776,13 @@ def test_sync_one_item_invalid_ciphertext_is_terminal_holds_cursor(db):
     assert item.last_error == "INVALID_ACCESS_TOKEN"
     log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
     assert log.status == IngestionStatus.FAILURE.value
+    # P3-003: retryable=False is the IngestionLog column default. This assertion
+    # (and the matching ones in the terminal/unexpected tests below) is partially
+    # tautological today — it cannot fail unless the implementation is changed.
+    # It is retained deliberately to guard against a FUTURE mutation that
+    # incorrectly sets retryable=True in a terminal/unexpected handler. The
+    # meaningful positive coverage lives in the two RetryablePlaidError tests
+    # (INSTITUTION_DOWN and RATE_LIMIT_EXCEEDED) which assert retryable is True.
     assert log.retryable is False
 
 
@@ -726,6 +832,106 @@ def test_sync_one_item_unexpected_error_holds_cursor(db):
     assert log.status == IngestionStatus.FAILURE.value
     assert log.retryable is False
     assert log.error_detail.startswith("unexpected:")
+
+
+def test_sync_one_item_rate_limit_sets_status_error(db):
+    """P2-006: a RetryablePlaidError whose code is NOT an institution-down code
+    (e.g. RATE_LIMIT_EXCEEDED) must set status/last_sync_status='error' (NOT
+    'institution_down'), hold the cursor, and write a retryable FAILURE log.
+    Exercises the ternary else-branch — a test fixed to INSTITUTION_DOWN can't."""
+    item, acct = _mapped(db)
+    item.cursor = "prev_cursor"
+    db.commit()
+    client = mock.Mock()
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.fetch_all_pages",
+                    side_effect=RetryablePlaidError("RATE_LIMIT_EXCEEDED")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.status == "error"
+    assert result.error_code == "RATE_LIMIT_EXCEEDED"
+    db.refresh(item)
+    assert item.cursor == "prev_cursor"
+    assert item.last_sync_status == "error"
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.FAILURE.value
+    assert log.retryable is True
+    assert log.error_detail == "RATE_LIMIT_EXCEEDED"
+
+
+def test_supersede_failure_holds_cursor(db):
+    """P2-007: if supersede_csv_rows raises during a first sync, the failure is
+    classified (result.failed += 1) and the cursor is held (NOT advanced) so a
+    clean re-run can complete the supersede. Guards REQ-PT-006/011."""
+    item, acct = _mapped(db, pm="Chase ****1234")
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="s1", account_id="acc_1")],
+                   has_more=False, next_cursor="cur1")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()), \
+         mock.patch("src.adapters.plaid_transactions.supersede_csv_rows",
+                    side_effect=RuntimeError("supersede boom")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.failed == 1
+    assert result.status == "error"
+    # The added row itself still ingested (failure was only in supersede).
+    assert db.query(Transaction).filter_by(source="plaid", source_id="s1").count() == 1
+    # Cursor held so the supersede is retried on a clean re-run.
+    db.refresh(item)
+    assert item.cursor is None
+
+
+def test_sync_one_item_modified_row_failure_holds_cursor(db):
+    """P2-008: a per-row failure inside a `modified` event must be isolated
+    (result.failed += 1) and hold the cursor, mirroring the added-row isolation.
+    Other events in the batch still process."""
+    item, acct = _mapped(db)
+    # Seed a row that the modified event will target.
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="mod1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    db.commit()
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(modified=[_plaid_txn(transaction_id="mod1", amount=11.0)],
+                   removed=[{"transaction_id": "rem_ghost"}],
+                   has_more=False, next_cursor="cur1")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.process_modified",
+                    side_effect=RuntimeError("modify boom")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.failed == 1
+    # The removed event (a no-op ghost) still ran — batch wasn't aborted.
+    assert result.removed == 0
+    # Cursor held on partial failure.
+    db.refresh(item)
+    assert item.cursor is None
+    assert result.status == "error"
+
+
+def test_sync_one_item_removed_row_failure_holds_cursor(db):
+    """P2-008: a per-row failure inside a `removed` event is isolated and holds
+    the cursor, mirroring added/modified isolation."""
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(removed=[{"transaction_id": "rem1"}],
+                   has_more=False, next_cursor="cur1")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.process_removed",
+                    side_effect=RuntimeError("remove boom")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.failed == 1
+    db.refresh(item)
+    assert item.cursor is None
+    assert result.status == "error"
 
 
 def test_non_first_sync_does_not_supersede(db):

@@ -629,7 +629,12 @@ def sync_now(
                 for r in batch.items
             ]
         }
-    assert item is not None  # narrowed by the item_id-not-None branch above
+    # item is guaranteed non-None here: item_id is not None on this path and the
+    # 404 branch above returns if the lookup missed. An explicit guard (rather
+    # than `assert`, which python -O strips) narrows the type for mypy and stays
+    # safe under optimisation (P2-004).
+    if item is None:  # pragma: no cover - unreachable, narrowing guard
+        raise HTTPException(status_code=500, detail="internal: item unexpectedly None")
     result = sync_one_item(session, item, client=client)
     session.commit()
     return {
@@ -670,6 +675,7 @@ def sync_transactions_now(
     return {
         "status": result.status,
         "added": result.added,
+        "reactivated": result.reactivated,
         "modified": result.modified,
         "removed": result.removed,
         "failed": result.failed,

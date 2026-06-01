@@ -167,10 +167,17 @@ def make_transaction(
         TransactionStatus.NEEDS_REVIEW.value if needs_review
         else TransactionStatus.AUTO_CLASSIFIED.value
     )
+    # Build review_reason from ALL applicable signals. When BOTH entity is
+    # unmapped AND it's a transfer-category, an if/elif chain would drop the
+    # transfer flag — an operator querying needs_review for transfer patterns
+    # would miss these dual-condition rows. Concatenate instead (P3-002).
+    reasons: list[str] = []
     if entity is None:
-        tx.review_reason = "plaid: account not mapped to an entity"
-    elif is_transfer_category:
-        tx.review_reason = "plaid: transfer-category — confirm transfer vs income"
+        reasons.append("account not mapped to an entity")
+    if is_transfer_category:
+        reasons.append("transfer-category — confirm transfer vs income")
+    if reasons:
+        tx.review_reason = "plaid: " + "; ".join(reasons)
     return tx
 
 
@@ -351,6 +358,17 @@ def process_added(
     for ptxn in added:
         existing = _existing_by_source_id(session, ptxn.transaction_id)
         if existing is not None:
+            # Defensive split_parent guard, mirroring process_removed /
+            # process_modified. A split_parent wouldn't normally be REJECTED with
+            # reason plaid_removed (process_removed skips split parents), but if a
+            # rare double-event left one in any state that Plaid re-delivers,
+            # reactivating via _apply_update would overwrite the parent amount and
+            # break the split-sum invariant for its children. Skip + warn instead.
+            if existing.status == TransactionStatus.SPLIT_PARENT.value:
+                logger.warning(
+                    "plaid readded skipped: split_parent row %s", existing.id
+                )
+                continue
             # Removed-then-readded: Plaid can re-deliver a previously-removed id.
             # A row we rejected via process_removed represents real activity that
             # Plaid now considers live again, so reactivate it instead of skipping
@@ -381,6 +399,31 @@ def process_added(
                 _apply_update(session, prior, ptxn)
                 prior.source_id = ptxn.transaction_id
                 prior.source_hash = compute_source_hash(SOURCE, ptxn.transaction_id)
+                # Re-evaluate transfer-category on the POSTED txn. A pending that
+                # carried a non-transfer PFC but posts as TRANSFER_IN/OUT would
+                # otherwise keep its prior status and slip through as
+                # auto_classified — silently dropping a real internal transfer
+                # signal. If it now reads as transfer-category and the row isn't
+                # already in needs_review, demote it so a human confirms
+                # transfer-vs-income (P3-001). split_parent rows are exempt: their
+                # status is structural, not a classification, and must not flip.
+                if (
+                    _is_plaid_transfer_category(ptxn)
+                    and prior.status
+                    not in (
+                        TransactionStatus.NEEDS_REVIEW.value,
+                        TransactionStatus.SPLIT_PARENT.value,
+                    )
+                ):
+                    old_status = prior.status
+                    prior.status = TransactionStatus.NEEDS_REVIEW.value
+                    prior.review_reason = (
+                        "plaid: transfer-category — confirm transfer vs income"
+                    )
+                    _audit_status_change(
+                        session, prior, old_status,
+                        TransactionStatus.NEEDS_REVIEW.value,
+                    )
                 session.flush()
                 continue
         acct = account_index.get(ptxn.account_id)
@@ -512,7 +555,9 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
             item.last_error = "PARTIAL_FAILURE"
             result.status = "error"
         item.last_sync_at = pulled_at
-        log_row.records_processed = result.added + result.modified + result.removed
+        log_row.records_processed = (
+            result.added + result.reactivated + result.modified + result.removed
+        )
         log_row.records_failed = result.failed
         log_row.status = (IngestionStatus.PARTIAL_FAILURE.value if result.failed
                           else IngestionStatus.SUCCESS.value)

@@ -1042,7 +1042,9 @@ def test_sync_transactions_now_rate_limited(
     # First call actually ran the sync: body carries the expected result shape.
     body = r1.json()
     assert body["status"] == "ok"
-    for key in ("added", "modified", "removed", "failed", "superseded"):
+    # P2-002 / P3-004: 'reactivated' must be in the response so operators driving
+    # a manual sync see reinstated plaid_readded rows distinctly from fresh adds.
+    for key in ("added", "reactivated", "modified", "removed", "failed", "superseded"):
         assert key in body
     r2 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
     assert r2.status_code == 429

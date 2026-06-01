@@ -58,9 +58,10 @@ The adapter is environment-agnostic: it runs against Plaid **sandbox** for tests
 | **REQ-PT-007** | Per-row savepoint (`session.begin_nested()`): one failing transaction is logged to `result.errors` and skipped; the batch continues. |
 | **REQ-PT-008** | Sign mapping: `db_amount = Decimal(str(-plaid_amount))`. Plaid `+` (outflow) → negative (expense); Plaid `−` (inflow) → positive (income). Quantized before hashing. |
 | **REQ-PT-009** | Each ingested row runs through the 3-tier classifier; `confidence < 0.7` → `status="needs_review"`. `description` = Plaid `merchant_name` else `name`. Full Plaid txn JSON stored in `raw_data`. |
-| **REQ-PT-010** | Entity is inherited from the mapped `Account.entity` (via `Account.plaid_account_id`). A txn for an unmapped Plaid account is ingested with `entity=NULL` and `status="needs_review"`. |
-| **REQ-PT-011** | First-sync CSV supersede: after backfill, existing non-Plaid register rows for the same `Account` whose `date` is within Plaid's covered range are marked `status="rejected"`, `review_reason="superseded_by_plaid"`, audit-logged. Never deleted. |
-| **REQ-PT-012** | Sole-source enforcement: `bank_csv` (and peer bank adapters) skip rows targeting an `Account` with non-null `plaid_item_id`, reporting them as skipped in `AdapterResult`. |
+| **REQ-PT-010** | Entity is inherited from the mapped `Account.entity` (authoritative — overrides the classifier's entity guess). `payment_method` is stamped from `Account.payment_method` (the account's label, e.g. `"Chase ****1234"`). A txn for an unmapped Plaid account is ingested with `entity=NULL`, `payment_method=NULL`, `status="needs_review"`. |
+| **REQ-PT-011** | First-sync CSV supersede, keyed on `payment_method` label (Transactions have no account FK): after backfill, existing register rows where `source != "plaid"` AND `payment_method == <mapped account's label>` AND `date` is within Plaid's covered range are marked `status="rejected"`, `review_reason="superseded_by_plaid"`, audit-logged. Never deleted. A NULL/blank account label disables supersede for that account (logged). |
+| **REQ-PT-012** | Sole-source enforcement: `bank_csv` skips rows whose config `payment_method` matches a "Plaid-owned" label — i.e. an `Account` row that has both a non-null `plaid_item_id` and that `payment_method`. Skipped rows are counted/reported in `AdapterResult`, not silently dropped. |
+| **REQ-PT-017** | `Account` gains a nullable `payment_method` label column (Alembic migration). `POST /map-accounts` accepts an optional `payment_method` per mapping; when creating/linking a depository account it should be set to the exact label the CSV imports used (so supersede matches history). The label is the join key for REQ-PT-010/011/012. |
 | **REQ-PT-013** | Human-edit preservation: if a row is `status="confirmed"` or has human edits, `modified`/post-reconcile refresh amount/date/raw_data but preserve human-set `entity`, `direction`, `tax_category`, `tax_subcategory`. |
 | **REQ-PT-014** | Daily launchd job `com.sparkry.plaid-transactions-sync.plist` runs `scripts/plaid_transactions_sync.py` (DRY-RUN default; `--apply` to commit). |
 | **REQ-PT-015** | Manual `POST /api/plaid/items/{id}/sync-transactions`, rate-limited 1/min/item (reuse balance sync-now guard); auth-protected like all Plaid routes. |
@@ -85,10 +86,12 @@ bank_csv.py: skip if Account.plaid_item_id ──┘
 | `scripts/plaid_transactions_sync.py` | **New.** launchd CLI wrapper; mirrors `scripts/plaid_balance_sync.py`. |
 | `com.sparkry.plaid-transactions-sync.plist` | **New.** Daily schedule; `doppler run -- python -m scripts.plaid_transactions_sync --apply`. Dedicated job (isolation from balance sync). |
 | `src/api/routes/plaid.py` | Add `POST /items/{id}/sync-transactions` (manual sync-now). |
-| `src/adapters/bank_csv.py` | Add the sole-source skip (REQ-PT-012). |
-| `src/models/enums.py` + Alembic migration | Extend `Broker` + `AccountType` to admit Chase / depository (`checking`, `savings`) — follows the `p4ext1enum0xt` precedent. CHECK-constraint values must match enum **values**, not member names (see `alembic-migration` skill / `migration-reviewer`). |
+| `src/adapters/bank_csv.py` | Add the sole-source skip keyed on `payment_method` (REQ-PT-012). |
+| `src/models/enums.py` | Add `Source.PLAID = "plaid"`. Extend `Broker` + `AccountType` to admit Chase / depository (`checking`, `savings`) — follows the `p4ext1enum0xt` precedent. |
+| Alembic migration | (a) `Source` CHECK is not enum-bound on `transactions` (free `String`), so no constraint change there — just the new enum member. (b) Add nullable `Account.payment_method` column (REQ-PT-017). (c) Extend `Broker`/`AccountType` CHECK constraints — values must match enum **values**, not member names (see `alembic-migration` skill / `migration-reviewer`). |
+| `src/api/routes/plaid.py` (`map-accounts`) | Accept optional `payment_method` per mapping; persist to `Account.payment_method` (REQ-PT-017). |
 
-No new tables. `PlaidItem.cursor` already exists.
+No new tables. `PlaidItem.cursor` already exists; `Account` gains one nullable column.
 
 ## 5. Sync Algorithm (per item)
 
@@ -124,16 +127,26 @@ uniqueness makes upserts no-ops.
 
 ## 7. CSV Supersede & Sole-Source Enforcement
 
+**The join key is `payment_method`, not an Account FK.** Register `Transaction` rows have no
+`account_id`; the only per-account discriminator on existing CSV rows is the free-text
+`payment_method` label (e.g. `"Chase ****1234"`). So both behaviors below match on that label.
+
 - **Arming:** mapping a Plaid account to an `Account` (`POST /map-accounts`) sets
-  `Account.plaid_item_id` / `plaid_account_id`. That mapping arms both behaviors below.
+  `Account.plaid_item_id` / `plaid_account_id` **and** `Account.payment_method` (the label).
+  Setting the label is what arms supersede + skip. The label MUST equal what the CSV imports
+  used for that account, or supersede won't find the history (data-hygiene requirement,
+  surfaced to the operator at mapping time).
 - **Backfill supersede (REQ-PT-011):** runs once, when `item.cursor` was `None` at the start
-  of the sync. Scope is limited to the specific `Account` and Plaid's covered date range, so
-  rows for other accounts or outside the range are untouched.
-- **Ongoing skip (REQ-PT-012):** `bank_csv` resolves the target `Account`; if it has a
-  `plaid_item_id`, the row is skipped and counted (not silently dropped — logged in
-  `AdapterResult`).
-- **Disconnect:** disconnecting a Plaid item leaves superseded CSV rows `rejected` (manual
-  re-activation if ever needed). Documented, not automated.
+  of the sync. Marks `status="rejected"` on rows where `source != "plaid"` AND
+  `payment_method == <label>` AND `date ∈ [covered_min, covered_max]`. Other labels, other
+  sources' rows with a different label, and out-of-range rows are untouched.
+- **Ongoing skip (REQ-PT-012):** before inserting a CSV row, `bank_csv` checks whether its
+  config `payment_method` is "Plaid-owned" (an `Account` exists with that `payment_method` and
+  a non-null `plaid_item_id`). If so the row is skipped and counted (logged in `AdapterResult`,
+  never silently dropped).
+- **Disconnect:** disconnecting a Plaid item leaves superseded CSV rows `rejected` and the
+  account label intact (so re-link resumes cleanly). Manual re-activation if ever needed.
+  Documented, not automated.
 
 ## 8. Testing (TDD, REQ-tagged)
 

@@ -642,6 +642,13 @@ def sync_transactions_now(
     1/min/item (REQ-PT-015)."""
     from src.adapters.plaid_transactions import sync_one_item as _tx_sync_one
 
+    # Validate the item exists BEFORE recording the rate-limit timestamp, so an
+    # arbitrary/fabricated item_id can't (a) grow the in-memory limiter dict
+    # unbounded or (b) consume the cooldown window on a 404.
+    item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="item not found")
+
     now = time.monotonic()
     last = _tx_sync_now_last_call.get(item_id, 0.0)
     if now - last < _SYNC_NOW_COOLDOWN_SECONDS:
@@ -649,9 +656,6 @@ def sync_transactions_now(
         raise HTTPException(status_code=429, detail=f"sync cooldown active, retry in {wait}s")
     _tx_sync_now_last_call[item_id] = now
 
-    item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
-    if item is None:
-        raise HTTPException(status_code=404, detail="item not found")
     client = _get_plaid_client()
     result = _tx_sync_one(session, item, client=client)
     session.commit()

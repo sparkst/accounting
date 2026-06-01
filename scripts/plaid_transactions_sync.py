@@ -56,18 +56,24 @@ def main(argv: list[str] | None = None) -> int:
 
     mode = "APPLIED" if args.apply else "DRY-RUN"
     logger.info(
-        "plaid tx sync %s: items=%d added=%d",
+        "plaid tx sync %s: items=%d added=%d modified=%d removed=%d "
+        "failed=%d superseded=%d",
         mode,
         len(batch.items),
         batch.total_added,
+        batch.total_modified,
+        batch.total_removed,
+        batch.total_failed,
+        batch.total_superseded,
     )
     for r in batch.items:
         logger.info(
-            "  %s status=%s added=%d error=%s",
-            getattr(r, "institution_name", r),
-            getattr(r, "status", "-"),
-            getattr(r, "added", 0),
-            getattr(r, "error_code", None) or "-",
+            "  %s status=%s added=%d failed=%d error=%s",
+            r.institution_name,
+            r.status,
+            r.added,
+            r.failed,
+            r.error_code or "-",
         )
     return 0
 

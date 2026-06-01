@@ -551,11 +551,7 @@ class BankCsvAdapter(BaseAdapter):
                 f"transaction(s): {', '.join(xref_ids[:3])}"
             )
 
-        status = (
-            TransactionStatus.NEEDS_REVIEW.value
-            if (review_reason or row.amount is None)
-            else TransactionStatus.NEEDS_REVIEW.value  # always needs review for bank imports
-        )
+        status = TransactionStatus.NEEDS_REVIEW.value  # bank imports always start as needs_review
 
         tx = Transaction(
             source=self.source,

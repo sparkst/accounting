@@ -1036,5 +1036,24 @@ def test_sync_transactions_now_rate_limited(
     )
     r1 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
     assert r1.status_code == 200
+    # First call actually ran the sync: body carries the expected result shape.
+    body = r1.json()
+    assert body["status"] == "ok"
+    for key in ("added", "modified", "removed", "failed", "superseded"):
+        assert key in body
     r2 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
     assert r2.status_code == 429
+
+
+def test_sync_transactions_now_404_on_unknown_item(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """REQ-PT-015: unknown item_id → 404, and the 404 does NOT consume the
+    cooldown nor grow the limiter dict."""
+    import src.api.routes.plaid as plaid_routes_mod
+
+    plaid_routes_mod._tx_sync_now_last_call.clear()
+    resp = client.post("/api/plaid/items/nonexistent-id/sync-transactions")
+    assert resp.status_code == 404
+    # 404 happened before the rate-limiter write — id not recorded.
+    assert "nonexistent-id" not in plaid_routes_mod._tx_sync_now_last_call

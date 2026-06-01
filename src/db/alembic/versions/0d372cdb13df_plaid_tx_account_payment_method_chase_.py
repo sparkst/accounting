@@ -84,13 +84,15 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
 
-    # Guard: refuse if any row uses the newly-added broker values
+    # Guard: refuse if any row uses the newly-added broker values. Use a
+    # parameterized expanding bindparam rather than f-string interpolation inside
+    # sa.text() — behavior is identical (the values are hardcoded enum strings)
+    # but the pattern is injection-safe by construction.
     new_brokers = tuple(b for b in _NEW_BROKERS if b not in _OLD_BROKERS)
     if new_brokers:
         rows = bind.execute(
-            sa.text(
-                "SELECT COUNT(*) FROM account WHERE broker IN"
-                f" ({_values_in(new_brokers)})"
+            sa.text("SELECT COUNT(*) FROM account WHERE broker IN :vals").bindparams(
+                sa.bindparam("vals", value=list(new_brokers), expanding=True)
             )
         ).scalar_one()
         if rows:
@@ -99,14 +101,13 @@ def downgrade() -> None:
                 f" {new_brokers}; reassign or delete them first"
             )
 
-    # Guard: refuse if any row uses the newly-added account_type values
+    # Guard: refuse if any row uses the newly-added account_type values.
     new_types = tuple(t for t in _NEW_ACCOUNT_TYPES if t not in _OLD_ACCOUNT_TYPES)
     if new_types:
         rows = bind.execute(
             sa.text(
-                "SELECT COUNT(*) FROM account WHERE account_type IN"
-                f" ({_values_in(new_types)})"
-            )
+                "SELECT COUNT(*) FROM account WHERE account_type IN :vals"
+            ).bindparams(sa.bindparam("vals", value=list(new_types), expanding=True))
         ).scalar_one()
         if rows:
             raise RuntimeError(

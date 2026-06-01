@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session
 
+from src.adapters.plaid_client import RetryablePlaidError, TerminalPlaidError
 from src.adapters.plaid_transactions import (
     build_tx_fields,
     fetch_all_pages,
@@ -30,9 +31,17 @@ from src.classification.engine import ClassificationResult
 from src.models.audit_event import AuditEvent
 from src.models.base import Base
 from src.models.brokerage import Account
-from src.models.enums import Direction, Entity, TaxCategory, TransactionStatus
+from src.models.enums import (
+    Direction,
+    Entity,
+    IngestionStatus,
+    TaxCategory,
+    TransactionStatus,
+)
+from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
+from src.utils.plaid_crypto import InvalidCiphertextError
 
 
 def _plaid_txn(**kw):
@@ -91,6 +100,54 @@ def test_source_and_hash_stable():
     assert f["source_id"] == "txn_xyz"
     assert f["source_hash"] == compute_source_hash("plaid", "txn_xyz")
     assert f["raw_data"]["transaction_id"] == "txn_xyz"
+
+
+def test_raw_data_is_complete_plaid_dict():
+    """REQ-PT-009: raw_data preserves the COMPLETE Plaid txn object verbatim."""
+    txn = _plaid_txn(transaction_id="txn_full", amount=42.5, name="ACME",
+                     merchant_name="Acme Co", pending=True)
+    f = build_tx_fields(txn)
+    assert f["raw_data"] == txn.to_dict()
+    # spot-check several distinct fields are all present, not just the id
+    for key in ("transaction_id", "account_id", "amount", "date", "name",
+                "merchant_name", "pending"):
+        assert key in f["raw_data"]
+
+
+# ── Internal-transfer detection (REQ-PT general / spec §10) ──────────────────
+
+
+def test_transfer_category_sets_direction_transfer(db):
+    """A Plaid TRANSFER-category txn overrides the classifier and is non-P&L."""
+    item, acct = _mapped(db)
+    pfc = SimpleNamespace(primary="TRANSFER_IN", detailed="TRANSFER_IN_DEPOSIT")
+    txn = _plaid_txn(transaction_id="xfer1", amount=-4800.0,
+                     name="Online Transfer from SAV", personal_finance_category=pfc)
+    # classifier would call this income; transfer detection must override it.
+    with mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls()):
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="Chase ****1234")
+    assert tx.direction == Direction.TRANSFER.value
+
+
+def test_transfer_code_sets_direction_transfer(db):
+    item, acct = _mapped(db)
+    txn = _plaid_txn(transaction_id="xfer2", transaction_code="transfer")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="Chase ****1234")
+    assert tx.direction == Direction.TRANSFER.value
+
+
+def test_non_transfer_keeps_classifier_direction(db):
+    item, acct = _mapped(db)
+    pfc = SimpleNamespace(primary="FOOD_AND_DRINK")
+    txn = _plaid_txn(transaction_id="meal1", personal_finance_category=pfc)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="Chase ****1234")
+    assert tx.direction == Direction.EXPENSE.value
 
 
 # ── Task 4 tests: make_transaction ────────────────────────────────────────────
@@ -187,6 +244,8 @@ def test_modified_updates_amount_but_preserves_confirmed_classification(db):
     row.status = "confirmed"
     row.tax_category = "OFFICE_EXPENSE"
     row.entity = "blackline"
+    row.direction = "income"
+    row.tax_subcategory = "home_office"
     db.commit()
     process_modified(db, [_plaid_txn(transaction_id="m1", amount=11.5)])
     db.refresh(row)
@@ -194,6 +253,25 @@ def test_modified_updates_amount_but_preserves_confirmed_classification(db):
     assert row.tax_category == "OFFICE_EXPENSE"
     assert row.entity == "blackline"
     assert row.status == "confirmed"
+    # REQ-PT-013: human-set direction + tax_subcategory survive a modified refresh.
+    assert row.direction == "income"
+    assert row.tax_subcategory == "home_office"
+
+
+def test_modified_amount_change_writes_audit_event(db):
+    """REQ-PT-005 audit: an amount delta on modified leaves a field-level trail."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="ma1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="ma1").one()
+    process_modified(db, [_plaid_txn(transaction_id="ma1", amount=15.0)])
+    events = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                            field_changed="amount").all()
+    assert len(events) == 1
+    assert Decimal(events[0].old_value) == Decimal("-10")
+    assert Decimal(events[0].new_value) == Decimal("-15")
+    assert events[0].entity_id is None and events[0].entity_type is None
 
 
 # ── Task 8 tests: process_removed (REQ-PT-004) ───────────────────────────────
@@ -227,6 +305,61 @@ def test_removed_writes_status_audit_event(db):
     assert len(events) == 1
     assert events[0].new_value == "rejected"
     assert events[0].entity_id is None and events[0].entity_type is None
+
+
+def test_pending_id_in_removed_is_noop_after_promotion(db):
+    """REQ-PT-005: after pending→posted promotion the original pending id no
+    longer exists, so it arriving in `removed` is a no-op (count 0) and the
+    promoted row is untouched."""
+    item, acct = _mapped(db)
+    pending = _plaid_txn(transaction_id="p1", amount=20.00, pending=True)
+    posted = _plaid_txn(transaction_id="post1", amount=22.50, pending=False,
+                        pending_transaction_id="p1")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [pending], account_index={"acc_1": acct})
+        process_added(db, item, [posted], account_index={"acc_1": acct})
+    assert process_removed(db, [{"transaction_id": "p1"}]) == 0
+    row = db.query(Transaction).filter_by(source="plaid").one()
+    assert row.source_id == "post1"
+    assert row.status != "rejected"
+
+
+def test_removed_then_readded_is_reactivated(db):
+    """REQ-PT-004: a removed (rejected) txn that Plaid re-adds must re-enter the
+    register (reactivated to needs_review), not stay rejected forever."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="rr1", amount=9.0)],
+                      account_index={"acc_1": acct})
+    process_removed(db, [{"transaction_id": "rr1"}])
+    row = db.query(Transaction).filter_by(source_id="rr1").one()
+    assert row.status == "rejected"
+    # Plaid re-delivers the same id as added.
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="rr1", amount=9.0)],
+                      account_index={"acc_1": acct})
+    db.refresh(row)
+    assert row.status == TransactionStatus.NEEDS_REVIEW.value
+    assert row.review_reason == "plaid_readded"
+    # status flip is audited
+    events = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                            field_changed="status").all()
+    assert any(e.new_value == "needs_review" for e in events)
+
+
+def test_removed_skips_split_parent(db):
+    """A split_parent row must NOT be rejected by process_removed (would orphan
+    its split children)."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="sp1")],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="sp1").one()
+    row.status = TransactionStatus.SPLIT_PARENT.value
+    db.commit()
+    assert process_removed(db, [{"transaction_id": "sp1"}]) == 0
+    db.refresh(row)
+    assert row.status == TransactionStatus.SPLIT_PARENT.value
 
 
 # ── Task 9 tests: fetch_all_pages (REQ-PT-001, REQ-PT-006) ───────────────────
@@ -301,6 +434,32 @@ def test_supersede_writes_status_audit_event(db):
     assert events[0].entity_id is None and events[0].entity_type is None
 
 
+def test_supersede_targets_only_bank_csv_not_other_sources(db):
+    """REQ-PT-011 narrowing: a Stripe/Gmail row sharing the payment_method label
+    inside the window is NOT collateral; only bank_csv rows are superseded.
+    A split_parent bank_csv row is also spared (orphan guard)."""
+    item, acct = _mapped(db, pm="Chase ****1234")
+    common = dict(date="2026-03-15", amount=Decimal("-5"), currency="USD",
+                  entity="sparkry", confidence=0.0,
+                  payment_method="Chase ****1234", raw_data={})
+    db.add(Transaction(source="bank_csv", source_id="bc", source_hash="hbc",
+                       description="csv", status="confirmed", **common))
+    db.add(Transaction(source="stripe", source_id="st", source_hash="hst",
+                       description="stripe payout", status="confirmed", **common))
+    db.add(Transaction(source="gmail_n8n", source_id="gm", source_hash="hgm",
+                       description="receipt", status="needs_review", **common))
+    db.add(Transaction(source="bank_csv", source_id="sp", source_hash="hsp",
+                       description="parent", status="split_parent", **common))
+    db.commit()
+    n = supersede_csv_rows(db, payment_method="Chase ****1234",
+                           covered_min="2026-01-01", covered_max="2026-05-31")
+    assert n == 1
+    assert db.query(Transaction).filter_by(source_id="bc").one().status == "rejected"
+    assert db.query(Transaction).filter_by(source_id="st").one().status == "confirmed"
+    assert db.query(Transaction).filter_by(source_id="gm").one().status == "needs_review"
+    assert db.query(Transaction).filter_by(source_id="sp").one().status == "split_parent"
+
+
 # ── Task 11 tests: sync_one_item orchestration (REQ-PT-001,006,007,011,016) ──
 
 
@@ -342,6 +501,159 @@ def test_sync_one_item_per_row_isolation(db):
     assert result.failed == 1
     assert db.query(Transaction).filter_by(source_id="ok").count() == 1
     assert db.query(Transaction).filter_by(source_id="bad").count() == 0
+    # REQ-PT-007: IngestionLog reflects the partial failure.
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.PARTIAL_FAILURE.value
+    assert log.records_failed == 1
+    # REQ-PT-006: a per-row failure must NOT advance the cursor (so the failed
+    # row is re-delivered next run).
+    db.refresh(item)
+    assert item.cursor is None
+    assert result.status == "error"
+
+
+def test_partial_failure_holds_cursor_then_clean_rerun_ingests(db):
+    """REQ-PT-006: after a partial-failure sync the cursor is held; a clean
+    re-run from the same cursor then ingests the previously-failed row."""
+    item, acct = _mapped(db)
+
+    def _client():
+        c = mock.Mock()
+        c.transactions_sync.side_effect = [
+            _sync_resp(added=[_plaid_txn(transaction_id="late", account_id="acc_1")],
+                       has_more=False, next_cursor="cur1")
+        ]
+        return c
+
+    calls = {"n": 0}
+
+    def _cls_first_fails(tx, session):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("transient")
+        return _cls()
+
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", side_effect=_cls_first_fails):
+        sync_one_item(db, item, client=_client())
+        db.commit()
+        # Cursor held at None (failure), row not ingested.
+        db.refresh(item)
+        assert item.cursor is None
+        assert db.query(Transaction).filter_by(source_id="late").count() == 0
+        # Clean re-run from the same cursor re-delivers and ingests it.
+        sync_one_item(db, item, client=_client())
+        db.commit()
+    db.refresh(item)
+    assert item.cursor == "cur1"
+    assert db.query(Transaction).filter_by(source_id="late").count() == 1
+
+
+# ── Error-path tests (REQ-PT-006, REQ-PT-016) ───────────────────────────────
+
+
+def test_sync_one_item_retryable_error_holds_cursor(db):
+    """RetryablePlaidError (INSTITUTION_DOWN): status institution_down, cursor
+    unchanged, last_error set, IngestionLog failure + retryable."""
+    item, acct = _mapped(db)
+    item.cursor = "prev_cursor"
+    db.commit()
+    client = mock.Mock()
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.fetch_all_pages",
+                    side_effect=RetryablePlaidError("INSTITUTION_DOWN")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.status == "institution_down"
+    assert result.error_code == "INSTITUTION_DOWN"
+    db.refresh(item)
+    assert item.cursor == "prev_cursor"
+    assert item.last_sync_status == "institution_down"
+    assert item.last_error == "INSTITUTION_DOWN"
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.FAILURE.value
+    assert log.retryable is True
+
+
+def test_sync_one_item_invalid_ciphertext_is_terminal_holds_cursor(db):
+    """InvalidCiphertextError → TerminalPlaidError(INVALID_ACCESS_TOKEN): status
+    error, cursor unchanged, last_error set."""
+    item, acct = _mapped(db)
+    item.cursor = "prev_cursor"
+    db.commit()
+    client = mock.Mock()
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token",
+                    side_effect=InvalidCiphertextError("bad")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.status == "error"
+    assert result.error_code == "INVALID_ACCESS_TOKEN"
+    db.refresh(item)
+    assert item.cursor == "prev_cursor"
+    assert item.last_sync_status == "error"
+    assert item.last_error == "INVALID_ACCESS_TOKEN"
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.FAILURE.value
+
+
+def test_sync_one_item_terminal_error_does_not_advance_cursor(db):
+    """REQ-PT-016: TerminalPlaidError(ITEM_LOGIN_REQUIRED) holds cursor, sets
+    last_sync_status='error' + last_error code."""
+    item, acct = _mapped(db)
+    item.cursor = "prev_cursor"
+    db.commit()
+    client = mock.Mock()
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.fetch_all_pages",
+                    side_effect=TerminalPlaidError("ITEM_LOGIN_REQUIRED")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.error_code == "ITEM_LOGIN_REQUIRED"
+    db.refresh(item)
+    assert item.cursor == "prev_cursor"
+    assert item.last_sync_status == "error"
+    assert item.last_error == "ITEM_LOGIN_REQUIRED"
+
+
+def test_sync_one_item_unexpected_error_holds_cursor(db):
+    """A generic Exception → status error, error_code UNEXPECTED, cursor held."""
+    item, acct = _mapped(db)
+    item.cursor = "prev_cursor"
+    db.commit()
+    client = mock.Mock()
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.fetch_all_pages",
+                    side_effect=RuntimeError("boom")):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.status == "error"
+    assert result.error_code == "UNEXPECTED"
+    db.refresh(item)
+    assert item.cursor == "prev_cursor"
+
+
+def test_non_first_sync_does_not_supersede(db):
+    """REQ-PT-011: supersede runs only on the first sync. With cursor already
+    set, a pre-existing confirmed bank_csv row must survive."""
+    item, acct = _mapped(db, pm="Chase ****1234")
+    item.cursor = "existing_cursor"
+    db.add(Transaction(source="bank_csv", source_id="keep", source_hash="hk",
+                       date="2026-03-15", description="x", amount=Decimal("-5"),
+                       currency="USD", entity="sparkry", status="confirmed",
+                       confidence=0.0, payment_method="Chase ****1234", raw_data={}))
+    db.commit()
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="n1", account_id="acc_1",
+                                     date="2026-03-15")],
+                   has_more=False, next_cursor="next_cursor")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.superseded == 0
+    assert db.query(Transaction).filter_by(source_id="keep").one().status == "confirmed"
 
 
 # ── Task 12 tests: sync_all_active batch driver, DRY-RUN default (REQ-PT-001) ──

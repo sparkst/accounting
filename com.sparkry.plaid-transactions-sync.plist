@@ -8,7 +8,7 @@
 
   <!-- Wraps in `doppler run` so DATABASE_PATH and Plaid secrets are present.
        Sync is idempotent: (source, source_id) unique constraint skips duplicates.
-       Run 30 min after balance sync (02:00) to avoid Plaid rate contention. -->
+       Runs daily at 06:30 local (see StartCalendarInterval below). -->
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/doppler</string>
@@ -29,7 +29,7 @@
     <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
 
-  <!-- Daily at 06:30 local time (30 min after balance sync at 02:00). -->
+  <!-- Daily at 06:30 local time. -->
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key><integer>6</integer>

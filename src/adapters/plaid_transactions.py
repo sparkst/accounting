@@ -22,11 +22,12 @@ from src.adapters.plaid_client import (
     PlaidErrorBase,
     RetryablePlaidError,
     TerminalPlaidError,
+    call_with_retry,
 )
 from src.classification.engine import classify
 from src.models.audit_event import AuditEvent
 from src.models.brokerage import Account
-from src.models.enums import ConfirmedBy, IngestionStatus, TransactionStatus
+from src.models.enums import ConfirmedBy, Direction, IngestionStatus, TransactionStatus
 from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
@@ -43,22 +44,38 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _audit_status_change(session: Session, tx: Transaction, old_status: str | None) -> None:
-    """Append a transaction-mode AuditEvent for an automated status flip.
+def _audit_field_change(
+    session: Session,
+    tx: Transaction,
+    *,
+    field: str,
+    old_value: Any,
+    new_value: Any,
+) -> None:
+    """Append a transaction-mode AuditEvent for an automated field change.
 
     Mirrors the canonical register-edit pattern in
     src/api/routes/transactions.py::_create_audit_events (transaction_id set;
-    entity_id/entity_type NULL; field_changed='status'). changed_by is 'auto'
-    because the flip is performed by the Plaid sync job, not a human.
+    entity_id/entity_type NULL). changed_by is 'auto' because the change is
+    performed by the Plaid sync job, not a human.
     """
     session.add(
         AuditEvent(
             transaction_id=tx.id,
-            field_changed="status",
-            old_value=str(old_status) if old_status is not None else None,
-            new_value=TransactionStatus.REJECTED.value,
+            field_changed=field,
+            old_value=str(old_value) if old_value is not None else None,
+            new_value=str(new_value) if new_value is not None else None,
             changed_by=ConfirmedBy.AUTO.value,
         )
+    )
+
+
+def _audit_status_change(
+    session: Session, tx: Transaction, old_status: str | None, new_status: str
+) -> None:
+    """Append a transaction-mode AuditEvent for an automated status flip."""
+    _audit_field_change(
+        session, tx, field="status", old_value=old_status, new_value=new_status
     )
 
 
@@ -83,6 +100,25 @@ def build_tx_fields(plaid_txn: Any) -> dict[str, Any]:
     }
 
 
+def _is_internal_transfer(plaid_txn: Any) -> bool:
+    """Detect an account-to-account transfer leg from Plaid metadata.
+
+    A Plaid transaction is a transfer when its personal_finance_category.primary
+    starts with "TRANSFER" OR transaction_code == "transfer". Handles object,
+    dict, and None shapes defensively (the SDK returns objects; tests use
+    SimpleNamespace/None). Transfers are non-P&L and must override whatever the
+    classifier guesses (an inflow leg looks exactly like income otherwise).
+    """
+    pfc = getattr(plaid_txn, "personal_finance_category", None)
+    primary = getattr(pfc, "primary", None) if pfc is not None else None
+    if primary is None and isinstance(pfc, dict):
+        primary = pfc.get("primary")
+    if isinstance(primary, str) and primary.upper().startswith("TRANSFER"):
+        return True
+    code = getattr(plaid_txn, "transaction_code", None)
+    return isinstance(code, str) and code.lower() == "transfer"
+
+
 def make_transaction(
     plaid_txn: Any, *, session: Session, entity: str | None, payment_method: str | None
 ) -> Transaction:
@@ -100,7 +136,13 @@ def make_transaction(
     tx.deductible_pct = result.deductible_pct
     tx.confidence = result.confidence
     tx.review_reason = result.review_reason
-    tx.entity = entity  # account entity is authoritative; classifier guess discarded
+    # Entity was set at construction (entity=entity above); classify() returns a
+    # result object and never mutates tx.entity, so no re-assignment is needed.
+    # Internal-transfer detection overrides the classifier's direction so a
+    # sweep between two linked accounts nets to zero off-P&L instead of being
+    # double-counted as income (inflow leg) + expense (outflow leg).
+    if _is_internal_transfer(plaid_txn):
+        tx.direction = Direction.TRANSFER.value
     needs_review = entity is None or result.confidence < _AUTO_THRESHOLD
     tx.status = (
         TransactionStatus.NEEDS_REVIEW.value if needs_review
@@ -119,11 +161,21 @@ def _existing_by_source_id(session: Session, source_id: str) -> Transaction | No
     )
 
 
-def _apply_update(tx: Transaction, ptxn: Any) -> None:
+def _apply_update(session: Session, tx: Transaction, ptxn: Any) -> None:
     """Refresh volatile fields from a modified/posted Plaid txn. Preserves human
-    classification (entity/tax_category/direction are NOT touched here)."""
+    classification (entity/tax_category/direction are NOT touched here).
+
+    A material amount change (pending→posted settlement or a Plaid `modified`
+    delta — tips/holds can differ) is audited so the register keeps a field-level
+    trail of the automated mutation."""
     fields = build_tx_fields(ptxn)
-    tx.amount = fields["amount"]
+    old_amount = tx.amount
+    new_amount = fields["amount"]
+    if old_amount != new_amount:
+        _audit_field_change(
+            session, tx, field="amount", old_value=old_amount, new_value=new_amount
+        )
+    tx.amount = new_amount
     tx.date = fields["date"]
     tx.description = fields["description"]
     tx.raw_data = fields["raw_data"]
@@ -138,7 +190,7 @@ def process_modified(session: Session, modified: list[Any]) -> int:
         row = _existing_by_source_id(session, ptxn.transaction_id)
         if row is None:
             continue
-        _apply_update(row, ptxn)
+        _apply_update(session, row, ptxn)
         session.flush()
         updated += 1
     return updated
@@ -149,20 +201,29 @@ def process_removed(session: Session, removed: list[Any]) -> int:
     (audit rule). No-op when already reconciled away or never seen."""
     count = 0
     for r in removed:
+        # Plaid SDK removed-entries are typed objects; dict support is retained
+        # for the test fixtures (which pass {"transaction_id": ...}).
         rid = r["transaction_id"] if isinstance(r, dict) else r.transaction_id
         row = _existing_by_source_id(session, rid)
         if row is None:
             continue
+        if row.status == TransactionStatus.SPLIT_PARENT.value:
+            # Rejecting a split parent would orphan its children — skip + warn.
+            logger.warning("plaid removed skipped: split_parent row %s", row.id)
+            continue
         old_status = row.status
-        row.status = "rejected"
+        row.status = TransactionStatus.REJECTED.value
         row.review_reason = "plaid_removed"
-        _audit_status_change(session, row, old_status)
+        _audit_status_change(session, row, old_status, TransactionStatus.REJECTED.value)
         session.flush()
         count += 1
     return count
 
 
 def _sync_request(access_token: str, cursor: str | None) -> Any:
+    # Deferred import: the plaid SDK model modules are imported lazily so the
+    # adapter module can be imported in environments where the Plaid SDK is not
+    # installed/initialized (mirrors the deferred-import pattern in routes/plaid.py).
     from plaid.model.transactions_sync_request import TransactionsSyncRequest
     if cursor:
         return TransactionsSyncRequest(access_token=access_token, cursor=cursor)
@@ -174,7 +235,6 @@ def fetch_all_pages(
 ) -> tuple[list[Any], list[Any], list[Any], str]:
     """Loop /transactions/sync until has_more is False. Returns
     (added, modified, removed, next_cursor)."""
-    from src.adapters.plaid_client import call_with_retry
     added: list[Any] = []
     modified: list[Any] = []
     removed: list[Any] = []
@@ -197,29 +257,41 @@ def fetch_all_pages(
 def supersede_csv_rows(
     session: Session, *, payment_method: str | None, covered_min: str, covered_max: str
 ) -> int:
-    """Mark non-Plaid rows for this payment_method label, within Plaid's covered
+    """Mark bank-CSV rows for this payment_method label, within Plaid's covered
     date range, as rejected (superseded). Audit rule: never delete. A blank label
-    disables supersede (returns 0, logged)."""
+    disables supersede (returns 0, logged).
+
+    Scope is intentionally narrowed to ``source == 'bank_csv'`` — the only source
+    the documented "Plaid replaces CSV history" supersede is meant to replace.
+    Gmail/Stripe/Shopify rows (and reconciliation-pair legs) that merely share a
+    payment_method label are NOT collateral. Confirmed rows ARE superseded (that
+    is the intended purpose: replacing confirmed CSV history with Plaid), but
+    split_parent rows are excluded so rejecting a parent never orphans its split
+    children. Mutations are wrapped in a savepoint so a mid-supersede failure
+    doesn't leave a partial audit trail.
+    """
     if not payment_method:
         logger.warning("plaid supersede skipped: account has no payment_method label")
         return 0
     rows = (
         session.query(Transaction)
         .filter(
-            Transaction.source != SOURCE,
+            Transaction.source == "bank_csv",
             Transaction.payment_method == payment_method,
             Transaction.date >= covered_min,
             Transaction.date <= covered_max,
             Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.status != TransactionStatus.SPLIT_PARENT.value,
         )
         .all()
     )
-    for row in rows:
-        old_status = row.status
-        row.status = TransactionStatus.REJECTED.value
-        row.review_reason = "superseded_by_plaid"
-        _audit_status_change(session, row, old_status)
-    session.flush()
+    with session.begin_nested():
+        for row in rows:
+            old_status = row.status
+            row.status = TransactionStatus.REJECTED.value
+            row.review_reason = "superseded_by_plaid"
+            _audit_status_change(session, row, old_status, TransactionStatus.REJECTED.value)
+        session.flush()
     return len(rows)
 
 
@@ -231,16 +303,38 @@ def process_added(
     Pending→posted reconcile: if a posted txn carries pending_transaction_id that
     matches an existing row, we UPDATE that row in place (promoting source_id to
     the posted id) rather than inserting a duplicate.
+
+    Accepts a list and loops internally, but the orchestrator (sync_one_item)
+    passes single-element slices so each row gets its own begin_nested() savepoint
+    (per-row isolation lives in the caller; this function is idempotent either
+    way and tests exercise it with full lists directly).
     """
     inserted = 0
     for ptxn in added:
-        if _existing_by_source_id(session, ptxn.transaction_id) is not None:
+        existing = _existing_by_source_id(session, ptxn.transaction_id)
+        if existing is not None:
+            # Removed-then-readded: Plaid can re-deliver a previously-removed id.
+            # A row we rejected via process_removed represents real activity that
+            # Plaid now considers live again, so reactivate it instead of skipping
+            # (which would strand it as rejected forever, dropping it from P&L).
+            if (
+                existing.status == TransactionStatus.REJECTED.value
+                and existing.review_reason == "plaid_removed"
+            ):
+                old_status = existing.status
+                _apply_update(session, existing, ptxn)
+                existing.status = TransactionStatus.NEEDS_REVIEW.value
+                existing.review_reason = "plaid_readded"
+                _audit_status_change(
+                    session, existing, old_status, TransactionStatus.NEEDS_REVIEW.value
+                )
+                session.flush()
             continue
         pending_id = getattr(ptxn, "pending_transaction_id", None)
         if pending_id:
             prior = _existing_by_source_id(session, pending_id)
             if prior is not None:
-                _apply_update(prior, ptxn)
+                _apply_update(session, prior, ptxn)
                 prior.source_id = ptxn.transaction_id
                 prior.source_hash = compute_source_hash(SOURCE, ptxn.transaction_id)
                 session.flush()
@@ -311,11 +405,14 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
                     result.modified += process_modified(session, [ptxn])
             except Exception:
                 result.failed += 1
-        try:
-            with session.begin_nested():
-                result.removed += process_removed(session, removed)
-        except Exception:
-            result.failed += 1
+        # Per-row savepoint isolation for removals (mirrors added/modified) so one
+        # bad removal doesn't roll back the rest (REQ-PT-007).
+        for r in removed:
+            try:
+                with session.begin_nested():
+                    result.removed += process_removed(session, [r])
+            except Exception:
+                result.failed += 1
 
         # Supersede is keyed on the dates of THIS sync's added txns, grouped per
         # account. A first sync that returns only modified/removed (no added)
@@ -338,10 +435,23 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
                     covered_min=min(acct_dates), covered_max=max(acct_dates),
                 )
 
-        item.cursor = next_cursor
+        # Advance the cursor ONLY on a fully clean page-loop. If any row failed,
+        # leave item.cursor UNCHANGED so the next sync re-fetches from the last
+        # good cursor and re-delivers the failed rows (re-fetch is idempotent via
+        # source_hash, so already-succeeded rows are no-ops). Advancing past a
+        # failed `added` row would permanently drop it (Plaid's /transactions/sync
+        # is incremental and never re-delivers a passed cursor). REQ-PT-006.
+        if result.failed == 0:
+            item.cursor = next_cursor
+            item.last_sync_status = "ok"
+            item.last_error = None
+            result.status = "ok"
+        else:
+            # Partial failure: surface it on the Item and hold the cursor.
+            item.last_sync_status = "error"
+            item.last_error = "PARTIAL_FAILURE"
+            result.status = "error"
         item.last_sync_at = pulled_at
-        item.last_sync_status = "ok"
-        item.last_error = None
         log_row.records_processed = result.added + result.modified + result.removed
         log_row.records_failed = result.failed
         log_row.status = (IngestionStatus.PARTIAL_FAILURE.value if result.failed
@@ -386,6 +496,22 @@ class TxBatchResult:
     @property
     def total_added(self) -> int:
         return sum(i.added for i in self.items)
+
+    @property
+    def total_modified(self) -> int:
+        return sum(i.modified for i in self.items)
+
+    @property
+    def total_removed(self) -> int:
+        return sum(i.removed for i in self.items)
+
+    @property
+    def total_failed(self) -> int:
+        return sum(i.failed for i in self.items)
+
+    @property
+    def total_superseded(self) -> int:
+        return sum(i.superseded for i in self.items)
 
 
 def sync_all_active(session: Session, *, client: Any, dry_run: bool = True) -> TxBatchResult:

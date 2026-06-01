@@ -230,6 +230,29 @@ def test_link_token_creates_placeholder_with_state_nonce(
     assert ph.item_id.startswith("placeholder_")
 
 
+def test_link_token_request_omits_invalid_balance_product(
+    client: TestClient, plaid_client_mock: MagicMock
+) -> None:
+    """REQ-025: ``balance`` must NOT be sent in ``required_if_supported_products``.
+
+    Plaid rejects it with HTTP 400 INVALID_PRODUCT — ``balance`` auto-initializes
+    whenever any other valid product (here ``transactions``) is requested. The
+    request-shape was never asserted before, so the real-API 400 slipped past the
+    mocked tests. Regression guard for the link-token 500.
+    """
+    plaid_client_mock.link_token_create.return_value = SimpleNamespace(
+        link_token="link-token-x"
+    )
+    resp = client.post("/api/plaid/link-token", json={})
+    assert resp.status_code == 200
+    req = plaid_client_mock.link_token_create.call_args[0][0]
+    payload = req.to_dict()
+    products = [str(p) for p in payload.get("products", [])]
+    assert "transactions" in products
+    req_if = [str(p) for p in (payload.get("required_if_supported_products") or [])]
+    assert "balance" not in req_if
+
+
 def test_exchange_rejects_missing_state_nonce(client: TestClient) -> None:
     """REQ-025: /exchange MUST validate state_nonce. Empty nonce → 422 (Pydantic)."""
     resp = client.post(

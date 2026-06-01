@@ -276,8 +276,10 @@ def create_link_token(
     req = LinkTokenCreateRequest(
         user=LinkTokenCreateRequestUser(client_user_id=placeholder.id),
         client_name="Travis Accounting",
+        # ``balance`` is intentionally omitted: Plaid rejects it in any product
+        # field (INVALID_PRODUCT) because it auto-initializes whenever another
+        # product — here ``transactions`` — is requested.
         products=[Products("transactions")],
-        required_if_supported_products=[Products("balance")],
         additional_consented_products=[Products("investments")],
         country_codes=[CountryCode("US")],
         language="en",

@@ -27,7 +27,12 @@ from src.adapters.plaid_client import (
 from src.classification.engine import classify
 from src.models.audit_event import AuditEvent
 from src.models.brokerage import Account
-from src.models.enums import ConfirmedBy, Direction, IngestionStatus, TransactionStatus
+from src.models.enums import (
+    ConfirmedBy,
+    IngestionStatus,
+    Source,
+    TransactionStatus,
+)
 from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidItem
 from src.models.transaction import Transaction
@@ -100,14 +105,23 @@ def build_tx_fields(plaid_txn: Any) -> dict[str, Any]:
     }
 
 
-def _is_internal_transfer(plaid_txn: Any) -> bool:
-    """Detect an account-to-account transfer leg from Plaid metadata.
+def _is_plaid_transfer_category(plaid_txn: Any) -> bool:
+    """Detect a Plaid TRANSFER-category txn from its metadata.
 
-    A Plaid transaction is a transfer when its personal_finance_category.primary
-    starts with "TRANSFER" OR transaction_code == "transfer". Handles object,
-    dict, and None shapes defensively (the SDK returns objects; tests use
-    SimpleNamespace/None). Transfers are non-P&L and must override whatever the
-    classifier guesses (an inflow leg looks exactly like income otherwise).
+    A Plaid transaction carries a transfer category when its
+    personal_finance_category.primary starts with "TRANSFER" OR
+    transaction_code == "transfer". Handles object, dict, and None shapes
+    defensively (the SDK returns objects; tests use SimpleNamespace/None).
+
+    IMPORTANT: this is NOT proof of an internal account-to-account transfer.
+    Plaid's PFC taxonomy assigns primary="TRANSFER_IN" (e.g.
+    TRANSFER_IN_DEPOSIT / TRANSFER_IN_ACCOUNT_TRANSFER) to ordinary inbound
+    ACH, wire, Zelle, and check deposits — which for the Sparkry / BlackLine
+    business depository accounts are exactly how client payments / revenue
+    arrive. We therefore do NOT auto-set direction=transfer (that would silently
+    drop real income from P&L / B&O). Instead a transfer-category txn is routed
+    to needs_review so a human confirms transfer-vs-income before any inbound
+    amount leaves the income aggregation.
     """
     pfc = getattr(plaid_txn, "personal_finance_category", None)
     primary = getattr(pfc, "primary", None) if pfc is not None else None
@@ -138,18 +152,25 @@ def make_transaction(
     tx.review_reason = result.review_reason
     # Entity was set at construction (entity=entity above); classify() returns a
     # result object and never mutates tx.entity, so no re-assignment is needed.
-    # Internal-transfer detection overrides the classifier's direction so a
-    # sweep between two linked accounts nets to zero off-P&L instead of being
-    # double-counted as income (inflow leg) + expense (outflow leg).
-    if _is_internal_transfer(plaid_txn):
-        tx.direction = Direction.TRANSFER.value
-    needs_review = entity is None or result.confidence < _AUTO_THRESHOLD
+    # A Plaid TRANSFER-category txn is NOT auto-set to direction=transfer: that
+    # over-broad rule silently dropped real inbound income (client ACH/Zelle/wire
+    # categorised TRANSFER_IN) from P&L/B&O. Instead we keep the classifier's
+    # direction as a suggestion and force needs_review so a human confirms
+    # transfer-vs-income. See _is_plaid_transfer_category for the rationale.
+    is_transfer_category = _is_plaid_transfer_category(plaid_txn)
+    needs_review = (
+        entity is None
+        or is_transfer_category
+        or result.confidence < _AUTO_THRESHOLD
+    )
     tx.status = (
         TransactionStatus.NEEDS_REVIEW.value if needs_review
         else TransactionStatus.AUTO_CLASSIFIED.value
     )
     if entity is None:
         tx.review_reason = "plaid: account not mapped to an entity"
+    elif is_transfer_category:
+        tx.review_reason = "plaid: transfer-category — confirm transfer vs income"
     return tx
 
 
@@ -189,6 +210,12 @@ def process_modified(session: Session, modified: list[Any]) -> int:
     for ptxn in modified:
         row = _existing_by_source_id(session, ptxn.transaction_id)
         if row is None:
+            continue
+        if row.status == TransactionStatus.SPLIT_PARENT.value:
+            # Updating a split parent's amount would break the split-sum
+            # invariant (children no longer sum to parent) — skip + warn,
+            # mirroring process_removed's split_parent guard.
+            logger.warning("plaid modified skipped: split_parent row %s", row.id)
             continue
         _apply_update(session, row, ptxn)
         session.flush()
@@ -276,7 +303,7 @@ def supersede_csv_rows(
     rows = (
         session.query(Transaction)
         .filter(
-            Transaction.source == "bank_csv",
+            Transaction.source == Source.BANK_CSV.value,
             Transaction.payment_method == payment_method,
             Transaction.date >= covered_min,
             Transaction.date <= covered_max,
@@ -295,10 +322,21 @@ def supersede_csv_rows(
     return len(rows)
 
 
+@dataclass
+class AddedCounts:
+    """Outcome of process_added: rows newly inserted vs previously-removed rows
+    reactivated (plaid_readded). Operators need the reactivated count separately
+    so a reinstated row isn't invisible in the added metric."""
+
+    inserted: int = 0
+    reactivated: int = 0
+
+
 def process_added(
     session: Session, item: PlaidItem, added: list[Any], *, account_index: dict[str, Account]
-) -> int:
-    """Insert added txns; idempotent on (source, source_id). Returns inserted count.
+) -> AddedCounts:
+    """Insert added txns; idempotent on (source, source_id). Returns AddedCounts
+    (inserted + reactivated).
 
     Pending→posted reconcile: if a posted txn carries pending_transaction_id that
     matches an existing row, we UPDATE that row in place (promoting source_id to
@@ -309,7 +347,7 @@ def process_added(
     (per-row isolation lives in the caller; this function is idempotent either
     way and tests exercise it with full lists directly).
     """
-    inserted = 0
+    counts = AddedCounts()
     for ptxn in added:
         existing = _existing_by_source_id(session, ptxn.transaction_id)
         if existing is not None:
@@ -322,6 +360,11 @@ def process_added(
                 and existing.review_reason == "plaid_removed"
             ):
                 old_status = existing.status
+                # NOTE: _apply_update overwrites amount with Plaid's re-delivered
+                # value. This is acceptable: a plaid_removed row was a vanished
+                # pending. A human-confirmed, amount-adjusted row that Plaid later
+                # removed then re-added is an edge case where the human amount is
+                # overwritten — see P3-002 in the qloop R2 review.
                 _apply_update(session, existing, ptxn)
                 existing.status = TransactionStatus.NEEDS_REVIEW.value
                 existing.review_reason = "plaid_readded"
@@ -329,6 +372,7 @@ def process_added(
                     session, existing, old_status, TransactionStatus.NEEDS_REVIEW.value
                 )
                 session.flush()
+                counts.reactivated += 1
             continue
         pending_id = getattr(ptxn, "pending_transaction_id", None)
         if pending_id:
@@ -345,8 +389,8 @@ def process_added(
         tx = make_transaction(ptxn, session=session, entity=entity, payment_method=pm)
         session.add(tx)
         session.flush()
-        inserted += 1
-    return inserted
+        counts.inserted += 1
+    return counts
 
 
 @dataclass
@@ -355,6 +399,7 @@ class TxItemResult:
     institution_name: str
     status: str = "ok"          # 'ok' | 'error' | 'institution_down'
     added: int = 0
+    reactivated: int = 0
     modified: int = 0
     removed: int = 0
     failed: int = 0
@@ -392,8 +437,10 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
         for ptxn in added:
             try:
                 with session.begin_nested():
-                    result.added += process_added(session, item, [ptxn],
-                                                   account_index=account_index)
+                    counts = process_added(session, item, [ptxn],
+                                           account_index=account_index)
+                    result.added += counts.inserted
+                    result.reactivated += counts.reactivated
             except Exception:
                 result.failed += 1
                 logger.exception("plaid tx added failure",
@@ -430,10 +477,23 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
                 acct_dates = dates_by_acct.get(acct.plaid_account_id, [])
                 if not acct_dates:
                     continue
-                result.superseded += supersede_csv_rows(
-                    session, payment_method=acct.payment_method,
-                    covered_min=min(acct_dates), covered_max=max(acct_dates),
-                )
+                # Isolate supersede per account: a supersede failure is
+                # classified (result.failed += 1) rather than escaping to the
+                # outer UNEXPECTED handler, and — because result.failed is now
+                # non-zero — the cursor is correctly held for a clean re-run.
+                try:
+                    with session.begin_nested():
+                        result.superseded += supersede_csv_rows(
+                            session, payment_method=acct.payment_method,
+                            covered_min=min(acct_dates), covered_max=max(acct_dates),
+                        )
+                except Exception:
+                    result.failed += 1
+                    logger.exception(
+                        "plaid supersede failure",
+                        extra={"plaid_item_id": item.id,
+                               "plaid_account_id": acct.plaid_account_id},
+                    )
 
         # Advance the cursor ONLY on a fully clean page-loop. If any row failed,
         # leave item.cursor UNCHANGED so the next sync re-fetches from the last
@@ -496,6 +556,10 @@ class TxBatchResult:
     @property
     def total_added(self) -> int:
         return sum(i.added for i in self.items)
+
+    @property
+    def total_reactivated(self) -> int:
+        return sum(i.reactivated for i in self.items)
 
     @property
     def total_modified(self) -> int:

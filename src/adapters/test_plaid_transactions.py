@@ -117,27 +117,51 @@ def test_raw_data_is_complete_plaid_dict():
 # ── Internal-transfer detection (REQ-PT general / spec §10) ──────────────────
 
 
-def test_transfer_category_sets_direction_transfer(db):
-    """A Plaid TRANSFER-category txn overrides the classifier and is non-P&L."""
+def test_transfer_category_routes_to_needs_review(db):
+    """A Plaid TRANSFER-category txn must NOT be auto-set to direction=transfer
+    (that silently drops real inbound income from P&L/B&O). Instead it is routed
+    to needs_review with the transfer-confirm reason, and the classifier's
+    direction is preserved as a suggestion."""
     item, acct = _mapped(db)
     pfc = SimpleNamespace(primary="TRANSFER_IN", detailed="TRANSFER_IN_DEPOSIT")
     txn = _plaid_txn(transaction_id="xfer1", amount=-4800.0,
                      name="Online Transfer from SAV", personal_finance_category=pfc)
-    # classifier would call this income; transfer detection must override it.
+    # classifier returns a high-confidence (0.95) result; without the override
+    # this would auto-classify. It must instead be held for human review.
     with mock.patch("src.adapters.plaid_transactions.classify",
                     return_value=_cls()):
         tx = make_transaction(txn, session=db, entity="personal",
                               payment_method="Chase ****1234")
-    assert tx.direction == Direction.TRANSFER.value
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    assert tx.review_reason == "plaid: transfer-category — confirm transfer vs income"
+    # classifier's direction is left as a suggestion, NOT overridden to transfer.
+    assert tx.direction == Direction.EXPENSE.value
 
 
-def test_transfer_code_sets_direction_transfer(db):
+def test_transfer_code_routes_to_needs_review(db):
     item, acct = _mapped(db)
     txn = _plaid_txn(transaction_id="xfer2", transaction_code="transfer")
     with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
         tx = make_transaction(txn, session=db, entity="personal",
                               payment_method="Chase ****1234")
-    assert tx.direction == Direction.TRANSFER.value
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    assert tx.review_reason == "plaid: transfer-category — confirm transfer vs income"
+    assert tx.direction == Direction.EXPENSE.value
+
+
+def test_transfer_in_client_deposit_not_silently_dropped(db):
+    """A TRANSFER_IN inbound deposit (indistinguishable from a real client ACH)
+    must NOT be auto-classified as a non-P&L transfer; it is surfaced for human
+    review so genuine income is never dropped from B&O gross receipts."""
+    item, acct = _mapped(db)
+    pfc = SimpleNamespace(primary="TRANSFER_IN", detailed="TRANSFER_IN_ACCOUNT_TRANSFER")
+    txn = _plaid_txn(transaction_id="client_ach", amount=-12000.0,
+                     name="ACH CREDIT ACME CORP", personal_finance_category=pfc)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        tx = make_transaction(txn, session=db, entity="sparkry",
+                              payment_method="Chase ****1234")
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    assert tx.direction != Direction.TRANSFER.value
 
 
 def test_non_transfer_keeps_classifier_direction(db):
@@ -148,6 +172,8 @@ def test_non_transfer_keeps_classifier_direction(db):
         tx = make_transaction(txn, session=db, entity="personal",
                               payment_method="Chase ****1234")
     assert tx.direction == Direction.EXPENSE.value
+    # A non-transfer, high-confidence row auto-classifies as usual.
+    assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
 
 
 # ── Task 4 tests: make_transaction ────────────────────────────────────────────
@@ -347,6 +373,42 @@ def test_removed_then_readded_is_reactivated(db):
     assert any(e.new_value == "needs_review" for e in events)
 
 
+def test_process_added_reports_reactivated_count(db):
+    """REQ-PT-004: process_added returns reactivated separately from inserted so
+    a reinstated (plaid_readded) row is visible in operator metrics."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        c1 = process_added(db, item, [_plaid_txn(transaction_id="rc1", amount=9.0)],
+                           account_index={"acc_1": acct})
+    assert c1.inserted == 1 and c1.reactivated == 0
+    process_removed(db, [{"transaction_id": "rc1"}])
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        c2 = process_added(db, item, [_plaid_txn(transaction_id="rc1", amount=9.0)],
+                           account_index={"acc_1": acct})
+    assert c2.inserted == 0 and c2.reactivated == 1
+
+
+def test_sync_one_item_accumulates_reactivated(db):
+    """sync_one_item rolls reactivations into result.reactivated / batch totals."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="sr1", amount=5.0)],
+                      account_index={"acc_1": acct})
+    process_removed(db, [{"transaction_id": "sr1"}])
+    db.commit()
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="sr1", account_id="acc_1", amount=5.0)],
+                   has_more=False, next_cursor="c")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+    assert result.reactivated == 1
+    assert result.added == 0
+
+
 def test_removed_skips_split_parent(db):
     """A split_parent row must NOT be rejected by process_removed (would orphan
     its split children)."""
@@ -359,6 +421,24 @@ def test_removed_skips_split_parent(db):
     db.commit()
     assert process_removed(db, [{"transaction_id": "sp1"}]) == 0
     db.refresh(row)
+    assert row.status == TransactionStatus.SPLIT_PARENT.value
+
+
+def test_modified_skips_split_parent(db):
+    """A Plaid 'modified' on a split_parent row must NOT change the parent's
+    amount (would break the split-sum invariant); skip + warn like removed."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="msp1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="msp1").one()
+    row.status = TransactionStatus.SPLIT_PARENT.value
+    db.commit()
+    original_amount = row.amount
+    # Plaid sends a modified event with a different amount.
+    assert process_modified(db, [_plaid_txn(transaction_id="msp1", amount=99.0)]) == 0
+    db.refresh(row)
+    assert row.amount == original_amount
     assert row.status == TransactionStatus.SPLIT_PARENT.value
 
 
@@ -505,6 +585,8 @@ def test_sync_one_item_per_row_isolation(db):
     log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
     assert log.status == IngestionStatus.PARTIAL_FAILURE.value
     assert log.records_failed == 1
+    # 1 ok row processed (the 'bad' row failed) — records_processed must reflect it.
+    assert log.records_processed == 1
     # REQ-PT-006: a per-row failure must NOT advance the cursor (so the failed
     # row is re-delivered next run).
     db.refresh(item)
@@ -573,6 +655,7 @@ def test_sync_one_item_retryable_error_holds_cursor(db):
     log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
     assert log.status == IngestionStatus.FAILURE.value
     assert log.retryable is True
+    assert log.error_detail == "INSTITUTION_DOWN"
 
 
 def test_sync_one_item_invalid_ciphertext_is_terminal_holds_cursor(db):
@@ -594,6 +677,7 @@ def test_sync_one_item_invalid_ciphertext_is_terminal_holds_cursor(db):
     assert item.last_error == "INVALID_ACCESS_TOKEN"
     log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
     assert log.status == IngestionStatus.FAILURE.value
+    assert log.retryable is False
 
 
 def test_sync_one_item_terminal_error_does_not_advance_cursor(db):
@@ -613,6 +697,12 @@ def test_sync_one_item_terminal_error_does_not_advance_cursor(db):
     assert item.cursor == "prev_cursor"
     assert item.last_sync_status == "error"
     assert item.last_error == "ITEM_LOGIN_REQUIRED"
+    # REQ-PT-016: terminal error writes a FAILURE log, non-retryable. Guards
+    # against a silent log-write regression.
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.FAILURE.value
+    assert log.retryable is False
+    assert log.error_detail == "ITEM_LOGIN_REQUIRED"
 
 
 def test_sync_one_item_unexpected_error_holds_cursor(db):
@@ -630,6 +720,12 @@ def test_sync_one_item_unexpected_error_holds_cursor(db):
     assert result.error_code == "UNEXPECTED"
     db.refresh(item)
     assert item.cursor == "prev_cursor"
+    # REQ-PT-007: unexpected error writes a FAILURE log, non-retryable, with the
+    # 'unexpected:' error_detail prefix. Guards against silent log-write loss.
+    log = db.query(IngestionLog).filter_by(source="plaid_tx:Chase").one()
+    assert log.status == IngestionStatus.FAILURE.value
+    assert log.retryable is False
+    assert log.error_detail.startswith("unexpected:")
 
 
 def test_non_first_sync_does_not_supersede(db):

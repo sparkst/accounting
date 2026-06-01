@@ -869,6 +869,9 @@ def test_sync_now_404_on_unknown_item(client: TestClient) -> None:
     plaid_routes_mod._sync_now_last_call.clear()
     resp = client.post("/api/plaid/sync-now?item_id=does-not-exist")
     assert resp.status_code == 404
+    # P2-004-SEC: the 404 must happen BEFORE the rate-limit write, so an unknown
+    # id neither consumes its cooldown slot nor grows the limiter dict.
+    assert "does-not-exist" not in plaid_routes_mod._sync_now_last_call
 
 
 def test_sync_now_rate_limited_to_one_per_minute_per_item(

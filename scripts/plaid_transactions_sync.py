@@ -56,11 +56,12 @@ def main(argv: list[str] | None = None) -> int:
 
     mode = "APPLIED" if args.apply else "DRY-RUN"
     logger.info(
-        "plaid tx sync %s: items=%d added=%d modified=%d removed=%d "
+        "plaid tx sync %s: items=%d added=%d reactivated=%d modified=%d removed=%d "
         "failed=%d superseded=%d",
         mode,
         len(batch.items),
         batch.total_added,
+        batch.total_reactivated,
         batch.total_modified,
         batch.total_removed,
         batch.total_failed,
@@ -68,14 +69,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     for r in batch.items:
         logger.info(
-            "  %s status=%s added=%d failed=%d error=%s",
+            "  %s status=%s added=%d reactivated=%d failed=%d error=%s",
             r.institution_name,
             r.status,
             r.added,
+            r.reactivated,
             r.failed,
             r.error_code or "-",
         )
-    return 0
+    # Exit non-zero so launchd surfaces a failed/held-cursor sync to ops.
+    # Any per-row failure (cursor held) OR an item in an error state qualifies.
+    has_failures = batch.total_failed > 0 or any(
+        r.status == "error" for r in batch.items
+    )
+    return 1 if has_failures else 0
 
 
 if __name__ == "__main__":

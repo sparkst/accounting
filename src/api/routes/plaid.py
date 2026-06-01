@@ -594,6 +594,16 @@ def sync_now(
     Plaid happy — Balance is per-call billed in production.
     """
     cooldown_key = item_id or "*"
+    # Validate the item exists BEFORE recording the rate-limit timestamp, so an
+    # arbitrary/fabricated item_id can't (a) grow the in-memory limiter dict
+    # unbounded or (b) consume the cooldown window on a 404. Mirrors the guard
+    # in sync_transactions_now. The global ("*") path has no 404 and is unchanged.
+    item: PlaidItem | None = None
+    if item_id is not None:
+        item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
+        if item is None:
+            raise HTTPException(status_code=404, detail="item not found")
+
     now = time.monotonic()
     last = _sync_now_last_call.get(cooldown_key, 0.0)
     if now - last < _SYNC_NOW_COOLDOWN_SECONDS:
@@ -619,9 +629,7 @@ def sync_now(
                 for r in batch.items
             ]
         }
-    item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
-    if item is None:
-        raise HTTPException(status_code=404, detail="item not found")
+    assert item is not None  # narrowed by the item_id-not-None branch above
     result = sync_one_item(session, item, client=client)
     session.commit()
     return {

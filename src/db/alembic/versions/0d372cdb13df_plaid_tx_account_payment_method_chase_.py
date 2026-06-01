@@ -49,6 +49,10 @@ _NEW_ACCOUNT_TYPES = (*_OLD_ACCOUNT_TYPES, "checking", "savings")
 
 
 def _values_in(values: Sequence[str]) -> str:
+    # Used ONLY for DDL CHECK-constraint strings (not DML). f-string
+    # interpolation of literals is safe inside a CHECK constraint definition.
+    # For DML queries (e.g. the COUNT(*) guards in downgrade()) use
+    # sa.bindparam(expanding=True) instead — never interpolate into a WHERE.
     return ", ".join(f"'{v}'" for v in values)
 
 

@@ -12,6 +12,8 @@ export default defineConfig({
 		}
 	},
 	preview: {
-		allowedHosts: ['macbook.ancon-cliff.ts.net']
+		host: '127.0.0.1',
+		port: 5173,
+		allowedHosts: ['books.sparkry.ai', 'ubuntu', 'localhost', '127.0.0.1']
 	}
 });

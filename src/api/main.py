@@ -24,6 +24,7 @@ from src.api.auth import require_api_key
 from src.api.routes.attachments import router as attachments_router
 from src.api.routes.brokerage import router as brokerage_router
 from src.api.routes.csv_import import router as csv_import_router
+from src.api.routes.health import ping_router as health_ping_router
 from src.api.routes.health import router as health_router
 from src.api.routes.ingest import router as ingest_router
 from src.api.routes.invoices import router as invoices_router
@@ -153,11 +154,14 @@ app.add_middleware(
 # Routers
 # ---------------------------------------------------------------------------
 
-# Health is always public (no auth dependency) so monitoring tools can reach it.
-app.include_router(health_router, prefix="/api")
+# Only the minimal ping is public (CF Access guards it at the edge).
+app.include_router(health_ping_router, prefix="/api")
 
 # All other routers require API key auth when API_KEY env var is set.
 _auth = [Depends(require_api_key)]
+
+# Rich health + source-config are dashboard diagnostics → behind API_KEY.
+app.include_router(health_router, prefix="/api", dependencies=_auth)
 
 app.include_router(attachments_router, prefix="/api", dependencies=_auth)
 app.include_router(brokerage_router, prefix="/api", dependencies=_auth)

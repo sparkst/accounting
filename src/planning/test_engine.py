@@ -1,13 +1,18 @@
 """Engine unit tests + source-spec §7 regression."""
 from __future__ import annotations
 
+import dataclasses
+from typing import Any
+
+import numpy as np
 import pytest
 
 from src.planning.engine import (
     loan_payment,
     real_spend,
+    simulate,
 )
-from src.planning.params import DEFAULTS
+from src.planning.params import DEFAULTS, Params
 
 
 def test_real_spend_flat_through_age_69() -> None:
@@ -30,7 +35,6 @@ def test_real_spend_glides_toward_floor_at_70_plus() -> None:
 
 def test_loan_payment_modes() -> None:
     """Three loan modes per source spec."""
-    import dataclasses
     base = dataclasses.replace(DEFAULTS, loan=1_000_000.0, loan_rate=0.0675)
 
     p_none = dataclasses.replace(base, loan_mode="none")
@@ -42,3 +46,62 @@ def test_loan_payment_modes() -> None:
     p_am = dataclasses.replace(base, loan_mode="amortize10")
     # 10-yr amortizing at 6.75% on $1M ≈ $141,478/yr
     assert 140_000 < loan_payment(p_am) < 143_000
+
+
+def _single_pool(**overrides: Any) -> Params:
+    """Build Params matching source-spec §7 — single $7.8M pool, no two-pool split,
+    no Amy wage stream (source spec has no Amy), source-spec tax_gross=1.13."""
+    base = dataclasses.replace(
+        DEFAULTS,
+        pool_taxable=7_800_000.0,
+        pool_retirement=0.0,
+        amy_wage_income=0.0,
+        amy_wage_years=0,
+    )
+    return dataclasses.replace(base, **overrides)
+
+
+# Source-spec §7 published results. ±1pp tolerance (REQ-PLAN-016).
+SPEC_TABLE = {
+    # (ret_mean, end_age, loan, loan_mode): survival
+    (0.065, 85, 0.0, "none"):                          0.71,
+    (0.08,  85, 0.0, "none"):                          0.86,
+    (0.10,  85, 0.0, "none"):                          0.95,
+    (0.065, 90, 0.0, "none"):                          0.68,
+    (0.08,  90, 0.0, "none"):                          0.83,
+    (0.10,  90, 0.0, "none"):                          0.94,
+    (0.065, 85, 1_000_000.0, "interest_only"):         0.56,
+    (0.08,  85, 1_000_000.0, "interest_only"):         0.72,
+    (0.10,  85, 1_000_000.0, "interest_only"):         0.89,
+    (0.065, 85, 1_000_000.0, "amortize10"):            0.56,
+    (0.08,  85, 1_000_000.0, "amortize10"):            0.73,
+    (0.10,  85, 1_000_000.0, "amortize10"):            0.88,
+}
+
+
+@pytest.mark.parametrize(
+    ("ret_mean", "end_age", "loan", "loan_mode", "expected"),
+    [(rm, ea, ln, lm, surv) for (rm, ea, ln, lm), surv in SPEC_TABLE.items()],
+)
+def test_source_spec_section_7_regression(
+    ret_mean: float, end_age: int, loan: float, loan_mode: str, expected: float
+) -> None:
+    """REQ-PLAN-016: source-spec §7 survival within ±1pp on every CI run."""
+    p = _single_pool(
+        ret_mean=ret_mean, end_age=end_age, loan=loan, loan_mode=loan_mode
+    )
+    r = simulate(p, seed=13)
+    assert abs(r.survival - expected) <= 0.01, (
+        f"ret={ret_mean} horizon={end_age} loan={loan} mode={loan_mode}: "
+        f"got {r.survival:.3f}, expected {expected:.2f}±0.01"
+    )
+
+
+def test_determinism_byte_identical_with_seed() -> None:
+    """REQ-PLAN-017: fixed seed → identical paths array across runs."""
+    p = _single_pool(ret_mean=0.08)
+    r1 = simulate(p, seed=42)
+    r2 = simulate(p, seed=42)
+    assert np.array_equal(r1.paths, r2.paths)
+    assert r1.survival == r2.survival
+    assert r1.percentiles == r2.percentiles

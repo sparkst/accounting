@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.planning.params import Params
+from src.planning.params import Params, ScenarioGrid
 
 
 def real_spend(age: int, p: Params) -> float:
@@ -157,3 +157,21 @@ def simulate(p: Params, seed: int = 42) -> Results:
         final_taxable_p50=float(np.percentile(PT, 50)),
         final_retirement_p50=float(np.percentile(PR, 50)),
     )
+
+
+def simulate_grid(
+    base: Params, grid: ScenarioGrid, seed: int = 42
+) -> dict[str, Results]:
+    """Run every scenario in `grid` against `base`. Returns {name: Results}.
+
+    Each scenario gets a deterministic per-name seed derived from `seed` so that
+    re-running a subset of scenarios produces the same results as running the
+    full grid.
+    """
+    out: dict[str, Results] = {}
+    for i, scen in enumerate(grid.scenarios):
+        p = scen.apply(base)
+        # Per-scenario seed: stable across grid sizes, deterministic.
+        scen_seed = seed * 1000 + i
+        out[scen.name] = simulate(p, seed=scen_seed)
+    return out

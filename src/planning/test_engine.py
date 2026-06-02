@@ -11,8 +11,9 @@ from src.planning.engine import (
     loan_payment,
     real_spend,
     simulate,
+    simulate_grid,
 )
-from src.planning.params import DEFAULTS, Params
+from src.planning.params import DEFAULTS, Params, ScenarioGrid
 
 
 def test_real_spend_flat_through_age_69() -> None:
@@ -246,3 +247,27 @@ def test_amy_wage_income_stops_at_amy_wage_years() -> None:
     expected_total_draw = 291_950.0
     expected_final = 10_000_000.0 - expected_total_draw
     assert r.paths[0, -1] == pytest.approx(expected_final, abs=1.0)
+
+
+def test_simulate_grid_runs_all_15_default_scenarios() -> None:
+    """REQ-PLAN-008: default grid runs all 15 cells in one invocation."""
+    # Use a smaller n_sims so the test runs fast.
+    base = dataclasses.replace(DEFAULTS, n_sims=500)
+    out = simulate_grid(base, ScenarioGrid.default(), seed=42)
+    assert len(out) == 15
+    assert "baseline_ret8_horizon85" in out
+    assert "+_biz_320k_10y_qsbs_10m" in out
+    # Each value is a Results
+    for name, r in out.items():
+        assert 0.0 <= r.survival <= 1.0, f"{name}: survival out of range"
+        assert r.paths.shape[0] == 500
+
+
+def test_simulate_grid_deterministic_per_scenario() -> None:
+    """Two grid runs with same seed produce identical per-scenario survival."""
+    base = dataclasses.replace(DEFAULTS, n_sims=500)
+    grid = ScenarioGrid.default()
+    out1 = simulate_grid(base, grid, seed=42)
+    out2 = simulate_grid(base, grid, seed=42)
+    for name in out1:
+        assert out1[name].survival == out2[name].survival

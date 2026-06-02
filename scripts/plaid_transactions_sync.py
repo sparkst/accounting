@@ -13,9 +13,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 # Add project root to path when invoked as a script.
@@ -28,6 +31,26 @@ from src.adapters.plaid_transactions import sync_all_active  # noqa: E402
 from src.db.connection import SessionLocal, init_db  # noqa: E402
 
 logger = logging.getLogger("plaid_transactions_sync")
+
+
+def _backup_lock_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "data" / ".backup.lock"
+
+
+@contextmanager
+def _backup_lock() -> Generator[None, None, None]:
+    """Hold data/.backup.lock EX across the entire --apply write (acquire-before-
+    begin, release-after-commit) so the pre-apply backup can't snapshot a partial
+    supersession batch. backup.sh takes this same lock symmetrically."""
+    path = _backup_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "w")  # noqa: SIM115  # must stay open across yield
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,8 +74,12 @@ def main(argv: list[str] | None = None) -> int:
 
     init_db()
     client = make_plaid_client()
-    with SessionLocal() as session:
-        batch = sync_all_active(session, client=client, dry_run=not args.apply)
+    if args.apply:
+        with _backup_lock(), SessionLocal() as session:
+            batch = sync_all_active(session, client=client, dry_run=False)
+    else:
+        with SessionLocal() as session:
+            batch = sync_all_active(session, client=client, dry_run=True)
 
     mode = "APPLIED" if args.apply else "DRY-RUN"
     logger.info(

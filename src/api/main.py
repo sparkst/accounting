@@ -37,6 +37,7 @@ from src.api.routes.vendor_rules import router as vendor_rules_router
 from src.classification.seed_rules import seed_vendor_rules
 from src.db.connection import SessionLocal, init_db
 from src.invoicing.seed_customers import seed_customers
+from src.planning.api import router as planning_router
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,7 @@ app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
 app.include_router(transactions_router, prefix="/api", dependencies=_auth)
 app.include_router(ingest_router, prefix="/api", dependencies=_auth)
 app.include_router(invoices_router, prefix="/api", dependencies=_auth)
+app.include_router(planning_router, prefix="/api", dependencies=_auth)
 app.include_router(plaid_router, prefix="/api", dependencies=_auth)
 app.include_router(reconciliation_router, prefix="/api", dependencies=_auth)
 app.include_router(tax_documents_router, prefix="/api", dependencies=_auth)

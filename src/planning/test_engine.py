@@ -105,3 +105,81 @@ def test_determinism_byte_identical_with_seed() -> None:
     assert np.array_equal(r1.paths, r2.paths)
     assert r1.survival == r2.survival
     assert r1.percentiles == r2.percentiles
+
+
+def test_two_pool_pre_59_5_drains_taxable_only() -> None:
+    """REQ-PLAN-003: draws taxable-only while age < 59.5."""
+    # Set up so first-year draw is large enough to be visible against starting balances.
+    p = dataclasses.replace(
+        DEFAULTS,
+        pool_taxable=1_000_000.0,
+        pool_retirement=1_000_000.0,
+        spend_start=500_000.0,
+        start_age=49,
+        end_age=50,           # only 1 year
+        ret_mean=0.0,         # no growth → easy to verify
+        ret_sd=0.0,
+        n_sims=1,
+        amy_wage_income=0.0,  # isolate spend
+        biz_income=0.0,
+        ss_amount=0.0,
+    )
+    r = simulate(p, seed=42)
+    # After one year of pure draw, retirement should be untouched at 1.0M and
+    # taxable should have been reduced by spend × tax_gross_taxable (no growth).
+    # The simulate API now needs to expose split balances — assert on paths
+    # by convention: paths[:, 1] is the COMBINED pool at end of year 1.
+    # For this test we use the two-pool split exposed via `final_taxable` /
+    # `final_retirement` fields on Results (added in T5).
+    assert r.paths.shape == (1, 2)
+    # Retirement should be visible separately on Results in T5; verify via
+    # split fields:
+    assert r.final_taxable_p50 == pytest.approx(1_000_000.0 - 500_000.0 * 1.13, abs=1.0)
+    assert r.final_retirement_p50 == pytest.approx(1_000_000.0, abs=1.0)
+
+
+def test_two_pool_pre_59_5_drain_to_zero_marks_ruined_early() -> None:
+    """REQ-PLAN-004: if taxable hits zero pre-59.5, path is ruined-early."""
+    p = dataclasses.replace(
+        DEFAULTS,
+        pool_taxable=100_000.0,   # tiny
+        pool_retirement=10_000_000.0,
+        spend_start=200_000.0,    # > taxable
+        start_age=49,
+        end_age=51,
+        ret_mean=0.0,
+        ret_sd=0.0,
+        n_sims=1,
+        amy_wage_income=0.0,
+        biz_income=0.0,
+        ss_amount=0.0,
+    )
+    r = simulate(p, seed=42)
+    assert r.ruined_early_count == 1
+    # Survival counts only paths intact through horizon → 0 here.
+    assert r.survival == 0.0
+
+
+def test_two_pool_post_59_5_pro_rata_split() -> None:
+    """REQ-PLAN-003: post-59.5 draws split pro-rata by current balance."""
+    p = dataclasses.replace(
+        DEFAULTS,
+        pool_taxable=1_500_000.0,
+        pool_retirement=500_000.0,    # 75/25 split
+        spend_start=200_000.0,
+        start_age=60,                 # starts post-59.5
+        end_age=61,
+        ret_mean=0.0,
+        ret_sd=0.0,
+        n_sims=1,
+        amy_wage_income=0.0,
+        biz_income=0.0,
+        ss_amount=0.0,
+    )
+    r = simulate(p, seed=42)
+    # spend = 200k. Gross-up is per-pool: taxable share 75% × 1.13, retirement
+    # share 25% × 1.25. Total grossed draw = 200k × (0.75*1.13 + 0.25*1.25) = 200k × 1.1600
+    # Taxable share of net draw: 200k × 0.75 × 1.13 = 169,500
+    # Retirement share of net draw: 200k × 0.25 × 1.25 =  62,500
+    assert r.final_taxable_p50 == pytest.approx(1_500_000.0 - 169_500.0, abs=1.0)
+    assert r.final_retirement_p50 == pytest.approx(500_000.0 - 62_500.0, abs=1.0)

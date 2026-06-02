@@ -45,65 +45,102 @@ def loan_payment(p: Params) -> float:
 class Results:
     """Output of one simulate() invocation across all sims."""
 
-    survival: float                            # mean of (final pool > 0)
-    owed: float                                # loan still owed at horizon (interest_only mode)
-    percentiles: dict[int, tuple[float, float, float]]  # age → (p10, p50, p90)
-    paths: np.ndarray                          # shape (n_sims, yrs+1) — for diagnostics/tests
-    ruined_early_count: int                    # placeholder for T5 two-pool; 0 in single-pool
+    survival: float
+    owed: float
+    percentiles: dict[int, tuple[float, float, float]]
+    paths: np.ndarray                       # (n_sims, yrs+1) — TOTAL pool per year
+    ruined_early_count: int                 # paths that exhausted taxable pre-59.5
+    final_taxable_p50: float                # diagnostic: median final taxable balance
+    final_retirement_p50: float             # diagnostic: median final retirement balance
 
 
 def simulate(p: Params, seed: int = 42) -> Results:
-    """Run n_sims Monte Carlo paths under params p. Single-pool baseline.
+    """Run n_sims Monte Carlo paths under params p. Two-pool with 59.5 access.
 
-    Vectorized: each year processes all sims simultaneously. The per-sim
-    recursion (source-spec §5 steps 1–9) is preserved exactly.
+    Pre-59.5: all draws come from taxable (gross by tax_gross_taxable). If
+    taxable goes negative, path is marked ruined-early; both pools are zeroed
+    for the remaining years to preserve totals math.
+
+    Post-59.5: draws split pro-rata by current balance; per-pool gross-up.
+
+    Returns the SAME `paths` shape as before — total pool per year — so the
+    source-spec §7 regression continues to operate on the same array.
+
+    When pool_retirement == 0 the two-pool branch reduces exactly to single-pool
+    behavior (share_r == 0, all draws from taxable regardless of age).
     """
     rng = np.random.default_rng(seed)
     yrs = p.end_age - p.start_age
     n = p.n_sims
 
-    # Initialize pool vector. Single-pool baseline: treat total pool as one.
-    P = np.full(n, p.pool_taxable + p.pool_retirement, dtype=np.float64)
+    PT = np.full(n, p.pool_taxable, dtype=np.float64)
+    PR = np.full(n, p.pool_retirement, dtype=np.float64)
+    ruined_early = np.zeros(n, dtype=bool)
 
     paths = np.zeros((n, yrs + 1), dtype=np.float64)
-    paths[:, 0] = P
+    paths[:, 0] = PT + PR
 
     pay = loan_payment(p)
+    g_t = p.tax_gross_taxable
+    g_r = p.tax_gross_retirement
 
     for t in range(yrs):
         age = p.start_age + t
-        spend = real_spend(age, p) * (1 + p.inflation) ** t
 
+        spend = real_spend(age, p) * (1 + p.inflation) ** t
         lc = (
             pay
             if (p.loan_mode == "interest_only" or (p.loan_mode == "amortize10" and t < 10))
             else 0.0
         )
-
         biz = p.biz_income if t < p.biz_years else 0.0
         amy = p.amy_wage_income if t < p.amy_wage_years else 0.0
         ss = p.ss_amount * (1 + p.inflation) ** t if age >= p.ss_start_age else 0.0
         inc = biz + amy + ss
+        net_need = max(spend + lc - inc, 0.0)
 
-        draw = max(spend + lc - inc, 0.0) * p.tax_gross_taxable
-        P = P - draw
+        if age < 59.5:
+            # Taxable-only draw, grossed up.
+            draw_t = net_need * g_t
+            PT = PT - draw_t
+            # Mark sims whose taxable went negative as ruined-early; zero both pools.
+            newly_ruined = (PT < 0) & ~ruined_early
+            ruined_early = ruined_early | newly_ruined
+            PT = np.where(ruined_early, 0.0, PT)
+            PR = np.where(ruined_early, 0.0, PR)
+        else:
+            # Pro-rata split by current balance. Per-pool gross-up.
+            total = PT + PR
+            # Avoid divide-by-zero on already-zero sims (already counted as failures).
+            safe = total > 0
+            share_t = np.where(safe, PT / np.where(safe, total, 1.0), 0.0)
+            share_r = np.where(safe, PR / np.where(safe, total, 1.0), 0.0)
+            draw_t_share = net_need * share_t * g_t
+            draw_r_share = net_need * share_r * g_r
+            PT = PT - draw_t_share
+            PR = PR - draw_r_share
+            PT = np.where(PT < 0, 0.0, PT)
+            PR = np.where(PR < 0, 0.0, PR)
 
         if t < p.contrib_years:
-            P = P + p.contrib
+            PT = PT + p.contrib
         if p.exit_year is not None and t == p.exit_year:
-            P = P + p.exit_amount
+            # QSBS exits go into taxable.
+            PT = PT + p.exit_amount
 
-        # One return draw per sim per year
+        # Apply same return to both pools (single asset assumption in v1).
         returns = rng.normal(p.ret_mean, p.ret_sd, size=n)
-        P = P * (1 + returns)
-        P = np.where(P < 0, 0.0, P)
+        PT = PT * (1 + returns)
+        PR = PR * (1 + returns)
+        PT = np.where(PT < 0, 0.0, PT)
+        PR = np.where(PR < 0, 0.0, PR)
 
-        paths[:, t + 1] = P
+        paths[:, t + 1] = PT + PR
 
-    # REQ-PLAN-015
     assert np.isfinite(paths).all(), "engine produced non-finite values"
 
-    survival = float((paths[:, -1] > 0).mean())
+    intact = (paths[:, -1] > 0) & ~ruined_early
+    survival = float(intact.mean())
     owed = p.loan if p.loan_mode == "interest_only" else 0.0
     percentiles: dict[int, tuple[float, float, float]] = {}
     for a in range(p.start_age, p.end_age + 1):
@@ -116,5 +153,7 @@ def simulate(p: Params, seed: int = 42) -> Results:
         owed=owed,
         percentiles=percentiles,
         paths=paths,
-        ruined_early_count=0,
+        ruined_early_count=int(ruined_early.sum()),
+        final_taxable_p50=float(np.percentile(PT, 50)),
+        final_retirement_p50=float(np.percentile(PR, 50)),
     )

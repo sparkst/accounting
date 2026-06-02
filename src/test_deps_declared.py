@@ -26,6 +26,7 @@ _REQUIRED = [
     "chardet",
     "icalendar",
     "resend",
+    "alembic",
 ]
 
 

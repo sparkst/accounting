@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Generator
-from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -29,7 +28,7 @@ import src.models.tax_document  # noqa: F401
 import src.models.tax_year_lock  # noqa: F401
 import src.models.transaction  # noqa: F401
 from src.models.base import Base
-from src.models.brokerage import Account
+from src.models.brokerage import Account  # noqa: F401 — registers `account` table (FK target)
 from src.models.history import HistoricalPrice  # noqa: F401
 from src.models.plaid import PlaidItem
 from src.utils.plaid_crypto import encrypt_token

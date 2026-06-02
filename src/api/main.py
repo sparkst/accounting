@@ -47,6 +47,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     Runs startup tasks before yielding, then teardown after.
     """
+    from src.api._startup_assert import assert_production_secrets
+
+    assert_production_secrets()
     logger.info("Starting accounting API — initialising database …")
     init_db()
     with SessionLocal() as session:

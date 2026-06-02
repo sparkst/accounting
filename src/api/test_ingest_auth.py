@@ -1,5 +1,43 @@
-"""§7 (revised): /api/ingest/run accepts either key; brokerage-csv + reclassify are browser-key only."""
+"""§7 (revised): /api/ingest/run accepts either key; brokerage-csv + reclassify are browser-key only.
+
+Auth-ONLY tests: the ingest + reclassify WORK is stubbed so an auth-passing POST
+does NOT run the real adapters / classification engine. Running it for real makes
+failing Claude API calls that trip the module-level circuit breaker in
+src.classification.llm_classifier — global state that then pollutes later
+classifier tests (they'd see "Circuit breaker open" instead of "API error").
+These tests assert ONLY the auth outcome (401 vs not).
+"""
+from types import SimpleNamespace
+
+import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture(autouse=True)
+def _stub_ingest_work(monkeypatch):
+    """Stub the ingest + reclassify work so auth-passing POSTs do no real work
+    (no adapters, no classifier, no Claude calls → no circuit-breaker pollution)."""
+    import src.api.routes.ingest as ingest_mod
+
+    monkeypatch.setattr(
+        ingest_mod,
+        "_run_ingest_locked",
+        lambda source=None: ingest_mod.IngestSummary(
+            ingested_count=0,
+            classified_count=0,
+            needs_review_count=0,
+            adapter_results=[],
+            warnings=[],
+            errors=[],
+        ),
+    )
+    monkeypatch.setattr(
+        ingest_mod,
+        "reclassify_all",
+        lambda *a, **k: SimpleNamespace(
+            vendor_updated=0, classified=0, still_needs_review=0, errors=[]
+        ),
+    )
 
 
 def _client(monkeypatch):

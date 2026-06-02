@@ -183,3 +183,66 @@ def test_two_pool_post_59_5_pro_rata_split() -> None:
     # Retirement share of net draw: 200k × 0.25 × 1.25 =  62,500
     assert r.final_taxable_p50 == pytest.approx(1_500_000.0 - 169_500.0, abs=1.0)
     assert r.final_retirement_p50 == pytest.approx(500_000.0 - 62_500.0, abs=1.0)
+
+
+def test_amy_wage_income_offsets_draw_during_wage_years() -> None:
+    """REQ-PLAN-018: amy_wage_income offsets draw for amy_wage_years."""
+    base = dataclasses.replace(
+        DEFAULTS,
+        pool_taxable=10_000_000.0,
+        pool_retirement=0.0,
+        spend_start=100_000.0,
+        ss_amount=0.0,
+        biz_income=0.0,
+        amy_wage_income=0.0,
+        amy_wage_years=0,
+        start_age=49,
+        end_age=51,
+        ret_mean=0.0,
+        ret_sd=0.0,
+        n_sims=1,
+    )
+    no_amy = simulate(base, seed=42)
+
+    with_amy = simulate(
+        dataclasses.replace(base, amy_wage_income=80_000.0, amy_wage_years=3),
+        seed=42,
+    )
+
+    # With Amy's $80k offsetting the $100k spend, net draw drops from
+    # 100k×1.13 = 113k/yr to 20k×1.13 = 22.6k/yr. Over 2 years the with-Amy
+    # path should retain ~$180k more.
+    no_amy_final = no_amy.paths[0, -1]
+    with_amy_final = with_amy.paths[0, -1]
+    diff = with_amy_final - no_amy_final
+    expected_diff = (80_000.0 * 1.13) * 2  # 2 years of saved draw
+    assert diff == pytest.approx(expected_diff, abs=1.0)
+
+
+def test_amy_wage_income_stops_at_amy_wage_years() -> None:
+    """After amy_wage_years, Amy's wage no longer offsets draw."""
+    p = dataclasses.replace(
+        DEFAULTS,
+        pool_taxable=10_000_000.0,
+        pool_retirement=0.0,
+        spend_start=100_000.0,
+        ss_amount=0.0,
+        biz_income=0.0,
+        amy_wage_income=80_000.0,
+        amy_wage_years=2,            # stops after t=2
+        start_age=49,
+        end_age=53,                  # 4 years total
+        ret_mean=0.0,
+        ret_sd=0.0,
+        n_sims=1,
+    )
+    r = simulate(p, seed=42)
+    # Years 0,1: spend inflates at 3%/yr. net_need = (spend - amy_wage) if amy active.
+    # Year 0: spend=100k, amy=80k, net_need=20k, draw=22.6k
+    # Year 1: spend=103k, amy=80k, net_need=23k, draw=25.99k
+    # Year 2: spend=106.09k, amy=0, net_need=106.09k, draw=119.88k
+    # Year 3: spend=109.27k, amy=0, net_need=109.27k, draw=123.48k
+    # Total draw ≈ 291.95k
+    expected_total_draw = 291_950.0
+    expected_final = 10_000_000.0 - expected_total_draw
+    assert r.paths[0, -1] == pytest.approx(expected_final, abs=1.0)

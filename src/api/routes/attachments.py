@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,12 +28,18 @@ router = APIRouter(tags=["attachments"])
 
 # Only serve files from these trusted directories
 _ALLOWED_ROOTS = [
-    Path("/Users/travis/SGDrive/LIVE_SYSTEM/accounting"),
-    Path("/Users/travis/SGDrive/dev/accounting/data"),
+    Path(p)
+    for p in (
+        os.environ.get("ATTACHMENT_ROOTS")
+        or "/Users/travis/SGDrive/LIVE_SYSTEM/accounting:/Users/travis/SGDrive/dev/accounting/data"
+    ).split(os.pathsep)
+    if p
 ]
 
 # Where uploaded receipts are saved
-_RECEIPTS_ROOT = Path("/Users/travis/SGDrive/dev/accounting/data/receipts")
+_RECEIPTS_ROOT = Path(
+    os.environ.get("RECEIPTS_ROOT", "/Users/travis/SGDrive/dev/accounting/data/receipts")
+)
 
 _ALLOWED_UPLOAD_MIME = {
     "image/jpeg",

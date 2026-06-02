@@ -36,6 +36,7 @@ A fifth idea — a dedicated Claude Code MCP/tool surface for ad-hoc analysis �
 
 - Port the Monte Carlo recursion from the source spec's Appendix A into `src/planning/engine.py` as a vectorized NumPy implementation.
 - Extend to a **two-pool** model (taxable + retirement) with a 59.5 access constraint, replacing the source spec's single-pool / single-`tax_gross` fudge.
+- Model **household income** as two separate streams — Sparkry consulting (`biz_income`/`biz_years`) and Amy's W-2 wages (`amy_wage_income`/`amy_wage_years`) — both offsetting draw while active.
 - Load live inputs from the existing local SQLite (wealth `AccountBalanceSnapshot`, `Transaction` register) without modifying their schemas.
 - Run a default **scenario grid** (15 cells) reproducing source-spec §7 and adding the most-used what-ifs.
 - Persist each invocation as a single `PlanningRun` row.
@@ -102,6 +103,16 @@ While age >= 59.5:
     No RMDs (deferred — flagged in run output).
 ```
 
+Income calculation (source-spec §5 step 3) is extended to include Amy's wage income as a separate deterministic stream:
+
+```
+income = (biz_income       if t < biz_years       else 0)
+       + (amy_wage_income  if t < amy_wage_years  else 0)
+       + (ss_amount * (1 + inflation)**t if age >= ss_start_age else 0)
+```
+
+`biz_income` and `amy_wage_income` are tracked as separate parameters (not summed) so each can have its own end-year, and so sub-project #4's monthly report can attribute income offsets to source. v1 defaults: `amy_wage_income=80000`, `amy_wage_years=3` (see §9 for context).
+
 Vectorized via `np.random.default_rng` + matrix ops: the per-sim loop in the source spec's Appendix A becomes `(n_sims × yrs)` array ops, ~100× faster — lets the full 15-cell scenario grid run in under a second.
 
 ### 4.2 Live-input loaders
@@ -114,6 +125,7 @@ Concrete queries against existing tables — no schema changes:
 | `pool_retirement` | `AccountBalanceSnapshot` (latest per-account) | `sum(balance)` where `account_type IN ('IRA','ROTH','401K','HSA','PENSION','ANNUITY')` |
 | `ttm_spend` | `Transaction` | `sum(abs(amount))` where `direction='expense' AND entity='personal' AND date >= today - 365d` |
 | `ttm_biz_income` | `Transaction` | `sum(amount)` where `entity='sparkry' AND direction='income' AND date >= today - 365d` |
+| `ttm_personal_income` | `Transaction` | `sum(amount)` where `entity='personal' AND direction='income' AND date >= today - 365d`. Informational only — shown alongside `amy_wage_income` so drift between Amy's planning value and her actual W-2 deposits is visible. Distinguishing Amy's W-2 from other personal income (Travis's distributions, refunds) requires classification beyond v1 scope; v1 just shows the gross. |
 | `ttm_tax_effective` | tax-export trailing year | Informational only — shown alongside `tax_gross` in output; never overrides. |
 
 **Sourcing convention** (set by user during design):
@@ -294,12 +306,21 @@ Added to `requirements/current.md` under a new `REQ-PLAN-*` block:
 | REQ-PLAN-015 | Engine asserts `np.isfinite(paths).all()` post-sim. |
 | REQ-PLAN-016 | Source-spec §7 regression test must remain within ±1pp survival on every CI run. |
 | REQ-PLAN-017 | Fixed-seed runs are byte-identical (determinism). |
+| REQ-PLAN-018 | Income calculation supports `biz_income` and `amy_wage_income` as separate parameters with independent end-years; both offset draw while active. v1 defaults: `amy_wage_income=80000`, `amy_wage_years=3`. |
+| REQ-PLAN-019 | `ttm_personal_income` live readout shown alongside `amy_wage_income` planning value for drift inspection (not used to override). |
 
 ---
 
 ## 9. Open questions & future work
 
 - **Source-spec discrepancy on `tax_gross_retirement`.** v1 picks 1.25 as a placeholder for retirement-account draws (federal ordinary income, no WA tax, ~22-24% effective). Confirm with CPA before sub-project #4 publishes a number publicly; for v1 ad-hoc/internal use, the placeholder is documented and not load-bearing.
-- **Whose age?** Source spec uses Travis's age (49). Amy's age affects SS claiming and survival horizon. v1 uses a single-person model from the source spec; couples-spousal-SS modeling is its own future sub-project (call it 1b if it grows past trivial).
+- **Whose age?** Source spec uses Travis's age (49). Amy's age affects SS claiming and survival horizon. v1 uses a single-person model from the source spec for the age timeline; couples-spousal-SS modeling is its own future sub-project (call it 1b).
+
+- **Amy's earnings history (input to 1b's spousal-SS model).** Captured during v1 design so it's ready when 1b lands:
+  - **Currently:** private-school teacher since 2018, ~$80,000/yr W-2. Plans to continue "a few more years" (v1 default: 3 yrs through ~2029).
+  - **Pre-current:** stay-at-home mom 2009–2018 (counts as $0 in SS's 35-year average).
+  - **Curves:** Feb 2009 end-date back to ~2004.
+  - **Public-school teacher (VA, NC):** through 2004. *Pension-system question:* if either state's teacher pension paid into Social Security, those years contribute to her SS record normally; if she was in a non-SS pension system (some districts opt out), WEP/GPO may reduce her benefit. **Confirm in 1b** via her SSA Statement (ssa.gov) before computing spousal-vs-own benefit.
+  - Today's `ss_amount=$50,000 household net` is presumably a rough sum of (Travis's full benefit + Amy's spousal/own benefit). 1b should decompose and validate.
 - **`pool_retirement` typing.** The source spec calls out the retirement sub-pool ($1.5M) as "treated as part of the single pool." v1's two-pool extension partially addresses this. The remaining gap (Roth vs traditional vs HSA tax treatment) is Roadmap §9.C.
 - **Reproducibility under engine upgrades.** When v1.1 adds Student-t, the §7 regression must remain on the Normal path. Add a `return_model='normal'|'student_t'` param; default stays `normal` until validation indicates otherwise.

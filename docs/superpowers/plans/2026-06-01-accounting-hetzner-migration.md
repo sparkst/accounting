@@ -135,6 +135,8 @@ git add pyproject.toml src/invoicing/test_pdf_deps.py
 git commit -m "feat(deps): declare fpdf2 + jinja2 for invoicing on Hetzner (REQ-HM-015)"
 ```
 
+> **Addendum (discovered during execution via a clean-venv `pytest --co` sweep — REQ-HM-011):** `fpdf2`/`jinja2` were NOT the only undeclared runtime deps. `stripe` (income ingestion + invoices), `openpyxl` (xlsx importers), `chardet` (bank CSV), `icalendar` (Fascinate calendar invoicing), and `resend` (invoice email + the A11 alert handler) are all imported under `src/` but were undeclared — present in the Mac venv but absent from a fresh `pip install`. All five are added to `pyproject.toml` and guarded by `src/test_deps_declared.py` (commit `fix(deps): declare stripe/openpyxl/chardet/icalendar/resend …`). The Part-B-Phase-1 quality-gate step depends on this. (One unrelated pre-existing failure remains in `src/adapters/test_vanguard_csv.py`: it imports a non-existent `VanguardCsvAdapter` — fails identically on the Mac, so it is out of migration scope.)
+
 ---
 
 ### Task A2: vite preview host/port/allowedHosts for books.sparkry.ai (REQ-HM-017)

@@ -37,23 +37,28 @@ def require_api_key(
         )
 
 
-def require_ingest_api_key(
+def require_api_or_ingest_key(
     header_key: str | None = Security(_API_KEY_HEADER),
 ) -> None:
-    """Enforce INGEST_API_KEY (machine-to-machine) for /api/ingest/* ONLY.
+    """Accept the browser API_KEY OR the machine INGEST_API_KEY.
 
-    Checks INGEST_API_KEY exclusively — it does NOT also accept API_KEY, so a
-    dashboard user who extracts the browser-baked VITE_API_KEY cannot drive
-    ingest. Non-empty/strength is guaranteed by the lifespan() boot assertion;
-    this dependency just compares.
+    Used for /api/ingest/run, which is called BOTH by the dashboard 'Sync Now'
+    button (browser API_KEY) and by the n8n automation (INGEST_API_KEY). It is a
+    trigger with no injectable body, so accepting either credential is safe; CF
+    Access gates all callers at the edge. Presence/strength/distinctness of the
+    keys in production is enforced by the lifespan() boot assertion.
     """
-    expected = os.environ.get("INGEST_API_KEY")
-    if not expected:
-        return
-
-    if not header_key or not hmac.compare_digest(header_key, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
+    api_key = os.environ.get("API_KEY")
+    ingest_key = os.environ.get("INGEST_API_KEY")
+    if not api_key and not ingest_key:
+        return  # dev/no-auth mode (matches require_api_key behavior)
+    if header_key:
+        if api_key and hmac.compare_digest(header_key, api_key):
+            return
+        if ingest_key and hmac.compare_digest(header_key, ingest_key):
+            return
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API key",
+        headers={"WWW-Authenticate": "ApiKey"},
+    )

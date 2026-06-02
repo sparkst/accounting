@@ -20,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from src.api.auth import require_api_key, require_ingest_api_key
+from src.api.auth import require_api_key
 from src.api.routes.attachments import router as attachments_router
 from src.api.routes.brokerage import router as brokerage_router
 from src.api.routes.csv_import import router as csv_import_router
@@ -167,11 +167,7 @@ app.include_router(attachments_router, prefix="/api", dependencies=_auth)
 app.include_router(brokerage_router, prefix="/api", dependencies=_auth)
 app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
 app.include_router(transactions_router, prefix="/api", dependencies=_auth)
-app.include_router(
-    ingest_router,
-    prefix="/api",
-    dependencies=[Depends(require_ingest_api_key)],
-)
+app.include_router(ingest_router, prefix="/api")
 app.include_router(invoices_router, prefix="/api", dependencies=_auth)
 app.include_router(plaid_router, prefix="/api", dependencies=_auth)
 app.include_router(reconciliation_router, prefix="/api", dependencies=_auth)

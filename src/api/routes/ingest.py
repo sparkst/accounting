@@ -22,7 +22,7 @@ import os
 import threading
 import traceback
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from src.adapters import INGEST_SOURCES, get_adapter
@@ -31,6 +31,7 @@ from src.adapters.brokerage_csv import (
     BrokerageCsvAdapter,
     detect_brokerage,
 )
+from src.api.auth import require_api_key, require_api_or_ingest_key
 from src.classification.engine import apply_result, classify
 from src.db.connection import SessionLocal
 from src.models.enums import Source, TransactionStatus
@@ -93,7 +94,7 @@ _SOURCE_QUERY = Query(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/ingest/run", response_model=IngestSummary)
+@router.post("/ingest/run", response_model=IngestSummary, dependencies=[Depends(require_api_or_ingest_key)])
 def run_ingest(
     source: Source | None = _SOURCE_QUERY,
 ) -> IngestSummary:
@@ -251,7 +252,7 @@ class ReclassifySummary(BaseModel):
     errors: list[str]
 
 
-@router.post("/ingest/reclassify", response_model=ReclassifySummary)
+@router.post("/ingest/reclassify", response_model=ReclassifySummary, dependencies=[Depends(require_api_key)])
 def run_reclassify() -> ReclassifySummary:
     """Re-extract forwarded-email vendors and reclassify all needs_review transactions.
 
@@ -316,7 +317,7 @@ _BROKERAGE_FORM_FIELD = Form(
 )
 
 
-@router.post("/import/brokerage-csv", response_model=BrokerageCsvImportSummary)
+@router.post("/import/brokerage-csv", response_model=BrokerageCsvImportSummary, dependencies=[Depends(require_api_key)])
 async def import_brokerage_csv(
     file: UploadFile = _BROKERAGE_FILE_FIELD,
     brokerage: str | None = _BROKERAGE_FORM_FIELD,

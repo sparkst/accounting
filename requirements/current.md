@@ -473,3 +473,31 @@ The summaries below are scan-aids; the spec is authoritative.
 ## REQ-PERF-021: Cloudflare wealth UI port — performance components on `internal.sparkry.ai/wealth/*`
 - Acceptance: `PerformanceKpis`, `PeriodTable`, `PrincipalGrowthChart` components ported to the Cloudflare Pages frontend. Wired into `/wealth`, `/wealth/accounts/[id]`, `/wealth/holdings/[symbol]`, and the data-integrity page on the CF deployment. Smoke tests pass for both local production (Tailscale) AND CF production.
 - Non-Goals: design changes from the local dashboard.
+
+---
+
+## REQ-PLAN-* — Retirement & Business Sustainability Planning Engine (v1)
+
+Source spec: `docs/superpowers/specs/2026-06-01-planning-engine-design.md`
+
+| REQ-ID | Requirement |
+|---|---|
+| REQ-PLAN-001 | Monte Carlo engine reproduces source-spec §5 recursion as a vectorized NumPy implementation. |
+| REQ-PLAN-002 | Engine is pure: `(Params, ScenarioGrid) → Results`, no I/O. |
+| REQ-PLAN-003 | Two-pool extension: draws taxable-only while `age < 59.5`; pro-rata by current balance while `age >= 59.5`. Per-pool `tax_gross`. |
+| REQ-PLAN-004 | Path is recorded as "ruined-early" if taxable hits zero pre-59.5; survival counts only intact-through-horizon paths. |
+| REQ-PLAN-005 | Live-input loaders read `AccountBalanceSnapshot` and `Transaction` without modifying their schemas. |
+| REQ-PLAN-006 | Pool defaults to live; other inputs default to planning; `--override` trumps both. |
+| REQ-PLAN-007 | `LiveInputs` is snapshotted into every `PlanningRun` row regardless of whether values were used. |
+| REQ-PLAN-008 | Default scenario grid contains the 15 scenarios listed in spec §4.3 and reproduces source-spec §7. |
+| REQ-PLAN-009 | Each `simulate` invocation produces exactly one `PlanningRun` row (atomic write). |
+| REQ-PLAN-010 | CLI supports `simulate`, `show-latest`, `compare`, plus `--dry-run`, `--override`, `--scenarios`, `--note`. |
+| REQ-PLAN-011 | `GET /api/planning/runs/latest` returns the most recent run or 404. |
+| REQ-PLAN-012 | Monthly launchd job (`com.sparkry.planning-monthly.plist`) invokes `simulate --source scheduled` on the 1st at 06:00 local. |
+| REQ-PLAN-013 | Stale wealth data (>7d) → warning, run proceeds, persisted in `staleness_warning`. |
+| REQ-PLAN-014 | Missing wealth data → hard fail with actionable message. |
+| REQ-PLAN-015 | Engine asserts `np.isfinite(paths).all()` post-sim. |
+| REQ-PLAN-016 | Source-spec §7 regression test must remain within ±1pp survival on every CI run. |
+| REQ-PLAN-017 | Fixed-seed runs are byte-identical (determinism). |
+| REQ-PLAN-018 | Income calculation supports `biz_income` and `amy_wage_income` as separate parameters with independent end-years; both offset draw while active. v1 defaults: `amy_wage_income=80000`, `amy_wage_years=3`. |
+| REQ-PLAN-019 | `ttm_personal_income` live readout shown alongside `amy_wage_income` planning value for drift inspection (not used to override). |

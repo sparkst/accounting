@@ -27,6 +27,7 @@ _REQUIRED = [
     "icalendar",
     "resend",
     "alembic",
+    "python-multipart",  # FastAPI File()/Form() routes (attachments, brokerage-csv upload)
 ]
 
 

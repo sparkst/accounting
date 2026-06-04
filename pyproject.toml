@@ -7,11 +7,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "sqlalchemy>=2.0.0",
-    # Pinned to the Mac's working line: the tier-3 classifier (llm_classifier.py)
-    # is written against the 0.84 SDK; a fresh unpinned install pulls 0.105+, whose
-    # changed messages API breaks tier-3 classification (8 test_engine failures
-    # proven version-induced). Lift-and-shift → reproduce the Mac. Bump deliberately.
-    "anthropic>=0.84,<0.85",
+    "google-genai>=2.8,<3",
     "pydantic>=2.10.0",
     "httpx>=0.28.0",
     "yfinance>=0.2.40",

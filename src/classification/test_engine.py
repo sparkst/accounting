@@ -420,15 +420,15 @@ class TestTier2Patterns:
 
 
 def _make_mock_client(response_json: dict[str, Any]) -> MagicMock:
-    """Build a mock Anthropic client that returns *response_json* as text."""
-    mock_content = MagicMock()
-    mock_content.text = json.dumps(response_json)
-
+    """Build a mock Gemini client that returns *response_json* as text."""
     mock_response = MagicMock()
-    mock_response.content = [mock_content]
+    mock_response.text = json.dumps(response_json)
+    mock_response.usage_metadata.prompt_token_count = 100
+    mock_response.usage_metadata.candidates_token_count = 50
+    mock_response.model_version = "gemini-2.5-flash-lite"
 
     mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_response
+    mock_client.models.generate_content.return_value = mock_response
 
     return mock_client
 
@@ -521,12 +521,10 @@ class TestTier3LLMClassifier:
         assert "Invalid tax_category" in result.reasoning
 
     def test_malformed_json_falls_back(self) -> None:
-        mock_content = MagicMock()
-        mock_content.text = "This is not JSON at all."
         mock_response = MagicMock()
-        mock_response.content = [mock_content]
+        mock_response.text = "This is not JSON at all."
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_client.models.generate_content.return_value = mock_response
 
         txn = _make_transaction(description="Mystery vendor")
         result = llm_classify(txn, _client=mock_client)
@@ -535,19 +533,17 @@ class TestTier3LLMClassifier:
         assert "JSON parse error" in result.reasoning
 
     def test_markdown_fenced_json_is_parsed(self) -> None:
-        """Claude sometimes wraps output in ```json ... ``` fences."""
-        mock_content = MagicMock()
-        mock_content.text = (
+        """Gemini sometimes wraps output in ```json ... ``` fences — _parse_response strips them."""
+        mock_response = MagicMock()
+        mock_response.text = (
             "```json\n"
             '{"entity": "sparkry", "tax_category": "OFFICE_EXPENSE", '
             '"direction": "expense", "confidence": 0.82, '
             '"reasoning": "Office supply purchase."}\n'
             "```"
         )
-        mock_response = MagicMock()
-        mock_response.content = [mock_content]
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_client.models.generate_content.return_value = mock_response
 
         txn = _make_transaction(description="Staples office supplies")
         result = llm_classify(txn, _client=mock_client)
@@ -557,19 +553,17 @@ class TestTier3LLMClassifier:
         assert result.confidence == pytest.approx(0.82)
 
     def test_api_error_returns_low_confidence(self) -> None:
-        import anthropic as _anthropic
+        from google.genai import errors as genai_errors
 
         mock_client = MagicMock()
-        mock_client.messages.create.side_effect = _anthropic.APIStatusError(
-            "rate limit",
-            response=MagicMock(status_code=429),
-            body={},
+        mock_client.models.generate_content.side_effect = genai_errors.ClientError(
+            429, {"error": {"message": "rate limit", "status": "RESOURCE_EXHAUSTED"}}
         )
         txn = _make_transaction(description="Any vendor")
         result = llm_classify(txn, _client=mock_client)
 
         assert result.confidence == 0.0
-        assert "API error" in result.reasoning
+        assert "Gemini API error" in result.reasoning
 
     def test_parse_response_confidence_clamped(self) -> None:
         raw = json.dumps(
@@ -731,7 +725,7 @@ class TestClassificationEngine:
         )
 
         with patch(
-            "src.classification.llm_classifier.anthropic.Anthropic",
+            "src.classification.llm_classifier.genai.Client",
             return_value=mock_client,
         ):
             result = classify(txn, seeded_session)

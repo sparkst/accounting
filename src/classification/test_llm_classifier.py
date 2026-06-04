@@ -19,10 +19,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from google.genai import errors as genai_errors
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-import anthropic
 from src.classification.llm_classifier import (
     _CB_FAILURE_THRESHOLD,
     _CB_RECOVERY_TIMEOUT_S,
@@ -89,12 +89,12 @@ def _make_transaction(
 
 
 def _make_mock_client(
-    model: str = "claude-3-5-haiku-20241022",
+    model: str = "gemini-2.5-flash-lite",
     input_tokens: int = 300,
     output_tokens: int = 80,
     response_json: dict[str, Any] | None = None,
 ) -> MagicMock:
-    """Return a mock Anthropic client whose messages.create() returns a realistic response."""
+    """Return a mock Gemini client whose models.generate_content() returns a realistic response."""
     if response_json is None:
         response_json = {
             "entity": "sparkry",
@@ -104,20 +104,14 @@ def _make_mock_client(
             "reasoning": "Mock classified as office expense.",
         }
 
-    text_block = MagicMock()
-    text_block.text = json.dumps(response_json)
-
-    usage = MagicMock()
-    usage.input_tokens = input_tokens
-    usage.output_tokens = output_tokens
-
-    response = MagicMock()
-    response.model = model
-    response.content = [text_block]
-    response.usage = usage
+    mock_response = MagicMock()
+    mock_response.text = json.dumps(response_json)
+    mock_response.usage_metadata.prompt_token_count = input_tokens
+    mock_response.usage_metadata.candidates_token_count = output_tokens
+    mock_response.model_version = model
 
     client = MagicMock()
-    client.messages.create.return_value = response
+    client.models.generate_content.return_value = mock_response
     return client
 
 
@@ -155,6 +149,25 @@ def test_estimate_cost_zero_tokens() -> None:
     assert cost == 0.0
 
 
+def test_estimate_cost_gemini_flash_lite_input() -> None:
+    """REQ-ID: LLM-USAGE-007 — gemini-2.5-flash-lite: $0.10/1M input."""
+    cost = estimate_cost_for_model("gemini-2.5-flash-lite", 1_000_000, 0)
+    assert abs(cost - 0.10) < 1e-9
+
+
+def test_estimate_cost_gemini_flash_lite_output() -> None:
+    """REQ-ID: LLM-USAGE-007 — gemini-2.5-flash-lite: $0.40/1M output."""
+    cost = estimate_cost_for_model("gemini-2.5-flash-lite", 0, 1_000_000)
+    assert abs(cost - 0.40) < 1e-9
+
+
+def test_estimate_cost_gemini_flash_lite_prefix_wins_over_flash() -> None:
+    """gemini-2.5-flash-lite must not accidentally match gemini-2.5-flash pricing."""
+    # If prefix ordering is wrong, flash-lite would match flash ($0.30) instead of $0.10
+    cost = estimate_cost_for_model("gemini-2.5-flash-lite", 1_000_000, 0)
+    assert abs(cost - 0.10) < 1e-9, "flash-lite should not fall through to flash pricing"
+
+
 # ---------------------------------------------------------------------------
 # LLMUsageLog written after successful API call
 # ---------------------------------------------------------------------------
@@ -164,7 +177,7 @@ def test_llm_usage_log_written_after_classification(session: Session) -> None:
     """REQ-ID: LLM-USAGE-004 — A log row is created when _session is provided."""
     txn = _make_transaction()
     client = _make_mock_client(
-        model="claude-3-5-haiku-20241022",
+        model="gemini-2.5-flash-lite",
         input_tokens=350,
         output_tokens=90,
     )
@@ -180,7 +193,7 @@ def test_llm_usage_log_written_after_classification(session: Session) -> None:
     assert result.confidence > 0.0
 
     # Log fields are correct
-    assert log.model == "claude-3-5-haiku-20241022"
+    assert log.model == "gemini-2.5-flash-lite"
     assert log.input_tokens == 350
     assert log.output_tokens == 90
     assert log.cost_estimate > 0.0
@@ -192,7 +205,7 @@ def test_llm_usage_log_contains_correct_cost(session: Session) -> None:
     """REQ-ID: LLM-USAGE-005 — Cost is computed using model-specific pricing."""
     txn = _make_transaction()
     client = _make_mock_client(
-        model="claude-3-5-haiku-20241022",
+        model="gemini-2.5-flash-lite",
         input_tokens=1_000_000,
         output_tokens=0,
     )
@@ -201,8 +214,8 @@ def test_llm_usage_log_contains_correct_cost(session: Session) -> None:
     session.commit()
 
     log = session.query(LLMUsageLog).one()
-    # Haiku input pricing: $0.25 / 1M
-    assert abs(log.cost_estimate - 0.25) < 1e-6
+    # gemini-2.5-flash-lite input pricing: $0.10 / 1M
+    assert abs(log.cost_estimate - 0.10) < 1e-6
 
 
 def test_llm_usage_log_stores_transaction_id(session: Session) -> None:
@@ -293,12 +306,10 @@ def test_usage_log_written_even_on_low_confidence(session: Session) -> None:
 
 
 def _make_failing_client() -> MagicMock:
-    """Return a mock client whose messages.create() always raises APIStatusError."""
+    """Return a mock client whose models.generate_content() always raises ClientError."""
     client = MagicMock()
-    client.messages.create.side_effect = anthropic.APIStatusError(
-        message="Service unavailable",
-        response=MagicMock(status_code=503, headers={}),
-        body=None,
+    client.models.generate_content.side_effect = genai_errors.ClientError(
+        503, {"error": {"message": "Service unavailable", "status": "UNAVAILABLE"}}
     )
     return client
 
@@ -330,7 +341,7 @@ class TestCircuitBreaker:
         fast_client = MagicMock()
         result = llm_classify(txn, _client=fast_client)
 
-        fast_client.messages.create.assert_not_called()
+        fast_client.models.generate_content.assert_not_called()
         assert result.confidence == 0.0
         assert result.reasoning == "Circuit breaker open"
 
@@ -353,7 +364,7 @@ class TestCircuitBreaker:
         good_client = _make_mock_client()
         result = llm_classify(txn, _client=good_client)
 
-        good_client.messages.create.assert_called_once()
+        good_client.models.generate_content.assert_called_once()
         assert result.confidence > 0.0
 
     def test_successful_half_open_call_closes_circuit(self) -> None:

@@ -13,7 +13,7 @@ _REQUIRED = [
     "fastapi",
     "uvicorn",
     "sqlalchemy",
-    "anthropic",
+    "google-genai",
     "pydantic",
     "httpx",
     "yfinance",

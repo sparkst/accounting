@@ -1,4 +1,4 @@
-"""LLMUsageLog ORM model — one row per Claude API call made by the classifier."""
+"""LLMUsageLog ORM model — one row per LLM API call made by the classifier."""
 
 import uuid
 from datetime import UTC, datetime
@@ -9,9 +9,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.models.base import Base
 
 # Cost per million tokens, keyed by model name prefix.
-# Haiku: $0.25/1M input, $1.25/1M output
-# Sonnet: $3/1M input, $15/1M output
+# Gemini: gemini-2.5-flash-lite: $0.10/1M input, $0.40/1M output
+#         gemini-2.5-flash:       $0.30/1M input, $2.50/1M output
+# NOTE: gemini-2.5-flash-lite must be listed BEFORE gemini-2.5-flash so the
+# more-specific prefix wins in the startswith() loop.
+# Claude (legacy): Haiku: $0.25/1M input, $1.25/1M output
+#                  Sonnet: $3/1M input, $15/1M output
 _PRICING: dict[str, tuple[float, float]] = {
+    "gemini-2.5-flash-lite": (0.10, 0.40),
+    "gemini-2.5-flash": (0.30, 2.50),
     "claude-3-5-haiku": (0.25, 1.25),
     "claude-3-haiku": (0.25, 1.25),
     "claude-3-5-sonnet": (3.0, 15.0),
@@ -49,6 +55,8 @@ def estimate_cost_for_model(model: str, input_tokens: int, output_tokens: int) -
     Sonnet pricing for unknown models.
 
     Pricing (per million tokens):
+    - gemini-2.5-flash-lite: $0.10 input / $0.40 output
+    - gemini-2.5-flash:      $0.30 input / $2.50 output
     - Haiku:  $0.25 input / $1.25 output
     - Sonnet: $3.00 input / $15.00 output
     - Opus:   $15.00 input / $75.00 output
@@ -62,7 +70,7 @@ def estimate_cost_for_model(model: str, input_tokens: int, output_tokens: int) -
 
 
 class LLMUsageLog(Base):
-    """Audit log for every Claude API call made during Tier 3 classification.
+    """Audit log for every LLM API call made during Tier 3 classification.
 
     Enables the health dashboard to show monthly call counts, token usage,
     and estimated spend so runaway costs can be caught early.
@@ -86,7 +94,7 @@ class LLMUsageLog(Base):
     model: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
-        comment="Claude model ID e.g. claude-3-5-haiku-20241022",
+        comment="LLM model ID e.g. gemini-2.5-flash-lite",
     )
 
     # ── Linked transaction (optional) ─────────────────────────────────────────

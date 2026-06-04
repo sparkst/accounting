@@ -1,5 +1,6 @@
 """REQ-HM-006: restore-test oracle — object-vs-own-metadata + monotonic + sentinel skip."""
 import sqlite3
+from datetime import date
 
 from scripts import backup_restore_test as brt
 
@@ -47,3 +48,23 @@ def test_integrity_failure_fails_verify(tmp_path):
     p = tmp_path / "bad.db"
     p.write_bytes(b"not a sqlite file" * 8)
     assert brt.verify_object(p, {"rows-transactions": 0, "rows-audit_events": 0, "rows-invoices": 0}, prior=None) is False
+
+
+# ── _date_key unit tests ──────────────────────────────────────────────────────
+
+def test_date_key_format():
+    db_key, meta_key = brt._date_key(date(2026, 6, 4))
+    assert db_key == "daily/accounting-2026-06-04.db"
+    assert meta_key == "daily/accounting-2026-06-04.meta.json"
+
+
+def test_date_key_zero_padded():
+    db_key, meta_key = brt._date_key(date(2026, 1, 5))
+    assert db_key == "daily/accounting-2026-01-05.db"
+    assert meta_key == "daily/accounting-2026-01-05.meta.json"
+
+
+def test_date_key_year_boundary():
+    db_key, meta_key = brt._date_key(date(2026, 12, 31))
+    assert db_key == "daily/accounting-2026-12-31.db"
+    assert meta_key == "daily/accounting-2026-12-31.meta.json"

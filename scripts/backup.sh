@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# backup.sh — consistent SQLite snapshot → integrity_check → versioned R2 upload.
+# backup.sh — consistent SQLite snapshot → integrity_check → wrangler r2 object;
+# readback-sha verify; deterministic date keys + .meta.json sidecar;
+# rolling 15-day delete via wrangler r2 object delete (no object listing needed).
 # REQ-HM-006: disk-free gate, flock serialization, integrity BEFORE upload,
-# etag verify, per-table row-count metadata, dead-man ping, in-progress sentinel.
+# readback-sha verify, per-table row-count sidecar, dead-man ping, in-progress
+# sentinel.
 #
-# Retention (daily 14d + weekly 8w) is handled by an R2 bucket lifecycle rule
-# OR a separate prune pass — NOT in this script to avoid fragile in-script prune.
+# Auth: CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID injected by doppler run.
+# Required runtime env: R2_BUCKET, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID.
+# Optional: HEALTHCHECK_PING_URL, CUTOVER_TS, WRANGLER_BIN, R2_DISABLE.
+#
+# Object key design (deterministic — no listing needed):
+#   daily/accounting-<YYYY-MM-DD>.db         — snapshot
+#   daily/accounting-<YYYY-MM-DD>.meta.json  — sidecar with row counts + sha256
+#
+# NOTE: An R2 bucket lifecycle rule is the preferred long-term mechanism for
+# tiered retention (daily 15d + weekly 8w). The 15-day rolling delete below is
+# belt-and-suspenders only; remove it once a lifecycle rule is configured.
 #
 # Testable env hooks:
 #   REPO_ROOT_OVERRIDE      — override repo root (for tests)
-#   R2_DISABLE=1            — skip R2 upload + etag verify (offline/test mode)
+#   R2_DISABLE=1            — skip wrangler upload + readback verify (offline/test mode)
 #   DISK_FREE_GB_OVERRIDE   — inject disk-free GB (skip real df call; for tests)
+#   WRANGLER_BIN            — override wrangler binary path (for tests)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +33,7 @@ SENTINEL="$REPO_ROOT/data/.backup.in-progress"
 TS="$(date -u '+%Y-%m-%dT%H%M%SZ')"
 TMP_SNAP="$(mktemp "${TMPDIR:-/tmp}/accounting-backup.XXXXXX.db")"
 MIN_FREE_GB=5
+WRANGLER="${WRANGLER_BIN:-wrangler}"
 
 # ── Cleanup trap ─────────────────────────────────────────────────────────────
 cleanup() {
@@ -80,7 +94,7 @@ if [ "$res" != "ok" ]; then
   exit 1
 fi
 
-# ── Per-table row counts → object metadata ───────────────────────────────────
+# ── Per-table row counts → sidecar metadata ──────────────────────────────────
 _count() { sqlite3 "$TMP_SNAP" "SELECT count(*) FROM $1;" 2>/dev/null || echo 0; }
 
 # sha256sum (GNU coreutils, Linux) with shasum -a 256 (macOS) fallback.
@@ -90,42 +104,60 @@ else
   sha="$(shasum -a 256 "$TMP_SNAP" | cut -d' ' -f1)"
 fi
 
-META="rows-transactions=$(_count transactions),rows-audit_events=$(_count audit_events),rows-invoices=$(_count invoices),cutover-ts=${CUTOVER_TS:-},sha256=${sha}"
-OBJECT_KEY="daily/accounting-${TS}.db"
+# ── R2 upload via wrangler ────────────────────────────────────────────────────
+DATE="$(date -u +%Y-%m-%d)"
+DB_KEY="daily/accounting-${DATE}.db"
+META_KEY="daily/accounting-${DATE}.meta.json"
 
-# ── R2 upload ────────────────────────────────────────────────────────────────
+# Build sidecar meta JSON (written to a temp file so wrangler can --file it).
+META_TMP="$(mktemp "${TMPDIR:-/tmp}/accounting-meta.XXXXXX.json")"
+cat > "$META_TMP" <<EOF
+{"rows-transactions": $(_count transactions), "rows-audit_events": $(_count audit_events), "rows-invoices": $(_count invoices), "sha256": "${sha}", "cutover-ts": "${CUTOVER_TS:-}", "created-utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+
 if [ "${R2_DISABLE:-0}" = "1" ]; then
-  echo "[backup] R2_DISABLE=1 — skipping upload (test/offline mode). key=$OBJECT_KEY meta=$META"
+  echo "[backup] R2_DISABLE=1 — skipping wrangler upload (test mode). key=$DB_KEY"
+  rm -f "$META_TMP"
 else
-  # R2 exposes an S3-compatible API; creds come from env via doppler run.
-  # Required env: R2_ENDPOINT, R2_BUCKET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
-  upload_etag="$(aws s3api put-object \
-      --endpoint-url "$R2_ENDPOINT" \
-      --bucket "$R2_BUCKET" \
-      --key "$OBJECT_KEY" \
-      --body "$TMP_SNAP" \
-      --metadata "$META" \
-      --query ETag \
-      --output text)"
+  # Upload DB snapshot.
+  "$WRANGLER" r2 object put "$R2_BUCKET/$DB_KEY" --file="$TMP_SNAP" --remote \
+    || { echo "ERROR: r2 put db failed" >&2; rm -f "$SENTINEL" "$META_TMP"; exit 1; }
 
-  # Verify: R2 returns the md5 of the uploaded object as the ETag (quoted).
-  if command -v md5sum >/dev/null 2>&1; then
-    local_md5="\"$(md5sum "$TMP_SNAP" | cut -d' ' -f1)\""
+  # Upload JSON sidecar.
+  "$WRANGLER" r2 object put "$R2_BUCKET/$META_KEY" --file="$META_TMP" --remote \
+    || { echo "ERROR: r2 put meta failed" >&2; rm -f "$SENTINEL" "$META_TMP"; exit 1; }
+  rm -f "$META_TMP"
+
+  # ── Readback-verify: download the db we just wrote, compare sha256 ──────────
+  VERIFY_TMP="$(mktemp "${TMPDIR:-/tmp}/accounting-verify.XXXXXX.db")"
+  "$WRANGLER" r2 object get "$R2_BUCKET/$DB_KEY" --file="$VERIFY_TMP" --remote \
+    || { echo "ERROR: r2 readback get failed" >&2; rm -f "$SENTINEL" "$VERIFY_TMP"; exit 1; }
+  if command -v sha256sum >/dev/null 2>&1; then
+    vsha="$(sha256sum "$VERIFY_TMP" | cut -d' ' -f1)"
   else
-    local_md5="\"$(md5 -q "$TMP_SNAP")\""
+    vsha="$(shasum -a 256 "$VERIFY_TMP" | cut -d' ' -f1)"
   fi
-
-  if [ "$upload_etag" != "$local_md5" ]; then
-    echo "ERROR: R2 etag mismatch (got $upload_etag want $local_md5)" >&2
+  rm -f "$VERIFY_TMP"
+  if [ "$vsha" != "$sha" ]; then
+    echo "ERROR: R2 readback sha mismatch (got $vsha want $sha)" >&2
     rm -f "$SENTINEL"
     exit 1
   fi
 
+  # ── Rolling retention: delete daily objects from 15 days ago ─────────────────
+  # Uses GNU date -d (Linux box); silently skips if unsupported or object absent.
+  # NOTE: an R2 bucket lifecycle rule is preferred for long-term tiered retention
+  # (daily 15d + weekly 8w) — this in-script delete is belt-and-suspenders only.
+  if OLD="$(date -u -d '15 days ago' +%Y-%m-%d 2>/dev/null)"; then
+    "$WRANGLER" r2 object delete "$R2_BUCKET/daily/accounting-${OLD}.db" --remote 2>/dev/null || true
+    "$WRANGLER" r2 object delete "$R2_BUCKET/daily/accounting-${OLD}.meta.json" --remote 2>/dev/null || true
+  fi
+
   # Dead-man healthcheck ping on success (optional; no-op if URL not set).
   [ -n "${HEALTHCHECK_PING_URL:-}" ] && \
-    curl -fsS --max-time 10 "$HEALTHCHECK_PING_URL" >/dev/null || true
+    curl -fsS --max-time 10 "$HEALTHCHECK_PING_URL" >/dev/null 2>&1 || true
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 rm -f "$SENTINEL"
-echo "[backup] OK: $OBJECT_KEY"
+echo "[backup] OK: $DB_KEY"

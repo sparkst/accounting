@@ -39,6 +39,7 @@ from src.models.tax_document import TaxDocument  # noqa: F401
 from src.models.tax_year_lock import TaxYearLock  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
+from src.planning.models import PlanningRun  # noqa: F401
 
 # Alembic Config object — provides access to values within alembic.ini.
 config = context.config

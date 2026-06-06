@@ -45,7 +45,7 @@ The plan uses these placeholders. Collect once; substitute at execution time.
 | When | Action |
 |---|---|
 | **NOW (pre-everything)** | Delete world-readable `/Users/travis/SGDrive/dev/accounting/.env`; **rotate** the live `RESEND_API_KEY` and `STRIPE_RESTRICTED_KEY` it contains (current exposure, independent of migration). |
-| Before Phase 1 | Confirm CF zone + Zero Trust org (P-1/P-2); provide/confirm R2 bucket + `R2_BACKUP_WRITE_TOKEN` (P-3); confirm `collab` is a separate user (P-4); confirm Syncthing roots exclude `data/` (P-5). |
+| Before Phase 1 | Confirm CF zone + Zero Trust org (P-1/P-2); provide/confirm R2 bucket + `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID` (P-3); confirm `collab` is a separate user (P-4); confirm Syncthing roots exclude `data/` (P-5). |
 | Phase 1 | Provide `<DOPPLER_SRV_TOKEN>`; set the real secret values in `accounting/srv`. |
 | Phase 3 | Create CF Access application + the two service tokens (n8n ingest; uptime checker) in the Zero Trust dashboard. |
 | **Phase 5** | Register `https://books.sparkry.ai/admin/connections/oauth-return` in the **production** Plaid app; **enter Chase credentials** in Plaid Link (final step). |
@@ -1452,7 +1452,7 @@ git push -u origin feat/accounting-hetzner-migration
 ## B-Phase 0 — Operator pre-flight (PAUSE) + box snapshot
 
 - [ ] **OPERATOR (NOW):** delete `/Users/travis/SGDrive/dev/accounting/.env`; rotate `RESEND_API_KEY` + `STRIPE_RESTRICTED_KEY`. Confirm done.
-- [ ] **OPERATOR:** confirm P-1 (CF DNS for `sparkry.ai`), P-2 (Zero Trust org + Google IdP), P-3 (R2 bucket + `R2_BACKUP_WRITE_TOKEN`), P-4 (`collab` is a separate user), P-5 (Syncthing roots).
+- [ ] **OPERATOR:** confirm P-1 (CF DNS for `sparkry.ai`), P-2 (Zero Trust org + Google IdP), P-3 (R2 bucket + `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`), P-4 (`collab` is a separate user), P-5 (Syncthing roots).
 - [ ] Take a **Hetzner Cloud snapshot** of `ubuntu-4gb-nbg1-2` (full-box rollback baseline) before any change.
 - [ ] SSH over Tailscale: `ssh travis@<BOX_TAILNET_HOST>`; record `free -m`, `systemctl status` of the collab sandbox + Syncthing (footprint for the §7 MemoryMax budget).
 
@@ -1460,7 +1460,7 @@ git push -u origin feat/accounting-hetzner-migration
 
 - [ ] `sudo timedatectl set-timezone UTC && timedatectl status` → `Time zone: UTC`.
 - [ ] Doppler EnvironmentFile: `sudo mkdir -p /etc/accounting`; write `/etc/accounting/doppler.env` containing `DOPPLER_TOKEN=<DOPPLER_SRV_TOKEN>`; `sudo chown root:root /etc/accounting/doppler.env && sudo chmod 600 /etc/accounting/doppler.env`; verify `stat -c '%a %U' /etc/accounting/doppler.env` → `600 root`.
-- [ ] **OPERATOR / executor:** create the Doppler `accounting/srv` config seeded from `accounting/dev` PLUS: `R2_BACKUP_WRITE_TOKEN`, `R2_ENDPOINT`, `R2_BUCKET`, `PLAID_ENV=production`, `PLAID_REDIRECT_URI=https://books.sparkry.ai/admin/connections/oauth-return`, `API_KEY` (`openssl rand -hex 32`), `INGEST_API_KEY` (`openssl rand -hex 32`, **distinct**), `VITE_API_KEY` (== `API_KEY`), `ANTHROPIC_API_KEY`, `PLAID_FERNET_KEY` (the key the migrated tokens were encrypted under), `GMAIL_N8N_DIRS`, `DEDUCTION_DIR`, `ATTACHMENT_ROOTS`, `RECEIPTS_ROOT`, `HEALTHCHECK_PING_URL`. Verify `openssl rand`-strength + `API_KEY != INGEST_API_KEY`.
+- [ ] **OPERATOR / executor:** create the Doppler `accounting/srv` config seeded from `accounting/dev` PLUS: `CLOUDFLARE_API_TOKEN` (R2 Storage Read+Write, mirrored from `accounting/prd` — NOT the wealth-scoped `R2_BACKUP_WRITE_TOKEN`, the wrong credential per the design note), `CLOUDFLARE_ACCOUNT_ID`, `R2_BUCKET`, `PLAID_ENV=production`, `PLAID_REDIRECT_URI=https://books.sparkry.ai/admin/connections/oauth-return`, `API_KEY` (`openssl rand -hex 32`), `INGEST_API_KEY` (`openssl rand -hex 32`, **distinct**), `VITE_API_KEY` (== `API_KEY`), `ANTHROPIC_API_KEY`, `PLAID_FERNET_KEY` (the key the migrated tokens were encrypted under), `GMAIL_N8N_DIRS`, `DEDUCTION_DIR`, `ATTACHMENT_ROOTS`, `RECEIPTS_ROOT`, `HEALTHCHECK_PING_URL`. Verify `openssl rand`-strength + `API_KEY != INGEST_API_KEY`.
 - [ ] Pin + install Doppler CLI (versioned). Verify `doppler run -- env | grep DOPPLER_TOKEN` returns empty in the child (token stripped).
 - [ ] `rsync -av --exclude='.env' --exclude='.venv' --exclude='node_modules' --exclude='data/' /Users/travis/SGDrive/dev/accounting/ travis@<BOX_TAILNET_HOST>:/home/travis/accounting/`
 - [ ] On box: `cd /home/travis/accounting && python3.12 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"`.
@@ -1486,9 +1486,22 @@ git push -u origin feat/accounting-hetzner-migration
 - [ ] Write `weekly-pl-report.timer` + `.service` (`OnCalendar=Mon *-*-* 06:00:00 UTC`, `Persistent=true`, `ExecStart=doppler run -- .venv/bin/python3 scripts/weekly-pl-report.py`, `OnFailure=…`).
 - [ ] Write `plaid-transactions-sync.timer` + `.service` (`doppler run --`, `Persistent=true`) — **install but DO NOT enable** (Phase 5).
 - [ ] Write `accounting-alert@.service`: `EnvironmentFile=/etc/accounting/doppler.env`, `User=travis`, `WorkingDirectory=/home/travis/accounting`, `ExecStart=doppler run -- .venv/bin/python3 -m scripts.alert "%i"`, `StartLimitIntervalSec=300`, `StartLimitBurst=3`, and **NO `OnFailure=`** (breaks alert recursion).
-- [ ] journald: set `SystemMaxUse=500M`, `SystemKeepFree=5G` in `/etc/systemd/journald.conf`; `systemctl restart systemd-journald`.
+- [ ] journald: create the **drop-in** `/etc/systemd/journald.conf.d/accounting.conf` (preserves package defaults across upgrades) with `SystemMaxUse=500M`, `SystemKeepFree=5G`, plus `RuntimeMaxUse=64M`, `RuntimeKeepFree=256M` (cap the in-RAM journal on the 4 GB box); `systemctl restart systemd-journald`.
 - [ ] `systemctl daemon-reload`; `systemctl enable --now accounting-api accounting-dashboard` (caddy after Phase 3 Caddyfile). Enable timers EXCEPT `plaid-transactions-sync`.
-- [ ] **nftables OUTPUT rule (§7):** `nft add table inet filter; nft add chain inet filter output '{ type filter hook output priority 0 ; }'; nft add rule inet filter output oifname "lo" skuid $(id -u <COLLAB_USER>) tcp dport { 8000, 5173, 9000 } drop`. Persist: `nft list ruleset > /etc/nftables.conf && systemctl enable --now nftables`.
+- [ ] **nftables OUTPUT rule (§7):** use a **dedicated table** `inet accounting_collab` (NOT the shared `inet filter`) so the rule can never collide with ufw or fail2ban tables. Write `/etc/nftables.conf` as a non-flushing, idempotent file — do **NOT** use `nft list ruleset > /etc/nftables.conf` (that captures ufw/fail2ban's tables, and the default config's `flush ruleset` would wipe them at boot):
+  ```
+  #!/usr/sbin/nft -f
+  # collab UID: verify `id -u <COLLAB_USER>` == the value below before loading.
+  add table inet accounting_collab
+  delete table inet accounting_collab
+  table inet accounting_collab {
+      chain output {
+          type filter hook output priority 0; policy accept;
+          oifname "lo" skuid <COLLAB_UID> tcp dport { 8000, 5173, 9000, 8384 } drop
+      }
+  }
+  ```
+  (8384 = Syncthing GUI, also a travis-owned loopback service.) Apply + persist: `nft -f /etc/nftables.conf && systemctl enable --now nftables`. `nft -f` runs as one atomic transaction — no open window. Verify ufw + fail2ban tables survive: `nft list tables` still shows `ip filter` / `inet f2b-table`.
 - [ ] **Firewall (§7):** ufw + Hetzner Cloud Firewall deny inbound 8000/5173/9000 from all except `<TAILSCALE_SUBNET>`.
 
 - [ ] 🔒 **PHASE-2 SECURITY GATE (all 5 must pass before Phase 3):**

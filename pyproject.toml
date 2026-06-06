@@ -22,6 +22,8 @@ dependencies = [
     "resend>=2.0",
     "alembic>=1.13",
     "python-multipart>=0.0.22",
+    "numpy>=1.26,<3",
+    "pandas>=2.0,<4",
 ]
 
 [project.optional-dependencies]

@@ -11,7 +11,8 @@ Generates a phone-readable financial pulse for Travis:
 Output: writes to reports/weekly-pl-latest.txt (overwritten each run)
         and reports/weekly-pl-{date}.txt (archived)
 
-Designed to run via LaunchAgent every Monday 6am.
+Designed to run via systemd timer (weekly-pl-report.timer) on the Hetzner box,
+Mon 06:00 UTC. stdout is captured by journald (journalctl -u weekly-pl-report).
 Output path is read by Jarvis/C3PO for Telegram delivery.
 """
 
@@ -182,7 +183,7 @@ def main() -> None:
     archive = reports_dir / f"weekly-pl-{date_str}.txt"
     archive.write_text(report + "\n", encoding="utf-8")
 
-    # Print to stdout (for LaunchAgent logs)
+    # Print to stdout (captured by journald: journalctl -u weekly-pl-report.service)
     print(report)
     print(f"\nSaved to: {latest}")
 

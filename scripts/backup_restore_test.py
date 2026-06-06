@@ -165,12 +165,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"[restore-test] FAIL: verify_object returned False for {db_key}",
                 file=sys.stderr,
             )
-            # Invoke the alert via the scripts.alert module.
-            try:
-                from scripts.alert import send_alert  # noqa: PLC0415
-                send_alert("accounting-backup-restore-test.service")
-            except Exception as alert_exc:  # noqa: BLE001
-                print(f"[restore-test] alert send failed: {alert_exc}", file=sys.stderr)
+            # Alerting is handled by systemd OnFailure=accounting-alert@%p.service
+            # (this exits non-zero → systemd fires the alert). A direct
+            # send_alert() call here would double-email across an hour boundary,
+            # since alert.py dedups per clock-hour. One mechanism, no race.
             return 1
 
         print(f"[restore-test] OK: {db_key} passed integrity + row-count oracle")

@@ -1,7 +1,8 @@
 """systemd OnFailure handler → one Resend email naming the failed unit.
 
-REQ-HM-014. Hourly per-unit dedup via /tmp sentinel; exits non-zero only on a
-real send failure. This unit has NO OnFailure= itself (breaks alert recursion)."""
+REQ-HM-014. Hourly per-unit dedup via a travis-owned sentinel dir (data/.alerts,
+not world-writable /tmp); exits non-zero only on a real send failure. This unit
+has NO OnFailure= itself (breaks alert recursion)."""
 from __future__ import annotations
 
 import os
@@ -35,7 +36,14 @@ def _resend_client() -> _Client:
 
 
 def _sentinel_dir() -> Path:
-    return Path("/tmp")
+    override = os.environ.get("ALERT_SENTINEL_DIR")
+    if override:
+        return Path(override)
+    # Persistent, travis-owned dedup dir — NOT world-writable /tmp. /tmp would
+    # (a) let the collab sandbox (separate untrusted OS user) pre-create
+    # alert-<unit>-<hour>.sent to SUPPRESS a real failure email, and (b) be
+    # wiped per-invocation under PrivateTmp=yes. data/.alerts (mode 700) avoids both.
+    return Path(__file__).resolve().parents[1] / "data" / ".alerts"
 
 
 def _hour() -> str:
@@ -43,7 +51,9 @@ def _hour() -> str:
 
 
 def send_alert(unit: str) -> int:
-    sentinel = _sentinel_dir() / f"alert-{unit}-{_hour()}.sent"
+    sdir = _sentinel_dir()
+    sdir.mkdir(parents=True, exist_ok=True)
+    sentinel = sdir / f"alert-{unit}-{_hour()}.sent"
     if sentinel.exists():
         print(f"[alert] already sent for {unit} this hour — skipping")
         return 0

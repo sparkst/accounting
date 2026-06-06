@@ -17,10 +17,13 @@ or Vanguard) for immediate ingestion. Max 50 MB.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import threading
 import traceback
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
@@ -250,6 +253,151 @@ class ReclassifySummary(BaseModel):
     classified: int
     still_needs_review: int
     errors: list[str]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ingest/gmail — n8n receipt upload (REQ-HM-019)
+# ---------------------------------------------------------------------------
+
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB per attachment
+_MAX_ATTACHMENTS = 25
+
+_GMAIL_RECEIPT_FIELD = Form(
+    ...,
+    description=(
+        "Receipt JSON — a single object (or a one-element array) with the "
+        "GmailN8nAdapter fields: id, filename, date, from, subject, body_text, body_html."
+    ),
+)
+_GMAIL_ATTACHMENTS_FIELD = File(
+    default=[],
+    description="Optional attachment binaries (PDFs etc.); staged as <id>_<name> siblings.",
+)
+
+
+class GmailUploadSummary(BaseModel):
+    """Result of a POST /api/ingest/gmail call."""
+
+    receipt_id: str
+    attachments_staged: int
+    ingest: IngestSummary | None
+    note: str
+
+
+def _gmail_staging_dir() -> Path:
+    """First GMAIL_N8N_DIRS entry — the dir the GmailN8nAdapter scans first.
+
+    Kept in lock-step with the adapter's own resolution so uploads land exactly
+    where the adapter reads them.
+    """
+    env_dirs = os.environ.get("GMAIL_N8N_DIRS")
+    if env_dirs:
+        first = next((d for d in env_dirs.split(os.pathsep) if d), None)
+        if first:
+            return Path(first)
+    from src.adapters.gmail_n8n import GmailN8nAdapter  # lazy: avoid import cycle
+
+    return Path(GmailN8nAdapter._DEFAULT_DIRS[0])
+
+
+@router.post(
+    "/ingest/gmail",
+    response_model=GmailUploadSummary,
+    dependencies=[Depends(require_api_or_ingest_key)],
+)
+async def ingest_gmail(
+    receipt: str = _GMAIL_RECEIPT_FIELD,
+    attachments: list[UploadFile] = _GMAIL_ATTACHMENTS_FIELD,
+) -> GmailUploadSummary:
+    """Stage an n8n-delivered Gmail receipt (+ attachments), then trigger ingest.
+
+    REQ-HM-019. Replaces the old Mac flow (n8n → Google Drive → SGDrive sync →
+    data/inbox). ``receipt`` is the JSON for ONE receipt — the bare object or a
+    one-element array — matching the on-disk format the GmailN8nAdapter reads.
+    Writes ``<id>.json`` (a one-element array) plus ``<id>_<basename>`` attachment
+    siblings into the gmail drop dir, then runs a gmail ingest pass.
+
+    Hardening: the receipt ``id`` must match ``[A-Za-z0-9_-]{1,128}`` and
+    attachment names are reduced to their basename, so neither can escape the
+    drop dir. Idempotent: the adapter dedups by content hash, so a retried/
+    duplicate delivery never creates a duplicate transaction (HTTP 409 from a
+    concurrent run is therefore unnecessary — staged files are picked up by the
+    in-progress or next pass).
+    """
+    try:
+        parsed = json.loads(receipt)
+    except (json.JSONDecodeError, TypeError) as err:
+        raise HTTPException(status_code=422, detail="receipt must be valid JSON") from err
+
+    if isinstance(parsed, list):
+        if len(parsed) != 1 or not isinstance(parsed[0], dict):
+            raise HTTPException(
+                status_code=422, detail="receipt array must contain exactly one object"
+            )
+        obj = parsed[0]
+    elif isinstance(parsed, dict):
+        obj = parsed
+    else:
+        raise HTTPException(
+            status_code=422, detail="receipt must be a JSON object or one-element array"
+        )
+
+    receipt_id = obj.get("id")
+    if not isinstance(receipt_id, str) or not _SAFE_ID_RE.fullmatch(receipt_id):
+        raise HTTPException(
+            status_code=422,
+            detail="receipt.id is required and must match [A-Za-z0-9_-]{1,128}",
+        )
+
+    if len(attachments) > _MAX_ATTACHMENTS:
+        raise HTTPException(
+            status_code=422, detail=f"too many attachments (max {_MAX_ATTACHMENTS})"
+        )
+
+    staging = _gmail_staging_dir()
+    staging.mkdir(parents=True, exist_ok=True)
+    staging_resolved = staging.resolve()
+
+    # Receipt JSON → one-element array (the adapter's on-disk format).
+    (staging / f"{receipt_id}.json").write_text(
+        json.dumps([obj], ensure_ascii=False), encoding="utf-8"
+    )
+
+    staged = 0
+    for up in attachments:
+        if up is None or not up.filename:
+            continue
+        base = os.path.basename(up.filename.replace("\\", "/")).strip()
+        if not base or base in (".", ".."):
+            continue
+        if base.startswith(f"{receipt_id}_"):  # avoid double <id>_ prefix
+            base = base[len(receipt_id) + 1 :]
+        dest = staging / f"{receipt_id}_{base}"
+        if dest.resolve().parent != staging_resolved:  # defense-in-depth vs traversal
+            raise HTTPException(status_code=422, detail=f"unsafe attachment name: {up.filename!r}")
+        data = await up.read(_MAX_ATTACHMENT_BYTES + 1)
+        if len(data) > _MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail=f"attachment {base!r} exceeds 25 MB")
+        dest.write_bytes(data)
+        staged += 1
+
+    summary: IngestSummary | None = None
+    note = "staged + ingested"
+    if _ingest_lock.acquire(blocking=False):
+        try:
+            summary = _run_ingest_locked(Source.GMAIL_N8N)
+        finally:
+            _ingest_lock.release()
+    else:
+        note = "staged; an ingest run is already in progress (files will be picked up)"
+
+    return GmailUploadSummary(
+        receipt_id=receipt_id,
+        attachments_staged=staged,
+        ingest=summary,
+        note=note,
+    )
 
 
 @router.post("/ingest/reclassify", response_model=ReclassifySummary, dependencies=[Depends(require_api_key)])

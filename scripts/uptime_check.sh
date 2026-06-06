@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
-# uptime_check.sh — external health probe of books.sparkry.ai through the tunnel.
+# uptime_check.sh — local serving-stack health probe.
 #
-# Exits non-zero (→ systemd OnFailure=accounting-alert@%p → one Resend email,
-# hourly-deduped) when the PUBLIC health endpoint is not 200 + {"ok":true}.
-# This exercises the whole external path: DNS → Cloudflare → tunnel → Caddy →
-# uvicorn, so it catches tunnel/cloudflared/Caddy/api failures.
+# Hits the LOCAL Caddy reverse proxy (127.0.0.1:9000 → uvicorn), so it exercises
+# Caddy routing + the api. Exits non-zero (→ systemd OnFailure=accounting-alert@%p
+# → one Resend email, hourly-deduped) unless the response is 200 + {"ok":true}.
 #
-# LIMITATION: this is an ON-BOX monitor — it cannot detect a total box-down
-# (if the box is off, the timer can't run). For true external coverage, run an
-# off-box Cloudflare cron Worker (REQ-HM-014, not yet built).
+# WHY LOCAL, NOT THE PUBLIC URL: probing https://books.sparkry.ai from the box's
+# own IP trips Cloudflare's managed challenge (403 "Just a moment…") → false
+# alarms. The local check is reliable and catches Caddy/uvicorn failures.
 #
-# Required env (injected by `doppler run` from accounting/srv):
-#   CF_ACCESS_UPTIME_CLIENT_ID, CF_ACCESS_UPTIME_CLIENT_SECRET
+# LIMITATIONS (both need an OFF-BOX Cloudflare cron Worker — REQ-HM-014, deferred):
+#   * does NOT verify the public tunnel path (DNS / CF Access / cloudflared);
+#   * cannot detect a total box-down (if the box is off, the timer can't run).
+#
 # Optional env:
-#   UPTIME_URL              override the probe URL
+#   UPTIME_URL              override the probe URL (default local Caddy)
 #   HEALTHCHECK_PING_URL    dead-man ping on success (no-op if unset)
 #   CURL_BIN                override the curl binary (for tests)
 set -uo pipefail
 
-URL="${UPTIME_URL:-https://books.sparkry.ai/api/health/ping}"
+URL="${UPTIME_URL:-http://127.0.0.1:9000/api/health/ping}"
 CURL="${CURL_BIN:-curl}"
 
-resp="$("$CURL" -s --max-time 15 -w $'\n%{http_code}' \
-  -H "CF-Access-Client-Id: ${CF_ACCESS_UPTIME_CLIENT_ID:-}" \
-  -H "CF-Access-Client-Secret: ${CF_ACCESS_UPTIME_CLIENT_SECRET:-}" \
-  "$URL" 2>&1)"
+resp="$("$CURL" -s --max-time 15 -w $'\n%{http_code}' "$URL" 2>&1)"
 
 code="$(printf '%s' "$resp" | tail -n1)"
 body="$(printf '%s' "$resp" | sed '$d')"

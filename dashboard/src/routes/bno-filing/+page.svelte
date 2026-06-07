@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { fetchTaxSummary, downloadExport } from '$lib/api';
-	import type { TaxSummary } from '$lib/api';
+	import { fetchTaxSummary, fetchMonthlyBreakdown, downloadExport } from '$lib/api';
+	import type { TaxSummary, MonthlyBreakdown } from '$lib/api';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 
@@ -53,6 +53,9 @@
 	let loading = $state(false);
 	let loadError = $state('');
 	let summary = $state<TaxSummary | null>(null);
+	// Per-month, per-category data — the ONLY source for the period breakdown.
+	// (`summary`/tax-summary is whole-year and must NOT drive the period rows.)
+	let monthly = $state<MonthlyBreakdown | null>(null);
 
 	// Step tracker (1=entity, 2=period, 3=summary)
 	let step = $state(1);
@@ -85,20 +88,31 @@
 			: (QUARTERS.find((q) => q.value === selectedQuarter)?.months ?? [])
 	);
 
-	/** Gross income from bno_monthly for the selected period only */
-	let grossReceipts = $derived.by((): number => {
-		if (!summary) return 0;
-		const bnoMonthly = (summary as any)?.bno_monthly as Array<{month: string; income: number}> | undefined;
-		if (bnoMonthly && bnoMonthly.length > 0) {
-			return bnoMonthly
-				.filter((m) => periodMonths.includes(m.month.slice(5)))
-				.reduce((sum, m) => sum + m.income, 0);
+	/** Per-income-category gross receipts for the SELECTED PERIOD only.
+	 * Aggregates the monthly breakdown across the period's months so the
+	 * category rows and the total are always consistent and period-scoped
+	 * (the prior code rendered whole-year line_items here — they showed YTD
+	 * totals that didn't match the period total). */
+	let periodCategories = $derived.by((): Array<{ tax_category: string; total: number }> => {
+		if (!monthly) return [];
+		const totals = new Map<string, number>();
+		for (const mo of monthly.months) {
+			const mm = mo.month.slice(5); // "MM"
+			if (!periodMonths.includes(mm)) continue;
+			for (const c of mo.categories) {
+				if (!c.is_income || c.is_reimbursable) continue;
+				totals.set(c.tax_category, (totals.get(c.tax_category) ?? 0) + c.total);
+			}
 		}
-		// Fallback: filter line_items (full-year data, less accurate)
-		return summary.line_items
-			.filter((li) => li.is_income && !li.is_reimbursable)
-			.reduce((sum, li) => sum + li.total, 0);
+		return [...totals.entries()]
+			.map(([tax_category, total]) => ({ tax_category, total }))
+			.sort((a, b) => a.tax_category.localeCompare(b.tax_category));
 	});
+
+	/** Total gross receipts for the period = sum of the period category rows. */
+	let grossReceipts = $derived<number>(
+		periodCategories.reduce((sum, c) => sum + c.total, 0)
+	);
 
 	let bnoTaxDue = $derived<number>(
 		Math.round(grossReceipts * BNO_RATE * 100) / 100
@@ -169,11 +183,16 @@
 		loading = true;
 		loadError = '';
 		summary = null;
+		monthly = null;
 		step = 3;
 
 		try {
-			const s = await fetchTaxSummary(selectedEntity, selectedYear);
+			const [s, m] = await Promise.all([
+				fetchTaxSummary(selectedEntity, selectedYear),
+				fetchMonthlyBreakdown(selectedEntity, selectedYear),
+			]);
 			summary = s;
+			monthly = m;
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Failed to load summary';
 		} finally {
@@ -389,10 +408,10 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each summary.line_items.filter((li) => li.is_income && !li.is_reimbursable) as li}
+							{#each periodCategories as c}
 								<tr>
-									<td>{li.tax_category.replace(/_/g, ' ')}</td>
-									<td class="col-right">{formatCurrency(li.total)}</td>
+									<td>{c.tax_category.replace(/_/g, ' ')}</td>
+									<td class="col-right">{formatCurrency(c.total)}</td>
 								</tr>
 							{:else}
 								<tr>

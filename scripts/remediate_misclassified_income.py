@@ -70,14 +70,17 @@ def main() -> None:
             .all()
         )
 
-        # ── Defect 2: positive processor-payout deposits tagged income ──
+        # ── Defect 2: positive processor-payout deposits (SHOPIFYPMT/STRIPE) ──
+        # Match by name regardless of current category/direction so we also
+        # re-lock rows left half-corrected (transfer + needs_review) that the
+        # reclassify pass would otherwise revert. Exclude already-confirmed so
+        # the script stays idempotent.
         candidates = (
             session.query(Transaction)
             .filter(
                 Transaction.source == "plaid",
                 Transaction.amount > 0,
-                Transaction.tax_category.in_(INCOME_CATEGORIES),
-                Transaction.status.notin_(EXCLUDED_STATUSES),
+                Transaction.status.notin_(EXCLUDED_STATUSES + ("confirmed",)),
             )
             .all()
         )
@@ -108,10 +111,14 @@ def main() -> None:
             print(f"  {t.date} {t.source:9} {float(t.amount):>10.2f} {t.tax_category} -> transfer  [{name}]")
             _log(session, t.id, "tax_category", t.tax_category, None)
             _log(session, t.id, "direction", t.direction, "transfer")
-            _log(session, t.id, "status", t.status, "needs_review")
+            # CONFIRMED (not needs_review): the ingest reclassify pass only
+            # re-runs classification on needs_review rows, and a "shopify"
+            # vendor rule would re-tag these positive deposits as income. Lock
+            # them so the correction is durable.
+            _log(session, t.id, "status", t.status, "confirmed")
             t.tax_category = None
             t.direction = "transfer"
-            t.status = "needs_review"
+            t.status = "confirmed"
             t.review_reason = (
                 "Reconciliation remediation: processor payout deposit mirrors "
                 "orders/charges already counted on the processor side; reset to "
@@ -139,6 +146,10 @@ def main() -> None:
             if t.direction != "expense":
                 _log(session, t.id, "direction", t.direction, "expense")
                 t.direction = "expense"
+            # CONFIRMED so the reclassify pass can't re-tag via the shopify rule.
+            if t.status == "needs_review":
+                _log(session, t.id, "status", t.status, "confirmed")
+                t.status = "confirmed"
             t.tax_category = "OTHER_EXPENSE"
             t.review_reason = (
                 "Refund remediation: Shopify refund is contra-revenue, not "

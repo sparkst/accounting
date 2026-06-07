@@ -618,6 +618,64 @@ class TestClassificationEngine:
         assert result.tax_category == TaxCategory.SALES_INCOME
         mock_llm.assert_not_called()
 
+    def test_plaid_outflow_never_classified_income(self, seeded_session: Session) -> None:
+        """Guard: an authoritative-signed outflow (Plaid, amount < 0) that a tier
+        labels as income is overridden to OTHER_EXPENSE + needs_review.
+
+        Regression for the Amex 'CLAUDE.AI SUBSCRIPTION' -220.60 charges that
+        keyword-matched SUBSCRIPTION_INCOME and inflated Sparkry B&O gross via
+        the abs(amount) tax aggregation.
+        """
+        txn = _make_transaction(
+            description="Mystery Vendor QQQ no-rule-match",
+            source=Source.PLAID.value,
+            amount=Decimal("-220.60"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.direction == Direction.EXPENSE
+        assert result.tax_category not in {
+            TaxCategory.CONSULTING_INCOME,
+            TaxCategory.SUBSCRIPTION_INCOME,
+            TaxCategory.SALES_INCOME,
+            TaxCategory.WHOLESALE_INCOME,
+        }
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+        assert "outflow" in (result.review_reason or "").lower()
+
+    def test_gmail_negative_income_not_overridden(self, seeded_session: Session) -> None:
+        """The guard must NOT touch Gmail: that adapter stores income as
+        -abs(amount) *before* classification sets direction=income, so a
+        negative Gmail amount classified as income is correct, not a mismatch.
+        """
+        txn = _make_transaction(
+            description="Stripe payout deposit receipt",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-500.00"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SALES_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="receipt body indicates income",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.direction == Direction.INCOME
+        assert result.tax_category == TaxCategory.SALES_INCOME
+
     def test_tier3_reached_for_unknown_vendor(self, seeded_session: Session) -> None:
         """Unknown vendor that matches no rule or pattern escalates to Tier 3."""
         txn = _make_transaction(

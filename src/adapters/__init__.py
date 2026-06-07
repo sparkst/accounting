@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 _REQUIRED_ENV: dict[Source, list[str]] = {
     Source.STRIPE: ["STRIPE_API_KEY"],
-    Source.SHOPIFY: ["SHOPIFY_API_KEY", "SHOPIFY_STORE_URL"],
+    Source.SHOPIFY: ["SHOPIFY_STORE_URL"],  # plus a credential — checked below (static token OR client-creds)
     # File-based adapters need no API keys
     Source.GMAIL_N8N: [],
     Source.DEDUCTION_EMAIL: [],
@@ -76,6 +76,20 @@ def get_adapter(source: Source) -> BaseAdapter | None:
             ", ".join(missing),
         )
         return None
+
+    # Shopify accepts EITHER a static Admin API token OR the dev-dashboard
+    # client-credentials grant (Client ID + Secret). Mirror the adapter's logic.
+    if source == Source.SHOPIFY:
+        has_static = bool(os.environ.get("SHOPIFY_API_KEY"))
+        has_client = bool(os.environ.get("SHOPIFY_CLIENT_ID")) and bool(
+            os.environ.get("SHOPIFY_CLIENT_SECRET") or os.environ.get("SHOPIFY_API_SECRET")
+        )
+        if not (has_static or has_client):
+            logger.warning(
+                "Skipping adapter 'shopify' — set SHOPIFY_API_KEY or "
+                "SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET",
+            )
+            return None
 
     try:
         if source == Source.GMAIL_N8N:

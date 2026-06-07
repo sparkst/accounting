@@ -136,10 +136,33 @@ def _ts_to_date(timestamp: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _metadata_dict(obj: Any) -> dict[str, Any]:
+    """Return a charge's ``metadata`` as a plain dict.
+
+    Stripe returns ``metadata`` as a ``StripeObject``, NOT a dict — and it
+    intercepts attribute access (``.get``, ``.items``, ``.keys``) as metadata
+    *key* lookups via ``__getattr__``, so ``meta.get(...)`` raises
+    ``AttributeError`` on any object that lacks a literal ``get`` key. Only the
+    class-level ``to_dict()`` method is safe. Plain dicts pass through.
+    """
+    meta = getattr(obj, "metadata", None)
+    if not meta:
+        return {}
+    if isinstance(meta, dict):
+        return meta
+    to_dict = getattr(type(meta), "to_dict", None)
+    if callable(to_dict):
+        try:
+            return dict(to_dict(meta))
+        except Exception:  # noqa: BLE001 — defensive; never fail classification on metadata shape
+            return {}
+    return {}
+
+
 def _is_substack(obj: Any) -> bool:
     """Return True when a charge is from Substack (subscription income)."""
     desc = (getattr(obj, "description", None) or "").lower()
-    meta = getattr(obj, "metadata", {}) or {}
+    meta = _metadata_dict(obj)
     source_meta = str(meta.get("source", "")).lower()
     platform_meta = str(meta.get("platform", "")).lower()
     return (

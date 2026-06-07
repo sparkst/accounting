@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +38,7 @@ from src.adapters.stripe_adapter import (
     _map_charge_fee,
     _map_payout,
     _map_refund,
+    _metadata_dict,
 )
 from src.models.base import Base
 from src.models.enums import (
@@ -215,6 +217,33 @@ class TestClassifyStripeObject:
         charge = _fake_charge(metadata={"source": "substack"})
         result = _classify_stripe_object(charge, Entity.SPARKRY)
         assert result["tax_category"] == TaxCategory.SUBSCRIPTION_INCOME
+
+    def test_charge_with_stripeobject_metadata(self) -> None:
+        """Regression: live Stripe returns metadata as a StripeObject, NOT a
+        dict, and intercepts ``.get`` as a key lookup → AttributeError. The
+        Substack/Travis backfill failed 7 rows on exactly this. Build a charge
+        whose .metadata is a real StripeObject and confirm classification works.
+        """
+        from stripe import StripeObject
+
+        meta = StripeObject.construct_from({"source": "substack"}, "sk_test")
+        # _metadata_dict must extract it without raising.
+        assert _metadata_dict(SimpleNamespace(metadata=meta)) == {"source": "substack"}
+        # A charge carrying that StripeObject metadata still classifies as Substack.
+        charge = _fake_charge()
+        charge.metadata = meta
+        result = _classify_stripe_object(charge, Entity.SPARKRY)
+        assert result["tax_category"] == TaxCategory.SUBSCRIPTION_INCOME
+
+    def test_metadata_dict_handles_missing_get_key(self) -> None:
+        """A StripeObject with NO ``source``/``platform`` keys must not raise
+        when those keys are read (the original AttributeError: get case)."""
+        from stripe import StripeObject
+
+        meta = StripeObject.construct_from({"order_id": "9999"}, "sk_test")
+        out = _metadata_dict(SimpleNamespace(metadata=meta))
+        assert out == {"order_id": "9999"}
+        assert out.get("source", "") == ""  # the call that used to blow up
 
     def test_payout(self) -> None:
         payout = _fake_payout()

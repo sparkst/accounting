@@ -53,8 +53,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 	try {
 		const res = await fetch(`${BASE}${path}`, {
-			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
 			...init,
+			// headers MUST come after ...init: spreading init last would clobber the
+			// merged headers and drop X-Api-Key for any caller that passes its own
+			// headers (e.g. plaidExchangePublicToken sets Content-Type) → 401.
+			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
 			...(controller ? { signal: controller.signal } : {})
 		});
 		if (!res.ok) {

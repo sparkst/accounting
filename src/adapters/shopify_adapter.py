@@ -386,8 +386,28 @@ class ShopifyAdapter(BaseAdapter):
 
         try:
             with httpx.Client(headers=headers, timeout=30.0) as client:
+                # Orders are the source of truth for gross receipts — an auth
+                # failure here is fatal.
                 self._ingest_orders(client, session, result, pending)
-                self._ingest_payouts(client, session, result, pending)
+                # Payouts are reconciliation-only and require the
+                # read_shopify_payments_payouts scope, which needs separate
+                # merchant approval. A 403 here must NOT discard the orders we
+                # just ingested — log a warning and continue.
+                try:
+                    self._ingest_payouts(client, session, result, pending)
+                except ShopifyAuthError as exc:
+                    logger.warning(
+                        "Shopify payouts skipped — %s. Orders ingested "
+                        "successfully. Grant read_shopify_payments_payouts to "
+                        "enable payout reconciliation.",
+                        exc,
+                    )
+                    # Soft note (no record_error → status stays SUCCESS).
+                    result.errors.append((
+                        "payouts",
+                        "Shopify payouts skipped: 403 (read_shopify_payments_payouts "
+                        "scope not approved). Orders ingested normally.",
+                    ))
         except ShopifyAuthError:
             result.status = IngestionStatus.FAILURE
             result.errors.append(("auth", "Authentication failed (401/403)"))

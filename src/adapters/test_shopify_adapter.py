@@ -31,7 +31,7 @@ from src.adapters.shopify_adapter import (
     _parse_payout,
 )
 from src.models.base import Base
-from src.models.enums import Direction, Entity, Source, TaxCategory
+from src.models.enums import Direction, Entity, IngestionStatus, Source, TaxCategory
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
 
@@ -329,6 +329,38 @@ class TestShopifyAdapterRun:
 
         with pytest.raises(ShopifyAuthError):
             adapter.run(session)
+
+    @patch("src.adapters.shopify_adapter.time.sleep")
+    @patch("src.adapters.shopify_adapter.httpx.Client")
+    def test_payouts_403_is_non_fatal_orders_still_ingested(
+        self, mock_client_cls: MagicMock, mock_sleep: MagicMock, session: Session, adapter: ShopifyAdapter
+    ) -> None:
+        """A 403 on payouts (read_shopify_payments_payouts not approved) must
+        NOT discard successfully-ingested orders — the run completes, the order
+        is persisted, and a soft note is recorded without marking FAILURE.
+        """
+        client_instance = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client_instance)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        orders_resp = _make_response(200, {"orders": [SAMPLE_ORDER]})
+        orders_resp.headers = {}
+        payouts_403 = _make_response(
+            403, {"errors": "This action requires merchant approval for "
+                            "read_shopify_payments_payouts scope."}
+        )
+        payouts_403.headers = {}
+        client_instance.get.side_effect = [orders_resp, payouts_403]
+
+        result = adapter.run(session)
+
+        # Order persisted despite the payouts 403.
+        assert session.query(Transaction).count() == 1
+        assert result.records_created == 1
+        assert result.status != IngestionStatus.FAILURE
+        # Soft note present, but not counted as a record failure.
+        assert any("payouts" in rid for rid, _ in result.errors)
+        assert result.records_failed == 0
 
     @patch("src.adapters.shopify_adapter.time.sleep")
     @patch("src.adapters.shopify_adapter.httpx.Client")

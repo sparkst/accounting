@@ -479,3 +479,38 @@ class TestShopifyAdapterRun:
         # At least one call with a value >= 0.5
         sleep_vals = [c.args[0] for c in mock_sleep.call_args_list]
         assert any(v >= 0.5 for v in sleep_vals)
+
+
+# ── client-credentials grant (dev-dashboard apps) ──────────────────────────────
+
+
+def test_resolve_token_prefers_static_key():
+    a = ShopifyAdapter(api_key="static-tok", store_url="test-store.myshopify.com")
+    with patch("src.adapters.shopify_adapter.httpx.post") as p:
+        assert a._resolve_access_token() == "static-tok"
+        p.assert_not_called()
+
+
+def test_resolve_token_client_credentials_grant():
+    a = ShopifyAdapter(client_id="cid", client_secret="csec", store_url="blacklinemtb.myshopify.com")
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"access_token": "shpat_xyz", "scope": "read_orders", "expires_in": 86399}
+    with patch("src.adapters.shopify_adapter.httpx.post", return_value=resp) as p:
+        tok = a._resolve_access_token()
+    assert tok == "shpat_xyz"
+    _, kwargs = p.call_args
+    assert p.call_args[0][0] == "https://blacklinemtb.myshopify.com/admin/oauth/access_token"
+    assert kwargs["data"] == {"grant_type": "client_credentials", "client_id": "cid", "client_secret": "csec"}
+
+
+def test_resolve_token_grant_failure_raises():
+    a = ShopifyAdapter(client_id="cid", client_secret="bad", store_url="blacklinemtb.myshopify.com")
+    resp = MagicMock(status_code=401)
+    resp.json.return_value = {}
+    with patch("src.adapters.shopify_adapter.httpx.post", return_value=resp), pytest.raises(ShopifyAuthError):
+        a._resolve_access_token()
+
+
+def test_init_requires_some_credential():
+    with pytest.raises(ValueError):
+        ShopifyAdapter(store_url="x.myshopify.com")

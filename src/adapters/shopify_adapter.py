@@ -289,16 +289,29 @@ class ShopifyAdapter(BaseAdapter):
         self,
         api_key: str | None = None,
         store_url: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
         min_delay_s: float = _DEFAULT_MIN_DELAY_S,
     ) -> None:
         self._api_key = api_key or os.environ.get("SHOPIFY_API_KEY", "")
+        self._client_id = client_id or os.environ.get("SHOPIFY_CLIENT_ID", "")
+        self._client_secret = (
+            client_secret
+            or os.environ.get("SHOPIFY_CLIENT_SECRET", "")
+            or os.environ.get("SHOPIFY_API_SECRET", "")
+        )
         self._store_url = store_url or os.environ.get("SHOPIFY_STORE_URL", "")
         self._min_delay_s = min_delay_s
 
-        if not self._api_key:
-            raise ValueError("SHOPIFY_API_KEY must be set (env var or constructor arg)")
         if not self._store_url:
             raise ValueError("SHOPIFY_STORE_URL must be set (env var or constructor arg)")
+        # Auth: a static Admin API token (legacy store custom app) OR the
+        # dev-dashboard client-credentials grant (Client ID + Secret).
+        if not self._api_key and not (self._client_id and self._client_secret):
+            raise ValueError(
+                "Set SHOPIFY_API_KEY (static token) or SHOPIFY_CLIENT_ID + "
+                "SHOPIFY_CLIENT_SECRET (dev-dashboard client-credentials grant)"
+            )
 
         # Normalise store URL — strip scheme and trailing slashes
         url = self._store_url.strip().rstrip("/")
@@ -307,6 +320,36 @@ class ShopifyAdapter(BaseAdapter):
         elif url.startswith("http://"):
             url = url[len("http://"):]
         self._base_url = f"https://{url}"
+
+    def _resolve_access_token(self) -> str:
+        """Return a usable Admin API access token.
+
+        Prefers a static ``SHOPIFY_API_KEY`` (legacy store custom-app token).
+        Otherwise performs Shopify's current dev-dashboard **client-credentials
+        grant** (``client_id`` + ``client_secret`` → a 24h token), which works
+        because the app and store belong to the same Shopify org. The 24h token
+        is fetched fresh each run, so no caching/refresh is needed.
+        """
+        if self._api_key:
+            return self._api_key
+        resp = httpx.post(
+            f"{self._base_url}/admin/oauth/access_token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+            },
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            raise ShopifyAuthError(
+                f"client-credentials grant failed ({resp.status_code}) — check Client ID/"
+                f"Secret and that the app is installed on {self._base_url}"
+            )
+        token = resp.json().get("access_token", "")
+        if not token:
+            raise ShopifyAuthError("client-credentials grant returned no access_token")
+        return str(token)
 
     @property
     def source(self) -> str:
@@ -334,7 +377,7 @@ class ShopifyAdapter(BaseAdapter):
         result = AdapterResult(source=self.source)
 
         headers = {
-            "X-Shopify-Access-Token": self._api_key,
+            "X-Shopify-Access-Token": self._resolve_access_token(),
             "Content-Type": "application/json",
         }
 

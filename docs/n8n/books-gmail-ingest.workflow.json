@@ -1,9 +1,9 @@
 {
-  "name": "Accounting — Gmail receipts → books.sparkry.ai",
+  "name": "ST-Accounting / Gmail Receipts → books.sparkry.ai",
   "nodes": [
     {
       "parameters": {
-        "content": "## Accounting receipt ingestion → Hetzner box\n\nGmail receipt → build receipt JSON → POST /api/ingest/gmail (behind Cloudflare Access).\nReplaces the old Mac flow (n8n → Google Drive → SGDrive → data/inbox).\n\n### Setup before activating\n1. **Gmail Trigger**: pick your Gmail OAuth2 credential + set the receipt filter `q` (e.g. `label:receipts`).\n2. **HTTP nodes (x2)**: replace the two placeholder header values with the Doppler `accounting/srv` secrets:\n   - `CF-Access-Client-Secret` ← `CF_ACCESS_INGEST_CLIENT_SECRET`\n   - `X-Api-Key` ← `INGEST_API_KEY`\n   (`CF-Access-Client-Id` is already filled in.)\n3. **Build Receipt** (Code): verify the field mapping matches your Gmail node output — with `simple:false`, field names can differ (From/Subject/Date/text/textHtml). Adjust if a field comes through empty.\n4. Enable **Retry On Fail** on the HTTP nodes (idempotent: the box dedups by content hash, so retries never double-post). Never silently drop a receipt — the old Mac is frozen.\n\n### Test = your point of no return\nSend yourself a real receipt → expect HTTP 200 → the transaction appears at https://books.sparkry.ai (status `needs_review`). The first successful POST makes the box the source of truth.",
+        "content": "## Accounting receipt ingestion → Hetzner box\n\nGmail receipt → build receipt JSON → POST /api/ingest/gmail (behind Cloudflare Access).\nReplaces the old Mac flow (n8n → Google Drive → SGDrive → data/inbox).\n\n### This is the REPO copy (safe to commit — secret placeholders, not live values)\n- **Gmail Trigger** credential = `Sparkry Gmail` (id UkRZygJdoRQl7US1). Resolves on the live n8n instance.\n- **CF-Access-Client-Id** is the real (non-secret) public client id.\n- The two HTTP nodes carry `REPLACE_WITH_*` placeholders for `CF_ACCESS_INGEST_CLIENT_SECRET` and `INGEST_API_KEY` (Doppler accounting/srv).\n\n### To run from this file\n1. Import, then replace the two placeholder header values with the Doppler secrets.\n2. Gmail filter `q` is set to `label:accounting-receipts OR to:travis+accounting@sparkry.com` — adjust to taste.\n3. **Build Receipt** (Code): verify field mapping vs your Gmail node output; double-check `body_text` resolves (drives amount extraction).\n\n### Deployed state (live)\nWorkflow `nr0j4Lt8ppGckywg` on n8n.sparkry.ai, active. n8n's Render egress IP is allowlisted in Cloudflare (Bot Fight Mode bypass); the companion `egress-ip-autoheal.workflow.json` keeps that rule in sync.",
         "height": 460,
         "width": 420,
         "color": 4
@@ -12,22 +12,42 @@
       "name": "Setup notes",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [-360, 120]
+      "position": [
+        -368,
+        128
+      ]
     },
     {
       "parameters": {
-        "pollTimes": { "item": [ { "mode": "everyMinute" } ] },
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
         "simple": false,
         "filters": {
-          "q": "REPLACE: your receipt filter, e.g. label:receipts -in:chats"
+          "q": "label:accounting-receipts OR to:travis+accounting@sparkry.com "
         },
-        "options": { "downloadAttachments": true }
+        "options": {
+          "downloadAttachments": true
+        }
       },
       "id": "gmail-trigger",
       "name": "Gmail Trigger",
       "type": "n8n-nodes-base.gmailTrigger",
       "typeVersion": 1.2,
-      "position": [140, 320]
+      "position": [
+        144,
+        320
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "UkRZygJdoRQl7US1",
+          "name": "Sparkry Gmail"
+        }
+      }
     },
     {
       "parameters": {
@@ -38,19 +58,30 @@
       "name": "Build Receipt",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [380, 320]
+      "position": [
+        384,
+        320
+      ]
     },
     {
       "parameters": {
         "conditions": {
-          "options": { "caseSensitive": true, "typeValidation": "loose", "version": 2 },
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
           "combinator": "and",
           "conditions": [
             {
               "id": "has-binary",
               "leftValue": "={{ Object.keys($binary || {}).length > 0 }}",
               "rightValue": "",
-              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
             }
           ]
         },
@@ -60,7 +91,10 @@
       "name": "Has attachments?",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [620, 320]
+      "position": [
+        624,
+        320
+      ]
     },
     {
       "parameters": {
@@ -69,26 +103,47 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "CF-Access-Client-Id", "value": "bad07e741ba1aab3247a6025400c8d29.access" },
-            { "name": "CF-Access-Client-Secret", "value": "REPLACE_WITH_CF_ACCESS_INGEST_CLIENT_SECRET" },
-            { "name": "X-Api-Key", "value": "REPLACE_WITH_INGEST_API_KEY" }
+            {
+              "name": "CF-Access-Client-Id",
+              "value": "bad07e741ba1aab3247a6025400c8d29.access"
+            },
+            {
+              "name": "CF-Access-Client-Secret",
+              "value": "REPLACE_WITH_CF_ACCESS_INGEST_CLIENT_SECRET"
+            },
+            {
+              "name": "X-Api-Key",
+              "value": "REPLACE_WITH_INGEST_API_KEY"
+            }
           ]
         },
         "sendBody": true,
         "contentType": "multipart-form-data",
         "bodyParameters": {
           "parameters": [
-            { "name": "receipt", "value": "={{ JSON.stringify($json.receipt) }}" },
-            { "parameterType": "formBinaryData", "name": "attachments", "inputDataFieldName": "attachment_0" }
+            {
+              "name": "receipt",
+              "value": "={{ JSON.stringify($json.receipt) }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "attachments",
+              "inputDataFieldName": "attachment_0"
+            }
           ]
         },
-        "options": { "timeout": 120000 }
+        "options": {
+          "timeout": 120000
+        }
       },
       "id": "http-with-attachments",
       "name": "Upload (with attachment)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [880, 200],
+      "position": [
+        880,
+        208
+      ],
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000
@@ -100,25 +155,42 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "CF-Access-Client-Id", "value": "bad07e741ba1aab3247a6025400c8d29.access" },
-            { "name": "CF-Access-Client-Secret", "value": "REPLACE_WITH_CF_ACCESS_INGEST_CLIENT_SECRET" },
-            { "name": "X-Api-Key", "value": "REPLACE_WITH_INGEST_API_KEY" }
+            {
+              "name": "CF-Access-Client-Id",
+              "value": "bad07e741ba1aab3247a6025400c8d29.access"
+            },
+            {
+              "name": "CF-Access-Client-Secret",
+              "value": "REPLACE_WITH_CF_ACCESS_INGEST_CLIENT_SECRET"
+            },
+            {
+              "name": "X-Api-Key",
+              "value": "REPLACE_WITH_INGEST_API_KEY"
+            }
           ]
         },
         "sendBody": true,
         "contentType": "multipart-form-data",
         "bodyParameters": {
           "parameters": [
-            { "name": "receipt", "value": "={{ JSON.stringify($json.receipt) }}" }
+            {
+              "name": "receipt",
+              "value": "={{ JSON.stringify($json.receipt) }}"
+            }
           ]
         },
-        "options": { "timeout": 120000 }
+        "options": {
+          "timeout": 120000
+        }
       },
       "id": "http-text-only",
       "name": "Upload (text-only)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [880, 440],
+      "position": [
+        880,
+        448
+      ],
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000
@@ -134,19 +206,60 @@
       "name": "Attachment note",
       "type": "n8n-nodes-base.stickyNote",
       "typeVersion": 1,
-      "position": [1280, 160]
+      "position": [
+        1280,
+        160
+      ]
     }
   ],
   "connections": {
-    "Gmail Trigger": { "main": [ [ { "node": "Build Receipt", "type": "main", "index": 0 } ] ] },
-    "Build Receipt": { "main": [ [ { "node": "Has attachments?", "type": "main", "index": 0 } ] ] },
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Receipt": {
+      "main": [
+        [
+          {
+            "node": "Has attachments?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Has attachments?": {
       "main": [
-        [ { "node": "Upload (with attachment)", "type": "main", "index": 0 } ],
-        [ { "node": "Upload (text-only)", "type": "main", "index": 0 } ]
+        [
+          {
+            "node": "Upload (with attachment)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upload (text-only)",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
-  "settings": { "executionOrder": "v1", "timezone": "America/Los_Angeles" },
-  "active": false
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 300,
+    "errorWorkflow": "iQi6zyArMZn0TzAT",
+    "availableInMCP": false
+  }
 }

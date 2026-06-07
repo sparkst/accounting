@@ -187,6 +187,9 @@ class TestParseRefund:
         tx = _parse_refund(refund, order)
         assert tx["amount"] == decimal.Decimal("-85.00")
         assert tx["direction"] == Direction.EXPENSE.value
+        # Contra-revenue must NOT sit in an income category (would inflate B&O
+        # gross via the abs(amount) aggregation).
+        assert tx["tax_category"] == TaxCategory.OTHER_EXPENSE.value
         assert tx["entity"] == Entity.BLACKLINE.value
         assert tx["source_id"] == "refund_9001"
 

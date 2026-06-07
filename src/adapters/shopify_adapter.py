@@ -217,7 +217,12 @@ def _parse_refund(refund: dict[str, Any], order: dict[str, Any]) -> dict[str, An
         "currency": currency,
         "entity": Entity.BLACKLINE.value,
         "direction": Direction.EXPENSE.value,
-        "tax_category": TaxCategory.SALES_INCOME.value,
+        # A refund is contra-revenue (money out), NOT income. It must not carry
+        # an income tax_category: the tax aggregation sums abs(amount) over
+        # income categories, so SALES_INCOME here would make the refund *add* to
+        # B&O gross instead of reducing net. OTHER_EXPENSE keeps gross = actual
+        # sales and books the refund as an outflow (consistent with direction).
+        "tax_category": TaxCategory.OTHER_EXPENSE.value,
         "status": TransactionStatus.NEEDS_REVIEW.value,
         "confidence": 0.8,
         "raw_data": refund,

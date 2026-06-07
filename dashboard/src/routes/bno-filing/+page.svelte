@@ -4,7 +4,16 @@
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 
-	const BNO_RATE = 0.015; // 1.5% B&O service/other activities rate
+	// WA B&O rate per income classification (verified vs the Feb 2026 Combined
+	// Excise Tax Return). The rate depends on the activity, NOT a flat 1.5%:
+	// service income is 1.5% but retail/wholesale sales are much lower.
+	const BO_RATE_BY_CATEGORY: Record<string, number> = {
+		CONSULTING_INCOME: 0.015, // Service & Other Activities
+		SUBSCRIPTION_INCOME: 0.015, // Service & Other Activities
+		SALES_INCOME: 0.00471, // Retailing
+		WHOLESALE_INCOME: 0.00484 // Wholesaling
+	};
+	const DEFAULT_BO_RATE = 0.015;
 	const CURRENT_YEAR = new Date().getFullYear();
 
 	type Entity = 'sparkry' | 'blackline';
@@ -114,9 +123,30 @@
 		periodCategories.reduce((sum, c) => sum + c.total, 0)
 	);
 
+	/** B&O tax due, computed per classification (service 1.5%, retailing 0.471%,
+	 * wholesaling 0.484%) — NOT a flat rate, which over-taxed retail entities. */
 	let bnoTaxDue = $derived<number>(
-		Math.round(grossReceipts * BNO_RATE * 100) / 100
+		Math.round(
+			periodCategories.reduce(
+				(sum, c) => sum + c.total * (BO_RATE_BY_CATEGORY[c.tax_category] ?? DEFAULT_BO_RATE),
+				0
+			) * 100
+		) / 100
 	);
+
+	/** The distinct B&O rates that apply this period (for the rate display). */
+	let periodRates = $derived<number[]>([
+		...new Set(periodCategories.map((c) => BO_RATE_BY_CATEGORY[c.tax_category] ?? DEFAULT_BO_RATE))
+	]);
+
+	/** Unconfirmed (needs_review) INCOME rows in the selected period — the only
+	 * kind that can change gross receipts. Drives the readiness warning. */
+	let periodIncomeUnconfirmed = $derived.by<number>(() => {
+		if (!monthly) return 0;
+		return monthly.months
+			.filter((mo) => periodMonths.includes(mo.month.slice(5)))
+			.reduce((sum, mo) => sum + (mo.income_unconfirmed ?? 0), 0);
+	});
 
 	// ── Filing history (localStorage) ─────────────────────────────────────────
 
@@ -207,12 +237,18 @@
 		if (!selectedEntity || downloading) return;
 		downloading = true;
 		downloadError = '';
-		const periodLabel = frequency === 'monthly'
+		// WA DOR upload, scoped to the SELECTED period (not the whole year):
+		// month=N for monthly filers, quarter=N (1-4) for quarterly filers.
+		const isMonthly = frequency === 'monthly';
+		const periodLabel = isMonthly
 			? `${selectedYear}-${selectedMonth}`
 			: `${selectedYear}-${selectedQuarter}`;
-		const filename = `bno_${selectedEntity}_${periodLabel}.csv`;
+		const query: Record<string, string | number> = isMonthly
+			? { format: 'dor', month: Number(selectedMonth) }
+			: { format: 'dor', quarter: Number(selectedQuarter.replace('Q', '')) };
+		const filename = `dor_${selectedEntity}_${periodLabel}.csv`;
 		try {
-			await downloadExport('bno', selectedEntity, selectedYear, filename);
+			await downloadExport('bno', selectedEntity, selectedYear, filename, query);
 		} catch (err) {
 			downloadError = err instanceof Error ? err.message : 'Download failed';
 		} finally {
@@ -435,8 +471,16 @@
 						<span class="bno-calc-value">{formatCurrency(grossReceipts)}</span>
 					</div>
 					<div class="bno-calc-row">
-						<span class="bno-calc-label">B&O Rate (Service &amp; Other)</span>
-						<span class="bno-calc-value">{(BNO_RATE * 100).toFixed(1)}%</span>
+						<span class="bno-calc-label">B&O Rate</span>
+						<span class="bno-calc-value">
+							{#if periodRates.length === 1}
+								{(periodRates[0] * 100).toFixed(3)}%
+							{:else if periodRates.length === 0}
+								—
+							{:else}
+								mixed (per classification)
+							{/if}
+						</span>
 					</div>
 					<div class="bno-calc-divider"></div>
 					<div class="bno-calc-row bno-total-row">
@@ -449,12 +493,14 @@
 					</p>
 				</div>
 
-				<!-- Readiness warning -->
-				{#if summary.readiness.readiness_pct < 100}
+				<!-- Readiness warning — period-scoped + income-only (only unconfirmed
+				     INCOME in this period can change gross receipts; unconfirmed
+				     expenses cannot). -->
+				{#if periodIncomeUnconfirmed > 0}
 					<div class="readiness-warn">
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-						{summary.readiness.readiness_pct.toFixed(0)}% of transactions confirmed —
-						{summary.readiness.unconfirmed_count} unconfirmed may affect gross receipts total.
+						{periodIncomeUnconfirmed} unconfirmed income transaction{periodIncomeUnconfirmed === 1 ? '' : 's'}
+						in this period may change gross receipts — confirm before filing.
 					</div>
 				{/if}
 

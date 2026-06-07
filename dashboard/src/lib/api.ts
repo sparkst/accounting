@@ -610,6 +610,8 @@ export interface MonthlyCategoryItem {
 export interface MonthlyBreakdownMonth {
 	month: string; // "YYYY-MM"
 	categories: MonthlyCategoryItem[];
+	/** Count of unconfirmed (needs_review) INCOME rows in this month. */
+	income_unconfirmed?: number;
 }
 
 export interface MonthlyBreakdown {
@@ -647,9 +649,14 @@ export async function downloadExport(
 	endpoint: 'freetaxusa' | 'taxact' | 'bno',
 	entity: string,
 	year: number,
-	filename: string
+	filename: string,
+	/** Extra query params, e.g. { format: 'dor', month: 4 } or { quarter: 1 }. */
+	query?: Record<string, string | number>
 ): Promise<void> {
-	const url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
+	let url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
+	for (const [k, v] of Object.entries(query ?? {})) {
+		url += `&${k}=${encodeURIComponent(String(v))}`;
+	}
 	const res = await fetch(url, { headers: getApiKeyHeader() });
 	if (!res.ok) {
 		const text = await res.text().catch(() => res.statusText);

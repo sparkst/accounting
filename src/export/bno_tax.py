@@ -285,13 +285,17 @@ DOR_ACCOUNT_IDS: dict[str, str] = {
     "blackline": "605922410",
 }
 
-# B&O line codes per entity classification
-# Line 7 = Service and Other Activities
-# Line 2 = Retailing
+# WA Combined Excise Tax Return B&O "Code" column (verified against the
+# Feb 2026 CETR form — these are the e-file/data-upload codes, NOT the line
+# numbers). Both entities are under $1M prior-year revenue, so Service & Other
+# uses code 40 (line 11, rate 1.5%). Codes 100/500 are the higher revenue tiers.
+#   Service & Other Activities (<$1M) → 40   (rate .015)
+#   Retailing                          → 2    (rate .00471)
+#   Wholesaling                        → 3    (rate .00484)
 DOR_LINE_CODES: dict[str, int] = {
-    "ServiceOther": 7,
+    "ServiceOther": 40,
     "Retailing": 2,
-    "Wholesaling": 6,
+    "Wholesaling": 3,
 }
 
 
@@ -299,41 +303,61 @@ def generate_dor_upload(
     transactions: list[dict[str, Any]],
     entity: str,
     year: int,
-    month: int,
+    month: int | None = None,
+    quarter: int | None = None,
 ) -> tuple[str, str]:
-    """Generate WA DOR My DOR Data Upload file for a single filing period.
+    """Generate a WA DOR My DOR Data Upload file for a single filing period.
 
-    Format follows the official My DOR Data Upload Instructions:
-    - ACCOUNT tag: TRA, Period (MMYYYY), Preparer, Email, Phone
-    - TAX tag: Line Code, Location Code (0 for state), Amount
+    Provide exactly one of ``month`` (1-12, monthly filer) or ``quarter`` (1-4,
+    quarterly filer). Format follows the official My DOR Data Upload Instructions:
+    - ACCOUNT tag: TRA, Period, Preparer, Email, Phone
+      Period is ``MMYYYY`` for monthly (e.g. 042026) and ``Q#YYYY`` for
+      quarterly (e.g. Q12026) — per the instructions' two ACCOUNT examples.
+    - TAX tag: Line Code, Location Code (0 for B&O/state), gross Amount.
+
+    The TAX amount is GROSS receipts on the classification's B&O code; DOR's
+    system applies the rate, so no rate is written here.
 
     Returns (file_content, filename).
     """
+    if (month is None) == (quarter is None):
+        raise ValueError("Provide exactly one of month or quarter.")
+
     entity_lower = entity.lower()
     account_id = DOR_ACCOUNT_IDS.get(entity_lower, "000000000")
-    period = f"{month:02d}{year}"
+    monthly = _aggregate_income_by_month(transactions, year)
 
-    lines: list[str] = []
+    # Resolve the period code + aggregate the period's income by B&O code.
+    period_income: dict[str, Decimal] = {}
+    if month is not None:
+        period = f"{month:02d}{year}"
+        period_income = dict(monthly.get(month, {}))
+        period_suffix = f"{month:02d}"
+    else:
+        assert quarter is not None
+        period = f"Q{quarter}{year}"
+        for m in range(3 * (quarter - 1) + 1, 3 * (quarter - 1) + 4):
+            for bo_code, amt in monthly.get(m, {}).items():
+                period_income[bo_code] = period_income.get(bo_code, Decimal("0")) + amt
+        period_suffix = f"Q{quarter}"
 
-    # ACCOUNT line
-    lines.append(
+    lines: list[str] = [
         f"ACCOUNT,{account_id},{period},"
         f"Travis Sparks,travis@sparkry.com,919-491-3894"
-    )
+    ]
 
-    # Aggregate income for the specified month
-    monthly = _aggregate_income_by_month(transactions, year)
-    month_data = monthly.get(month, {})
-
-    if month_data:
-        for bo_code, amount in sorted(month_data.items()):
-            line_code = DOR_LINE_CODES.get(bo_code, 7)
+    if period_income:
+        for bo_code, amount in sorted(period_income.items()):
+            # Default to Service & Other (40) for any unmapped classification.
+            line_code = DOR_LINE_CODES.get(bo_code, 40)
             lines.append(f"TAX,{line_code},0,{amount:.2f}")
     else:
-        # Even if zero, include a TAX line so the file is valid
-        default_line = 7 if entity_lower == "sparkry" else 2
+        # No activity — still emit a valid zero TAX line on the entity's
+        # primary classification (Sparkry = Service & Other 40, BlackLine =
+        # Retailing 2).
+        default_line = 40 if entity_lower == "sparkry" else 2
         lines.append(f"TAX,{default_line},0,0.00")
 
     content = "\n".join(lines) + "\n"
-    filename = f"dor_upload_{entity_lower}_{year}_{month:02d}.csv"
+    filename = f"dor_upload_{entity_lower}_{year}_{period_suffix}.csv"
     return content, filename

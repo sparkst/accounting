@@ -275,6 +275,8 @@ class Broker(enum.StrEnum):
     FG_ANNUITY = "fg_annuity"
     GSK_PENSION = "gsk_pension"
     CHASE = "chase"
+    AMEX = "amex"
+    OTHER = "other"  # generic fallback for any other Plaid-linked institution
 
 
 class AccountType(enum.StrEnum):
@@ -298,6 +300,7 @@ class AccountType(enum.StrEnum):
     RSU = "rsu"
     CHECKING = "checking"
     SAVINGS = "savings"
+    CREDIT_CARD = "credit_card"
     OTHER = "other"
 
 

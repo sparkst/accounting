@@ -207,21 +207,21 @@
 		if (name.includes('fidelity')) return 'fidelity';
 		if (name.includes('etrade') || name.includes('e*trade')) return 'etrade';
 		if (name.includes('franklin')) return 'franklin_templeton';
-		return 'other';
+		if (name.includes('chase')) return 'chase';
+		if (name.includes('amex') || name.includes('american express')) return 'amex';
+		return 'other'; // valid generic fallback (broker enum includes 'other')
 	}
 
-	function inferAccountType(plaidType: string | null | undefined, _subtype: string | null | undefined): string {
-		if (!plaidType) return 'taxable';
+	function inferAccountType(plaidType: string | null | undefined, subtype: string | null | undefined): string {
+		const sub = (subtype ?? '').toLowerCase();
 		switch (plaidType) {
 			case 'depository':
-				return 'taxable';
+				return sub === 'savings' ? 'savings' : 'checking';
 			case 'credit':
-				return 'other';
+				return 'credit_card';
 			case 'brokerage':
 			case 'investment':
 				return 'taxable';
-			case 'loan':
-				return 'other';
 			default:
 				return 'other';
 		}

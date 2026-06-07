@@ -178,10 +178,14 @@ def session() -> Generator[Session, None, None]:
 
 @pytest.fixture
 def adapter(monkeypatch: pytest.MonkeyPatch) -> StripeAdapter:
-    """StripeAdapter with fake API key and connected account IDs via environment."""
-    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-    monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_test_sparkry")
-    monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_test_blackline")
+    """StripeAdapter with per-account fake API keys via environment.
+
+    Separate-account model: each Stripe account authenticates with its own
+    restricted key (no Stripe-Account header). STRIPE_API_KEY = Sparkry sub.
+    """
+    monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+    monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "rk_test_blackline")
+    monkeypatch.delenv("STRIPE_API_KEY_TRAVIS_PERSONAL", raising=False)
     return StripeAdapter()
 
 
@@ -331,28 +335,26 @@ class TestPersonalMixedMode:
     def test_travis_personal_account_added_when_env_var_set(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-        monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_sp")
-        monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_bl")
-        monkeypatch.setenv("STRIPE_ACCOUNT_TRAVIS_PERSONAL", "acct_travis")
+        monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+        monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "rk_test_bl")
+        monkeypatch.setenv("STRIPE_API_KEY_TRAVIS_PERSONAL", "rk_test_travis")
         adapter = StripeAdapter()
-        assert adapter._account_travis_personal == "acct_travis"
+        assert adapter._key_travis_personal == "rk_test_travis"
 
     def test_travis_personal_account_omitted_when_env_var_absent(
         self, adapter: StripeAdapter
     ) -> None:
-        # `adapter` fixture only sets SPARKRY + BLACKLINE, not TRAVIS_PERSONAL.
-        assert adapter._account_travis_personal is None
+        # `adapter` fixture only sets SPARKRY + BLACKLINE keys, not TRAVIS_PERSONAL.
+        assert adapter._key_travis_personal is None
 
     def test_ingest_personal_mixed_flags_non_invoice_row(
         self, monkeypatch: pytest.MonkeyPatch, session: Session
     ) -> None:
-        """End-to-end: with the third account configured, a non-invoice charge
-        on it lands in the DB with a populated review_reason."""
-        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-        monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_sp")
-        monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_bl")
-        monkeypatch.setenv("STRIPE_ACCOUNT_TRAVIS_PERSONAL", "acct_travis")
+        """End-to-end: with the third account's key configured, a non-invoice
+        charge on it lands in the DB with a populated review_reason."""
+        monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+        monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "rk_test_bl")
+        monkeypatch.setenv("STRIPE_API_KEY_TRAVIS_PERSONAL", "rk_test_travis")
         adapter = StripeAdapter()
 
         sub_charge = _fake_charge(
@@ -368,8 +370,10 @@ class TestPersonalMixedMode:
 
         with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
             def side_effect(client: Any, resource: str, entity: Any, **kw: Any) -> list[Any]:
-                acct = kw.get("stripe_account")
-                if acct == "acct_travis" and resource == "charges":
+                # Separate-account model: discriminate by the per-account key the
+                # StripeClient was built with (no Stripe-Account header anymore).
+                key = client._requestor.api_key
+                if key == "rk_test_travis" and resource == "charges":
                     return [sub_charge, anomaly_charge]
                 return []
 
@@ -511,17 +515,21 @@ class TestMapRefund:
 class TestStripeAdapterInit:
     def test_missing_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY_TRAVIS_PERSONAL", raising=False)
         with pytest.raises(EnvironmentError, match="STRIPE_API_KEY"):
             StripeAdapter()
 
-    def test_connected_accounts_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-        monkeypatch.delenv("STRIPE_ACCOUNT_SPARKRY", raising=False)
-        monkeypatch.delenv("STRIPE_ACCOUNT_BLACKLINE", raising=False)
+    def test_secondary_keys_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Only the Sparkry key (STRIPE_API_KEY) is required; the other two
+        # accounts are optional and skipped when their keys are absent.
+        monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+        monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY_TRAVIS_PERSONAL", raising=False)
         adapter = StripeAdapter()
-        assert adapter._api_key == "sk_test_platform"
-        assert adapter._account_sparkry is None
-        assert adapter._account_blackline is None
+        assert adapter._key_sparkry == "rk_test_sparkry"
+        assert adapter._key_blackline is None
+        assert adapter._key_travis_personal is None
 
 
 class TestStripeAdapterRun:

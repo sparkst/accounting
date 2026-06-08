@@ -8,12 +8,15 @@ a fixed `today`.
 from __future__ import annotations
 
 import calendar
+import logging
 from dataclasses import dataclass
 from datetime import date, timedelta
 
 from sqlalchemy.orm import Session
 
 from src.models.invoice import Customer, Invoice
+
+logger = logging.getLogger(__name__)
 
 DOR_LOGIN_URL = "https://secure.dor.wa.gov/home/Login"
 SPARKRY_DOR_ACCOUNT = "605-965-107"
@@ -167,9 +170,17 @@ def _invoice_draft_alerts(today: date, session: Session) -> list[Alert]:
         reminder_date = _draft_reminder_date(inv)
         if reminder_date is None or today_iso < reminder_date[:10]:
             continue
+        try:
+            reminder_dt = date.fromisoformat(reminder_date[:10])
+        except ValueError:
+            logger.warning(
+                "invoice %s has unparseable reminder_date %r — skipping",
+                inv.id, reminder_date,
+            )
+            continue
         customer = session.get(Customer, inv.customer_id)
         customer_name = customer.name if customer is not None else "(unknown customer)"
-        days_outstanding = (today - date.fromisoformat(reminder_date[:10])).days
+        days_outstanding = (today - reminder_dt).days
         action_url = INVOICE_DETAIL_URL.format(invoice_id=inv.id)
         body = (
             f"Draft invoice {_safe(inv.invoice_number)} for {_safe(customer_name)} "

@@ -28,6 +28,8 @@ def test_sparkry_monthly_fires_on_reminder_days() -> None:
     # Body must carry the actionable context.
     assert "605-965-107" in sparkry.body_text  # DOR account
     assert "April 2026" in sparkry.body_text  # filing period
+    assert sparkry.due_date is not None
+    assert sparkry.due_date in sparkry.body_text  # due date rendered in body
     assert "https://secure.dor.wa.gov/home/Login" in sparkry.action_url
 
 
@@ -51,6 +53,8 @@ def test_blackline_q1_fires_in_april_reminder_window() -> None:
     assert bl.due_date == "2026-04-30"
     assert "605-922-410" in bl.body_text
     assert "Q1" in bl.body_text
+    assert bl.due_date is not None
+    assert bl.due_date in bl.body_text  # due date rendered in body
 
 
 def test_blackline_q1_fires_on_due_date_apr_30() -> None:
@@ -235,3 +239,18 @@ def test_draft_body_contains_customer_name_and_days_outstanding(inv_session: Ses
     assert "days outstanding" in alert.body_text
     assert "sparkry" in alert.body_text
     assert "100" in alert.body_text
+    assert "2026-06-01" in alert.body_text  # scheduled/reminder date rendered
+
+
+def test_draft_invoice_unparseable_date_is_skipped_not_fatal(inv_session: Session) -> None:
+    # A draft holding a non-ISO date string must be skipped, never crash dispatch.
+    inv_id = _make_draft(inv_session, number="202606-007", due="06/05/2026", submitted=None)
+    alerts = compute_invoice_alerts(date(2026, 6, 10), inv_session)
+    assert f"invoice:draft:{inv_id}" not in {a.alert_key for a in alerts}
+
+
+def test_sweep_body_lists_recurring_billers(inv_session: Session) -> None:
+    alerts = compute_invoice_alerts(date(2026, 6, 30), inv_session)
+    sweep = next(a for a in alerts if a.alert_key == "invoice:sweep:2026-06")
+    assert "Cardinal Health" in sweep.body_text
+    assert "How To Fascinate" in sweep.body_text

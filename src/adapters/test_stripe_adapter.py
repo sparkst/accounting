@@ -47,6 +47,7 @@ from src.models.enums import (
     IngestionStatus,
     Source,
     TaxCategory,
+    TaxSubcategory,
     TransactionStatus,
 )
 from src.models.ingestion_log import IngestionLog
@@ -460,7 +461,12 @@ class TestMapChargeFee:
         assert fee_tx is not None
         assert fee_tx.amount == Decimal("-58.30")
         assert fee_tx.direction == Direction.EXPENSE.value
-        assert fee_tx.tax_category == TaxCategory.LEGAL_AND_PROFESSIONAL.value
+        # Merchant fee → Other Expenses (27a) + payment_processing, and
+        # auto_classified so the reclassify pass can't split it across
+        # categories or reassign the entity.
+        assert fee_tx.tax_category == TaxCategory.OTHER_EXPENSE.value
+        assert fee_tx.tax_subcategory == TaxSubcategory.PAYMENT_PROCESSING.value
+        assert fee_tx.status == TransactionStatus.AUTO_CLASSIFIED.value
         assert fee_tx.entity == Entity.SPARKRY.value
         assert fee_tx.source_id == "fee_ch_sp1"
 

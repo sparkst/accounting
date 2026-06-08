@@ -39,6 +39,7 @@ from src.models.enums import (
     IngestionStatus,
     Source,
     TaxCategory,
+    TaxSubcategory,
     TransactionStatus,
 )
 from src.models.ingestion_log import IngestionLog
@@ -348,8 +349,14 @@ def _map_charge_fee(charge: Any, entity: Entity) -> Transaction | None:
         currency=currency,
         entity=entity.value,
         direction=Direction.EXPENSE.value,
-        tax_category=TaxCategory.LEGAL_AND_PROFESSIONAL.value,
-        status=TransactionStatus.NEEDS_REVIEW.value,
+        # A Stripe processing fee is an unambiguous merchant fee → Other
+        # Expenses (Sch C 27a) + payment_processing subcategory. AUTO_CLASSIFIED
+        # (not needs_review) so the ingest reclassify pass / Tier-3 LLM can't
+        # split identical fees across categories or reassign the entity (which it
+        # did: ~$356 of Sparkry fees got mislabeled to BlackLine/Supplies).
+        tax_category=TaxCategory.OTHER_EXPENSE.value,
+        tax_subcategory=TaxSubcategory.PAYMENT_PROCESSING.value,
+        status=TransactionStatus.AUTO_CLASSIFIED.value,
         confidence=0.95,
         raw_data=raw,
     )

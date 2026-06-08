@@ -52,6 +52,13 @@ class ClassificationResult:
 # Minimum confidence required for auto-classification.
 _AUTO_CLASSIFY_THRESHOLD = 0.7
 
+# Sources where the ingesting adapter assigns the entity AUTHORITATIVELY — Stripe
+# from the per-account API key, Shopify from the store. Classification (esp. the
+# Tier-3 LLM) must never reassign which business owns these rows; it was guessing
+# wrong (parent-account Substack charges/fees/payouts → BlackLine). Only the
+# tax category is open to (re)classification for these.
+_ENTITY_AUTHORITATIVE_SOURCES = frozenset({Source.STRIPE.value, Source.SHOPIFY.value})
+
 # Sources whose stored ``amount`` sign is the authoritative cash direction
 # (negative = real outflow). For these, an income classification on a negative
 # amount is internally contradictory and must be vetoed. NOTE: gmail_n8n is
@@ -180,7 +187,14 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
 
     Does **not** commit the session — that is the caller's responsibility.
     """
-    transaction.entity = result.entity.value
+    # Preserve the adapter's entity for sources where it is structurally
+    # determined (Stripe per-account, Shopify store). Classification may set the
+    # entity only when the adapter could not (e.g. gmail/bank → entity is None).
+    if (
+        transaction.source not in _ENTITY_AUTHORITATIVE_SOURCES
+        or transaction.entity is None
+    ):
+        transaction.entity = result.entity.value
     transaction.tax_category = result.tax_category.value
     transaction.direction = result.direction.value
     transaction.confidence = result.confidence

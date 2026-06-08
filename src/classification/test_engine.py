@@ -745,6 +745,40 @@ class TestClassificationEngine:
             assert txn.status == TransactionStatus.AUTO_CLASSIFIED.value
             assert txn.review_reason is None
 
+    def test_apply_result_preserves_entity_for_stripe(self) -> None:
+        """Stripe entity is set authoritatively by the adapter (per-account key);
+        classification must NOT reassign it. Regression for parent-account
+        Substack charges/fees/payouts being relabeled BlackLine by the LLM."""
+        txn = _make_transaction(description="STRIPE charge", source=Source.STRIPE.value)
+        txn.entity = Entity.SPARKRY.value  # adapter set this from the account key
+        result = ClassificationResult(
+            entity=Entity.BLACKLINE,  # the LLM's (wrong) guess
+            tax_category=TaxCategory.SALES_INCOME,
+            direction=Direction.INCOME,
+            confidence=0.9,
+            tier_used=3,
+            reasoning="LLM guess",
+        )
+        apply_result(txn, result)
+        assert txn.entity == Entity.SPARKRY.value  # preserved, not overwritten
+        assert txn.tax_category == TaxCategory.SALES_INCOME.value  # category still applied
+
+    def test_apply_result_sets_entity_for_non_authoritative_source(self) -> None:
+        """For gmail/bank the adapter can't know the entity, so classification
+        legitimately assigns it."""
+        txn = _make_transaction(description="bank row", source=Source.BANK_CSV.value)
+        txn.entity = None
+        result = ClassificationResult(
+            entity=Entity.BLACKLINE,
+            tax_category=TaxCategory.SALES_INCOME,
+            direction=Direction.INCOME,
+            confidence=0.9,
+            tier_used=1,
+            reasoning="rule",
+        )
+        apply_result(txn, result)
+        assert txn.entity == Entity.BLACKLINE.value
+
     def test_apply_result_sets_review_reason_when_needed(self) -> None:
         txn = _make_transaction(description="Unknown")
         result = ClassificationResult(

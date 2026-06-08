@@ -303,3 +303,35 @@ class TestDorUploadQuarterly:
             generate_dor_upload([], "sparkry", 2026)
         with pytest.raises(ValueError):
             generate_dor_upload([], "sparkry", 2026, month=1, quarter=1)
+
+
+class TestDorUploadRetailSalesTax:
+    """A WA retail order must emit pre-tax B&O + state + local sales-tax lines."""
+
+    def _wa_order(self) -> dict:
+        # $100 incl $9.30 WA tax → $90.70 pre-tax, Sammamish (1739).
+        return {
+            "date": "2026-01-15",
+            "amount": "100.00",
+            "tax_category": "SALES_INCOME",
+            "source": "shopify",
+            "raw_data": {
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": "Sammamish"},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": "Sammamish City Tax"},
+                ],
+            },
+        }
+
+    def test_retail_upload_has_pretax_bo_and_sales_tax_lines(self):
+        content, _ = generate_dor_upload([self._wa_order()], "blackline", 2026, quarter=1)
+        tax_lines = [r.split(",") for r in content.strip().split("\n") if r.startswith("TAX")]
+        # B&O Retailing (code 2) on the PRE-TAX basis, not the $100 tax-inclusive.
+        assert ["TAX", "2", "0", "90.70"] in tax_lines
+        # State retail sales tax (code 1) on the taxable amount.
+        assert ["TAX", "1", "0", "90.70"] in tax_lines
+        # Local sales tax (code 45) at the Sammamish location code.
+        assert ["TAX", "45", "1739", "90.70"] in tax_lines

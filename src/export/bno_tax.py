@@ -298,6 +298,10 @@ DOR_LINE_CODES: dict[str, int] = {
     "Wholesaling": 3,
 }
 
+# Retail sales tax codes (WA CETR Section II/III, verified vs Feb 2026 form):
+DOR_STATE_RETAIL_SALES_LINE = 1   # line 28 "Retail Sales", code 01, 6.5%
+DOR_LOCAL_SALES_LINE = 45         # Section III local sales tax (with location code)
+
 
 def generate_dor_upload(
     transactions: list[dict[str, Any]],
@@ -315,11 +319,16 @@ def generate_dor_upload(
       quarterly (e.g. Q12026) — per the instructions' two ACCOUNT examples.
     - TAX tag: Line Code, Location Code (0 for B&O/state), gross Amount.
 
-    The TAX amount is GROSS receipts on the classification's B&O code; DOR's
-    system applies the rate, so no rate is written here.
+    B&O TAX amounts are pre-tax. Retailing is reported on the corrected basis
+    (pre-tax, net of confirmed interstate) from ``compute_retail_detail`` — NOT
+    the tax-inclusive aggregation. For retail income the file also emits the
+    State Retail Sales (code 1) line and a Local Sales (code 45) line per WA DOR
+    location code, with the destination-sourced taxable amount.
 
     Returns (file_content, filename).
     """
+    from src.export.retail_sales_tax import compute_retail_detail
+
     if (month is None) == (quarter is None):
         raise ValueError("Provide exactly one of month or quarter.")
 
@@ -327,34 +336,55 @@ def generate_dor_upload(
     account_id = DOR_ACCOUNT_IDS.get(entity_lower, "000000000")
     monthly = _aggregate_income_by_month(transactions, year)
 
-    # Resolve the period code + aggregate the period's income by B&O code.
-    period_income: dict[str, Decimal] = {}
     if month is not None:
         period = f"{month:02d}{year}"
-        period_income = dict(monthly.get(month, {}))
         period_suffix = f"{month:02d}"
+        months = [month]
     else:
         assert quarter is not None
         period = f"Q{quarter}{year}"
-        for m in range(3 * (quarter - 1) + 1, 3 * (quarter - 1) + 4):
-            for bo_code, amt in monthly.get(m, {}).items():
-                period_income[bo_code] = period_income.get(bo_code, Decimal("0")) + amt
         period_suffix = f"Q{quarter}"
+        months = [3 * (quarter - 1) + i for i in (1, 2, 3)]
+
+    # Non-retail B&O income (Service & Other, Wholesaling) — these carry no sales
+    # tax, so the aggregated amount is already the pre-tax figure.
+    period_income: dict[str, Decimal] = {}
+    for m in months:
+        for bo_code, amt in monthly.get(m, {}).items():
+            period_income[bo_code] = period_income.get(bo_code, Decimal("0")) + amt
+
+    detail = compute_retail_detail(transactions, year, month=month, quarter=quarter)
+    state_taxable = sum(
+        (loc.taxable_amount for loc in detail.by_location), Decimal("0")
+    )
 
     lines: list[str] = [
         f"ACCOUNT,{account_id},{period},"
         f"Travis Sparks,travis@sparkry.com,919-491-3894"
     ]
 
-    if period_income:
-        for bo_code, amount in sorted(period_income.items()):
-            # Default to Service & Other (40) for any unmapped classification.
-            line_code = DOR_LINE_CODES.get(bo_code, 40)
-            lines.append(f"TAX,{line_code},0,{amount:.2f}")
-    else:
-        # No activity — still emit a valid zero TAX line on the entity's
-        # primary classification (Sparkry = Service & Other 40, BlackLine =
-        # Retailing 2).
+    emitted = False
+    # B&O: non-retailing classifications from the aggregation ...
+    for bo_code, amount in sorted(period_income.items()):
+        if bo_code == "Retailing":
+            continue  # emitted below on the corrected pre-tax basis
+        lines.append(f"TAX,{DOR_LINE_CODES.get(bo_code, 40)},0,{amount:.2f}")
+        emitted = True
+    # ... and Retailing on the pre-tax, net-of-interstate basis.
+    if detail.wa_taxable > 0:
+        lines.append(f"TAX,{DOR_LINE_CODES['Retailing']},0,{detail.wa_taxable:.2f}")
+        emitted = True
+
+    # Retail sales tax: state line + one local line per DOR location code.
+    if state_taxable > 0:
+        lines.append(f"TAX,{DOR_STATE_RETAIL_SALES_LINE},0,{state_taxable:.2f}")
+        for loc in detail.by_location:
+            lines.append(
+                f"TAX,{DOR_LOCAL_SALES_LINE},{loc.location_code},{loc.taxable_amount:.2f}"
+            )
+        emitted = True
+
+    if not emitted:
         default_line = 40 if entity_lower == "sparkry" else 2
         lines.append(f"TAX,{default_line},0,0.00")
 

@@ -114,7 +114,8 @@ Derived from the same obligations encoded in `_build_tax_deadlines()`
 
 Each `tax_bo` alert email contains, prominently:
 - Entity name + **DOR account ID**
-- **Filing period** (e.g. "May 2026" for Sparkry; "Q1 2026 (Jan–Mar)" for BlackLine)
+- **Filing period** (e.g. "May 2026" for Sparkry; "Q1 (Jan-Mar)" for BlackLine — ASCII
+  hyphen in the rendered label for encoding robustness)
 - **Due date**
 - `action_url`
 
@@ -136,7 +137,9 @@ ack to silence reminders early is **out of scope for v1** (noted in §9).
 ### 4.2 Invoice monthly sweep — `alert_type = "invoice_sweep"`
 
 - Fires **once, on the last calendar day of each month** (handles 28/29/30/31).
-- Subject: "Time to create & submit this month's invoices".
+- Subject: "Time to create & submit {Month YYYY} invoices" (e.g. "Time to create &
+  submit June 2026 invoices" — month is named in the subject so the EA can tell periods
+  apart at a glance).
 - Body lists the recurring billers as a checklist (Cardinal Health flat-rate, Fascinate
   calendar-based) so nothing is forgotten.
 - `action_url` → invoicing area of the dashboard.

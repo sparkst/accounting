@@ -40,6 +40,11 @@ mypy src/
 # Run a single test
 pytest src/adapters/test_gmail_n8n.py -v
 
+# EA alert dispatch (DRY-RUN default; --apply to POST to n8n)
+doppler run -- python scripts/alerts_dispatch.py            # dry-run, today
+doppler run -- python scripts/alerts_dispatch.py --apply    # send
+doppler run -- python scripts/alerts_dispatch.py --date 2026-06-30  # test a date
+
 # Alembic migrations
 alembic current                                         # show current DB revision
 alembic upgrade head                                    # apply all pending migrations
@@ -139,9 +144,10 @@ rm data/accounting.snapshot.db
   Active Doppler configs:
   - `accounting/dev` — local importers + FastAPI runtime. Pass via `doppler run --project accounting --config dev`.
   - `accounting/prd` — off-Cloudflare backup vault for CRM-shared secrets (per `sparkry-crm/CLAUDE.md` convention). Also holds `PLAID_TOKEN_ENC_KEY_MIGRATION` (read by the wealth-migration script at cutover) and the SENTRY_DSN + R2_BACKUP_WRITE_TOKEN mirrors.
+  - `accounting/srv` — Hetzner server runtime config; all systemd units inject it via `doppler run --config srv`. (Per the Hetzner migration: never `accounting/dev` / `accounting/prd` on the box.)
   - `accounting/stg`, `accounting/dev_personal` — staging / personal contexts.
 
-  Keys in `accounting/dev`: `STRIPE_API_KEY`, `STRIPE_RESTRICTED_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `STRIPE_ACCOUNT_TRAVIS_PERSONAL`, `RESEND_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `N8N_WEBHOOK_SECRET`, `API_KEY`, `PLAID_CLIENT_ID`, `PLAID_SANDBOX_SECRET`, `PLAID_PRODUCTION_SECRET`, `PLAID_ENV`, **`PLAID_FERNET_KEY`** (renamed from `PLAID_TOKEN_ENC_KEY` at wealth-migration M0c — see `src/utils/plaid_crypto.py` for the legacy-name fallback), `WEALTH_API_BASE`, `WEALTH_INTERNAL_KEY`, `WEALTH_TARGET_DEFAULT`.
+  Keys in `accounting/dev`: `STRIPE_API_KEY`, `STRIPE_RESTRICTED_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `STRIPE_ACCOUNT_TRAVIS_PERSONAL`, `RESEND_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `N8N_WEBHOOK_SECRET`, `API_KEY`, `PLAID_CLIENT_ID`, `PLAID_SANDBOX_SECRET`, `PLAID_PRODUCTION_SECRET`, `PLAID_ENV`, **`PLAID_FERNET_KEY`** (renamed from `PLAID_TOKEN_ENC_KEY` at wealth-migration M0c — see `src/utils/plaid_crypto.py` for the legacy-name fallback), `WEALTH_API_BASE`, `WEALTH_INTERNAL_KEY`, `WEALTH_TARGET_DEFAULT`, **`N8N_ALERTS_WEBHOOK_URL`**, **`N8N_ALERTS_WEBHOOK_SECRET`**, **`ALERT_FROM_EMAIL`**, **`ALERT_TO_EMAIL`** (EA alert routing — **NOT YET PROVISIONED**; needed before `--apply`; also required in `accounting/srv` on Hetzner).
 
 ---
 
@@ -214,6 +220,7 @@ Five launchd services behind a Caddy reverse proxy over Tailscale. API plist use
 | Backup | `com.sparkry.accounting-backup.plist` | — | Periodic SQLite backup (`scripts/backup.sh`) |
 | Weekly P&L | `com.sparkry.weekly-pl-report.plist` | — | Monday P&L email (`scripts/weekly-pl-report.py`) |
 | Plaid Transactions Sync | `com.sparkry.plaid-transactions-sync.plist` | — | Daily Plaid transaction sync (`scripts/plaid_transactions_sync.py --apply`). **NOT loaded yet** — gated on `PLAID_ENV=production` + `transactions` product approval + Chase OAuth redirect setup (spec §9 prerequisites). |
+| Alerts Dispatch | `com.sparkry.alerts-dispatch.{service,timer}` (Hetzner); `com.sparkry.alerts-dispatch.plist` (macOS parity) | — | Daily EA tax + invoice alert emails via n8n webhook (`scripts/alerts_dispatch.py --apply`). DRY-RUN until `N8N_ALERTS_WEBHOOK_URL/SECRET` provisioned. |
 
 ```bash
 # Restart a service after code changes

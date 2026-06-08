@@ -382,7 +382,12 @@ def _map_payout(payout: Any, entity: Entity) -> Transaction:
         entity=entity.value,
         direction=Direction.TRANSFER.value,
         tax_category=None,
-        status=TransactionStatus.NEEDS_REVIEW.value,
+        # AUTO_CLASSIFIED, NOT needs_review: a payout is unambiguously a transfer
+        # (money moving Stripe→bank), never income. needs_review would expose it
+        # to the ingest reclassify pass, where the Tier-3 LLM mislabels
+        # "Stripe payout" as SALES_INCOME — the engine can't represent a transfer
+        # so it must never re-touch one.
+        status=TransactionStatus.AUTO_CLASSIFIED.value,
         confidence=0.9,
         raw_data=_to_dict(payout),
     )

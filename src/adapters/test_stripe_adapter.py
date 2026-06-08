@@ -47,6 +47,7 @@ from src.models.enums import (
     IngestionStatus,
     Source,
     TaxCategory,
+    TransactionStatus,
 )
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
@@ -519,6 +520,16 @@ class TestMapPayout:
         assert tx.direction == Direction.TRANSFER.value
         assert tx.amount == Decimal("99.00")
         assert tx.source_id == "po_test"
+
+    def test_payout_is_auto_classified_not_needs_review(self) -> None:
+        """Regression: a payout must NOT be needs_review — that fed it to the
+        ingest reclassify pass, where the LLM mislabeled "Stripe payout" as
+        SALES_INCOME (13 parent-account payouts wrongly booked as BlackLine
+        sales). It must be transfer + no tax_category + auto_classified."""
+        tx = _map_payout(_fake_payout(payout_id="po_x", amount=10000), Entity.SPARKRY)
+        assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
+        assert tx.tax_category is None
+        assert tx.direction == Direction.TRANSFER.value
 
     def test_payout_date_uses_arrival_date(self) -> None:
         # arrival_date = 2023-11-16 00:00:00 UTC = 1700092800

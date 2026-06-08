@@ -1,6 +1,11 @@
 <script lang="ts">
-	import { fetchTaxSummary, fetchMonthlyBreakdown, downloadExport } from '$lib/api';
-	import type { TaxSummary, MonthlyBreakdown } from '$lib/api';
+	import {
+		fetchTaxSummary,
+		fetchMonthlyBreakdown,
+		fetchRetailDetail,
+		downloadExport
+	} from '$lib/api';
+	import type { TaxSummary, MonthlyBreakdown, RetailDetail } from '$lib/api';
 
 	// ── Constants ─────────────────────────────────────────────────────────────
 
@@ -65,6 +70,9 @@
 	// Per-month, per-category data — the ONLY source for the period breakdown.
 	// (`summary`/tax-summary is whole-year and must NOT drive the period rows.)
 	let monthly = $state<MonthlyBreakdown | null>(null);
+	// Retail (BlackLine) detail: pre-tax gross, interstate deduction, WA-taxable
+	// retailing B&O, and WA retail sales tax to remit by location code.
+	let retail = $state<RetailDetail | null>(null);
 
 	// Step tracker (1=entity, 2=period, 3=summary)
 	let step = $state(1);
@@ -148,6 +156,13 @@
 			.reduce((sum, mo) => sum + (mo.income_unconfirmed ?? 0), 0);
 	});
 
+	/** True when this entity/period has retail sales — drives the corrected
+	 * retailing-B&O view (pre-tax + interstate deduction) and the WA retail
+	 * sales-tax-to-remit section. */
+	let isRetail = $derived<boolean>(
+		!!retail && (retail.gross_retailing > 0 || retail.sales_tax_collected > 0)
+	);
+
 	// ── Filing history (localStorage) ─────────────────────────────────────────
 
 	function getFilingHistory(): Record<string, string> {
@@ -214,15 +229,23 @@
 		loadError = '';
 		summary = null;
 		monthly = null;
+		retail = null;
 		step = 3;
 
+		const periodOpts =
+			frequency === 'monthly'
+				? { month: Number(selectedMonth) }
+				: { quarter: Number(selectedQuarter.replace('Q', '')) };
+
 		try {
-			const [s, m] = await Promise.all([
+			const [s, m, r] = await Promise.all([
 				fetchTaxSummary(selectedEntity, selectedYear),
 				fetchMonthlyBreakdown(selectedEntity, selectedYear),
+				fetchRetailDetail(selectedEntity, selectedYear, periodOpts),
 			]);
 			summary = s;
 			monthly = m;
+			retail = r;
 		} catch (err) {
 			loadError = err instanceof Error ? err.message : 'Failed to load summary';
 		} finally {
@@ -465,33 +488,101 @@
 				</div>
 
 				<!-- B&O tax calculation -->
-				<div class="bno-calc-box">
-					<div class="bno-calc-row">
-						<span class="bno-calc-label">Gross Receipts</span>
-						<span class="bno-calc-value">{formatCurrency(grossReceipts)}</span>
+				{#if isRetail && retail}
+					<!-- Retailing B&O on the correct basis: pre-tax gross, less
+					     out-of-state (interstate) sales, taxed at the retailing rate. -->
+					<div class="bno-calc-box">
+						<div class="bno-calc-row">
+							<span class="bno-calc-label">Retailing gross (pre-tax)</span>
+							<span class="bno-calc-value">{formatCurrency(retail.gross_retailing)}</span>
+						</div>
+						<div class="bno-calc-row">
+							<span class="bno-calc-label">Less: out-of-state sales (interstate deduction)</span>
+							<span class="bno-calc-value">−{formatCurrency(retail.interstate_deduction)}</span>
+						</div>
+						<div class="bno-calc-row">
+							<span class="bno-calc-label">WA taxable retailing</span>
+							<span class="bno-calc-value">{formatCurrency(retail.wa_taxable)}</span>
+						</div>
+						<div class="bno-calc-row">
+							<span class="bno-calc-label">B&O Rate (Retailing)</span>
+							<span class="bno-calc-value">0.471%</span>
+						</div>
+						<div class="bno-calc-divider"></div>
+						<div class="bno-calc-row bno-total-row">
+							<span class="bno-calc-label">Retailing B&O Due</span>
+							<span class="bno-total-value">{formatCurrency(retail.retailing_bo)}</span>
+						</div>
+						<p class="bno-dor-note">
+							DOR Account: <strong>{dorAccount(selectedEntity)}</strong>
+							&nbsp;·&nbsp; File at <a href="https://dor.wa.gov" target="_blank" rel="noopener">dor.wa.gov</a>
+						</p>
 					</div>
-					<div class="bno-calc-row">
-						<span class="bno-calc-label">B&O Rate</span>
-						<span class="bno-calc-value">
-							{#if periodRates.length === 1}
-								{(periodRates[0] * 100).toFixed(3)}%
-							{:else if periodRates.length === 0}
-								—
-							{:else}
-								mixed (per classification)
-							{/if}
-						</span>
+
+					<!-- WA Retail Sales Tax — collected via Shopify, must be remitted
+					     to DOR (Shopify set channel_liable=false). -->
+					{#if retail.sales_tax_collected > 0}
+						<div class="summary-section">
+							<h3 class="summary-section-title">WA Retail Sales Tax — to remit</h3>
+							<table class="summary-table">
+								<thead>
+									<tr>
+										<th>Location (DOR code)</th>
+										<th class="col-right">Taxable sales</th>
+										<th class="col-right">Tax collected</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each retail.by_location as loc}
+										<tr>
+											<td>{loc.location_name} ({loc.location_code})</td>
+											<td class="col-right">{formatCurrency(loc.taxable_amount)}</td>
+											<td class="col-right">{formatCurrency(loc.tax_collected)}</td>
+										</tr>
+									{/each}
+								</tbody>
+								<tfoot>
+									<tr class="summary-total-row">
+										<td>Total sales tax to remit</td>
+										<td class="col-right"></td>
+										<td class="col-right">{formatCurrency(retail.sales_tax_collected)}</td>
+									</tr>
+								</tfoot>
+							</table>
+							<p class="bno-dor-note">
+								Collected at checkout via Shopify (not remitted by Shopify) — owed to WA DOR with this return.
+							</p>
+						</div>
+					{/if}
+				{:else}
+					<div class="bno-calc-box">
+						<div class="bno-calc-row">
+							<span class="bno-calc-label">Gross Receipts</span>
+							<span class="bno-calc-value">{formatCurrency(grossReceipts)}</span>
+						</div>
+						<div class="bno-calc-row">
+							<span class="bno-calc-label">B&O Rate</span>
+							<span class="bno-calc-value">
+								{#if periodRates.length === 1}
+									{(periodRates[0] * 100).toFixed(3)}%
+								{:else if periodRates.length === 0}
+									—
+								{:else}
+									mixed (per classification)
+								{/if}
+							</span>
+						</div>
+						<div class="bno-calc-divider"></div>
+						<div class="bno-calc-row bno-total-row">
+							<span class="bno-calc-label">B&O Tax Due</span>
+							<span class="bno-total-value">{formatCurrency(bnoTaxDue)}</span>
+						</div>
+						<p class="bno-dor-note">
+							DOR Account: <strong>{dorAccount(selectedEntity)}</strong>
+							&nbsp;·&nbsp; File at <a href="https://dor.wa.gov" target="_blank" rel="noopener">dor.wa.gov</a>
+						</p>
 					</div>
-					<div class="bno-calc-divider"></div>
-					<div class="bno-calc-row bno-total-row">
-						<span class="bno-calc-label">B&O Tax Due</span>
-						<span class="bno-total-value">{formatCurrency(bnoTaxDue)}</span>
-					</div>
-					<p class="bno-dor-note">
-						DOR Account: <strong>{dorAccount(selectedEntity)}</strong>
-						&nbsp;·&nbsp; File at <a href="https://dor.wa.gov" target="_blank" rel="noopener">dor.wa.gov</a>
-					</p>
-				</div>
+				{/if}
 
 				<!-- Readiness warning — period-scoped + income-only (only unconfirmed
 				     INCOME in this period can change gross receipts; unconfirmed

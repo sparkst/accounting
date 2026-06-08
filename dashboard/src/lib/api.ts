@@ -629,6 +629,38 @@ export async function fetchMonthlyBreakdown(
 	);
 }
 
+// ── Retail sales tax (BlackLine) ──────────────────────────────────────────────
+
+export interface RetailLocationLine {
+	location_code: string;
+	location_name: string;
+	taxable_amount: number;
+	tax_collected: number;
+}
+
+export interface RetailDetail {
+	entity: string;
+	year: number;
+	period: string;
+	gross_retailing: number;
+	interstate_deduction: number;
+	wa_taxable: number;
+	retailing_bo: number;
+	sales_tax_collected: number;
+	by_location: RetailLocationLine[];
+}
+
+export async function fetchRetailDetail(
+	entity: string,
+	year: number,
+	opts: { month?: number; quarter?: number }
+): Promise<RetailDetail> {
+	let url = `/bno/retail-detail?entity=${encodeURIComponent(entity)}&year=${year}`;
+	if (opts.month !== undefined) url += `&month=${opts.month}`;
+	if (opts.quarter !== undefined) url += `&quarter=${opts.quarter}`;
+	return request<RetailDetail>(url);
+}
+
 export async function fetchTaxSummary(
 	entity: string,
 	year: number,

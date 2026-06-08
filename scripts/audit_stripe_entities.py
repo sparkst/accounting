@@ -59,6 +59,11 @@ def _derived_entity(t: Transaction) -> str | None:
         return "blackline"
     if t.source != "stripe":
         return None
+    # Product override: a "Black Line MTB Apparel" sale belongs to BlackLine even
+    # when it settled in Sparkry's Stripe account (commingled payment). Product
+    # identity beats the collecting account for these.
+    if "black line mtb apparel" in (t.description or "").lower():
+        return "blackline"
     blob = _search_blob(t)
     for suffix, entity in ACCOUNT_ENTITY.items():
         if suffix in blob:

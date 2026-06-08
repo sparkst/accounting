@@ -83,9 +83,9 @@ class Alert:
     entity: str           # "sparkry" | "blackline" | "personal" | "all"
     subject: str          # email subject line
     body_text: str        # plain-text email body (rendered, ready to send)
-    body_html: str | None # optional HTML body
     due_date: str | None  # ISO date the obligation is due (for context/sorting)
     action_url: str       # deep link the recipient clicks to act
+    body_html: str | None = None  # optional HTML body; last because it has a default
 ```
 
 `alert_key` is the *obligation* identity (one per period/invoice). The dedup key for a
@@ -215,6 +215,8 @@ that drops only the new table. Validate with the `alembic-migration` skill.
 - Header **`X-Webhook-Secret`** = Doppler key `N8N_ALERTS_WEBHOOK_SECRET`.
 - n8n **must reject** (HTTP 401) any request whose `X-Webhook-Secret` does not match.
   (Mirrors the existing `N8N_WEBHOOK_SECRET` convention used elsewhere in the stack.)
+- The secret SHOULD be compared using a constant-time equality function (e.g. `crypto.timingSafeEqual` in Node.js) to prevent timing attacks.
+- The secret SHOULD be at least 32 bytes of cryptographically random data.
 
 ### 6.3 Request payload (one POST per alert)
 
@@ -248,6 +250,9 @@ that drops only the new table. Validate with the `alembic-migration` skill.
    retried by the accounting side next day).
 4. Idempotency on n8n's side is **optional** — the accounting system already guarantees
    one send per `(alert_key, occurrence_date)`. n8n may log `alert_key` for traceability.
+5. (Defense in depth) n8n SHOULD also hardcode/allowlist the recipient and reject unknown
+   `to` values — the accounting side enforces an `ALLOWED_TO` set, but a second check in
+   n8n prevents any misconfiguration from routing emails to unintended addresses.
 
 ### 6.5 Response
 - **200** = accepted/sent. Body ignored by the accounting side.

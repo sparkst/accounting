@@ -61,6 +61,8 @@ REQ-ID: REQ-ALERT-006 (dedup uniqueness)
 REQ-ID: REQ-ALERT-010 (table shape)
 """
 
+from __future__ import annotations
+
 from collections.abc import Generator
 
 import pytest
@@ -80,7 +82,8 @@ _Session = sessionmaker(bind=_ENGINE)
 def session() -> Generator[Session, None, None]:
     s = _Session()
     yield s
-    s.rollback()
+    s.query(AlertDispatch).delete()
+    s.commit()
     s.close()
 
 
@@ -114,6 +117,7 @@ def test_alert_key_occurrence_date_is_unique(session: Session) -> None:
     session.add(AlertDispatch(**common))
     with pytest.raises(IntegrityError):
         session.commit()
+    session.rollback()
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -149,6 +153,7 @@ def _new_uuid() -> str:
 
 
 def _now_iso() -> str:
+    # naive UTC string, matches other models
     return datetime.now(UTC).replace(tzinfo=None).isoformat()
 
 
@@ -209,7 +214,8 @@ from src.alerts.models import AlertDispatch  # noqa: F401
 
 - [ ] **Step 2: Register for autogenerate**
 
-In `src/db/alembic/env.py`, after `from src.models.transaction import Transaction  # noqa: F401`, add:
+In `src/db/alembic/env.py`, after `from src.planning.models import PlanningRun  # noqa: F401`
+(the last import in the model-registration block — confirmed at plan time), add:
 
 ```python
 from src.alerts.models import AlertDispatch  # noqa: F401
@@ -314,12 +320,14 @@ REQ-ID: REQ-ALERT-002 (BlackLine quarterly B&O escalation)
 REQ-ID: REQ-ALERT-003 (tax_bo body has account id, period, due date, login url)
 """
 
+from __future__ import annotations
+
 from datetime import date
 
-from src.alerts.rules import compute_tax_alerts
+from src.alerts.rules import Alert, compute_tax_alerts
 
 
-def _by_key(alerts: list) -> dict:
+def _by_key(alerts: list[Alert]) -> dict[str, Alert]:
     return {a.alert_key: a for a in alerts}
 
 
@@ -377,6 +385,29 @@ def test_no_tax_alerts_on_quiet_month_day() -> None:
     # A non-due month (e.g. May) day that is not a Sparkry reminder day.
     alerts = compute_tax_alerts(date(2026, 5, 13))
     assert alerts == []
+
+
+def test_sparkry_silent_after_due_date() -> None:
+    # 2026-05-26 is after the 25th due date — no Sparkry April alert.
+    alerts = compute_tax_alerts(date(2026, 5, 26))
+    assert "tax:sparkry:bo:2026-04" not in _by_key(alerts)
+
+
+def test_blackline_q2_and_q3() -> None:
+    # July 10 → Q2 (Apr-Jun) due 2026-07-31.
+    bl_q2 = _by_key(compute_tax_alerts(date(2026, 7, 10))).get("tax:blackline:bo:2026-Q2")
+    assert bl_q2 is not None
+    assert bl_q2.due_date == "2026-07-31"
+    # October 17 → Q3 (Jul-Sep) due 2026-10-31.
+    bl_q3 = _by_key(compute_tax_alerts(date(2026, 10, 17))).get("tax:blackline:bo:2026-Q3")
+    assert bl_q3 is not None
+    assert bl_q3.due_date == "2026-10-31"
+
+
+def test_blackline_silent_after_due_date() -> None:
+    # May is not a BlackLine due month — no blackline alert.
+    alerts = compute_tax_alerts(date(2026, 5, 1))
+    assert "tax:blackline:bo:2026-Q1" not in _by_key(alerts)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -406,6 +437,10 @@ DOR_LOGIN_URL = "https://secure.dor.wa.gov/home/Login"
 SPARKRY_DOR_ACCOUNT = "605-965-107"
 BLACKLINE_DOR_ACCOUNT = "605-922-410"
 
+
+def _safe(s: str) -> str:
+    return s.replace("\r", "").replace("\n", " ")
+
 # Reminder days within the relevant month.
 SPARKRY_REMINDER_DAYS = (3, 10, 17, 25)
 BLACKLINE_REMINDER_DAYS = (3, 10, 17, 24)  # plus the due date (last day), added below
@@ -421,7 +456,7 @@ class Alert:
     body_text: str
     due_date: str | None
     action_url: str
-    body_html: str | None = None
+    body_html: str | None = None  # last-with-default intentionally; spec §3.1 matches
 
 
 def _last_day(year: int, month: int) -> int:
@@ -510,7 +545,7 @@ def compute_tax_alerts(today: date) -> list[Alert]:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `doppler run -- pytest src/alerts/test_rules.py -v`
-Expected: PASS (7 passed)
+Expected: PASS (10 passed)  <!-- 7 original + test_sparkry_silent_after_due_date + test_blackline_q2_and_q3 + test_blackline_silent_after_due_date -->
 
 - [ ] **Step 5: Commit**
 
@@ -544,6 +579,7 @@ from src.alerts.rules import compute_invoice_alerts  # noqa: E402
 from src.models.base import Base  # noqa: E402
 from src.models.enums import BillingModel  # noqa: E402
 from src.models.invoice import Customer, Invoice  # noqa: E402
+from src.models.transaction import Transaction  # noqa: F401, E402  # registers FK table
 
 _INV_ENGINE = create_engine(
     "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -594,6 +630,12 @@ def test_sweep_fires_on_last_day_of_month(inv_session: Session) -> None:
     assert "invoice:sweep:2026-06" in keys
 
 
+def test_sweep_subject_matches_spec(inv_session: Session) -> None:
+    alerts = compute_invoice_alerts(date(2026, 6, 30), inv_session)
+    sweep = next(a for a in alerts if a.alert_key == "invoice:sweep:2026-06")
+    assert sweep.subject == "Time to create & submit June 2026 invoices"
+
+
 def test_sweep_silent_on_non_last_day(inv_session: Session) -> None:
     alerts = compute_invoice_alerts(date(2026, 6, 29), inv_session)
     keys = {a.alert_key for a in alerts}
@@ -642,6 +684,29 @@ def test_draft_falls_back_to_submitted_date_when_due_missing(inv_session: Sessio
     inv_id = _make_draft(inv_session, number="202606-004", due=None, submitted="2026-06-03")
     alerts = compute_invoice_alerts(date(2026, 6, 4), inv_session)
     assert f"invoice:draft:{inv_id}" in {a.alert_key for a in alerts}
+
+
+def test_sweep_handles_leap_year_february(inv_session: Session) -> None:
+    # 2028 is a leap year; Feb 29 is the last day.
+    alerts = compute_invoice_alerts(date(2028, 2, 29), inv_session)
+    assert "invoice:sweep:2028-02" in {a.alert_key for a in alerts}
+
+
+def test_draft_invoice_all_dates_null_is_skipped(inv_session: Session) -> None:
+    # A draft with due=None, submitted=None (service_period_end default None) must not fire.
+    inv_id = _make_draft(inv_session, number="202606-005", due=None, submitted=None)
+    alerts = compute_invoice_alerts(date(2026, 6, 10), inv_session)
+    assert f"invoice:draft:{inv_id}" not in {a.alert_key for a in alerts}
+
+
+def test_draft_body_contains_customer_name_and_days_outstanding(inv_session: Session) -> None:
+    inv_id = _make_draft(inv_session, number="202606-006", due="2026-06-01", submitted=None)
+    alerts = compute_invoice_alerts(date(2026, 6, 5), inv_session)
+    alert = next(a for a in alerts if a.alert_key == f"invoice:draft:{inv_id}")
+    assert "Cardinal Health" in alert.body_text
+    assert "days outstanding" in alert.body_text
+    assert "sparkry" in alert.body_text
+    assert "100" in alert.body_text
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -656,7 +721,7 @@ Add to the top of `src/alerts/rules.py` (after the existing imports):
 ```python
 from sqlalchemy.orm import Session
 
-from src.models.invoice import Invoice
+from src.models.invoice import Customer, Invoice
 ```
 
 Add these constants near the other module constants:
@@ -690,7 +755,7 @@ def _invoice_sweep_alert(today: date) -> Alert | None:
         occurrence_date=today.isoformat(),
         alert_type="invoice_sweep",
         entity="all",
-        subject=f"Submit {month_label} invoices",
+        subject=f"Time to create & submit {month_label} invoices",
         body_text=body,
         due_date=today.isoformat(),
         action_url=INVOICE_SWEEP_URL,
@@ -707,13 +772,16 @@ def _invoice_draft_alerts(today: date, session: Session) -> list[Alert]:
     today_iso = today.isoformat()
     for inv in drafts:
         reminder_date = _draft_reminder_date(inv)
-        if reminder_date is None or today_iso < reminder_date:
+        if reminder_date is None or today_iso < reminder_date[:10]:
             continue
+        customer = session.get(Customer, inv.customer_id)
+        customer_name = customer.name if customer is not None else "(unknown customer)"
+        days_outstanding = (today - date.fromisoformat(reminder_date[:10])).days
         action_url = INVOICE_DETAIL_URL.format(invoice_id=inv.id)
         body = (
-            f"Draft invoice {inv.invoice_number} ({inv.entity}) for "
-            f"${inv.total} has not been sent.\n"
-            f"Scheduled date: {reminder_date}.\n"
+            f"Draft invoice {_safe(inv.invoice_number)} for {_safe(customer_name)} "
+            f"({_safe(inv.entity)}) totaling ${inv.total} has not been sent.\n"
+            f"Scheduled date: {reminder_date} ({days_outstanding} days outstanding).\n"
             f"Open it: {action_url}"
         )
         out.append(
@@ -722,7 +790,7 @@ def _invoice_draft_alerts(today: date, session: Session) -> list[Alert]:
                 occurrence_date=today_iso,
                 alert_type="invoice_draft",
                 entity=inv.entity,
-                subject=f"Draft invoice {inv.invoice_number} still needs to be sent",
+                subject=f"Draft invoice {_safe(inv.invoice_number)} still needs to be sent",
                 body_text=body,
                 due_date=reminder_date,
                 action_url=action_url,
@@ -744,7 +812,7 @@ def compute_invoice_alerts(today: date, session: Session) -> list[Alert]:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `doppler run -- pytest src/alerts/test_rules.py -v`
-Expected: PASS (all rule tests pass)
+Expected: PASS (all rule tests pass — 10 tax + 11 invoice = 21 total)
 
 - [ ] **Step 5: Commit**
 
@@ -809,7 +877,7 @@ def test_build_payload_has_required_fields() -> None:
 
 
 def test_dry_run_makes_no_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _boom(*a, **k):  # pragma: no cover - must never be called
+    def _boom(*a: object, **k: object) -> None:  # pragma: no cover
         raise AssertionError("network call made during DRY-RUN")
 
     monkeypatch.setattr(httpx, "post", _boom)
@@ -820,14 +888,14 @@ def test_dry_run_makes_no_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_apply_posts_with_secret_header(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
+    captured: dict[str, object] = {}
 
     class _Resp:
-        status_code = 200
-        is_success = True
-        text = "ok"
+        status_code: int = 200
+        is_success: bool = True
+        text: str = "ok"
 
-    def _fake_post(url, json, headers, timeout):  # noqa: A002
+    def _fake_post(url: str, json: dict[str, object], headers: dict[str, str], timeout: float) -> _Resp:
         captured["url"] = url
         captured["json"] = json
         captured["headers"] = headers
@@ -853,11 +921,54 @@ def test_apply_without_config_returns_failed(monkeypatch: pytest.MonkeyPatch) ->
     assert result.http_status is None
 
 
+def test_apply_rejects_non_https_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("N8N_ALERTS_WEBHOOK_URL", "http://n8n.example/webhook/alerts")
+    monkeypatch.setenv("N8N_ALERTS_WEBHOOK_SECRET", "s3cret")
+    result = post_alert(_ALERT, apply=True)
+    assert result.status == "failed"
+    assert result.error == "webhook url must be https"
+
+
+def test_apply_rejects_non_allowlisted_recipient(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALERT_TO_EMAIL", "attacker@evil.com")
+    result = post_alert(_ALERT, apply=False)
+    assert result.status == "failed"
+    assert result.error == "recipient not allowlisted"
+
+
+def test_apply_rejects_non_allowlisted_sender(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALERT_FROM_EMAIL", "spoofed@evil.com")
+    result = post_alert(_ALERT, apply=False)
+    assert result.status == "failed"
+    assert result.error == "sender not allowlisted"
+
+
+def test_build_payload_body_html_is_none_by_default() -> None:
+    payload = build_payload(_ALERT, "Travis@sparkry.com", "ea-alerts@sparkry.com")
+    assert payload["body_html"] is None
+
+
+def test_build_payload_body_html_passes_through() -> None:
+    alert_with_html = Alert(
+        alert_key="tax:sparkry:bo:2026-04",
+        occurrence_date="2026-05-10",
+        alert_type="tax_bo",
+        entity="sparkry",
+        subject="WA B&O due",
+        body_text="plain body",
+        due_date="2026-05-25",
+        action_url="https://secure.dor.wa.gov/home/Login",
+        body_html="<p>html body</p>",
+    )
+    payload = build_payload(alert_with_html, "Travis@sparkry.com", "ea-alerts@sparkry.com")
+    assert payload["body_html"] == "<p>html body</p>"
+
+
 def test_apply_non_2xx_is_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Resp:
-        status_code = 500
-        is_success = False
-        text = "boom"
+        status_code: int = 500
+        is_success: bool = False
+        text: str = "boom"
 
     monkeypatch.setenv("N8N_ALERTS_WEBHOOK_URL", "https://n8n.example/webhook/alerts")
     monkeypatch.setenv("N8N_ALERTS_WEBHOOK_SECRET", "s3cret")
@@ -897,6 +1008,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_FROM = "Travis@sparkry.com"
 DEFAULT_TO = "ea-alerts@sparkry.com"
+ALLOWED_TO = {"ea-alerts@sparkry.com"}  # recipient allowlist — defense-in-depth
+ALLOWED_FROM = {"Travis@sparkry.com"}  # sender allowlist — parity with recipient guard
 
 
 @dataclass(frozen=True)
@@ -906,7 +1019,7 @@ class WebhookResult:
     error: str | None
 
 
-def build_payload(alert: Alert, from_email: str, to_email: str) -> dict:
+def build_payload(alert: Alert, from_email: str, to_email: str) -> dict[str, str | None]:
     return {
         "from": from_email,
         "to": to_email,
@@ -925,18 +1038,23 @@ def build_payload(alert: Alert, from_email: str, to_email: str) -> dict:
 def post_alert(alert: Alert, *, apply: bool, timeout: float = 10.0) -> WebhookResult:
     from_email = os.environ.get("ALERT_FROM_EMAIL", DEFAULT_FROM)
     to_email = os.environ.get("ALERT_TO_EMAIL", DEFAULT_TO)
+    if to_email not in ALLOWED_TO:
+        return WebhookResult("failed", None, "recipient not allowlisted")
+    if from_email not in ALLOWED_FROM:
+        return WebhookResult("failed", None, "sender not allowlisted")
     payload = build_payload(alert, from_email, to_email)
 
     if not apply:
-        logger.info("DRY-RUN alert %s (%s)", alert.alert_key, alert.subject)
+        logger.debug("DRY-RUN alert %s (%s)", alert.alert_key, alert.subject)
         return WebhookResult("dry_run", None, None)
 
     url = os.environ.get("N8N_ALERTS_WEBHOOK_URL", "")
     secret = os.environ.get("N8N_ALERTS_WEBHOOK_SECRET", "")
     if not url or not secret:
-        return WebhookResult(
-            "failed", None, "N8N_ALERTS_WEBHOOK_URL/SECRET not configured"
-        )
+        logger.warning("post_alert: webhook not configured — N8N_ALERTS_WEBHOOK_URL/SECRET missing; --apply runs will fail")
+        return WebhookResult("failed", None, "webhook not configured")
+    if not url.startswith("https://"):
+        return WebhookResult("failed", None, "webhook url must be https")
 
     headers = {"X-Webhook-Secret": secret, "Content-Type": "application/json"}
     # SECURITY: never log the secret value.
@@ -944,17 +1062,19 @@ def post_alert(alert: Alert, *, apply: bool, timeout: float = 10.0) -> WebhookRe
     try:
         resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
     except httpx.HTTPError as exc:
-        return WebhookResult("failed", None, str(exc))
+        logger.debug("n8n webhook network error key=%s: %s", alert.alert_key, exc)
+        return WebhookResult("failed", None, "network error")
 
     if resp.is_success:
         return WebhookResult("sent", resp.status_code, None)
-    return WebhookResult("failed", resp.status_code, resp.text[:500])
+    logger.debug("n8n webhook non-2xx key=%s status=%s", alert.alert_key, resp.status_code)
+    return WebhookResult("failed", resp.status_code, f"http {resp.status_code}")
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `doppler run -- pytest src/alerts/test_webhook.py -v`
-Expected: PASS (5 passed)
+Expected: PASS (10 passed)  <!-- original 5 + test_apply_rejects_non_https_url + test_apply_rejects_non_allowlisted_recipient + test_apply_rejects_non_allowlisted_sender + test_build_payload_body_html_passes_through + test_apply_non_2xx_is_failed -->
 
 - [ ] **Step 5: Commit**
 
@@ -981,6 +1101,8 @@ Create `src/alerts/test_dispatcher.py`:
 REQ-ID: REQ-ALERT-006 (dedup — running twice sends once)
 REQ-ID: REQ-ALERT-008 (per-alert error isolation)
 """
+
+from __future__ import annotations
 
 from collections.abc import Generator
 from datetime import date
@@ -1107,6 +1229,25 @@ def test_exception_in_post_is_isolated(
     summary = dispatch_alerts(session, date(2026, 5, 10), apply=True)
     assert summary.sent == 1
     assert summary.failed == 1
+
+
+def test_dry_run_skips_already_sent(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # First run with apply=True sends the alert.
+    monkeypatch.setattr(
+        dispatcher_mod, "compute_tax_alerts", lambda today: [_alert("k1")]
+    )
+    monkeypatch.setattr(dispatcher_mod, "compute_invoice_alerts", lambda today, s: [])
+    monkeypatch.setattr(
+        dispatcher_mod, "post_alert", lambda a, apply: WebhookResult("sent", 200, None)
+    )
+    dispatch_alerts(session, date(2026, 5, 10), apply=True)
+
+    # DRY-RUN on the same day: already-sent alert is skipped, not counted as dry_run.
+    summary = dispatch_alerts(session, date(2026, 5, 10), apply=False)
+    assert summary.skipped == 1
+    assert summary.dry_run == 0
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1132,6 +1273,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.alerts.models import AlertDispatch
@@ -1159,20 +1301,28 @@ def _already_sent(session: Session, alert: Alert) -> AlertDispatch | None:
 
 def _record(session: Session, alert: Alert, result: WebhookResult) -> None:
     existing = _already_sent(session, alert)
-    row = existing or AlertDispatch(
+    if existing is not None:
+        existing.status = result.status
+        existing.http_status = result.http_status
+        existing.error_detail = result.error
+        session.commit()
+        return
+    row = AlertDispatch(
         alert_key=alert.alert_key,
         occurrence_date=alert.occurrence_date,
         alert_type=alert.alert_type,
         entity=alert.entity,
         subject=alert.subject,
         status=result.status,
+        http_status=result.http_status,
+        error_detail=result.error,
     )
-    row.status = result.status
-    row.http_status = result.http_status
-    row.error_detail = result.error
-    if existing is None:
-        session.add(row)
-    session.commit()
+    try:
+        with session.begin_nested():
+            session.add(row)
+        session.commit()
+    except IntegrityError:
+        pass  # savepoint already rolled back the failed insert; concurrent run won — safe to skip
 
 
 def dispatch_alerts(session: Session, today: date, *, apply: bool) -> DispatchSummary:
@@ -1180,17 +1330,16 @@ def dispatch_alerts(session: Session, today: date, *, apply: bool) -> DispatchSu
     summary = DispatchSummary()
 
     for alert in alerts:
-        if apply:
-            existing = _already_sent(session, alert)
-            if existing is not None and existing.status == "sent":
-                summary.skipped += 1
-                continue
+        existing = _already_sent(session, alert)
+        if existing is not None and existing.status == "sent":
+            summary.skipped += 1
+            continue
 
         try:
             result = post_alert(alert, apply=apply)
-        except Exception as exc:  # noqa: BLE001 — isolate one bad alert
+        except Exception:  # noqa: BLE001 — isolate one bad alert
             logger.exception("alert %s raised during dispatch", alert.alert_key)
-            result = WebhookResult("failed", None, str(exc))
+            result = WebhookResult("failed", None, "dispatch error")
 
         if result.status == "sent":
             summary.sent += 1
@@ -1212,7 +1361,7 @@ def dispatch_alerts(session: Session, today: date, *, apply: bool) -> DispatchSu
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `doppler run -- pytest src/alerts/test_dispatcher.py -v`
-Expected: PASS (4 passed)
+Expected: PASS (5 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -1239,70 +1388,69 @@ Create `src/alerts/test_cli.py`:
 REQ-ID: REQ-ALERT-007 (DRY-RUN is the default; --apply opts in)
 """
 
-import runpy
-import sys
 from datetime import date
 
 import pytest
 
-
-def _run(argv: list[str]) -> None:
-    old = sys.argv
-    sys.argv = ["alerts_dispatch.py", *argv]
-    try:
-        runpy.run_module("scripts.alerts_dispatch", run_name="__main__")
-    finally:
-        sys.argv = old
-
-
-def test_default_is_dry_run(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    captured = {}
-
-    import scripts.alerts_dispatch as cli
-
-    def _fake_dispatch(session, today, *, apply):
-        captured["apply"] = apply
-        captured["today"] = today
-        from src.alerts.dispatcher import DispatchSummary
-
-        return DispatchSummary(dry_run=2)
-
-    monkeypatch.setattr(cli, "dispatch_alerts", _fake_dispatch)
-    monkeypatch.setattr(cli, "init_db", lambda: None)
-    monkeypatch.setattr(cli, "SessionLocal", lambda: _DummySession())
-
-    _run(["--date", "2026-05-10"])
-    assert captured["apply"] is False
-    assert captured["today"] == date(2026, 5, 10)
-
-
-def test_apply_flag_enables_send(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = {}
-    import scripts.alerts_dispatch as cli
-
-    def _fake_dispatch(session, today, *, apply):
-        captured["apply"] = apply
-        from src.alerts.dispatcher import DispatchSummary
-
-        return DispatchSummary(sent=1)
-
-    monkeypatch.setattr(cli, "dispatch_alerts", _fake_dispatch)
-    monkeypatch.setattr(cli, "init_db", lambda: None)
-    monkeypatch.setattr(cli, "SessionLocal", lambda: _DummySession())
-
-    _run(["--apply", "--date", "2026-05-10"])
-    assert captured["apply"] is True
+import scripts.alerts_dispatch as cli
+from src.alerts.dispatcher import DispatchSummary
 
 
 class _DummySession:
     def close(self) -> None:
         pass
+
+
+def test_default_is_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_dispatch(session: object, today: date, *, apply: bool) -> DispatchSummary:
+        captured["apply"] = apply
+        captured["today"] = today
+        return DispatchSummary(dry_run=2)
+
+    monkeypatch.setattr(cli, "dispatch_alerts", _fake_dispatch)
+    monkeypatch.setattr(cli, "init_db", lambda: None)
+    monkeypatch.setattr(cli, "SessionLocal", _DummySession)
+
+    rc = cli.main(["--date", "2026-05-10"])
+    assert rc == 0
+    assert captured["apply"] is False
+    assert captured["today"] == date(2026, 5, 10)
+
+
+def test_apply_flag_enables_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_dispatch(session: object, today: date, *, apply: bool) -> DispatchSummary:
+        captured["apply"] = apply
+        return DispatchSummary(sent=1)
+
+    monkeypatch.setattr(cli, "dispatch_alerts", _fake_dispatch)
+    monkeypatch.setattr(cli, "init_db", lambda: None)
+    monkeypatch.setattr(cli, "SessionLocal", _DummySession)
+
+    rc = cli.main(["--apply", "--date", "2026-05-10"])
+    assert rc == 0
+    assert captured["apply"] is True
+
+
+def test_failed_alerts_return_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_dispatch(session: object, today: date, *, apply: bool) -> DispatchSummary:
+        return DispatchSummary(failed=1)
+
+    monkeypatch.setattr(cli, "dispatch_alerts", _fake_dispatch)
+    monkeypatch.setattr(cli, "init_db", lambda: None)
+    monkeypatch.setattr(cli, "SessionLocal", _DummySession)
+
+    rc = cli.main(["--apply", "--date", "2026-05-10"])
+    assert rc == 1
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `doppler run -- pytest src/alerts/test_cli.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'scripts.alerts_dispatch'`
+Expected: FAIL — `ModuleNotFoundError: No module named 'scripts.alerts_dispatch'` (the CLI file does not exist yet)
 
 - [ ] **Step 3: Implement the CLI**
 
@@ -1341,7 +1489,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--date",
-        type=lambda s: date.fromisoformat(s),
+        type=date.fromisoformat,
         default=None,
         help="Override today's date (YYYY-MM-DD) for testing.",
     )
@@ -1374,7 +1522,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `doppler run -- pytest src/alerts/test_cli.py -v`
-Expected: PASS (2 passed)
+Expected: PASS (3 passed)  <!-- test_default_is_dry_run + test_apply_flag_enables_send + test_failed_alerts_return_nonzero -->
 
 - [ ] **Step 5: Smoke-test the real DRY-RUN against the live DB**
 
@@ -1409,17 +1557,25 @@ Create `deploy/com.sparkry.alerts-dispatch.service`:
 Description=Sparkry accounting — daily EA alert dispatch
 After=network-online.target
 Wants=network-online.target
+# Activated by com.sparkry.alerts-dispatch.timer — not enabled directly (no [Install] needed).
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/accounting
-ExecStart=/usr/bin/doppler run --project accounting --config dev -- \
-    /opt/accounting/.venv/bin/python scripts/alerts_dispatch.py --apply
-# Until N8N_ALERTS_WEBHOOK_URL/SECRET are provisioned, drop --apply to stay DRY-RUN.
+ExecStart=/usr/bin/doppler run --project accounting --config srv -- \
+    /opt/accounting/.venv/bin/python -m scripts.alerts_dispatch --apply
+# Until N8N_ALERTS_WEBHOOK_URL/SECRET are provisioned in accounting/srv,
+# remove --apply to stay DRY-RUN.
+# Doppler keys required in accounting/srv (and accounting/dev for local):
+#   N8N_ALERTS_WEBHOOK_URL, N8N_ALERTS_WEBHOOK_SECRET, ALERT_FROM_EMAIL, ALERT_TO_EMAIL
 ```
 
-> Adjust `WorkingDirectory`, the venv path, and `--config` to match the Hetzner box.
-> Keep `--apply` off until the Doppler webhook keys exist (the job runs DRY-RUN safely).
+> Note: `scripts/` is a Python namespace package (no `__init__.py` required; confirmed
+> by existing `scripts/test_*.py` collected via pytest and `import scripts.auto_pair_transfers`
+> working without one). The `-m scripts.alerts_dispatch` invocation works as-is.
+>
+> Adjust `WorkingDirectory` and the venv path to match the Hetzner box deployment.
+> Keep `--apply` off until the Doppler webhook keys are provisioned (the job runs DRY-RUN safely).
 
 - [ ] **Step 2: Create the systemd timer unit**
 
@@ -1465,10 +1621,13 @@ Create `com.sparkry.alerts-dispatch.plist`:
         <key>Hour</key><integer>7</integer>
         <key>Minute</key><integer>0</integer>
     </dict>
+    <key>WorkingDirectory</key>
+    <string>/Users/travis/SGDrive/dev/accounting</string>
     <key>StandardOutPath</key>
-    <string>/Users/travis/SGDrive/dev/accounting/logs/alerts-dispatch.log</string>
+    <string>/Users/travis/Library/Logs/com.sparkry.alerts-dispatch.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/travis/SGDrive/dev/accounting/logs/alerts-dispatch.err</string>
+    <string>/Users/travis/Library/Logs/com.sparkry.alerts-dispatch.error.log</string>
+    <!-- Remove --apply from ProgramArguments until N8N_ALERTS_WEBHOOK_URL/SECRET are provisioned in accounting/dev. -->
 </dict>
 </plist>
 ```
@@ -1538,6 +1697,18 @@ And add a row to the Local Deployment table:
 ```markdown
 | Alerts Dispatch | `com.sparkry.alerts-dispatch.{service,timer}` | — | Daily EA tax + invoice alert emails via n8n webhook (`scripts/alerts_dispatch.py --apply`). DRY-RUN until `N8N_ALERTS_WEBHOOK_URL/SECRET` provisioned. |
 ```
+
+Also append the four new Doppler keys to the "Keys in `accounting/dev`" list in `CLAUDE.md`:
+
+```
+`N8N_ALERTS_WEBHOOK_URL`, `N8N_ALERTS_WEBHOOK_SECRET`, `ALERT_FROM_EMAIL`,
+`ALERT_TO_EMAIL` — NOT YET PROVISIONED; needed before `--apply`. Also required
+in `accounting/srv` on Hetzner.
+```
+
+Also add an `accounting/srv` bullet to the "Active Doppler configs" list in `CLAUDE.md`
+(it currently lists only `dev`, `prd`, `stg`, `dev_personal`): note it is the Hetzner
+server runtime config that all systemd units inject via `doppler run --config srv`.
 
 - [ ] **Step 4: Commit**
 

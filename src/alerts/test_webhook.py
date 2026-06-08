@@ -4,6 +4,8 @@ REQ-ID: REQ-ALERT-007 (DRY-RUN default — no network without apply)
 REQ-ID: REQ-ALERT-009 (payload shape + secret header)
 """
 
+from typing import cast
+
 import httpx
 import pytest
 
@@ -69,8 +71,8 @@ def test_apply_posts_with_secret_header(monkeypatch: pytest.MonkeyPatch) -> None
     assert result.status == "sent"
     assert result.http_status == 200
     assert captured["url"] == "https://n8n.example/webhook/alerts"
-    assert captured["headers"]["X-Webhook-Secret"] == "s3cret"
-    assert captured["json"]["alert_key"] == "tax:sparkry:bo:2026-04"
+    assert cast(dict[str, object], captured["headers"])["X-Webhook-Secret"] == "s3cret"
+    assert cast(dict[str, object], captured["json"])["alert_key"] == "tax:sparkry:bo:2026-04"
 
 
 def test_apply_without_config_returns_failed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,9 +11,21 @@ import calendar
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from sqlalchemy.orm import Session
+
+from src.models.invoice import Customer, Invoice
+
 DOR_LOGIN_URL = "https://secure.dor.wa.gov/home/Login"
 SPARKRY_DOR_ACCOUNT = "605-965-107"
 BLACKLINE_DOR_ACCOUNT = "605-922-410"
+
+INVOICE_SWEEP_URL = "https://macbook.ancon-cliff.ts.net/invoices"
+INVOICE_DETAIL_URL = "https://macbook.ancon-cliff.ts.net/invoices/{invoice_id}"
+
+RECURRING_BILLERS = (
+    "Cardinal Health (SAP flat-rate, monthly)",
+    "How To Fascinate (calendar-based, hourly)",
+)
 
 
 def _safe(s: str) -> str:
@@ -117,4 +129,74 @@ def compute_tax_alerts(today: date) -> list[Alert]:
         alert = builder(today)
         if alert is not None:
             alerts.append(alert)
+    return alerts
+
+
+def _invoice_sweep_alert(today: date) -> Alert | None:
+    if today.day != _last_day(today.year, today.month):
+        return None
+    month_key = today.strftime("%Y-%m")
+    month_label = today.strftime("%B %Y")
+    checklist = "\n".join(f"  - {b}" for b in RECURRING_BILLERS)
+    body = (
+        f"It's the last day of {month_label} — time to create & submit this "
+        f"month's invoices.\n\nRecurring billers to check:\n{checklist}\n\n"
+        f"Open invoicing: {INVOICE_SWEEP_URL}"
+    )
+    return Alert(
+        alert_key=f"invoice:sweep:{month_key}",
+        occurrence_date=today.isoformat(),
+        alert_type="invoice_sweep",
+        entity="all",
+        subject=f"Time to create & submit {month_label} invoices",
+        body_text=body,
+        due_date=today.isoformat(),
+        action_url=INVOICE_SWEEP_URL,
+    )
+
+
+def _draft_reminder_date(invoice: Invoice) -> str | None:
+    return invoice.due_date or invoice.submitted_date or invoice.service_period_end
+
+
+def _invoice_draft_alerts(today: date, session: Session) -> list[Alert]:
+    drafts = session.query(Invoice).filter(Invoice.status == "draft").all()
+    out: list[Alert] = []
+    today_iso = today.isoformat()
+    for inv in drafts:
+        reminder_date = _draft_reminder_date(inv)
+        if reminder_date is None or today_iso < reminder_date[:10]:
+            continue
+        customer = session.get(Customer, inv.customer_id)
+        customer_name = customer.name if customer is not None else "(unknown customer)"
+        days_outstanding = (today - date.fromisoformat(reminder_date[:10])).days
+        action_url = INVOICE_DETAIL_URL.format(invoice_id=inv.id)
+        body = (
+            f"Draft invoice {_safe(inv.invoice_number)} for {_safe(customer_name)} "
+            f"({_safe(inv.entity)}) totaling ${inv.total} has not been sent.\n"
+            f"Scheduled date: {reminder_date} ({days_outstanding} days outstanding).\n"
+            f"Open it: {action_url}"
+        )
+        out.append(
+            Alert(
+                alert_key=f"invoice:draft:{inv.id}",
+                occurrence_date=today_iso,
+                alert_type="invoice_draft",
+                entity=inv.entity,
+                subject=f"Draft invoice {_safe(inv.invoice_number)} still needs to be sent",
+                body_text=body,
+                due_date=reminder_date,
+                action_url=action_url,
+            )
+        )
+    return out
+
+
+def compute_invoice_alerts(today: date, session: Session) -> list[Alert]:
+    """Return all invoice-submission alerts that fire on `today`."""
+    alerts: list[Alert] = []
+    sweep = _invoice_sweep_alert(today)
+    if sweep is not None:
+        alerts.append(sweep)
+    alerts.extend(_invoice_draft_alerts(today, session))
     return alerts

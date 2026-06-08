@@ -93,3 +93,145 @@ def test_blackline_silent_after_due_date() -> None:
     # May is not a BlackLine due month — no blackline alert.
     alerts = compute_tax_alerts(date(2026, 5, 1))
     assert "tax:blackline:bo:2026-Q1" not in _by_key(alerts)
+
+
+# --- Invoice rules ---------------------------------------------------------
+
+from collections.abc import Generator  # noqa: E402
+
+import pytest  # noqa: E402
+from sqlalchemy import create_engine  # noqa: E402
+from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
+
+from src.alerts.rules import compute_invoice_alerts  # noqa: E402
+from src.models.base import Base  # noqa: E402
+from src.models.enums import BillingModel  # noqa: E402
+from src.models.invoice import Customer, Invoice  # noqa: E402
+from src.models.transaction import Transaction  # noqa: F401, E402  # registers FK table
+
+_INV_ENGINE = create_engine(
+    "sqlite:///:memory:", connect_args={"check_same_thread": False}
+)
+Base.metadata.create_all(_INV_ENGINE)
+_InvSession = sessionmaker(bind=_INV_ENGINE)
+
+
+@pytest.fixture()
+def inv_session() -> Generator[Session, None, None]:
+    s = _InvSession()
+    yield s
+    # Clean rows between tests for isolation.
+    s.query(Invoice).delete()
+    s.query(Customer).delete()
+    s.commit()
+    s.close()
+
+
+def _make_customer(s: Session) -> str:
+    # Customer has no `entity` column; billing_model is required.
+    c = Customer(name="Cardinal Health", billing_model=BillingModel.FLAT_RATE.value)
+    s.add(c)
+    s.commit()
+    return c.id
+
+
+def _make_draft(s: Session, *, number: str, due: str | None, submitted: str | None) -> str:
+    cid = _make_customer(s)
+    inv = Invoice(
+        invoice_number=number,
+        customer_id=cid,
+        entity="sparkry",
+        status="draft",
+        due_date=due,
+        submitted_date=submitted,
+        subtotal=0,
+        total=100,
+    )
+    s.add(inv)
+    s.commit()
+    return inv.id
+
+
+def test_sweep_fires_on_last_day_of_month(inv_session: Session) -> None:
+    alerts = compute_invoice_alerts(date(2026, 6, 30), inv_session)
+    keys = {a.alert_key for a in alerts}
+    assert "invoice:sweep:2026-06" in keys
+
+
+def test_sweep_subject_matches_spec(inv_session: Session) -> None:
+    alerts = compute_invoice_alerts(date(2026, 6, 30), inv_session)
+    sweep = next(a for a in alerts if a.alert_key == "invoice:sweep:2026-06")
+    assert sweep.subject == "Time to create & submit June 2026 invoices"
+
+
+def test_sweep_silent_on_non_last_day(inv_session: Session) -> None:
+    alerts = compute_invoice_alerts(date(2026, 6, 29), inv_session)
+    keys = {a.alert_key for a in alerts}
+    assert "invoice:sweep:2026-06" not in keys
+
+
+def test_sweep_handles_february(inv_session: Session) -> None:
+    alerts = compute_invoice_alerts(date(2026, 2, 28), inv_session)
+    assert "invoice:sweep:2026-02" in {a.alert_key for a in alerts}
+
+
+def test_draft_invoice_fires_daily_from_due_date(inv_session: Session) -> None:
+    inv_id = _make_draft(inv_session, number="202606-001", due="2026-06-05", submitted=None)
+    # On due date.
+    a1 = compute_invoice_alerts(date(2026, 6, 5), inv_session)
+    # A few days later — still draft, still fires.
+    a2 = compute_invoice_alerts(date(2026, 6, 9), inv_session)
+    assert f"invoice:draft:{inv_id}" in {a.alert_key for a in a1}
+    assert f"invoice:draft:{inv_id}" in {a.alert_key for a in a2}
+
+
+def test_draft_invoice_silent_before_due_date(inv_session: Session) -> None:
+    inv_id = _make_draft(inv_session, number="202606-002", due="2026-06-20", submitted=None)
+    alerts = compute_invoice_alerts(date(2026, 6, 1), inv_session)
+    assert f"invoice:draft:{inv_id}" not in {a.alert_key for a in alerts}
+
+
+def test_non_draft_invoice_never_fires(inv_session: Session) -> None:
+    cid = _make_customer(inv_session)
+    inv = Invoice(
+        invoice_number="202606-003",
+        customer_id=cid,
+        entity="sparkry",
+        status="sent",
+        due_date="2026-06-01",
+        subtotal=0,
+        total=100,
+    )
+    inv_session.add(inv)
+    inv_session.commit()
+    alerts = compute_invoice_alerts(date(2026, 6, 10), inv_session)
+    assert f"invoice:draft:{inv.id}" not in {a.alert_key for a in alerts}
+
+
+def test_draft_falls_back_to_submitted_date_when_due_missing(inv_session: Session) -> None:
+    inv_id = _make_draft(inv_session, number="202606-004", due=None, submitted="2026-06-03")
+    alerts = compute_invoice_alerts(date(2026, 6, 4), inv_session)
+    assert f"invoice:draft:{inv_id}" in {a.alert_key for a in alerts}
+
+
+def test_sweep_handles_leap_year_february(inv_session: Session) -> None:
+    # 2028 is a leap year; Feb 29 is the last day.
+    alerts = compute_invoice_alerts(date(2028, 2, 29), inv_session)
+    assert "invoice:sweep:2028-02" in {a.alert_key for a in alerts}
+
+
+def test_draft_invoice_all_dates_null_is_skipped(inv_session: Session) -> None:
+    # A draft with due=None, submitted=None (service_period_end default None) must not fire.
+    inv_id = _make_draft(inv_session, number="202606-005", due=None, submitted=None)
+    alerts = compute_invoice_alerts(date(2026, 6, 10), inv_session)
+    assert f"invoice:draft:{inv_id}" not in {a.alert_key for a in alerts}
+
+
+def test_draft_body_contains_customer_name_and_days_outstanding(inv_session: Session) -> None:
+    inv_id = _make_draft(inv_session, number="202606-006", due="2026-06-01", submitted=None)
+    alerts = compute_invoice_alerts(date(2026, 6, 5), inv_session)
+    alert = next(a for a in alerts if a.alert_key == f"invoice:draft:{inv_id}")
+    assert "Cardinal Health" in alert.body_text
+    assert "days outstanding" in alert.body_text
+    assert "sparkry" in alert.body_text
+    assert "100" in alert.body_text

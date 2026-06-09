@@ -22,8 +22,8 @@ DOR_LOGIN_URL = "https://secure.dor.wa.gov/home/Login"
 SPARKRY_DOR_ACCOUNT = "605-965-107"
 BLACKLINE_DOR_ACCOUNT = "605-922-410"
 
-INVOICE_SWEEP_URL = "https://macbook.ancon-cliff.ts.net/invoices"
-INVOICE_DETAIL_URL = "https://macbook.ancon-cliff.ts.net/invoices/{invoice_id}"
+INVOICE_SWEEP_URL = "https://books.sparkry.ai/invoices"
+INVOICE_DETAIL_URL = "https://books.sparkry.ai/invoices/{invoice_id}"
 
 RECURRING_BILLERS = (
     "Cardinal Health (SAP flat-rate, monthly)",

@@ -49,6 +49,8 @@ from src.models.tax_year_lock import TaxYearLock  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
 
+from src.alerts.models import AlertDispatch  # noqa: F401
+
 _DEFAULT_DB_PATH = "data/accounting.db"
 
 

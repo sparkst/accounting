@@ -501,3 +501,24 @@ Source spec: `docs/superpowers/specs/2026-06-01-planning-engine-design.md`
 | REQ-PLAN-017 | Fixed-seed runs are byte-identical (determinism). |
 | REQ-PLAN-018 | Income calculation supports `biz_income` and `amy_wage_income` as separate parameters with independent end-years; both offset draw while active. v1 defaults: `amy_wage_income=80000`, `amy_wage_years=3`. |
 | REQ-PLAN-019 | `ttm_personal_income` live readout shown alongside `amy_wage_income` planning value for drift inspection (not used to override). |
+
+## REQ-ALERT-* — EA Alert Routing via n8n Webhook (v1)
+
+Push-model daily dispatch: the accounting system computes due WA B&O tax and
+invoice-submission reminders, dedupes them in the `alert_dispatch` ledger, and POSTs
+email-ready payloads to an n8n webhook relay (n8n sends Travis@sparkry.com →
+ea-alerts@sparkry.com). DRY-RUN by default; `--apply` to send.
+Spec: `docs/superpowers/specs/2026-06-07-ea-alert-routing-design.md`.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-ALERT-001 | Sparkry monthly WA B&O reminders fire on the 3rd/10th/17th/25th and stop after the 25th. |
+| REQ-ALERT-002 | BlackLine quarterly WA B&O reminders fire weekly through the due date (4/30, 7/31, 10/31, 1/31; Jan = prior-year Q4). |
+| REQ-ALERT-003 | tax_bo email body carries DOR account ID, filing period, due date, and the My DOR login URL. |
+| REQ-ALERT-004 | Invoice sweep fires once on the last calendar day of the month with the recurring-biller checklist. |
+| REQ-ALERT-005 | Draft invoices remind daily from their reminder_date until status leaves `draft`; one unparseable date never halts the batch. |
+| REQ-ALERT-006 | Dedup: one send per `(alert_key, occurrence_date)` via the `alert_dispatch` UNIQUE constraint. |
+| REQ-ALERT-007 | DRY-RUN is the default; `--apply` opts into POSTing and recording sends. |
+| REQ-ALERT-008 | Per-alert error isolation; a failed POST is recorded `failed` and retried on the next run. |
+| REQ-ALERT-009 | Webhook POST sends the documented payload + `X-Webhook-Secret` header; HTTPS-only; recipient/sender allowlisted. |
+| REQ-ALERT-010 | `alert_dispatch` migration is additive with a clean downgrade (audit invariants preserved). |

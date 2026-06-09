@@ -35,6 +35,15 @@ PLAID_STALE_THRESHOLD = timedelta(hours=48)
 
 router = APIRouter(tags=["health"])
 
+ping_router = APIRouter(tags=["health"])
+
+
+@ping_router.get("/health/ping")
+def health_ping() -> dict[str, bool]:
+    """Minimal readiness probe — no DB, no secrets. Used by the systemd
+    ExecStartPost probe and the external CF uptime Worker."""
+    return {"ok": True}
+
 # All known sources — shown even if no ingestion run has occurred yet.
 _ALL_SOURCES: list[str] = [s.value for s in Source]
 
@@ -410,7 +419,7 @@ _SOURCE_CONFIG: dict[str, dict[str, Any]] = {
         "label": "Shopify",
         "mode": "automated",
         "env_vars": ["SHOPIFY_API_KEY", "SHOPIFY_STORE_URL"],
-        "notes": "Requires Shopify API key and store URL in .env.",
+        "notes": "Requires SHOPIFY_API_KEY and SHOPIFY_STORE_URL in the runtime config.",
     },
     "bank_csv": {
         "label": "Bank CSV",

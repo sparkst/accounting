@@ -6,8 +6,8 @@
 	// (opener) re-initializes with the original link_token plus
 	// `receivedRedirectUri = window.location.href` to finish the flow.
 	//
-	// This page lives at https://accounting-plaid.<tunnel>/admin/connections/oauth-return
-	// (exposed via Cloudflare tunnel; the rest of the dashboard stays Tailscale-only).
+	// This page lives at https://books.sparkry.ai/admin/connections/oauth-return
+	// (served via Cloudflare Tunnel behind Cloudflare Access).
 
 	let message = $state('Completing Plaid authorization…');
 

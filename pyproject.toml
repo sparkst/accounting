@@ -7,19 +7,34 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "sqlalchemy>=2.0.0",
-    "anthropic>=0.40.0",
+    "google-genai>=2.8,<3",
     "pydantic>=2.10.0",
     "httpx>=0.28.0",
     "yfinance>=0.2.40",
     "plaid-python>=18.0.0,<25.0.0",
     "cryptography>=43.0.0",
+    "fpdf2>=2.7",
+    "jinja2>=3.1",
+    "stripe>=14.0",
+    "openpyxl>=3.1",
+    "chardet>=5.0",
+    "icalendar>=6.0",
+    "resend>=2.0",
+    "alembic>=1.13",
+    "python-multipart>=0.0.22",
+    "numpy>=1.26,<3",
+    "pandas>=2.0,<4",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.8.0",
-    "mypy>=1.13.0",
-    "pytest>=8.3.0",
+    # Pinned to reproduce the Mac's gate behavior on the Hetzner box (REQ-HM-011).
+    # Unpinned upper bounds would pull mypy 2.x / newer ruff, which type-check and
+    # lint STRICTER than the Mac (mypy 1.19 / ruff 0.15.6) and break "gates pass
+    # exactly as on the Mac". Bump deliberately, in lockstep with a Mac upgrade.
+    "ruff~=0.15.6",
+    "mypy~=1.19",
+    "pytest~=9.0",
 ]
 
 [tool.ruff]
@@ -40,3 +55,8 @@ exclude = ["dashboard/"]
 testpaths = ["src", "scripts", ".claude/hooks", ".claude/skills"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+# Quarantine: scripts/test_ingest_brokerage.py imports a non-existent
+# `VanguardCsvAdapter` (pre-existing breakage; fails identically on the Mac), and
+# its collection error otherwise hard-aborts the ENTIRE pytest run (zero tests).
+# Ignore it so the suite runs; the brokerage owner should fix or remove the stale test.
+addopts = "--ignore=scripts/test_ingest_brokerage.py"

@@ -420,15 +420,15 @@ class TestTier2Patterns:
 
 
 def _make_mock_client(response_json: dict[str, Any]) -> MagicMock:
-    """Build a mock Anthropic client that returns *response_json* as text."""
-    mock_content = MagicMock()
-    mock_content.text = json.dumps(response_json)
-
+    """Build a mock Gemini client that returns *response_json* as text."""
     mock_response = MagicMock()
-    mock_response.content = [mock_content]
+    mock_response.text = json.dumps(response_json)
+    mock_response.usage_metadata.prompt_token_count = 100
+    mock_response.usage_metadata.candidates_token_count = 50
+    mock_response.model_version = "gemini-2.5-flash-lite"
 
     mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_response
+    mock_client.models.generate_content.return_value = mock_response
 
     return mock_client
 
@@ -521,12 +521,10 @@ class TestTier3LLMClassifier:
         assert "Invalid tax_category" in result.reasoning
 
     def test_malformed_json_falls_back(self) -> None:
-        mock_content = MagicMock()
-        mock_content.text = "This is not JSON at all."
         mock_response = MagicMock()
-        mock_response.content = [mock_content]
+        mock_response.text = "This is not JSON at all."
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_client.models.generate_content.return_value = mock_response
 
         txn = _make_transaction(description="Mystery vendor")
         result = llm_classify(txn, _client=mock_client)
@@ -535,19 +533,17 @@ class TestTier3LLMClassifier:
         assert "JSON parse error" in result.reasoning
 
     def test_markdown_fenced_json_is_parsed(self) -> None:
-        """Claude sometimes wraps output in ```json ... ``` fences."""
-        mock_content = MagicMock()
-        mock_content.text = (
+        """Gemini sometimes wraps output in ```json ... ``` fences — _parse_response strips them."""
+        mock_response = MagicMock()
+        mock_response.text = (
             "```json\n"
             '{"entity": "sparkry", "tax_category": "OFFICE_EXPENSE", '
             '"direction": "expense", "confidence": 0.82, '
             '"reasoning": "Office supply purchase."}\n'
             "```"
         )
-        mock_response = MagicMock()
-        mock_response.content = [mock_content]
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = mock_response
+        mock_client.models.generate_content.return_value = mock_response
 
         txn = _make_transaction(description="Staples office supplies")
         result = llm_classify(txn, _client=mock_client)
@@ -557,19 +553,17 @@ class TestTier3LLMClassifier:
         assert result.confidence == pytest.approx(0.82)
 
     def test_api_error_returns_low_confidence(self) -> None:
-        import anthropic as _anthropic
+        from google.genai import errors as genai_errors
 
         mock_client = MagicMock()
-        mock_client.messages.create.side_effect = _anthropic.APIStatusError(
-            "rate limit",
-            response=MagicMock(status_code=429),
-            body={},
+        mock_client.models.generate_content.side_effect = genai_errors.ClientError(
+            429, {"error": {"message": "rate limit", "status": "RESOURCE_EXHAUSTED"}}
         )
         txn = _make_transaction(description="Any vendor")
         result = llm_classify(txn, _client=mock_client)
 
         assert result.confidence == 0.0
-        assert "API error" in result.reasoning
+        assert "Gemini API error" in result.reasoning
 
     def test_parse_response_confidence_clamped(self) -> None:
         raw = json.dumps(
@@ -623,6 +617,64 @@ class TestClassificationEngine:
         assert result.entity == Entity.BLACKLINE
         assert result.tax_category == TaxCategory.SALES_INCOME
         mock_llm.assert_not_called()
+
+    def test_plaid_outflow_never_classified_income(self, seeded_session: Session) -> None:
+        """Guard: an authoritative-signed outflow (Plaid, amount < 0) that a tier
+        labels as income is overridden to OTHER_EXPENSE + needs_review.
+
+        Regression for the Amex 'CLAUDE.AI SUBSCRIPTION' -220.60 charges that
+        keyword-matched SUBSCRIPTION_INCOME and inflated Sparkry B&O gross via
+        the abs(amount) tax aggregation.
+        """
+        txn = _make_transaction(
+            description="Mystery Vendor QQQ no-rule-match",
+            source=Source.PLAID.value,
+            amount=Decimal("-220.60"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.direction == Direction.EXPENSE
+        assert result.tax_category not in {
+            TaxCategory.CONSULTING_INCOME,
+            TaxCategory.SUBSCRIPTION_INCOME,
+            TaxCategory.SALES_INCOME,
+            TaxCategory.WHOLESALE_INCOME,
+        }
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+        assert "outflow" in (result.review_reason or "").lower()
+
+    def test_gmail_negative_income_not_overridden(self, seeded_session: Session) -> None:
+        """The guard must NOT touch Gmail: that adapter stores income as
+        -abs(amount) *before* classification sets direction=income, so a
+        negative Gmail amount classified as income is correct, not a mismatch.
+        """
+        txn = _make_transaction(
+            description="Stripe payout deposit receipt",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-500.00"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SALES_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="receipt body indicates income",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.direction == Direction.INCOME
+        assert result.tax_category == TaxCategory.SALES_INCOME
 
     def test_tier3_reached_for_unknown_vendor(self, seeded_session: Session) -> None:
         """Unknown vendor that matches no rule or pattern escalates to Tier 3."""
@@ -693,6 +745,40 @@ class TestClassificationEngine:
             assert txn.status == TransactionStatus.AUTO_CLASSIFIED.value
             assert txn.review_reason is None
 
+    def test_apply_result_preserves_entity_for_stripe(self) -> None:
+        """Stripe entity is set authoritatively by the adapter (per-account key);
+        classification must NOT reassign it. Regression for parent-account
+        Substack charges/fees/payouts being relabeled BlackLine by the LLM."""
+        txn = _make_transaction(description="STRIPE charge", source=Source.STRIPE.value)
+        txn.entity = Entity.SPARKRY.value  # adapter set this from the account key
+        result = ClassificationResult(
+            entity=Entity.BLACKLINE,  # the LLM's (wrong) guess
+            tax_category=TaxCategory.SALES_INCOME,
+            direction=Direction.INCOME,
+            confidence=0.9,
+            tier_used=3,
+            reasoning="LLM guess",
+        )
+        apply_result(txn, result)
+        assert txn.entity == Entity.SPARKRY.value  # preserved, not overwritten
+        assert txn.tax_category == TaxCategory.SALES_INCOME.value  # category still applied
+
+    def test_apply_result_sets_entity_for_non_authoritative_source(self) -> None:
+        """For gmail/bank the adapter can't know the entity, so classification
+        legitimately assigns it."""
+        txn = _make_transaction(description="bank row", source=Source.BANK_CSV.value)
+        txn.entity = None
+        result = ClassificationResult(
+            entity=Entity.BLACKLINE,
+            tax_category=TaxCategory.SALES_INCOME,
+            direction=Direction.INCOME,
+            confidence=0.9,
+            tier_used=1,
+            reasoning="rule",
+        )
+        apply_result(txn, result)
+        assert txn.entity == Entity.BLACKLINE.value
+
     def test_apply_result_sets_review_reason_when_needed(self) -> None:
         txn = _make_transaction(description="Unknown")
         result = ClassificationResult(
@@ -731,7 +817,7 @@ class TestClassificationEngine:
         )
 
         with patch(
-            "src.classification.llm_classifier.anthropic.Anthropic",
+            "src.classification.llm_classifier.genai.Client",
             return_value=mock_client,
         ):
             result = classify(txn, seeded_session)

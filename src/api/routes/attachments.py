@@ -10,8 +10,8 @@ JSON array.
 
 from __future__ import annotations
 
-import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,12 +27,18 @@ router = APIRouter(tags=["attachments"])
 
 # Only serve files from these trusted directories
 _ALLOWED_ROOTS = [
-    Path("/Users/travis/SGDrive/LIVE_SYSTEM/accounting"),
-    Path("/Users/travis/SGDrive/dev/accounting/data"),
+    Path(p)
+    for p in (
+        os.environ.get("ATTACHMENT_ROOTS")
+        or "/Users/travis/SGDrive/LIVE_SYSTEM/accounting:/Users/travis/SGDrive/dev/accounting/data"
+    ).split(os.pathsep)
+    if p
 ]
 
 # Where uploaded receipts are saved
-_RECEIPTS_ROOT = Path("/Users/travis/SGDrive/dev/accounting/data/receipts")
+_RECEIPTS_ROOT = Path(
+    os.environ.get("RECEIPTS_ROOT", "/Users/travis/SGDrive/dev/accounting/data/receipts")
+)
 
 _ALLOWED_UPLOAD_MIME = {
     "image/jpeg",
@@ -65,12 +71,21 @@ _MIME_MAP = {
 
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MB
 
+# Module-level singleton (avoids B008 — no function call in a default arg).
+_UPLOAD_FILE = File(...)
+
 
 def _is_safe_path(path: Path) -> bool:
-    """Verify path is under an allowed root and doesn't escape via symlinks."""
+    """Verify path is under an allowed root and doesn't escape via symlinks.
+
+    Uses ``Path.is_relative_to`` (not ``str.startswith``) so a sibling directory
+    whose name merely shares a prefix with a root — e.g. ``<root>-backup`` vs
+    ``<root>`` — cannot pass the guard. Both operands are ``.resolve()``-d, so
+    symlink escapes are also caught.
+    """
     resolved = path.resolve()
     return any(
-        str(resolved).startswith(str(root.resolve()))
+        resolved.is_relative_to(root.resolve())
         for root in _ALLOWED_ROOTS
     )
 
@@ -105,7 +120,7 @@ async def serve_attachment(path: str) -> FileResponse:
 @router.post("/transactions/{transaction_id}/upload-receipt")
 async def upload_receipt(
     transaction_id: str,
-    file: UploadFile = File(...),
+    file: UploadFile = _UPLOAD_FILE,
 ) -> JSONResponse:
     """Upload a receipt file and attach it to a transaction.
 
@@ -123,7 +138,7 @@ async def upload_receipt(
         raise HTTPException(status_code=400, detail="Invalid transaction ID format")
     # Resolve and verify path stays within receipts root
     dest_dir_check = (_RECEIPTS_ROOT / transaction_id).resolve()
-    if not str(dest_dir_check).startswith(str(_RECEIPTS_ROOT.resolve())):
+    if not dest_dir_check.is_relative_to(_RECEIPTS_ROOT.resolve()):
         raise HTTPException(status_code=400, detail="Invalid transaction ID")
 
     # Validate content type

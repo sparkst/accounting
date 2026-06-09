@@ -5,10 +5,14 @@ from __future__ import annotations
 import csv
 import io
 
+import pytest
+
 from src.export.bno_tax import (
+    DOR_LINE_CODES,
     build_blackline_bno_csv,
     build_sparkry_bno_csv,
     generate_bno_export,
+    generate_dor_upload,
 )
 
 # ---------------------------------------------------------------------------
@@ -226,3 +230,108 @@ class TestGenerateBnoExport:
     def test_blackline_filename(self):
         _, filename = generate_bno_export([], "blackline", 2025)
         assert filename == "bno_blackline_2025.csv"
+
+
+# ---------------------------------------------------------------------------
+# Tests: generate_dor_upload (WA DOR My DOR data-upload file)
+# ---------------------------------------------------------------------------
+
+
+class TestDorUploadLineCodes:
+    """Line codes must match the WA Combined Excise Tax Return 'Code' column."""
+
+    def test_service_other_is_code_40(self):
+        # Service & Other Activities (<$1M) = code 40, NOT 7 (07 = Manufacturing).
+        assert DOR_LINE_CODES["ServiceOther"] == 40
+
+    def test_retailing_is_code_2(self):
+        assert DOR_LINE_CODES["Retailing"] == 2
+
+    def test_wholesaling_is_code_3(self):
+        assert DOR_LINE_CODES["Wholesaling"] == 3
+
+
+class TestDorUploadMonthly:
+    def test_monthly_period_is_mmyyyy(self):
+        # Sparkry Feb 2025: one consulting charge → Service & Other (code 40).
+        content, filename = generate_dor_upload(
+            SPARKRY_TRANSACTIONS, "sparkry", 2025, month=2
+        )
+        rows = [r.split(",") for r in content.strip().split("\n")]
+        account = rows[0]
+        assert account[0] == "ACCOUNT"
+        assert account[1] == "605965107"  # dashes removed
+        assert account[2] == "022025"  # MMYYYY
+        tax = rows[1]
+        assert tax[0] == "TAX"
+        assert tax[1] == "40"  # Service & Other, not 7
+        assert tax[2] == "0"  # B&O location code
+        assert tax[3] == "10000.00"
+
+    def test_monthly_filename(self):
+        _, filename = generate_dor_upload([], "sparkry", 2026, month=4)
+        assert filename == "dor_upload_sparkry_2026_04.csv"
+
+    def test_empty_month_emits_zero_service_line_for_sparkry(self):
+        content, _ = generate_dor_upload([], "sparkry", 2026, month=4)
+        tax = content.strip().split("\n")[1].split(",")
+        assert tax == ["TAX", "40", "0", "0.00"]
+
+
+class TestDorUploadQuarterly:
+    def test_quarterly_period_is_qnyyyy(self):
+        # BlackLine Q1 2025: SALES_INCOME 5000+6000+4000 = 15000 → Retailing (2).
+        content, filename = generate_dor_upload(
+            BLACKLINE_TRANSACTIONS, "blackline", 2025, quarter=1
+        )
+        rows = [r.split(",") for r in content.strip().split("\n")]
+        assert rows[0][1] == "605922410"
+        assert rows[0][2] == "Q12025"  # Q#YYYY
+        tax = rows[1]
+        assert tax[0] == "TAX"
+        assert tax[1] == "2"  # Retailing
+        assert tax[3] == "15000.00"  # quarter sum
+        assert filename == "dor_upload_blackline_2025_Q1.csv"
+
+    def test_empty_quarter_emits_zero_retailing_line_for_blackline(self):
+        content, _ = generate_dor_upload([], "blackline", 2026, quarter=2)
+        tax = content.strip().split("\n")[1].split(",")
+        assert tax == ["TAX", "2", "0", "0.00"]
+
+    def test_requires_exactly_one_of_month_or_quarter(self):
+        with pytest.raises(ValueError):
+            generate_dor_upload([], "sparkry", 2026)
+        with pytest.raises(ValueError):
+            generate_dor_upload([], "sparkry", 2026, month=1, quarter=1)
+
+
+class TestDorUploadRetailSalesTax:
+    """A WA retail order must emit pre-tax B&O + state + local sales-tax lines."""
+
+    def _wa_order(self) -> dict:
+        # $100 incl $9.30 WA tax → $90.70 pre-tax, Sammamish (1739).
+        return {
+            "date": "2026-01-15",
+            "amount": "100.00",
+            "tax_category": "SALES_INCOME",
+            "source": "shopify",
+            "raw_data": {
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": "Sammamish"},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": "Sammamish City Tax"},
+                ],
+            },
+        }
+
+    def test_retail_upload_has_pretax_bo_and_sales_tax_lines(self):
+        content, _ = generate_dor_upload([self._wa_order()], "blackline", 2026, quarter=1)
+        tax_lines = [r.split(",") for r in content.strip().split("\n") if r.startswith("TAX")]
+        # B&O Retailing (code 2) on the PRE-TAX basis, not the $100 tax-inclusive.
+        assert ["TAX", "2", "0", "90.70"] in tax_lines
+        # State retail sales tax (code 1) on the taxable amount.
+        assert ["TAX", "1", "0", "90.70"] in tax_lines
+        # Local sales tax (code 45) at the Sammamish location code.
+        assert ["TAX", "45", "1739", "90.70"] in tax_lines

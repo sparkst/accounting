@@ -24,6 +24,7 @@ from src.api.auth import require_api_key
 from src.api.routes.attachments import router as attachments_router
 from src.api.routes.brokerage import router as brokerage_router
 from src.api.routes.csv_import import router as csv_import_router
+from src.api.routes.health import ping_router as health_ping_router
 from src.api.routes.health import router as health_router
 from src.api.routes.ingest import router as ingest_router
 from src.api.routes.invoices import router as invoices_router
@@ -48,6 +49,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     Runs startup tasks before yielding, then teardown after.
     """
+    from src.api._startup_assert import assert_production_secrets
+
+    assert_production_secrets()
     logger.info("Starting accounting API — initialising database …")
     init_db()
     with SessionLocal() as session:
@@ -141,6 +145,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://books.sparkry.ai",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -151,17 +156,20 @@ app.add_middleware(
 # Routers
 # ---------------------------------------------------------------------------
 
-# Health is always public (no auth dependency) so monitoring tools can reach it.
-app.include_router(health_router, prefix="/api")
+# Only the minimal ping is public (CF Access guards it at the edge).
+app.include_router(health_ping_router, prefix="/api")
 
 # All other routers require API key auth when API_KEY env var is set.
 _auth = [Depends(require_api_key)]
+
+# Rich health + source-config are dashboard diagnostics → behind API_KEY.
+app.include_router(health_router, prefix="/api", dependencies=_auth)
 
 app.include_router(attachments_router, prefix="/api", dependencies=_auth)
 app.include_router(brokerage_router, prefix="/api", dependencies=_auth)
 app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
 app.include_router(transactions_router, prefix="/api", dependencies=_auth)
-app.include_router(ingest_router, prefix="/api", dependencies=_auth)
+app.include_router(ingest_router, prefix="/api")
 app.include_router(invoices_router, prefix="/api", dependencies=_auth)
 app.include_router(planning_router, prefix="/api", dependencies=_auth)
 app.include_router(plaid_router, prefix="/api", dependencies=_auth)

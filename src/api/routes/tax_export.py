@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from src.api.deps import get_db
 from src.export.bno_tax import generate_bno_export, generate_dor_upload
 from src.export.freetaxusa import generate_freetaxusa_export
+from src.export.retail_sales_tax import compute_retail_detail
 from src.export.taxact import generate_taxact_export
 from src.models.enums import Entity, TransactionStatus
 from src.models.transaction import Transaction
@@ -701,6 +702,10 @@ def get_monthly_breakdown(
 
     # Accumulate: month_num -> category -> deductible total
     month_cat: dict[int, dict[str, Decimal]] = {m: {} for m in range(1, 13)}
+    # Count of unconfirmed (needs_review) INCOME rows per month — drives a
+    # period-scoped, income-only readiness warning in the B&O wizard. Unconfirmed
+    # *expense* rows never change gross receipts, so they are excluded here.
+    month_income_unconfirmed: dict[int, int] = dict.fromkeys(range(1, 13), 0)
 
     for tx in transactions:
         cat = tx.tax_category
@@ -720,6 +725,9 @@ def get_monthly_breakdown(
 
         bucket = month_cat[month_num]
         bucket[cat] = bucket.get(cat, Decimal("0")) + deductible
+
+        if cat in INCOME_CATEGORIES and tx.status not in CONFIRMED_STATUSES:
+            month_income_unconfirmed[month_num] += 1
 
     # Determine today so we only emit months up to the current month for the
     # current year (avoids confusing all-zero future months).
@@ -750,9 +758,63 @@ def get_monthly_breakdown(
                     "is_reimbursable": is_reimbursable,
                 }
             )
-        months_out.append({"month": f"{year}-{m:02d}", "categories": categories})
+        months_out.append({
+            "month": f"{year}-{m:02d}",
+            "categories": categories,
+            "income_unconfirmed": month_income_unconfirmed[m],
+        })
 
     return {"entity": entity, "year": year, "months": months_out}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/bno/retail-detail — WA retail sales tax + retailing-B&O detail
+# ---------------------------------------------------------------------------
+
+
+@router.get("/bno/retail-detail")
+def get_retail_detail(
+    entity: str = Query(..., description="Entity (retail only: blackline)"),
+    year: int = Query(..., description="Tax year"),
+    month: int | None = Query(default=None, ge=1, le=12),
+    quarter: int | None = Query(default=None, ge=1, le=4),
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Per-period retail detail: pre-tax retailing gross, interstate deduction,
+    WA-taxable amount + retailing B&O, and WA retail sales tax collected (to
+    remit) broken down by WA DOR location code.
+    """
+    entity = _validate_entity(entity)
+    _validate_year(year)
+    if (month is None) == (quarter is None):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide exactly one of month or quarter.",
+        )
+
+    transactions = _fetch_transactions(session, entity, year)
+    tx_dicts = [_tx_to_dict(tx) for tx in transactions]
+    d = compute_retail_detail(tx_dicts, year, month=month, quarter=quarter)
+
+    return {
+        "entity": entity,
+        "year": year,
+        "period": f"{month:02d}" if month is not None else f"Q{quarter}",
+        "gross_retailing": float(d.gross_retailing),
+        "interstate_deduction": float(d.interstate_deduction),
+        "wa_taxable": float(d.wa_taxable),
+        "retailing_bo": float(d.retailing_bo),
+        "sales_tax_collected": float(d.sales_tax_collected),
+        "by_location": [
+            {
+                "location_code": li.location_code,
+                "location_name": li.location_name,
+                "taxable_amount": float(li.taxable_amount),
+                "tax_collected": float(li.tax_collected),
+            }
+            for li in d.by_location
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1015,7 +1077,13 @@ def export_bno(
         default=None,
         ge=1,
         le=12,
-        description="Month (1-12) for single-month filing (DOR format)",
+        description="Month (1-12) for single-month DOR filing (monthly filers)",
+    ),
+    quarter: int | None = Query(
+        default=None,
+        ge=1,
+        le=4,
+        description="Quarter (1-4) for single-quarter DOR filing (quarterly filers)",
     ),
     format: str = Query(
         default="summary",
@@ -1029,8 +1097,8 @@ def export_bno(
     BlackLine: quarterly breakdown (4 rows per classification).
     Adds a WARNING row if >20% of transactions are unconfirmed.
 
-    With format=dor and month=N, returns a WA DOR My DOR Data Upload file
-    for the specified single month.
+    With format=dor, returns a WA DOR My DOR Data Upload file for a single
+    period — pass month=N (monthly filers) or quarter=N (quarterly filers).
     """
     entity = _validate_entity(entity)
     _validate_year(year)
@@ -1046,14 +1114,16 @@ def export_bno(
 
     tx_dicts = [_tx_to_dict(tx) for tx in transactions]
 
-    # DOR upload format (single-month filing)
+    # DOR upload format (single filing period — month OR quarter)
     if format.lower() == "dor":
-        if month is None:
+        if (month is None) == (quarter is None):
             raise HTTPException(
                 status_code=422,
-                detail="month parameter is required for DOR upload format.",
+                detail="DOR upload requires exactly one of month or quarter.",
             )
-        content, filename = generate_dor_upload(tx_dicts, entity, year, month)
+        content, filename = generate_dor_upload(
+            tx_dicts, entity, year, month=month, quarter=quarter
+        )
         return Response(
             content=content,
             media_type="text/csv; charset=utf-8",

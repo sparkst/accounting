@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -196,9 +197,13 @@ class DeductionEmailAdapter(BaseAdapter):
     )
 
     def __init__(self, source_dirs: list[str] | None = None) -> None:
-        self._dirs: list[Path] = [
-            Path(d) for d in (source_dirs or list(self._DEFAULT_DIRS))
-        ]
+        env_dirs = os.environ.get("DEDUCTION_DIR")
+        default_dirs = (
+            [d for d in env_dirs.split(os.pathsep) if d]
+            if env_dirs
+            else list(self._DEFAULT_DIRS)
+        )
+        self._dirs: list[Path] = [Path(d) for d in (source_dirs or default_dirs)]
 
     @property
     def source(self) -> str:

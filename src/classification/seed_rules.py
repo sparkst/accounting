@@ -263,6 +263,20 @@ _SEED_RULES: list[_RuleDef] = [
         confidence=0.95,
         examples=40,
     ),
+    # Shopify monthly PLATFORM/HOSTING fee — "SHOPIFY* <digits>" on the card —
+    # is a website-hosting EXPENSE, not sales income. The asterisk distinguishes
+    # it from the payout ("SHOPIFYPMT") and order ("Shopify Order #") income,
+    # which lack one. examples=41 so it outranks the generic \bshopify\b income
+    # rule (examples=40) when both match the "SHOPIFY*" charge string.
+    _RuleDef(
+        vendor_pattern=r"shopify\s*\*",
+        entity=Entity.BLACKLINE,
+        tax_category=TaxCategory.SUPPLIES,
+        direction=Direction.EXPENSE,
+        tax_subcategory=TaxSubcategory.ECOMMERCE_PLATFORM,
+        confidence=0.97,
+        examples=41,
+    ),
     # Ecommerce platforms
     _RuleDef(
         vendor_pattern=r"woocommerce",

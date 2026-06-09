@@ -92,6 +92,19 @@ def _get_plaid_client() -> Any:
     return make_plaid_client()
 
 
+def _plaid_redirect_uri() -> str | None:
+    """REQ-HM-007: OAuth redirect URI for production banks (e.g. Chase).
+
+    Sent on the LinkTokenCreateRequest only when ``PLAID_REDIRECT_URI`` is set.
+    The env var is always honoured regardless of ``PLAID_ENV`` so staging
+    environments that want OAuth can also use it.  Local sandbox runs without
+    the var remain unaffected.
+    """
+    import os
+
+    return os.environ.get("PLAID_REDIRECT_URI") or None
+
+
 # ── Request / response models ────────────────────────────────────────────────
 
 
@@ -276,7 +289,7 @@ def create_link_token(
     session.flush()  # need placeholder.id for the Plaid request user payload
 
     client = _get_plaid_client()
-    req = LinkTokenCreateRequest(
+    req_kwargs: dict[str, Any] = dict(
         user=LinkTokenCreateRequestUser(client_user_id=placeholder.id),
         client_name="Travis Accounting",
         # ``balance`` is intentionally omitted: Plaid rejects it in any product
@@ -287,6 +300,10 @@ def create_link_token(
         country_codes=[CountryCode("US")],
         language="en",
     )
+    _redirect = _plaid_redirect_uri()
+    if _redirect:
+        req_kwargs["redirect_uri"] = _redirect  # REQ-HM-007: Chase OAuth
+    req = LinkTokenCreateRequest(**req_kwargs)
     resp = client.link_token_create(req)
     session.commit()
     return LinkTokenResponse(
@@ -531,13 +548,17 @@ def relink_item(
     item.state_nonce_expires_at = expires_at
 
     client = _get_plaid_client()
-    req = LinkTokenCreateRequest(
+    req_kwargs: dict[str, Any] = dict(
         user=LinkTokenCreateRequestUser(client_user_id=item.id),
         client_name="Travis Accounting",
         country_codes=[CountryCode("US")],
         language="en",
         access_token=access_token,  # update-mode signal
     )
+    _redirect = _plaid_redirect_uri()
+    if _redirect:
+        req_kwargs["redirect_uri"] = _redirect  # REQ-HM-007: Chase OAuth
+    req = LinkTokenCreateRequest(**req_kwargs)
     resp = client.link_token_create(req)
     session.commit()
     return LinkTokenResponse(

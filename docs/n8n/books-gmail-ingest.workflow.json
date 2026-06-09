@@ -1,0 +1,265 @@
+{
+  "name": "ST-Accounting / Gmail Receipts → books.sparkry.ai",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Accounting receipt ingestion → Hetzner box\n\nGmail receipt → build receipt JSON → POST /api/ingest/gmail (behind Cloudflare Access).\nReplaces the old Mac flow (n8n → Google Drive → SGDrive → data/inbox).\n\n### This is the REPO copy (safe to commit — secret placeholders, not live values)\n- **Gmail Trigger** credential = `Sparkry Gmail` (id UkRZygJdoRQl7US1). Resolves on the live n8n instance.\n- **CF-Access-Client-Id** is the real (non-secret) public client id.\n- The two HTTP nodes carry `REPLACE_WITH_*` placeholders for `CF_ACCESS_INGEST_CLIENT_SECRET` and `INGEST_API_KEY` (Doppler accounting/srv).\n\n### To run from this file\n1. Import, then replace the two placeholder header values with the Doppler secrets.\n2. Gmail filter `q` is set to `label:accounting-receipts OR to:travis+accounting@sparkry.com` — adjust to taste.\n3. **Build Receipt** (Code): verify field mapping vs your Gmail node output; double-check `body_text` resolves (drives amount extraction).\n\n### Deployed state (live)\nWorkflow `nr0j4Lt8ppGckywg` on n8n.sparkry.ai, active. n8n's Render egress IP is allowlisted in Cloudflare (Bot Fight Mode bypass); the companion `egress-ip-autoheal.workflow.json` keeps that rule in sync.",
+        "height": 460,
+        "width": 420,
+        "color": 4
+      },
+      "id": "note-setup",
+      "name": "Setup notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -368,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {
+          "q": "label:accounting-receipts OR to:travis+accounting@sparkry.com "
+        },
+        "options": {
+          "downloadAttachments": true
+        }
+      },
+      "id": "gmail-trigger",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        144,
+        320
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "UkRZygJdoRQl7US1",
+          "name": "Sparkry Gmail"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Map the Gmail message to the accounting receipt contract.\n// NOTE: with simple:false the field names depend on your Gmail node version —\n// verify each value below resolves (especially body_text). Adjust as needed.\nconst m = $json;\nconst id = String(m.id || m.messageId || m.threadId || '');\nconst from = m.From || m.from || (m.headers && m.headers.from) || '';\nconst subject = m.Subject || m.subject || (m.headers && m.headers.subject) || '';\nconst date = m.date || m.Date || (m.headers && m.headers.date) || new Date().toISOString();\nconst body_text = m.text || m.textPlain || m.snippet || '';\nconst body_html = m.textHtml || m.html || '';\nconst safeFrom = String(from).replace(/[^A-Za-z0-9]+/g, '_').slice(0, 40);\nif (!id) { throw new Error('No Gmail message id — cannot build receipt'); }\nreturn {\n  json: {\n    receipt: {\n      id,\n      filename: String(date).slice(0, 10) + '_' + safeFrom + '_' + id,\n      date: String(date),\n      from: String(from),\n      subject: String(subject),\n      body_text: String(body_text),\n      body_html: String(body_html)\n    }\n  },\n  binary: $binary\n};"
+      },
+      "id": "build-receipt",
+      "name": "Build Receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        384,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "has-binary",
+              "leftValue": "={{ Object.keys($binary || {}).length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "if-attachments",
+      "name": "Has attachments?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        624,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://books.sparkry.ai/api/ingest/gmail",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "CF-Access-Client-Id",
+              "value": "bad07e741ba1aab3247a6025400c8d29.access"
+            },
+            {
+              "name": "CF-Access-Client-Secret",
+              "value": "REPLACE_WITH_CF_ACCESS_INGEST_CLIENT_SECRET"
+            },
+            {
+              "name": "X-Api-Key",
+              "value": "REPLACE_WITH_INGEST_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "receipt",
+              "value": "={{ JSON.stringify($json.receipt) }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "attachments",
+              "inputDataFieldName": "attachment_0"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "http-with-attachments",
+      "name": "Upload (with attachment)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        208
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://books.sparkry.ai/api/ingest/gmail",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "CF-Access-Client-Id",
+              "value": "bad07e741ba1aab3247a6025400c8d29.access"
+            },
+            {
+              "name": "CF-Access-Client-Secret",
+              "value": "REPLACE_WITH_CF_ACCESS_INGEST_CLIENT_SECRET"
+            },
+            {
+              "name": "X-Api-Key",
+              "value": "REPLACE_WITH_INGEST_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "receipt",
+              "value": "={{ JSON.stringify($json.receipt) }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "http-text-only",
+      "name": "Upload (text-only)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        880,
+        448
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "content": "### Multiple attachments\nThe **with-attachment** branch sends only `attachment_0`. For receipts with several PDFs, add more body parameters in that node:\n`attachments` → `attachment_1`, `attachments` → `attachment_2`, … (same field name, each pointing at the next binary property). The endpoint accepts up to 25, 25 MB each.",
+        "height": 200,
+        "width": 360,
+        "color": 5
+      },
+      "id": "note-attachments",
+      "name": "Attachment note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1280,
+        160
+      ]
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Receipt": {
+      "main": [
+        [
+          {
+            "node": "Has attachments?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has attachments?": {
+      "main": [
+        [
+          {
+            "node": "Upload (with attachment)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upload (text-only)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 300,
+    "errorWorkflow": "iQi6zyArMZn0TzAT",
+    "availableInMCP": false
+  }
+}

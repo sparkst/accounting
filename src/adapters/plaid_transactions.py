@@ -9,6 +9,7 @@ entity-stamp, CSV supersede, and CSV-skip (the register has no account FK).
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -47,6 +48,18 @@ _AUTO_THRESHOLD = 0.7
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _json_safe(obj: Any) -> Any:
+    """Coerce a Plaid ``to_dict()`` payload into a JSON-serializable structure.
+
+    Plaid's SDK keeps ``date``/``datetime`` (and occasionally Decimal) values as
+    native objects, which the SQLAlchemy JSON ``raw_data`` column cannot encode
+    ("Object of type date is not JSON serializable"). Round-tripping through
+    ``json.dumps(..., default=str)`` stringifies any such values while preserving
+    the full payload for the audit trail.
+    """
+    return json.loads(json.dumps(obj, default=str))
 
 
 def _audit_field_change(
@@ -101,7 +114,7 @@ def build_tx_fields(plaid_txn: Any) -> dict[str, Any]:
         "description": description,
         "amount": amount,
         "currency": "USD",
-        "raw_data": plaid_txn.to_dict(),
+        "raw_data": _json_safe(plaid_txn.to_dict()),
     }
 
 

@@ -1198,3 +1198,23 @@ def test_sync_one_item_rerun_from_same_cursor_is_idempotent(db):
         sync_one_item(db, item, client=_fresh_client())
         db.commit()
     assert db.query(Transaction).filter_by(source="plaid", source_id="dup1").count() == 1
+
+
+def test_raw_data_json_safe_with_native_date_objects():
+    """Phase-5: Plaid to_dict() returns native datetime.date values; raw_data must
+    be coerced JSON-safe or the INSERT fails ('Object of type date is not JSON
+    serializable'), which silently dropped all 60 first-sync transactions."""
+    import json as _json
+    from datetime import date as _date
+
+    txn = _plaid_txn()
+    txn.to_dict = lambda: {
+        "transaction_id": "t1",
+        "date": _date(2026, 3, 18),
+        "authorized_date": _date(2026, 3, 17),
+        "amount": 24.27,
+    }
+    f = build_tx_fields(txn)
+    _json.dumps(f["raw_data"])  # must not raise
+    assert f["raw_data"]["date"] == "2026-03-18"
+    assert f["raw_data"]["authorized_date"] == "2026-03-17"

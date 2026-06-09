@@ -53,8 +53,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 	try {
 		const res = await fetch(`${BASE}${path}`, {
-			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
 			...init,
+			// headers MUST come after ...init: spreading init last would clobber the
+			// merged headers and drop X-Api-Key for any caller that passes its own
+			// headers (e.g. plaidExchangePublicToken sets Content-Type) → 401.
+			headers: { 'Content-Type': 'application/json', ...getApiKeyHeader(), ...init?.headers },
 			...(controller ? { signal: controller.signal } : {})
 		});
 		if (!res.ok) {
@@ -607,6 +610,8 @@ export interface MonthlyCategoryItem {
 export interface MonthlyBreakdownMonth {
 	month: string; // "YYYY-MM"
 	categories: MonthlyCategoryItem[];
+	/** Count of unconfirmed (needs_review) INCOME rows in this month. */
+	income_unconfirmed?: number;
 }
 
 export interface MonthlyBreakdown {
@@ -622,6 +627,38 @@ export async function fetchMonthlyBreakdown(
 	return request<MonthlyBreakdown>(
 		`/tax-summary/monthly?entity=${encodeURIComponent(entity)}&year=${year}`
 	);
+}
+
+// ── Retail sales tax (BlackLine) ──────────────────────────────────────────────
+
+export interface RetailLocationLine {
+	location_code: string;
+	location_name: string;
+	taxable_amount: number;
+	tax_collected: number;
+}
+
+export interface RetailDetail {
+	entity: string;
+	year: number;
+	period: string;
+	gross_retailing: number;
+	interstate_deduction: number;
+	wa_taxable: number;
+	retailing_bo: number;
+	sales_tax_collected: number;
+	by_location: RetailLocationLine[];
+}
+
+export async function fetchRetailDetail(
+	entity: string,
+	year: number,
+	opts: { month?: number; quarter?: number }
+): Promise<RetailDetail> {
+	let url = `/bno/retail-detail?entity=${encodeURIComponent(entity)}&year=${year}`;
+	if (opts.month !== undefined) url += `&month=${opts.month}`;
+	if (opts.quarter !== undefined) url += `&quarter=${opts.quarter}`;
+	return request<RetailDetail>(url);
 }
 
 export async function fetchTaxSummary(
@@ -644,9 +681,14 @@ export async function downloadExport(
 	endpoint: 'freetaxusa' | 'taxact' | 'bno',
 	entity: string,
 	year: number,
-	filename: string
+	filename: string,
+	/** Extra query params, e.g. { format: 'dor', month: 4 } or { quarter: 1 }. */
+	query?: Record<string, string | number>
 ): Promise<void> {
-	const url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
+	let url = `${BASE}/export/${endpoint}?entity=${encodeURIComponent(entity)}&year=${year}`;
+	for (const [k, v] of Object.entries(query ?? {})) {
+		url += `&${k}=${encodeURIComponent(String(v))}`;
+	}
 	const res = await fetch(url, { headers: getApiKeyHeader() });
 	if (!res.ok) {
 		const text = await res.text().catch(() => res.statusText);

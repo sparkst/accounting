@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import src.models.plaid  # noqa: F401 — registers PlaidItem so Account.plaid_item_id FK resolves
 from src.models.base import Base
 from src.models.brokerage import (
     Account,
@@ -15,7 +16,6 @@ from src.models.brokerage import (
     PositionSnapshot,
     RealizedGainLoss,
 )
-import src.models.plaid  # noqa: F401 — registers PlaidItem so Account.plaid_item_id FK resolves
 from src.models.enums import (
     AccountType,
     Broker,
@@ -520,3 +520,29 @@ def test_account_delete_cascades(session: Session) -> None:
     assert session.query(BrokerageTransaction).count() == 0
     assert session.query(PositionSnapshot).count() == 0
     assert session.query(RealizedGainLoss).count() == 0
+
+
+@pytest.mark.parametrize(
+    "broker,acct_type",
+    [
+        (Broker.AMEX, AccountType.CREDIT_CARD),
+        (Broker.CHASE, AccountType.CHECKING),
+        (Broker.OTHER, AccountType.SAVINGS),
+    ],
+)
+def test_account_accepts_plaid_card_and_bank_values(session, broker, acct_type):
+    """Phase-5 Plaid: amex/other/chase brokers + credit_card/checking/savings types
+    pass ck_account_broker / ck_account_type (the mapping-500 fix, REQ-HM-019)."""
+    acct = Account(
+        broker=broker.value,
+        account_number="x1234",
+        account_name="Test card/bank",
+        account_type=acct_type.value,
+        entity=Entity.SPARKRY.value,
+        tax_sheltered=False,
+    )
+    session.add(acct)
+    session.commit()
+    assert acct.id is not None
+    assert acct.broker == broker.value
+    assert acct.account_type == acct_type.value

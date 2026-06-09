@@ -285,55 +285,109 @@ DOR_ACCOUNT_IDS: dict[str, str] = {
     "blackline": "605922410",
 }
 
-# B&O line codes per entity classification
-# Line 7 = Service and Other Activities
-# Line 2 = Retailing
+# WA Combined Excise Tax Return B&O "Code" column (verified against the
+# Feb 2026 CETR form — these are the e-file/data-upload codes, NOT the line
+# numbers). Both entities are under $1M prior-year revenue, so Service & Other
+# uses code 40 (line 11, rate 1.5%). Codes 100/500 are the higher revenue tiers.
+#   Service & Other Activities (<$1M) → 40   (rate .015)
+#   Retailing                          → 2    (rate .00471)
+#   Wholesaling                        → 3    (rate .00484)
 DOR_LINE_CODES: dict[str, int] = {
-    "ServiceOther": 7,
+    "ServiceOther": 40,
     "Retailing": 2,
-    "Wholesaling": 6,
+    "Wholesaling": 3,
 }
+
+# Retail sales tax codes (WA CETR Section II/III, verified vs Feb 2026 form):
+DOR_STATE_RETAIL_SALES_LINE = 1   # line 28 "Retail Sales", code 01, 6.5%
+DOR_LOCAL_SALES_LINE = 45         # Section III local sales tax (with location code)
 
 
 def generate_dor_upload(
     transactions: list[dict[str, Any]],
     entity: str,
     year: int,
-    month: int,
+    month: int | None = None,
+    quarter: int | None = None,
 ) -> tuple[str, str]:
-    """Generate WA DOR My DOR Data Upload file for a single filing period.
+    """Generate a WA DOR My DOR Data Upload file for a single filing period.
 
-    Format follows the official My DOR Data Upload Instructions:
-    - ACCOUNT tag: TRA, Period (MMYYYY), Preparer, Email, Phone
-    - TAX tag: Line Code, Location Code (0 for state), Amount
+    Provide exactly one of ``month`` (1-12, monthly filer) or ``quarter`` (1-4,
+    quarterly filer). Format follows the official My DOR Data Upload Instructions:
+    - ACCOUNT tag: TRA, Period, Preparer, Email, Phone
+      Period is ``MMYYYY`` for monthly (e.g. 042026) and ``Q#YYYY`` for
+      quarterly (e.g. Q12026) — per the instructions' two ACCOUNT examples.
+    - TAX tag: Line Code, Location Code (0 for B&O/state), gross Amount.
+
+    B&O TAX amounts are pre-tax. Retailing is reported on the corrected basis
+    (pre-tax, net of confirmed interstate) from ``compute_retail_detail`` — NOT
+    the tax-inclusive aggregation. For retail income the file also emits the
+    State Retail Sales (code 1) line and a Local Sales (code 45) line per WA DOR
+    location code, with the destination-sourced taxable amount.
 
     Returns (file_content, filename).
     """
+    from src.export.retail_sales_tax import compute_retail_detail
+
+    if (month is None) == (quarter is None):
+        raise ValueError("Provide exactly one of month or quarter.")
+
     entity_lower = entity.lower()
     account_id = DOR_ACCOUNT_IDS.get(entity_lower, "000000000")
-    period = f"{month:02d}{year}"
+    monthly = _aggregate_income_by_month(transactions, year)
 
-    lines: list[str] = []
+    if month is not None:
+        period = f"{month:02d}{year}"
+        period_suffix = f"{month:02d}"
+        months = [month]
+    else:
+        assert quarter is not None
+        period = f"Q{quarter}{year}"
+        period_suffix = f"Q{quarter}"
+        months = [3 * (quarter - 1) + i for i in (1, 2, 3)]
 
-    # ACCOUNT line
-    lines.append(
-        f"ACCOUNT,{account_id},{period},"
-        f"Travis Sparks,travis@sparkry.com,919-491-3894"
+    # Non-retail B&O income (Service & Other, Wholesaling) — these carry no sales
+    # tax, so the aggregated amount is already the pre-tax figure.
+    period_income: dict[str, Decimal] = {}
+    for m in months:
+        for bo_code, amt in monthly.get(m, {}).items():
+            period_income[bo_code] = period_income.get(bo_code, Decimal("0")) + amt
+
+    detail = compute_retail_detail(transactions, year, month=month, quarter=quarter)
+    state_taxable = sum(
+        (loc.taxable_amount for loc in detail.by_location), Decimal("0")
     )
 
-    # Aggregate income for the specified month
-    monthly = _aggregate_income_by_month(transactions, year)
-    month_data = monthly.get(month, {})
+    lines: list[str] = [
+        f"ACCOUNT,{account_id},{period},"
+        f"Travis Sparks,travis@sparkry.com,919-491-3894"
+    ]
 
-    if month_data:
-        for bo_code, amount in sorted(month_data.items()):
-            line_code = DOR_LINE_CODES.get(bo_code, 7)
-            lines.append(f"TAX,{line_code},0,{amount:.2f}")
-    else:
-        # Even if zero, include a TAX line so the file is valid
-        default_line = 7 if entity_lower == "sparkry" else 2
+    emitted = False
+    # B&O: non-retailing classifications from the aggregation ...
+    for bo_code, amount in sorted(period_income.items()):
+        if bo_code == "Retailing":
+            continue  # emitted below on the corrected pre-tax basis
+        lines.append(f"TAX,{DOR_LINE_CODES.get(bo_code, 40)},0,{amount:.2f}")
+        emitted = True
+    # ... and Retailing on the pre-tax, net-of-interstate basis.
+    if detail.wa_taxable > 0:
+        lines.append(f"TAX,{DOR_LINE_CODES['Retailing']},0,{detail.wa_taxable:.2f}")
+        emitted = True
+
+    # Retail sales tax: state line + one local line per DOR location code.
+    if state_taxable > 0:
+        lines.append(f"TAX,{DOR_STATE_RETAIL_SALES_LINE},0,{state_taxable:.2f}")
+        for loc in detail.by_location:
+            lines.append(
+                f"TAX,{DOR_LOCAL_SALES_LINE},{loc.location_code},{loc.taxable_amount:.2f}"
+            )
+        emitted = True
+
+    if not emitted:
+        default_line = 40 if entity_lower == "sparkry" else 2
         lines.append(f"TAX,{default_line},0,0.00")
 
     content = "\n".join(lines) + "\n"
-    filename = f"dor_upload_{entity_lower}_{year}_{month:02d}.csv"
+    filename = f"dor_upload_{entity_lower}_{year}_{period_suffix}.csv"
     return content, filename

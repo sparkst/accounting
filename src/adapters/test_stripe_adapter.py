@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Generator
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +38,7 @@ from src.adapters.stripe_adapter import (
     _map_charge_fee,
     _map_payout,
     _map_refund,
+    _metadata_dict,
 )
 from src.models.base import Base
 from src.models.enums import (
@@ -45,6 +47,8 @@ from src.models.enums import (
     IngestionStatus,
     Source,
     TaxCategory,
+    TaxSubcategory,
+    TransactionStatus,
 )
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
@@ -178,10 +182,14 @@ def session() -> Generator[Session, None, None]:
 
 @pytest.fixture
 def adapter(monkeypatch: pytest.MonkeyPatch) -> StripeAdapter:
-    """StripeAdapter with fake API key and connected account IDs via environment."""
-    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-    monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_test_sparkry")
-    monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_test_blackline")
+    """StripeAdapter with per-account fake API keys via environment.
+
+    Separate-account model: each Stripe account authenticates with its own
+    restricted key (no Stripe-Account header). STRIPE_API_KEY = Sparkry sub.
+    """
+    monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+    monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "rk_test_blackline")
+    monkeypatch.delenv("STRIPE_API_KEY_TRAVIS_PERSONAL", raising=False)
     return StripeAdapter()
 
 
@@ -211,6 +219,33 @@ class TestClassifyStripeObject:
         charge = _fake_charge(metadata={"source": "substack"})
         result = _classify_stripe_object(charge, Entity.SPARKRY)
         assert result["tax_category"] == TaxCategory.SUBSCRIPTION_INCOME
+
+    def test_charge_with_stripeobject_metadata(self) -> None:
+        """Regression: live Stripe returns metadata as a StripeObject, NOT a
+        dict, and intercepts ``.get`` as a key lookup → AttributeError. The
+        Substack/Travis backfill failed 7 rows on exactly this. Build a charge
+        whose .metadata is a real StripeObject and confirm classification works.
+        """
+        from stripe import StripeObject
+
+        meta = StripeObject.construct_from({"source": "substack"}, "sk_test")
+        # _metadata_dict must extract it without raising.
+        assert _metadata_dict(SimpleNamespace(metadata=meta)) == {"source": "substack"}
+        # A charge carrying that StripeObject metadata still classifies as Substack.
+        charge = _fake_charge()
+        charge.metadata = meta
+        result = _classify_stripe_object(charge, Entity.SPARKRY)
+        assert result["tax_category"] == TaxCategory.SUBSCRIPTION_INCOME
+
+    def test_metadata_dict_handles_missing_get_key(self) -> None:
+        """A StripeObject with NO ``source``/``platform`` keys must not raise
+        when those keys are read (the original AttributeError: get case)."""
+        from stripe import StripeObject
+
+        meta = StripeObject.construct_from({"order_id": "9999"}, "sk_test")
+        out = _metadata_dict(SimpleNamespace(metadata=meta))
+        assert out == {"order_id": "9999"}
+        assert out.get("source", "") == ""  # the call that used to blow up
 
     def test_payout(self) -> None:
         payout = _fake_payout()
@@ -331,28 +366,26 @@ class TestPersonalMixedMode:
     def test_travis_personal_account_added_when_env_var_set(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-        monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_sp")
-        monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_bl")
-        monkeypatch.setenv("STRIPE_ACCOUNT_TRAVIS_PERSONAL", "acct_travis")
+        monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+        monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "rk_test_bl")
+        monkeypatch.setenv("STRIPE_API_KEY_TRAVIS_PERSONAL", "rk_test_travis")
         adapter = StripeAdapter()
-        assert adapter._account_travis_personal == "acct_travis"
+        assert adapter._key_travis_personal == "rk_test_travis"
 
     def test_travis_personal_account_omitted_when_env_var_absent(
         self, adapter: StripeAdapter
     ) -> None:
-        # `adapter` fixture only sets SPARKRY + BLACKLINE, not TRAVIS_PERSONAL.
-        assert adapter._account_travis_personal is None
+        # `adapter` fixture only sets SPARKRY + BLACKLINE keys, not TRAVIS_PERSONAL.
+        assert adapter._key_travis_personal is None
 
     def test_ingest_personal_mixed_flags_non_invoice_row(
         self, monkeypatch: pytest.MonkeyPatch, session: Session
     ) -> None:
-        """End-to-end: with the third account configured, a non-invoice charge
-        on it lands in the DB with a populated review_reason."""
-        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-        monkeypatch.setenv("STRIPE_ACCOUNT_SPARKRY", "acct_sp")
-        monkeypatch.setenv("STRIPE_ACCOUNT_BLACKLINE", "acct_bl")
-        monkeypatch.setenv("STRIPE_ACCOUNT_TRAVIS_PERSONAL", "acct_travis")
+        """End-to-end: with the third account's key configured, a non-invoice
+        charge on it lands in the DB with a populated review_reason."""
+        monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+        monkeypatch.setenv("STRIPE_API_KEY_BLACKLINE", "rk_test_bl")
+        monkeypatch.setenv("STRIPE_API_KEY_TRAVIS_PERSONAL", "rk_test_travis")
         adapter = StripeAdapter()
 
         sub_charge = _fake_charge(
@@ -368,8 +401,10 @@ class TestPersonalMixedMode:
 
         with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
             def side_effect(client: Any, resource: str, entity: Any, **kw: Any) -> list[Any]:
-                acct = kw.get("stripe_account")
-                if acct == "acct_travis" and resource == "charges":
+                # Separate-account model: discriminate by the per-account key the
+                # StripeClient was built with (no Stripe-Account header anymore).
+                key = client._requestor.api_key
+                if key == "rk_test_travis" and resource == "charges":
                     return [sub_charge, anomaly_charge]
                 return []
 
@@ -426,7 +461,12 @@ class TestMapChargeFee:
         assert fee_tx is not None
         assert fee_tx.amount == Decimal("-58.30")
         assert fee_tx.direction == Direction.EXPENSE.value
-        assert fee_tx.tax_category == TaxCategory.LEGAL_AND_PROFESSIONAL.value
+        # Merchant fee → Other Expenses (27a) + payment_processing, and
+        # auto_classified so the reclassify pass can't split it across
+        # categories or reassign the entity.
+        assert fee_tx.tax_category == TaxCategory.OTHER_EXPENSE.value
+        assert fee_tx.tax_subcategory == TaxSubcategory.PAYMENT_PROCESSING.value
+        assert fee_tx.status == TransactionStatus.AUTO_CLASSIFIED.value
         assert fee_tx.entity == Entity.SPARKRY.value
         assert fee_tx.source_id == "fee_ch_sp1"
 
@@ -487,6 +527,16 @@ class TestMapPayout:
         assert tx.amount == Decimal("99.00")
         assert tx.source_id == "po_test"
 
+    def test_payout_is_auto_classified_not_needs_review(self) -> None:
+        """Regression: a payout must NOT be needs_review — that fed it to the
+        ingest reclassify pass, where the LLM mislabeled "Stripe payout" as
+        SALES_INCOME (13 parent-account payouts wrongly booked as BlackLine
+        sales). It must be transfer + no tax_category + auto_classified."""
+        tx = _map_payout(_fake_payout(payout_id="po_x", amount=10000), Entity.SPARKRY)
+        assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
+        assert tx.tax_category is None
+        assert tx.direction == Direction.TRANSFER.value
+
     def test_payout_date_uses_arrival_date(self) -> None:
         # arrival_date = 2023-11-16 00:00:00 UTC = 1700092800
         payout = _fake_payout(arrival_date=1700092800, created=0)
@@ -511,17 +561,21 @@ class TestMapRefund:
 class TestStripeAdapterInit:
     def test_missing_api_key_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY_TRAVIS_PERSONAL", raising=False)
         with pytest.raises(EnvironmentError, match="STRIPE_API_KEY"):
             StripeAdapter()
 
-    def test_connected_accounts_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("STRIPE_API_KEY", "sk_test_platform")
-        monkeypatch.delenv("STRIPE_ACCOUNT_SPARKRY", raising=False)
-        monkeypatch.delenv("STRIPE_ACCOUNT_BLACKLINE", raising=False)
+    def test_secondary_keys_optional(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Only the Sparkry key (STRIPE_API_KEY) is required; the other two
+        # accounts are optional and skipped when their keys are absent.
+        monkeypatch.setenv("STRIPE_API_KEY", "rk_test_sparkry")
+        monkeypatch.delenv("STRIPE_API_KEY_BLACKLINE", raising=False)
+        monkeypatch.delenv("STRIPE_API_KEY_TRAVIS_PERSONAL", raising=False)
         adapter = StripeAdapter()
-        assert adapter._api_key == "sk_test_platform"
-        assert adapter._account_sparkry is None
-        assert adapter._account_blackline is None
+        assert adapter._key_sparkry == "rk_test_sparkry"
+        assert adapter._key_blackline is None
+        assert adapter._key_travis_personal is None
 
 
 class TestStripeAdapterRun:

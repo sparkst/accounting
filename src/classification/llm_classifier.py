@@ -1,8 +1,8 @@
-"""Tier 3: LLM classification via Claude API.
+"""Tier 3: LLM classification via Gemini API.
 
-Sends structured transaction context to Claude and parses the response into a
+Sends structured transaction context to Gemini and parses the response into a
 :class:`~src.classification.engine.ClassificationResult`. The prompt includes
-entity descriptions and the full list of valid tax categories so Claude can
+entity descriptions and the full list of valid tax categories so Gemini can
 return a structured JSON payload.
 
 For unit tests, inject a mock client by passing ``_client`` directly rather
@@ -18,7 +18,9 @@ import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-import anthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
 from src.classification.engine import ClassificationResult
 from src.models.enums import Direction, Entity, TaxCategory
@@ -35,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_MODEL = "claude-3-5-haiku-20241022"
+_MODEL = "gemini-2.5-flash-lite"
 _MAX_TOKENS = 512
 
 # Circuit breaker settings
@@ -153,16 +155,16 @@ def llm_classify(
     transaction: Transaction,
     *,
     api_key: str | None = None,
-    _client: anthropic.Anthropic | None = None,
+    _client: genai.Client | None = None,
     _session: Session | None = None,
 ) -> ClassificationResult:
-    """Classify *transaction* using Claude.
+    """Classify *transaction* using Gemini.
 
     Args:
         transaction: Transaction to classify (read-only).
-        api_key: Anthropic API key override. Falls back to
-            ``ANTHROPIC_API_KEY`` environment variable.
-        _client: Inject a pre-built (or mock) Anthropic client. When set,
+        api_key: Gemini API key override. Falls back to
+            ``GEMINI_API_KEY`` environment variable.
+        _client: Inject a pre-built (or mock) Gemini client. When set,
             *api_key* is ignored. Intended for unit tests.
         _session: Optional SQLAlchemy session. When provided, an
             :class:`~src.models.llm_usage.LLMUsageLog` row is written after
@@ -176,13 +178,13 @@ def llm_classify(
         ``reasoning``. When the circuit breaker is open, returns immediately
         with ``reasoning="Circuit breaker open"`` and confidence 0.
     """
-    # Circuit breaker check — skip Claude when the circuit is open
+    # Circuit breaker check — skip Gemini when the circuit is open
     if not _circuit.allow_attempt():
-        logger.warning("Circuit breaker: OPEN — skipping Claude API call, returning needs_review")
+        logger.warning("Circuit breaker: OPEN — skipping Gemini API call, returning needs_review")
         return _cb_fallback_result()
 
-    client = _client or anthropic.Anthropic(
-        api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    client = _client or genai.Client(
+        api_key=api_key or os.environ.get("GEMINI_API_KEY", "")
     )
 
     raw: dict[str, Any] = (
@@ -202,11 +204,15 @@ def llm_classify(
 
     try:
         t0 = time.monotonic()
-        response = client.messages.create(
+        response = client.models.generate_content(
             model=_MODEL,
-            max_tokens=_MAX_TOKENS,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            contents=user_message,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                max_output_tokens=_MAX_TOKENS,
+                temperature=0.0,
+                response_mime_type="application/json",
+            ),
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -221,17 +227,15 @@ def llm_classify(
             transaction_id=getattr(transaction, "id", None),
         )
 
-        first_block = response.content[0]
-        # Accept TextBlock; other block types (ToolUseBlock, etc.) are unexpected.
-        raw_text_val: str | None = getattr(first_block, "text", None)
+        raw_text_val: str | None = response.text
         if raw_text_val is None:
-            return _error_result("Unexpected response block type from Claude API")
+            return _error_result("Empty response from Gemini API")
         raw_text: str = raw_text_val.strip()
         return _parse_response(raw_text)
-    except anthropic.APIError as exc:
-        logger.error("Anthropic API error: %s", exc)
+    except genai_errors.APIError as exc:
+        logger.error("Gemini API error: %s", exc)
         _circuit.record_failure()
-        return _error_result(f"Anthropic API error: {exc}")
+        return _error_result(f"Gemini API error: {exc}")
     except Exception as exc:  # noqa: BLE001
         logger.error("Unexpected error in LLM classifier: %s", exc)
         _circuit.record_failure()
@@ -258,11 +262,11 @@ def _write_usage_log(
     if session is None:
         return
     try:
-        _raw_model = getattr(response, "model", _MODEL)
+        _raw_model = getattr(response, "model_version", None) or _MODEL
         model_name: str = str(_raw_model) if isinstance(_raw_model, str) else _MODEL
-        usage = getattr(response, "usage", None)
-        input_tokens: int = int(getattr(usage, "input_tokens", 0))
-        output_tokens: int = int(getattr(usage, "output_tokens", 0))
+        usage_metadata = getattr(response, "usage_metadata", None)
+        input_tokens: int = int(getattr(usage_metadata, "prompt_token_count", 0) or 0)
+        output_tokens: int = int(getattr(usage_metadata, "candidates_token_count", 0) or 0)
         cost = estimate_cost_for_model(model_name, input_tokens, output_tokens)
 
         log_entry = LLMUsageLog(

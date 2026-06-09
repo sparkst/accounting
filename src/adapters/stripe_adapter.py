@@ -39,6 +39,7 @@ from src.models.enums import (
     IngestionStatus,
     Source,
     TaxCategory,
+    TaxSubcategory,
     TransactionStatus,
 )
 from src.models.ingestion_log import IngestionLog
@@ -136,10 +137,33 @@ def _ts_to_date(timestamp: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _metadata_dict(obj: Any) -> dict[str, Any]:
+    """Return a charge's ``metadata`` as a plain dict.
+
+    Stripe returns ``metadata`` as a ``StripeObject``, NOT a dict — and it
+    intercepts attribute access (``.get``, ``.items``, ``.keys``) as metadata
+    *key* lookups via ``__getattr__``, so ``meta.get(...)`` raises
+    ``AttributeError`` on any object that lacks a literal ``get`` key. Only the
+    class-level ``to_dict()`` method is safe. Plain dicts pass through.
+    """
+    meta = getattr(obj, "metadata", None)
+    if not meta:
+        return {}
+    if isinstance(meta, dict):
+        return meta
+    to_dict = getattr(type(meta), "to_dict", None)
+    if callable(to_dict):
+        try:
+            return dict(to_dict(meta))
+        except Exception:  # noqa: BLE001 — defensive; never fail classification on metadata shape
+            return {}
+    return {}
+
+
 def _is_substack(obj: Any) -> bool:
     """Return True when a charge is from Substack (subscription income)."""
     desc = (getattr(obj, "description", None) or "").lower()
-    meta = getattr(obj, "metadata", {}) or {}
+    meta = _metadata_dict(obj)
     source_meta = str(meta.get("source", "")).lower()
     platform_meta = str(meta.get("platform", "")).lower()
     return (
@@ -325,8 +349,14 @@ def _map_charge_fee(charge: Any, entity: Entity) -> Transaction | None:
         currency=currency,
         entity=entity.value,
         direction=Direction.EXPENSE.value,
-        tax_category=TaxCategory.LEGAL_AND_PROFESSIONAL.value,
-        status=TransactionStatus.NEEDS_REVIEW.value,
+        # A Stripe processing fee is an unambiguous merchant fee → Other
+        # Expenses (Sch C 27a) + payment_processing subcategory. AUTO_CLASSIFIED
+        # (not needs_review) so the ingest reclassify pass / Tier-3 LLM can't
+        # split identical fees across categories or reassign the entity (which it
+        # did: ~$356 of Sparkry fees got mislabeled to BlackLine/Supplies).
+        tax_category=TaxCategory.OTHER_EXPENSE.value,
+        tax_subcategory=TaxSubcategory.PAYMENT_PROCESSING.value,
+        status=TransactionStatus.AUTO_CLASSIFIED.value,
         confidence=0.95,
         raw_data=raw,
     )
@@ -359,7 +389,12 @@ def _map_payout(payout: Any, entity: Entity) -> Transaction:
         entity=entity.value,
         direction=Direction.TRANSFER.value,
         tax_category=None,
-        status=TransactionStatus.NEEDS_REVIEW.value,
+        # AUTO_CLASSIFIED, NOT needs_review: a payout is unambiguously a transfer
+        # (money moving Stripe→bank), never income. needs_review would expose it
+        # to the ingest reclassify pass, where the Tier-3 LLM mislabels
+        # "Stripe payout" as SALES_INCOME — the engine can't represent a transfer
+        # so it must never re-touch one.
+        status=TransactionStatus.AUTO_CLASSIFIED.value,
         confidence=0.9,
         raw_data=_to_dict(payout),
     )
@@ -523,9 +558,9 @@ def _ingest_entity(
             )
         except stripe.AuthenticationError as exc:
             msg = (
-                f"Authentication failed for entity '{entity_label}' "
-                f"(STRIPE_API_KEY, account={stripe_account or 'platform'}): {exc}. "
-                "Check that the API key is correct and has read permissions."
+                f"Authentication failed for entity '{entity_label}': {exc}. "
+                "Check that the per-account restricted key is correct and has "
+                "read permissions (charges, payouts, refunds)."
             )
             logger.error(msg)
             result.record_error(f"stripe:{entity_label}:{resource}", Exception(msg))
@@ -599,53 +634,54 @@ def _ingest_entity(
 
 class StripeAdapter(BaseAdapter):
     """Ingests Stripe charges, payouts, and refunds for Sparkry LLC and
-    BlackLine MTB LLC via Stripe Connect.
+    BlackLine MTB LLC.
 
-    Uses one platform API key and up to three connected account IDs:
-        ``STRIPE_API_KEY``                  — Platform key (shared)
-        ``STRIPE_ACCOUNT_SPARKRY``          — Connected account for Sparkry LLC
-        ``STRIPE_ACCOUNT_BLACKLINE``        — Connected account for BlackLine MTB LLC
-        ``STRIPE_ACCOUNT_TRAVIS_PERSONAL``  — Travis's personal Stripe account that
-                                              processes Sparkry Substack subscriptions.
-                                              Runs in ``PERSONAL_MIXED`` mode: only
+    Sparkry, BlackLine, and the top-level Travis account are SEPARATE Stripe
+    accounts (not Connect), so each authenticates with its OWN restricted key —
+    no ``Stripe-Account`` header:
+        ``STRIPE_API_KEY``                  — Sparkry LLC account (required)
+        ``STRIPE_API_KEY_BLACKLINE``        — BlackLine MTB LLC account (optional)
+        ``STRIPE_API_KEY_TRAVIS_PERSONAL``  — Travis's top-level account that
+                                              processes Sparkry Substack
+                                              subscriptions (optional). Runs in
+                                              ``PERSONAL_MIXED`` mode: only
                                               invoice/subscription charges are
                                               auto-classified; anything else is
                                               flagged via ``review_reason``.
 
-    The platform key must be present at construction time. Connected account
-    IDs are optional — if omitted, the adapter fetches from the platform
-    account directly (useful for single-entity setups).
+    At least one key must be present at construction time. Accounts whose key
+    is absent are skipped during :meth:`run`.
 
     Args:
-        api_key:                 Override for testing; omit to read from env.
-        account_sparkry:         Connected account ID override; omit to read from env.
-        account_blackline:       Connected account ID override; omit to read from env.
-        account_travis_personal: Connected account ID override; omit to read from env.
-                                 Ingested as ``entity=sparkry`` in ``PERSONAL_MIXED``
-                                 mode.
+        api_key:             Sparkry key override for testing; omit to read STRIPE_API_KEY.
+        key_blackline:       BlackLine key override; omit to read STRIPE_API_KEY_BLACKLINE.
+        key_travis_personal: Top-level/Substack key override; omit to read
+                             STRIPE_API_KEY_TRAVIS_PERSONAL. Ingested as
+                             ``entity=sparkry`` in ``PERSONAL_MIXED`` mode.
     """
 
     def __init__(
         self,
         api_key: str | None = None,
-        account_sparkry: str | None = None,
-        account_blackline: str | None = None,
-        account_travis_personal: str | None = None,
+        key_blackline: str | None = None,
+        key_travis_personal: str | None = None,
     ) -> None:
-        key = api_key or os.environ.get("STRIPE_API_KEY")
-
-        if not key:
-            raise OSError(
-                "STRIPE_API_KEY is not set. "
-                "Add it to Doppler or pass api_key= to StripeAdapter()."
-            )
-
-        self._api_key = key
-        self._account_sparkry = account_sparkry or os.environ.get("STRIPE_ACCOUNT_SPARKRY")
-        self._account_blackline = account_blackline or os.environ.get("STRIPE_ACCOUNT_BLACKLINE")
-        self._account_travis_personal = (
-            account_travis_personal or os.environ.get("STRIPE_ACCOUNT_TRAVIS_PERSONAL")
+        # Sparkry, BlackLine, and the top-level Travis/Substack account are
+        # SEPARATE Stripe accounts (not Connect), so each authenticates with its
+        # OWN restricted key — no Stripe-Account header. ``api_key`` /
+        # STRIPE_API_KEY is the Sparkry account; the others are optional.
+        self._key_sparkry = api_key or os.environ.get("STRIPE_API_KEY")
+        self._key_blackline = key_blackline or os.environ.get("STRIPE_API_KEY_BLACKLINE")
+        self._key_travis_personal = (
+            key_travis_personal or os.environ.get("STRIPE_API_KEY_TRAVIS_PERSONAL")
         )
+
+        if not (self._key_sparkry or self._key_blackline or self._key_travis_personal):
+            raise OSError(
+                "No Stripe key set. Set STRIPE_API_KEY (Sparkry) and optionally "
+                "STRIPE_API_KEY_BLACKLINE / STRIPE_API_KEY_TRAVIS_PERSONAL. "
+                "Add them to Doppler or pass to StripeAdapter()."
+            )
 
     @property
     def source(self) -> str:
@@ -663,22 +699,22 @@ class StripeAdapter(BaseAdapter):
         """
         result = AdapterResult(source=self.source)
 
-        # Each tuple is (entity, connected_account_id_or_None, account_mode).
-        # The travis-personal account ingests into Sparkry but uses
-        # PERSONAL_MIXED so non-invoice charges are flagged for review.
+        # Each tuple is (entity, per_account_api_key, account_mode). Separate
+        # accounts → each uses its own key with NO Stripe-Account header. The
+        # top-level Travis account holds Sparkry Substack revenue + personal
+        # charges, so PERSONAL_MIXED flags non-invoice charges for review.
         accounts: list[tuple[Entity, str | None, str]] = [
-            (Entity.SPARKRY, self._account_sparkry, ACCOUNT_MODE_STANDARD),
-            (Entity.BLACKLINE, self._account_blackline, ACCOUNT_MODE_STANDARD),
+            (Entity.SPARKRY, self._key_sparkry, ACCOUNT_MODE_STANDARD),
+            (Entity.BLACKLINE, self._key_blackline, ACCOUNT_MODE_STANDARD),
+            (Entity.SPARKRY, self._key_travis_personal, ACCOUNT_MODE_PERSONAL_MIXED),
         ]
-        if self._account_travis_personal:
-            accounts.append(
-                (Entity.SPARKRY, self._account_travis_personal, ACCOUNT_MODE_PERSONAL_MIXED)
-            )
 
-        for entity, acct_id, mode in accounts:
+        for entity, key, mode in accounts:
+            if not key:
+                continue  # account not configured — skip
             _ingest_entity(
-                self._api_key, entity, session, result,
-                stripe_account=acct_id, mode=mode,
+                key, entity, session, result,
+                stripe_account=None, mode=mode,
             )
 
         # Upgrade PARTIAL_FAILURE → FAILURE when nothing was created and there

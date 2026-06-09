@@ -31,7 +31,7 @@ from src.adapters.shopify_adapter import (
     _parse_payout,
 )
 from src.models.base import Base
-from src.models.enums import Direction, Entity, Source, TaxCategory
+from src.models.enums import Direction, Entity, IngestionStatus, Source, TaxCategory
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
 
@@ -187,6 +187,9 @@ class TestParseRefund:
         tx = _parse_refund(refund, order)
         assert tx["amount"] == decimal.Decimal("-85.00")
         assert tx["direction"] == Direction.EXPENSE.value
+        # Contra-revenue must NOT sit in an income category (would inflate B&O
+        # gross via the abs(amount) aggregation).
+        assert tx["tax_category"] == TaxCategory.OTHER_EXPENSE.value
         assert tx["entity"] == Entity.BLACKLINE.value
         assert tx["source_id"] == "refund_9001"
 
@@ -329,6 +332,38 @@ class TestShopifyAdapterRun:
 
         with pytest.raises(ShopifyAuthError):
             adapter.run(session)
+
+    @patch("src.adapters.shopify_adapter.time.sleep")
+    @patch("src.adapters.shopify_adapter.httpx.Client")
+    def test_payouts_403_is_non_fatal_orders_still_ingested(
+        self, mock_client_cls: MagicMock, mock_sleep: MagicMock, session: Session, adapter: ShopifyAdapter
+    ) -> None:
+        """A 403 on payouts (read_shopify_payments_payouts not approved) must
+        NOT discard successfully-ingested orders — the run completes, the order
+        is persisted, and a soft note is recorded without marking FAILURE.
+        """
+        client_instance = MagicMock()
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=client_instance)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        orders_resp = _make_response(200, {"orders": [SAMPLE_ORDER]})
+        orders_resp.headers = {}
+        payouts_403 = _make_response(
+            403, {"errors": "This action requires merchant approval for "
+                            "read_shopify_payments_payouts scope."}
+        )
+        payouts_403.headers = {}
+        client_instance.get.side_effect = [orders_resp, payouts_403]
+
+        result = adapter.run(session)
+
+        # Order persisted despite the payouts 403.
+        assert session.query(Transaction).count() == 1
+        assert result.records_created == 1
+        assert result.status != IngestionStatus.FAILURE
+        # Soft note present, but not counted as a record failure.
+        assert any("payouts" in rid for rid, _ in result.errors)
+        assert result.records_failed == 0
 
     @patch("src.adapters.shopify_adapter.time.sleep")
     @patch("src.adapters.shopify_adapter.httpx.Client")
@@ -479,3 +514,38 @@ class TestShopifyAdapterRun:
         # At least one call with a value >= 0.5
         sleep_vals = [c.args[0] for c in mock_sleep.call_args_list]
         assert any(v >= 0.5 for v in sleep_vals)
+
+
+# ── client-credentials grant (dev-dashboard apps) ──────────────────────────────
+
+
+def test_resolve_token_prefers_static_key():
+    a = ShopifyAdapter(api_key="static-tok", store_url="test-store.myshopify.com")
+    with patch("src.adapters.shopify_adapter.httpx.post") as p:
+        assert a._resolve_access_token() == "static-tok"
+        p.assert_not_called()
+
+
+def test_resolve_token_client_credentials_grant():
+    a = ShopifyAdapter(client_id="cid", client_secret="csec", store_url="blacklinemtb.myshopify.com")
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"access_token": "shpat_xyz", "scope": "read_orders", "expires_in": 86399}
+    with patch("src.adapters.shopify_adapter.httpx.post", return_value=resp) as p:
+        tok = a._resolve_access_token()
+    assert tok == "shpat_xyz"
+    _, kwargs = p.call_args
+    assert p.call_args[0][0] == "https://blacklinemtb.myshopify.com/admin/oauth/access_token"
+    assert kwargs["data"] == {"grant_type": "client_credentials", "client_id": "cid", "client_secret": "csec"}
+
+
+def test_resolve_token_grant_failure_raises():
+    a = ShopifyAdapter(client_id="cid", client_secret="bad", store_url="blacklinemtb.myshopify.com")
+    resp = MagicMock(status_code=401)
+    resp.json.return_value = {}
+    with patch("src.adapters.shopify_adapter.httpx.post", return_value=resp), pytest.raises(ShopifyAuthError):
+        a._resolve_access_token()
+
+
+def test_init_requires_some_credential():
+    with pytest.raises(ValueError):
+        ShopifyAdapter(store_url="x.myshopify.com")

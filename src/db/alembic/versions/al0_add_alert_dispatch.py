@@ -1,7 +1,7 @@
 """REQ-ALERT-010 add alert_dispatch table (EA alert dedup + audit ledger)
 
 Revision ID: al0_add_alert_dispatch
-Revises: 63c79e8be034
+Revises: p5cards01amex
 Create Date: 2026-06-08 00:00:00.000000
 
 Additive only. Creates the alert_dispatch table used to dedupe and audit EA
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "al0_add_alert_dispatch"
-down_revision: str | Sequence[str] | None = "63c79e8be034"
+down_revision: str | Sequence[str] | None = "p5cards01amex"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -7,12 +7,13 @@ If no tier reaches the threshold the transaction is flagged needs_review.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
-from src.models.enums import Direction, Entity, TaxCategory, TransactionStatus
+from src.models.enums import Direction, Entity, Source, TaxCategory, TransactionStatus
 
 if TYPE_CHECKING:
     from src.models.transaction import Transaction
@@ -50,6 +51,71 @@ class ClassificationResult:
 
 # Minimum confidence required for auto-classification.
 _AUTO_CLASSIFY_THRESHOLD = 0.7
+
+# Sources where the ingesting adapter assigns the entity AUTHORITATIVELY — Stripe
+# from the per-account API key, Shopify from the store. Classification (esp. the
+# Tier-3 LLM) must never reassign which business owns these rows; it was guessing
+# wrong (parent-account Substack charges/fees/payouts → BlackLine). Only the
+# tax category is open to (re)classification for these.
+_ENTITY_AUTHORITATIVE_SOURCES = frozenset({Source.STRIPE.value, Source.SHOPIFY.value})
+
+# Sources whose stored ``amount`` sign is the authoritative cash direction
+# (negative = real outflow). For these, an income classification on a negative
+# amount is internally contradictory and must be vetoed. NOTE: gmail_n8n is
+# deliberately excluded — it stores income as -abs(amount) *before* the
+# classifier assigns direction=income (see CLAUDE.md "Adapter behavior"), so a
+# negative Gmail amount tagged income is correct, not a mismatch.
+_AUTHORITATIVE_SIGN_SOURCES = frozenset({Source.PLAID.value, Source.BANK_CSV.value})
+
+_INCOME_TAX_CATEGORIES = frozenset({
+    TaxCategory.CONSULTING_INCOME,
+    TaxCategory.SUBSCRIPTION_INCOME,
+    TaxCategory.SALES_INCOME,
+    TaxCategory.WHOLESALE_INCOME,
+})
+
+
+def _reconcile_sign(
+    transaction: Transaction, result: ClassificationResult
+) -> ClassificationResult:
+    """Veto income classification on an authoritative-signed outflow.
+
+    A Plaid/bank row with ``amount < 0`` is real money leaving the account, so
+    it can never be income. When a tier nonetheless labels it income (e.g. a
+    vendor keyword like "subscription" or "shopify" on a credit-card *charge*),
+    override to ``OTHER_EXPENSE`` and route to ``needs_review`` so a human picks
+    the real expense category — rather than silently inflating B&O gross via the
+    ``abs(amount)`` tax aggregation. Returns *result* unchanged when consistent.
+    """
+    if transaction.source not in _AUTHORITATIVE_SIGN_SOURCES:
+        return result
+    if transaction.amount is None:
+        return result
+    try:
+        is_outflow = Decimal(str(transaction.amount)) < 0
+    except (InvalidOperation, ValueError):
+        return result
+
+    is_income = (
+        result.direction == Direction.INCOME
+        or result.tax_category in _INCOME_TAX_CATEGORIES
+    )
+    if not (is_outflow and is_income):
+        return result
+
+    return replace(
+        result,
+        direction=Direction.EXPENSE,
+        tax_category=TaxCategory.OTHER_EXPENSE,
+        status=TransactionStatus.NEEDS_REVIEW,
+        deductible_pct=1.0,
+        review_reason=(
+            f"Sign/category mismatch: {transaction.source} amount "
+            f"{transaction.amount} is an outflow but was classified as income "
+            f"({result.tax_category.value}, tier {result.tier_used}). Overridden "
+            "to expense for review."
+        ),
+    )
 
 
 def classify(
@@ -89,21 +155,21 @@ def classify(
     if tier1 is not None and tier1.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier1.tier_used = 1
         tier1.status = TransactionStatus.AUTO_CLASSIFIED
-        return tier1
+        return _reconcile_sign(transaction, tier1)
 
     # ── Tier 2: Structural patterns ─────────────────────────────────────────
     tier2 = _pat_mod.match_structural_pattern(transaction)
     if tier2 is not None and tier2.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier2.tier_used = 2
         tier2.status = TransactionStatus.AUTO_CLASSIFIED
-        return tier2
+        return _reconcile_sign(transaction, tier2)
 
     # ── Tier 3: LLM classification ──────────────────────────────────────────
     tier3 = _llm_mod.llm_classify(transaction, api_key=anthropic_api_key, _session=session)
     if tier3.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier3.tier_used = 3
         tier3.status = TransactionStatus.AUTO_CLASSIFIED
-        return tier3
+        return _reconcile_sign(transaction, tier3)
 
     # ── Needs review ────────────────────────────────────────────────────────
     # Best partial result is kept so the reviewer has a pre-filled suggestion.
@@ -113,7 +179,7 @@ def classify(
         f"Low confidence ({tier3.confidence:.2f}) from Tier 3 LLM: "
         f"{tier3.reasoning}"
     )
-    return tier3
+    return _reconcile_sign(transaction, tier3)
 
 
 def apply_result(transaction: Transaction, result: ClassificationResult) -> None:
@@ -121,7 +187,14 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
 
     Does **not** commit the session — that is the caller's responsibility.
     """
-    transaction.entity = result.entity.value
+    # Preserve the adapter's entity for sources where it is structurally
+    # determined (Stripe per-account, Shopify store). Classification may set the
+    # entity only when the adapter could not (e.g. gmail/bank → entity is None).
+    if (
+        transaction.source not in _ENTITY_AUTHORITATIVE_SOURCES
+        or transaction.entity is None
+    ):
+        transaction.entity = result.entity.value
     transaction.tax_category = result.tax_category.value
     transaction.direction = result.direction.value
     transaction.confidence = result.confidence

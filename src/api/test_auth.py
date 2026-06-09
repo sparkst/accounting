@@ -4,7 +4,7 @@ REQ-ID: S1-009-01  With API_KEY set, requests without a key get 401.
 REQ-ID: S1-009-02  With API_KEY set, requests with the correct key get 200.
 REQ-ID: S1-009-03  With API_KEY set, requests with the wrong key get 401.
 REQ-ID: S1-009-04  Without API_KEY set, all requests pass (dev mode).
-REQ-ID: S1-009-05  Health endpoint is always accessible, even when API_KEY is set.
+REQ-ID: S1-009-05  /health/ping is always accessible; rich health requires API_KEY (§7).
 REQ-ID: S1-009-06  API key accepted via X-Api-Key header.
 REQ-ID: S1-009-07  API key accepted via api_key query parameter.
 """
@@ -172,16 +172,20 @@ def test_with_api_key_set_query_param_is_rejected(client: TestClient) -> None:
         assert resp.status_code == 401
 
 
-def test_health_always_accessible_with_api_key_set(client: TestClient) -> None:
-    """REQ-ID: S1-009-05 — Health endpoint bypasses auth entirely."""
+def test_health_ping_always_accessible_with_api_key_set(client: TestClient) -> None:
+    """REQ-ID: S1-009-05 — /health/ping is the public readiness probe; no auth needed."""
     with patch.dict("os.environ", {"API_KEY": "secret-test-key"}):
-        # No key supplied at all
-        resp = client.get("/api/health")
+        resp = client.get("/api/health/ping")
         assert resp.status_code == 200, resp.text
+        assert resp.json() == {"ok": True}
 
 
-def test_health_source_config_always_accessible_with_api_key_set(client: TestClient) -> None:
-    """Health sub-routes also bypass auth."""
+def test_rich_health_requires_auth_when_api_key_set(client: TestClient) -> None:
+    """Rich health endpoints are dashboard diagnostics — they require the API key (§7)."""
     with patch.dict("os.environ", {"API_KEY": "secret-test-key"}):
-        resp = client.get("/api/health/source-config")
-        assert resp.status_code == 200, resp.text
+        # Without key: 401
+        assert client.get("/api/health").status_code == 401
+        assert client.get("/api/health/source-config").status_code == 401
+        # With correct key: 200
+        assert client.get("/api/health", headers={"X-Api-Key": "secret-test-key"}).status_code == 200
+        assert client.get("/api/health/source-config", headers={"X-Api-Key": "secret-test-key"}).status_code == 200

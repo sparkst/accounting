@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Production system deployed locally via launchd + Caddy reverse proxy, accessible at `https://macbook.ancon-cliff.ts.net`. All core features implemented: transaction ingestion, classification, invoicing, tax exports, reconciliation, and dashboard.
+Production runs on the Hetzner box `ubuntu-4gb-nbg1-2` (Ubuntu 24.04), public at `https://books.sparkry.ai` via Cloudflare Tunnel + Cloudflare Access (Google SSO) — migrated off the MacBook/launchd stack June 2026 (spec `docs/superpowers/specs/2026-06-01-accounting-hetzner-migration-design.md`). All core features implemented: transaction ingestion, classification, invoicing, tax exports, reconciliation, and dashboard.
 
 **Design spec:** `docs/superpowers/specs/2026-03-15-accounting-system-design.md`
 **Requirements:** `requirements/current.md` (≈45 REQ-IDs incl. REQ-WC-001..019)
@@ -113,7 +113,7 @@ rm data/accounting.snapshot.db
 - **Tax Documents** (`src/tax_docs/`): Tax document intake and processing.
 - **Brokerage** (`src/adapters/{schwab,fidelity,etrade,vanguard}_csv.py`, `src/models/brokerage.py`, `src/api/routes/brokerage.py`): Broker statement CSV ingestion with position snapshots; surfaced in dashboard at `/wealth` (frontend route renamed 2026-05-12; backend API paths still `/api/brokerage/*`).
 - **Brokerage history** (`src/models/history.py`): Phase 3 schema sitting alongside the live brokerage tables — `HistoricalPrice` (yfinance daily EOD), `AccountBalanceSnapshot` (XLSX historical aggregates), `ExpectedAccount` (manually-curated coverage list driving the missing-accounts panel), `CostBasisLot` (lot-level historical data), `AccountTag` (free-text tags for filter chips). Endpoints under `/api/brokerage/`: `networth-history`, `networth-history-benchmark`, `holdings/{symbol}/history`, `missing-accounts`, `PUT /accounts/{id}/tags`, `PATCH /accounts/{id}` (partial-update of `account_name`, `beneficiary`, `notes`), `GET /accounts/{id}/detail` (full per-account dossier: metadata + tags + latest 10 positions/balances + transaction count by action + lifetime realized G/L summary + recent IngestionLog rows). Per-account detail page at `/wealth/accounts/<id>`. `networth-history?include_unmatched=true` runs the canonical two-tier dedup against legacy XLSX rows — see comment at the top of the endpoint; the Cloudflare port mirrors this exactly.
-- **Reports** (`src/reports/`): Weekly P&L generator, run via launchd (`com.sparkry.weekly-pl-report.plist`).
+- **Reports** (`src/reports/`): Weekly P&L generator, run via systemd timer (`weekly-pl-report.timer`); writes `reports/weekly-pl-latest.txt` (served at `/reports/*`).
 - **Utilities** (`src/utils/`): Reconciliation engine and shared helpers.
 - **Dashboard** (`dashboard/`): SvelteKit frontend calling FastAPI backend. Apple design principles. Keyboard-first (y=confirm, e=edit, s=split, d=duplicate, j/k=navigate).
 
@@ -144,7 +144,7 @@ rm data/accounting.snapshot.db
   Active Doppler configs:
   - `accounting/dev` — local importers + FastAPI runtime. Pass via `doppler run --project accounting --config dev`.
   - `accounting/prd` — off-Cloudflare backup vault for CRM-shared secrets (per `sparkry-crm/CLAUDE.md` convention). Also holds `PLAID_TOKEN_ENC_KEY_MIGRATION` (read by the wealth-migration script at cutover) and the SENTRY_DSN + R2_BACKUP_WRITE_TOKEN mirrors.
-  - `accounting/srv` — Hetzner server runtime config; all systemd units inject it via `doppler run --config srv`. (Per the Hetzner migration: never `accounting/dev` / `accounting/prd` on the box.)
+  - `accounting/srv` — Hetzner server runtime config; selected by the Doppler **service token** in root-600 `/etc/accounting/doppler.env` (no `--config` flag), injected via `doppler run -- env -u DOPPLER_TOKEN <cmd>`. (Per the Hetzner migration: never `accounting/dev` / `accounting/prd` on the box.)
   - `accounting/stg`, `accounting/dev_personal` — staging / personal contexts.
 
   Keys in `accounting/dev`: `STRIPE_API_KEY`, `STRIPE_RESTRICTED_KEY`, `STRIPE_ACCOUNT_SPARKRY`, `STRIPE_ACCOUNT_BLACKLINE`, `STRIPE_ACCOUNT_TRAVIS_PERSONAL`, `RESEND_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_STORE_URL`, `N8N_WEBHOOK_SECRET`, `API_KEY`, `PLAID_CLIENT_ID`, `PLAID_SANDBOX_SECRET`, `PLAID_PRODUCTION_SECRET`, `PLAID_ENV`, **`PLAID_FERNET_KEY`** (renamed from `PLAID_TOKEN_ENC_KEY` at wealth-migration M0c — see `src/utils/plaid_crypto.py` for the legacy-name fallback), `WEALTH_API_BASE`, `WEALTH_INTERNAL_KEY`, `WEALTH_TARGET_DEFAULT`, **`N8N_ALERTS_WEBHOOK_URL`**, **`N8N_ALERTS_WEBHOOK_SECRET`**, **`ALERT_FROM_EMAIL`**, **`ALERT_TO_EMAIL`** (EA alert routing — **NOT YET PROVISIONED**; needed before `--apply`; also required in `accounting/srv` on Hetzner).
@@ -179,8 +179,9 @@ src/utils/plaid_crypto.py — Fernet AES; reads PLAID_FERNET_KEY (preferred) or 
 src/export/          — Tax export formatters (FreeTaxUSA, B&O)
 src/reports/         — Weekly P&L report generator
 scripts/             — Operational scripts (backup, deduction-scan, auto-confirm, ingest-brokerage)
-scripts/plaid_balance_sync.py — Daily Plaid balance sync; invoked by com.sparkry.plaid-balance-sync.plist
-scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); invoked by com.sparkry.plaid-transactions-sync.plist (NOT loaded — see prerequisites above)
+scripts/plaid_balance_sync.py — Daily Plaid balance sync (was launchd on the retired Mac; no box systemd unit yet — re-add at Plaid/Chase go-live, Phase 5)
+scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); box unit `plaid-transactions-sync.timer` installed but DISABLED until Plaid/Chase go-live (Phase 5)
+scripts/uptime_check.sh — local serving-stack health probe (`accounting-uptime-check.timer`, every 5 min → alert on failure)
 dashboard/           — SvelteKit frontend (built with vite, served via vite preview)
 dashboard/src/routes/admin/connections/ — Plaid Link UI + OAuth-return handler
 data/                — SQLite DB, CSV drop zone (GITIGNORED). Pre-migration snapshots at `accounting.pre-wealth-migration-<ts>.db`.
@@ -208,30 +209,40 @@ Tax categories, data source details, data model, and adapter specs are all in th
 
 ---
 
-## Local Deployment
+## Production Deployment (Hetzner)
 
-Five launchd services behind a Caddy reverse proxy over Tailscale. API plist uses `doppler run --` to inject secrets at runtime.
+Runs on the Hetzner box `ubuntu-4gb-nbg1-2` (Ubuntu 24.04), public at **`https://books.sparkry.ai`**:
+`cloudflared` tunnel → **Caddy** (`127.0.0.1:9000`, `admin off`) → uvicorn (`/api/*`→8000) / SvelteKit (`/`→5173, `/reports/*` file_server). **Cloudflare Access** gates the edge — Google SSO for humans; scoped **service tokens** for machines (`books-ingest` → `/api/ingest/*` for n8n; `books-health-ping` → `/api/health/ping` for monitoring). All services run as `travis` under **systemd**; secrets come from Doppler config **`accounting/srv`** (service token in root-600 `/etc/accounting/doppler.env`), injected with `doppler run -- env -u DOPPLER_TOKEN <cmd>` so the token reaches neither the process argv nor the app environment. Backups go to **Cloudflare R2** via `wrangler` (replaces SGDrive). The agentic-collab sandbox cohabits as a separate `collab` user; an nftables OUTPUT rule blocks `collab`→loopback app ports. The old MacBook launchd/Caddy/Tailscale stack is retired.
 
-| Service | Plist | Port | What |
-|---------|-------|------|------|
-| API | `com.sparkry.accounting-api.plist` | 8000 | FastAPI via `doppler run -- uvicorn` |
-| Dashboard | `com.sparkry.accounting-dashboard.plist` | 5173 | SvelteKit via `vite preview` (requires `npm run build` first) |
-| Caddy | `com.sparkry.caddy-accounting.plist` | 443 | HTTPS reverse proxy |
-| Backup | `com.sparkry.accounting-backup.plist` | — | Periodic SQLite backup (`scripts/backup.sh`) |
-| Weekly P&L | `com.sparkry.weekly-pl-report.plist` | — | Monday P&L email (`scripts/weekly-pl-report.py`) |
-| Plaid Transactions Sync | `com.sparkry.plaid-transactions-sync.plist` | — | Daily Plaid transaction sync (`scripts/plaid_transactions_sync.py --apply`). **NOT loaded yet** — gated on `PLAID_ENV=production` + `transactions` product approval + Chase OAuth redirect setup (spec §9 prerequisites). |
-| Alerts Dispatch | `com.sparkry.alerts-dispatch.{service,timer}` (Hetzner); `com.sparkry.alerts-dispatch.plist` (macOS parity) | — | Daily EA tax + invoice alert emails via n8n webhook (`scripts/alerts_dispatch.py --apply`). DRY-RUN until `N8N_ALERTS_WEBHOOK_URL/SECRET` provisioned. |
+**Migration:** spec `docs/superpowers/specs/2026-06-01-accounting-hetzner-migration-design.md` + plan `docs/superpowers/plans/2026-06-01-accounting-hetzner-migration.md`.
+
+| Unit | Type | What |
+|------|------|------|
+| `accounting-api.service` | service | FastAPI/uvicorn `127.0.0.1:8000` (boot-asserts `API_KEY` ≠ `INGEST_API_KEY` in production) |
+| `accounting-dashboard.service` | service | SvelteKit `vite preview` `127.0.0.1:5173` |
+| `caddy.service` | service | reverse proxy `127.0.0.1:9000` (cloudflared upstream) |
+| `cloudflared.service` | service | Cloudflare Tunnel `books-accounting` (token in root-600 `/etc/cloudflared/token`) |
+| `accounting-alert@.service` | template | Resend email on any unit's `OnFailure=` (hourly-deduped, sentinel in `data/.alerts`) |
+| `accounting-backup.timer` | timer | daily 03:17 UTC → R2 (`scripts/backup.sh`, readback-verified, 15d rolling) |
+| `accounting-backup-restore-test.timer` | timer | weekly Sun 07:00 UTC restore + row-count oracle (`scripts/backup_restore_test.py`) |
+| `accounting-disk-check.timer` | timer | every 6h; `<5 GB` free → alert |
+| `weekly-pl-report.timer` | timer | Mon 06:00 UTC → writes `reports/weekly-pl-latest.txt` (served at `/reports/*`) |
+| `accounting-uptime-check.timer` | timer | every 5 min; local Caddy `:9000` health probe → alert on failure |
+| `plaid-transactions-sync.timer` | timer | **installed, DISABLED** until Plaid/Chase go-live (Phase 5) |
+| `accounting-ea-alerts.timer` | timer | daily 14:05 UTC → EA WA B&O tax + invoice-submission reminders via n8n webhook (`scripts/alerts_dispatch.py --apply`); DRY-RUN until `N8N_ALERTS_WEBHOOK_URL/SECRET` in `accounting/srv`. Units in `deploy/accounting-ea-alerts.{service,timer}`. |
+
+All service units use `ProtectSystem=strict` + `ProtectHome=read-only` + a syscall/namespace sandbox; `XDG_*` / `DOPPLER_CONFIG_DIR` are redirected into `data/` so tools can write logs/cache under the read-only home.
 
 ```bash
-# Restart a service after code changes
-launchctl unload com.sparkry.accounting-api.plist && launchctl load com.sparkry.accounting-api.plist
+# Box access: ssh travis@ubuntu (Tailscale SSH); ssh root@ubuntu for systemctl/firewall.
+# Code is NEVER hand-edited on the box — change on the Mac → commit → push → rsync.
+ssh root@ubuntu 'systemctl restart accounting-api accounting-dashboard caddy'
 
-# Dashboard changes require rebuild before restart
-cd dashboard && npm run build
-launchctl unload com.sparkry.accounting-dashboard.plist && launchctl load com.sparkry.accounting-dashboard.plist
+# Dashboard changes require a rebuild (VITE_API_KEY baked in) before restart:
+cd dashboard && doppler run --config srv -- npm run build   # then re-rsync + restart accounting-dashboard
 ```
 
-Access via `https://macbook.ancon-cliff.ts.net` (Tailscale). Caddy routes `/api/*` → API, everything else → dashboard.
+Access via `https://books.sparkry.ai` (Cloudflare Access → Google login). n8n delivers Gmail receipts to `POST /api/ingest/gmail`.
 
 ---
 

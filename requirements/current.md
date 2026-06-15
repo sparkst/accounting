@@ -522,3 +522,26 @@ Spec: `docs/superpowers/specs/2026-06-07-ea-alert-routing-design.md`.
 | REQ-ALERT-008 | Per-alert error isolation; a failed POST is recorded `failed` and retried on the next run. |
 | REQ-ALERT-009 | Webhook POST sends the documented payload + `X-Webhook-Secret` header; HTTPS-only; recipient/sender allowlisted. |
 | REQ-ALERT-010 | `alert_dispatch` migration is additive with a clean downgrade (audit invariants preserved). |
+
+## REQ-BAL-* — Balance Milestone Alerts (v1)
+
+Replace the per-account day-over-day **balance-drift** alert (REQ-PS-003 in `sparkry-crm`)
+with **milestone-crossing** alerts, implemented in both systems: `sparkry-crm` (personal
+accounts) and the `accounting` box (business accounts: Sparkry, BlackLine, business cards).
+Type-driven rules in code; day-over-day crossing test vs the prior-day baseline; dedup per
+`(account, level, UTC-day)`; severity-tagged POST to the n8n `UT-Send Alert Message` stack
+(no direct email — n8n owns Telegram/Gmail routing); plus a daily `info` account-pulse digest.
+Spec: `docs/superpowers/specs/2026-06-14-balance-milestone-alerts-design.md`.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-BAL-001 | Checking accounts alert on a downward crossing of milestones [$10k, $5k, $1k, $0]. Severity: <$10k & <$5k → `info`; <$1k → `sev3`; <$0 (overdraft) → `sev2`. |
+| REQ-BAL-002 | Savings / other depository accounts alert on crossing below $100 (`sev3`). |
+| REQ-BAL-003 | Credit accounts alert on an upward crossing of $10k and every +$10k thereafter ($20k, $30k…). Severity: $10k → `info`; ≥$20k → `sev3`. |
+| REQ-BAL-004 | Investment accounts keep drift alerting, tightened from `OR` to `\|Δ%\| ≥ 15% AND \|Δ$\| ≥ $25,000`. Loan accounts are muted. |
+| REQ-BAL-005 | A milestone fires only on a day-over-day directional crossing vs the prior-calendar-day baseline; a null prior-day baseline never fires. Liability (credit/loan) sign-negation and scale-2 quantization preserved. |
+| REQ-BAL-006 | Dedup: at most one alert per `(account_id, level, UTC-day)`; a level re-fires only after the balance recovers across it on a later day (no same-day re-dip, no daily nag). |
+| REQ-BAL-007 | All alerts POST a severity-tagged payload (`type` ∈ info/sev2/sev3) to the n8n `UT-Send Alert Message` webhook; HTTPS-only; secret header; no direct Resend/email send. |
+| REQ-BAL-008 | A daily `info` account-pulse digest fires ~14:00 UTC listing every monitored account, its current balance, and any breached-state flag. |
+| REQ-BAL-009 | Box prerequisites: the disconnected Chase business Plaid Item is re-authed (human action) AND a daily `plaid_balance_sync` systemd timer writes fresh snapshots, before business-account alerts are enabled. |
+| REQ-BAL-010 | DRY-RUN is the default for the box dispatcher (`--apply` opts into POSTing); per-alert error isolation — one failed POST never halts the batch. |

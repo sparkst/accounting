@@ -180,7 +180,7 @@ src/export/          — Tax export formatters (FreeTaxUSA, B&O)
 src/reports/         — Weekly P&L report generator
 scripts/             — Operational scripts (backup, deduction-scan, auto-confirm, ingest-brokerage)
 scripts/plaid_balance_sync.py — Daily Plaid balance sync (was launchd on the retired Mac; no box systemd unit yet — re-add at Plaid/Chase go-live, Phase 5)
-scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); box unit `plaid-transactions-sync.timer` installed but DISABLED until Plaid/Chase go-live (Phase 5)
+scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); box unit `plaid-transactions-sync.timer` LIVE (daily 05:00 UTC, writes real txns — Amex + Chase). Job exits non-zero if any Item errors, so a single `ITEM_LOGIN_REQUIRED` (re-auth needed) trips the daily OnFailure alert even though the other Items synced.
 scripts/uptime_check.sh — local serving-stack health probe (`accounting-uptime-check.timer`, every 5 min → alert on failure)
 dashboard/           — SvelteKit frontend (built with vite, served via vite preview)
 dashboard/src/routes/admin/connections/ — Plaid Link UI + OAuth-return handler
@@ -228,7 +228,7 @@ Runs on the Hetzner box `ubuntu-4gb-nbg1-2` (Ubuntu 24.04), public at **`https:/
 | `accounting-disk-check.timer` | timer | every 6h; `<5 GB` free → alert |
 | `weekly-pl-report.timer` | timer | Mon 06:00 UTC → writes `reports/weekly-pl-latest.txt` (served at `/reports/*`) |
 | `accounting-uptime-check.timer` | timer | every 5 min; local Caddy `:9000` health probe → alert on failure |
-| `plaid-transactions-sync.timer` | timer | **installed, DISABLED** until Plaid/Chase go-live (Phase 5) |
+| `plaid-transactions-sync.timer` | timer | **LIVE** daily 05:00 UTC → `plaid_transactions_sync --apply` (Amex + Chase). Exits non-zero if any Item errors (e.g. `ITEM_LOGIN_REQUIRED`), tripping the OnFailure alert. |
 | `accounting-ea-alerts.timer` | timer | daily 14:05 UTC → EA WA B&O tax + invoice-submission reminders via n8n webhook (`scripts/alerts_dispatch.py --apply`); DRY-RUN until `N8N_ALERTS_WEBHOOK_URL/SECRET` in `accounting/srv`. Units in `deploy/accounting-ea-alerts.{service,timer}`. |
 
 All service units use `ProtectSystem=strict` + `ProtectHome=read-only` + a syscall/namespace sandbox; `XDG_*` / `DOPPLER_CONFIG_DIR` are redirected into `data/` so tools can write logs/cache under the read-only home.

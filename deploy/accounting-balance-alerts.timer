@@ -1,0 +1,12 @@
+[Unit]
+Description=Run accounting balance-alert dispatch + pulse daily at 14:00 UTC (~07:00 Pacific)
+
+[Timer]
+OnCalendar=*-*-* 14:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+# GATED: install but DO NOT `systemctl enable` until REQ-BAL-009 prerequisites
+# are met (Chase business Plaid Item re-authed + a daily plaid_balance_sync timer
+# writing fresh snapshots). Until then run DRY-RUN by hand to validate.

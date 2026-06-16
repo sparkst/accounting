@@ -1,0 +1,31 @@
+[Unit]
+Description=Daily Plaid balance sync (--apply) — writes plaid_account_balance_snapshot rows
+OnFailure=accounting-alert@%p.service
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python3 -m scripts.plaid_balance_sync --apply
+TimeoutStartSec=600
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by plaid-balance-sync.timer. Provides the daily prior-calendar-day
+# baseline the balance-milestone alerts (REQ-BAL-005) cross against.

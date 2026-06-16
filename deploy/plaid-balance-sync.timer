@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily Plaid balance sync at 04:00 UTC (before the 14:00 balance-alert run)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

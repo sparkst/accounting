@@ -1,0 +1,39 @@
+[Unit]
+Description=Accounting balance-milestone alert dispatch + daily account pulse via n8n
+After=network-online.target
+Wants=network-online.target
+OnFailure=accounting-alert@%p.service
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+# Doppler config is selected by the service token in /etc/accounting/doppler.env
+# (scoped to accounting/srv) — no --config flag needed. Requires
+# N8N_SEVERITY_WEBHOOK_URL/SECRET in accounting/srv.
+# --digest sends the daily account pulse (REQ-BAL-008) in the same run.
+# Drop --apply to run DRY-RUN (no n8n POST, no DB writes).
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python -m scripts.balance_alerts_dispatch --apply --digest
+TimeoutStartSec=120
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by accounting-balance-alerts.timer — not enabled directly (no [Install]).
+# GATED: do not enable the timer until REQ-BAL-009 prerequisites are met
+# (Chase business Plaid Item re-authed + daily plaid_balance_sync writing snapshots).

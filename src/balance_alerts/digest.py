@@ -79,16 +79,35 @@ def build_pulse(today: date, session: Session) -> list[PulseLine]:
     return sorted(lines, key=lambda x: (not x.breached, x.account_name))
 
 
+# Pulse layout: accounts grouped under a type header, largest balance first
+# (any flagged account still surfaces at the top of its group with a ⚠️).
+_PULSE_KIND_ORDER = ("checking", "savings", "credit", "investment")
+_PULSE_KIND_LABEL = {
+    "checking": "Checking",
+    "savings": "Savings",
+    "credit": "Credit",
+    "investment": "Investment",
+}
+
+
 def render_pulse(lines: list[PulseLine]) -> str:
     if not lines:
         return "No monitored accounts."
-    rows = []
-    for ln in lines:
-        flag = " ⚠️" if ln.breached else ""
-        rows.append(f"  {ln.account_name} ({ln.kind}): ${ln.balance:,.2f}{flag}")
+    blocks: list[str] = []
+    for kind in _PULSE_KIND_ORDER:
+        group = [ln for ln in lines if ln.kind == kind]
+        if not group:
+            continue
+        group.sort(key=lambda x: (not x.breached, -x.balance))
+        rows = [
+            f"  {ln.account_name} — ${ln.balance:,.2f}{' ⚠️' if ln.breached else ''}"
+            for ln in group
+        ]
+        blocks.append(_PULSE_KIND_LABEL[kind] + "\n" + "\n".join(rows))
     breached = sum(1 for x in lines if x.breached)
-    head = f"Account pulse — {len(lines)} accounts, {breached} flagged."
-    return head + "\n" + "\n".join(rows)
+    n = len(lines)
+    footer = f"{n} account{'s' if n != 1 else ''} · {breached} flagged"
+    return "\n\n".join(blocks) + "\n\n" + footer
 
 
 def _pulse_already_sent(session: Session, key: str, occ: str) -> bool:
@@ -119,7 +138,7 @@ def _record_pulse(session: Session, key: str, occ: str, result: WebhookResult) -
         occurrence_date=occ,
         alert_type="balance_pulse",
         entity="all",
-        subject=f"Daily account pulse — {occ}",
+        subject=f"Business Account Snapshot — {occ}",
         status=result.status,
         http_status=result.http_status,
         error_detail=result.error,
@@ -142,7 +161,7 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
     lines = build_pulse(today, session)
     payload = build_payload_dict(
         severity="info",
-        title=f"Daily account pulse — {occ}",
+        title=f"📊 Business Account Snapshot · {today:%b} {today.day}",
         message=render_pulse(lines),
         alert_key=key,
     )

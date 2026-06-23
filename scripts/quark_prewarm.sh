@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 # quark_prewarm.sh — background pre-load of Quark's data so "how are we doing" is instant.
 #
-# Runs the (quick) Hetzner snapshot pull AND the live D1 net-worth fetch IN PARALLEL,
-# then caches the merged contract to data/.quark-cache/digest.env with a timestamp.
-# Designed to be fired detached from a SessionStart hook on Claude launch.
+# Fires the FAST digest (scripts/quark_digest.sh): the register digest computed
+# READ-ONLY on the box (~KB over SSH) IN PARALLEL with the live D1 net worth. NO
+# 31 MB snapshot pull. Designed to be fired detached from a SessionStart hook.
 #
 # Debounced: if the cache is fresher than QUARK_PREWARM_TTL_MIN (default 25), it's a
-# no-op — so opening several sessions in a row won't re-pull. Uses --quick (no prod
-# Plaid sync) so launching Claude never hammers Plaid or the box's write path; the
-# box's own daily timers keep the snapshot day-fresh.
+# no-op — so opening several sessions in a row won't re-pull.
 #
-# Cache contract (data/.quark-cache/digest.env), sourced by the Quark skill:
-#   QUARK_DB / QUARK_FRESH / QUARK_ASOF / QUARK_STALE / QUARK_PLAID_REAUTH
-#   QUARK_NETWORTH / QUARK_NETWORTH_ASOF / QUARK_NETWORTH_SOURCE
-#   QUARK_PREWARM_AT=<epoch seconds>
+# Populates data/.quark-cache/{register.json, networth.json, digest.env}, which the
+# Quark skill reads first (instant) before falling back to a live pull.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,25 +37,6 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rm -rf "$LOCK"' EXIT
 
-tmp_ref="$(mktemp)"
-tmp_nw="$(mktemp)"
-trap 'rm -rf "$LOCK"; rm -f "$tmp_ref" "$tmp_nw"' EXIT
-
-# --- Parallel: Hetzner snapshot pull (quick) ∥ live D1 net worth ---
-bash "$ROOT/scripts/quark_refresh.sh" --quick >"$tmp_ref" 2>/dev/null &
-pid_ref=$!
+# Run the fast digest (itself parallel: box register read ∥ D1 net worth). KB, ~2.5s.
 doppler run --project accounting --config dev -- \
-  bash "$ROOT/scripts/quark_networth.sh" >"$tmp_nw" 2>/dev/null &
-pid_nw=$!
-
-wait "$pid_ref" || true
-wait "$pid_nw" || true
-
-# Merge both contracts + a stamp into the cache (atomic write via temp + mv).
-tmp_cache="$(mktemp)"
-{
-  grep '^QUARK_' "$tmp_ref" 2>/dev/null || true
-  grep '^QUARK_' "$tmp_nw" 2>/dev/null || true
-  echo "QUARK_PREWARM_AT=$(now_epoch)"
-} > "$tmp_cache"
-mv -f "$tmp_cache" "$CACHE"
+  bash "$ROOT/scripts/quark_digest.sh" >/dev/null 2>&1 || true

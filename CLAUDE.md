@@ -102,6 +102,32 @@ rm data/accounting.snapshot.db
 
 ---
 
+## Quark — your Ferengi CFO
+
+`Quark` is a persona skill (`~/.claude/skills/quark/`) that runs the books as a
+colorful DS9-Ferengi CFO + wealth advisor + draft-only stock-picker across all
+three entities. It triggers on "Quark", "ask my CFO", "run it by Quark", or any
+P&L / runway / tax-posture / net-worth / deal-pressure-test / investment ask.
+
+**Lazy-loads the latest financials on every invocation.** Production data lives on
+the Hetzner box; the local DB is stale. `scripts/quark_refresh.sh` syncs every
+account on the box (the sanctioned Plaid jobs) and pulls a **read-only** snapshot
+to `data/accounting.live.db` (gitignored), which Quark reads via `DATABASE_PATH`
+— never touching the local source-of-truth DB.
+
+```bash
+bash scripts/quark_refresh.sh           # full: sync accounts on the box, then pull (~1 min)
+bash scripts/quark_refresh.sh --quick   # snapshot only, no sync (~15s)
+```
+
+Guardrails baked into the skill: **read-only** (SELECT only; the only sanctioned
+write is the box's own daily sync) and **draft-only** (never sends/pays/trades —
+mirrors `qdecide`). Requires Tailscale SSH to the box (`travis@ubuntu` +
+`root@ubuntu` for the sync trigger); falls back to the stale local DB and says so
+if the box is unreachable.
+
+---
+
 ## Architecture
 
 **Data flow:** Sources → Adapters (Python) → Classification (3-tier) → SQLite Register → Dashboard (SvelteKit) / Tax Exports

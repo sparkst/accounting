@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.result import BaseImportResult
+from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account
 from src.models.enums import AccountType, Broker, Entity, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
@@ -47,6 +48,39 @@ SOURCE_TAG = "north_american_iul"
 
 NA_BROKER = Broker.NORTH_AMERICAN.value
 _DEFAULT_ACCOUNT_NAME = "North American Builder Plus IUL"
+
+# Cloud target — reuses the AccountBalanceSnapshot ingest path on the wealth
+# Worker (same source the NW Mutual / F&G carriers post under), so the D1
+# net-worth aggregation picks the policy up by ``raw_account_name``.
+_CLOUD_INGEST_SOURCE = "xlsx-snapshot"
+
+
+def _resolve_balance(
+    surrender_value: object | None,
+    accumulation_value: object | None,
+    policy_number: str,
+    result: BaseImportResult,
+) -> Decimal | None:
+    """Surrender value preferred; accumulation fallback (with a loud warning)."""
+    try:
+        if surrender_value is not None:
+            return parse_currency(surrender_value)
+        if accumulation_value is not None:
+            booked = parse_currency(accumulation_value)
+            result.warnings.append(
+                f"policy {policy_number}: no surrender value supplied — booked the "
+                "accumulation value, which OVERSTATES liquidation value during the "
+                "surrender-charge period. Replace once the surrender value is known."
+            )
+            return booked
+    except ValueError as exc:
+        result.errors.append(f"policy {policy_number}: unparseable value: {exc}")
+        return None
+    result.errors.append(
+        f"policy {policy_number}: neither surrender_value nor "
+        "accumulation_value supplied — nothing to book"
+    )
+    return None
 
 
 @dataclass
@@ -138,27 +172,9 @@ def import_policy(
     result = ImportResult()
     result.distinct_accounts = [policy_number]
 
-    # ── Resolve the balance: surrender value preferred, accumulation fallback. ──
-    booked: Decimal | None = None
-    try:
-        if surrender_value is not None:
-            booked = parse_currency(surrender_value)
-        elif accumulation_value is not None:
-            booked = parse_currency(accumulation_value)
-            result.warnings.append(
-                f"policy {policy_number}: no surrender value supplied — booked the "
-                "accumulation value, which OVERSTATES liquidation value during the "
-                "surrender-charge period. Replace once the surrender value is known."
-            )
-    except ValueError as exc:
-        result.errors.append(f"policy {policy_number}: unparseable value: {exc}")
-        booked = None
-
-    if booked is None and not result.errors:
-        result.errors.append(
-            f"policy {policy_number}: neither surrender_value nor "
-            "accumulation_value supplied — nothing to book"
-        )
+    booked = _resolve_balance(
+        surrender_value, accumulation_value, policy_number, result
+    )
 
     if dry_run:
         return result
@@ -237,6 +253,52 @@ def import_policy(
     return result
 
 
+# ── Cloud-mode ───────────────────────────────────────────────────────────────
+
+
+def import_policy_cloud(
+    *,
+    policy_number: str,
+    as_of: date,
+    surrender_value: object | None = None,
+    accumulation_value: object | None = None,
+    account_name: str | None = None,
+) -> ImportResult:
+    """POST one IUL balance snapshot to the wealth Worker (D1 net worth).
+
+    Mirrors :func:`import_policy` value resolution (surrender preferred), then
+    posts an ``AccountBalanceSnapshot`` row under the shared ``xlsx-snapshot``
+    ingest source so the D1 net-worth aggregation resolves it by
+    ``raw_account_name``. Sign convention: balance is a positive asset value.
+    """
+    result = ImportResult()
+    result.distinct_accounts = [policy_number]
+
+    booked = _resolve_balance(
+        surrender_value, accumulation_value, policy_number, result
+    )
+    if result.errors or booked is None:
+        return result
+
+    raw_account_name = account_name or _DEFAULT_ACCOUNT_NAME
+    row = {
+        "raw_account_name": raw_account_name,
+        "as_of": as_of.isoformat(),
+        "balance": str(quantize_balance(booked)),
+        "source": SOURCE_TAG,
+        "source_row_hash": _row_hash(policy_number, as_of, booked),
+    }
+    try:
+        post_to_wealth({"rows": [row]}, _CLOUD_INGEST_SOURCE)
+        result.imported += 1
+    except WealthClientError as exc:
+        label = f"policy {policy_number}@{as_of.isoformat()}"
+        result.errors.append(f"{label}: cloud POST error — {exc}")
+        logger.error("north_american_iul cloud POST error: %s — %s",
+                     label, type(exc).__name__)
+    return result
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 
@@ -255,8 +317,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     s.add_argument("--cost-basis", help="Policy cost basis (notes).")
     s.add_argument("--beneficiary", help="Beneficiary name.")
     s.add_argument("--account-name", help="Account display name.")
+    s.add_argument("--target", choices=("local", "cloud"), default="local",
+                   help="Write target for --apply: local DB or wealth Worker (D1).")
     s.add_argument("--apply", action="store_true",
-                   help="Write to the DB (default is DRY-RUN).")
+                   help="Write to the target (default is DRY-RUN).")
     return p
 
 
@@ -292,6 +356,17 @@ def main(argv: list[str] | None = None) -> int:
         result = import_policy(**common, dry_run=True)
         _print_summary(result, dry_run=True)
         return 0
+
+    if args.target == "cloud":
+        result = import_policy_cloud(
+            policy_number=args.policy,
+            as_of=as_of,
+            surrender_value=args.surrender,
+            accumulation_value=args.accumulation,
+            account_name=args.account_name,
+        )
+        _print_summary(result, dry_run=False)
+        return 1 if result.errors else 0
 
     try:
         from src.db.connection import get_session  # late import keeps tests light

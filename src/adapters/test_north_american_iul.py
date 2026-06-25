@@ -126,6 +126,35 @@ def test_reimport_is_idempotent(session: Session) -> None:
     assert len(session.scalars(select(Account)).all()) == 1
 
 
+def test_cloud_posts_surrender_value_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-IUL-005: cloud port POSTs one snapshot row with the surrender value."""
+    from src.adapters import north_american_iul as mod
+
+    captured: dict = {}
+
+    def _fake_post(payload, source):  # type: ignore[no-untyped-def]
+        captured["payload"] = payload
+        captured["source"] = source
+        return {"ok": True}
+
+    monkeypatch.setattr(mod, "post_to_wealth", _fake_post)
+    result = mod.import_policy_cloud(
+        policy_number=_POLICY,
+        as_of=_AS_OF,
+        surrender_value="$256,564.03",
+        accumulation_value="$466,928.72",
+        account_name="North American Builder Plus IUL4 — Travis",
+    )
+    assert result.imported == 1
+    assert result.errors == []
+    rows = captured["payload"]["rows"]
+    assert len(rows) == 1
+    # Surrender value wins, quantized to cents, posted as a string.
+    assert rows[0]["balance"] == "256564.03"
+    assert rows[0]["as_of"] == "2026-06-24"
+    assert rows[0]["source"] == "north_american_iul"
+
+
 def test_string_input_preserves_precision(session: Session) -> None:
     """REQ-IUL-004: '$466,928.72' parses to the exact Decimal, no float drift."""
     result = import_policy(

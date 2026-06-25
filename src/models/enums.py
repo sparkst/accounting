@@ -274,6 +274,7 @@ class Broker(enum.StrEnum):
     NW_MUTUAL = "nw_mutual"
     FG_ANNUITY = "fg_annuity"
     GSK_PENSION = "gsk_pension"
+    NORTH_AMERICAN = "north_american"  # North American Builder Plus IUL (indexed universal life)
     CHASE = "chase"
     AMEX = "amex"
     OTHER = "other"  # generic fallback for any other Plaid-linked institution

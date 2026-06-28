@@ -1,0 +1,32 @@
+# .project/manifest.yaml — the per-repo contract the Fleet Overseer reads.
+#
+# FACTS are deterministic and are rewritten by the freshness writer on every
+# commit; never edit them by hand. SUMMARY and PINNED are the deliberate,
+# human/LLM-authored layers — the placeholders below are meant to be replaced.
+
+# ── FACTS (deterministic; rewritten by the freshness writer, never by hand) ──
+schema_version: 1
+name: accounting
+repo: github.com/sparkst/accounting
+last_commit: "2026-06-25T00:27Z  (a2cbcfd)"
+last_synced: "2026-06-25T00:27Z"
+languages: [css, html, js, python, shell, sql, ts]
+deps_changed: false
+tests: {count: 0, last_run: '1970-01-01', status: unknown}
+ci: {provider: unknown, status: unknown}
+tree_digest: "a062539bf56fc149"
+summary_stale: true
+
+# ── SUMMARY (LLM-written; "deliberate" layer; refreshed on purpose) ──
+summary: "PLACEHOLDER — run a deliberate SUMMARY refresh to replace this stub; summary_stale stays TRUE until a real summary is written."
+architecture_doc: docs/architecture.md
+status_doc: requirements/current.md
+
+# ── PINNED MEMORY (3–5 things the overseer always needs) ──
+pinned:
+  active_goal: "PLACEHOLDER — set the active goal for this repo (TODO stub)."
+  sharp_edges:
+    - "PLACEHOLDER — list sharp edges / gotchas the overseer must respect (TODO stub)."
+  do_not_touch:
+    - "PLACEHOLDER — list paths the overseer must never modify, e.g. .env (TODO stub)."
+memory_store: .project/memory/

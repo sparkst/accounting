@@ -20,7 +20,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 

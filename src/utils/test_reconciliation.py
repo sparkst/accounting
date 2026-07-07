@@ -419,7 +419,7 @@ def test_remove_manual_match_pair_returns_to_unmatched(session: Session) -> None
     assert any(m.payout.id == payout.id for m in result_before.matched)
 
     remove_manual_match(session, payout.id, bank.id)
-    result_after = find_matches(session)
+    find_matches(session)
 
     # They may auto-rematch (amount/date qualify), but they must no longer
     # be locked as a manual pair — verify they aren't "manually confirmed" (confidence=1.0)

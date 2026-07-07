@@ -337,20 +337,214 @@ def _snap(account_id: str, d: date, bal: str, ptype: str = "depository",
     )
 
 
-def test_gap_account_no_prior_calendar_day_does_not_fire(session: Session) -> None:
-    """An account with a snapshot gap (Fri→Mon, no row on latest-1) never fires.
-
-    REQ-BAL-005 keys strictly on the prior CALENDAR day; this pins that intended
-    (and operationally sharp) behavior so a future change is a conscious choice.
+def test_gap_account_within_7d_falls_back_and_fires_with_gap_note(session: Session) -> None:
+    """REQ-FIX-PLD-003: a snapshot gap (Fri→Mon, no row on latest-1) falls back to
+    the most recent snapshot within 7 days instead of muting the crossing — a
+    data gap must not permanently swallow milestone alerts.
     """
     session.add(
         Account(id="gap", broker="chase", account_number="g-1",
                 account_name="Gap Checking", account_type="checking", entity="sparkry")
     )
     session.add(_snap("gap", date(2026, 6, 10), "5000.00"))   # earlier row exists
-    session.add(_snap("gap", date(2026, 6, 14), "200.00"))    # no June 13 row
+    session.add(_snap("gap", date(2026, 6, 14), "200.00"))    # no June 11-13 rows
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 4
+    assert "(4d data gap" in alerts[0].message
+
+
+def test_gap_account_beyond_7d_still_does_not_fire(session: Session) -> None:
+    """REQ-FIX-PLD-003: the fallback window is bounded at 7 days — beyond that,
+    REQ-BAL-005's null-baseline clause still governs (no fire)."""
+    session.add(
+        Account(id="gap8", broker="chase", account_number="g-2",
+                account_name="Gap8 Checking", account_type="checking", entity="sparkry")
+    )
+    session.add(_snap("gap8", date(2026, 6, 5), "5000.00"))   # 9 days before latest
+    session.add(_snap("gap8", date(2026, 6, 14), "200.00"))
     session.commit()
     assert compute_balance_alerts(date(2026, 6, 14), session) == []
+
+
+def test_gap_account_exactly_7d_boundary_still_fires(session: Session) -> None:
+    """REQ-FIX-PLD-003 boundary: a baseline exactly 7 days before the latest
+    snapshot is the last INCLUDED day of the fallback window (>=, not >)."""
+    session.add(
+        Account(id="gap7", broker="chase", account_number="g-7",
+                account_name="Gap7 Checking", account_type="checking", entity="sparkry")
+    )
+    session.add(_snap("gap7", date(2026, 6, 7), "5000.00"))   # exactly 7 days before latest
+    session.add(_snap("gap7", date(2026, 6, 14), "200.00"))
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 7
+
+
+def test_gap_account_exactly_8d_boundary_does_not_fire(session: Session) -> None:
+    """REQ-FIX-PLD-003 boundary: a baseline exactly 8 days before the latest
+    snapshot is the first EXCLUDED day of the fallback window — pins the
+    inclusive/exclusive edge in the opposite direction from the 7d test
+    above so a future off-by-one window widening/narrowing is caught."""
+    session.add(
+        Account(id="gap8b", broker="chase", account_number="g-8b",
+                account_name="Gap8b Checking", account_type="checking", entity="sparkry")
+    )
+    session.add(_snap("gap8b", date(2026, 6, 6), "5000.00"))  # exactly 8 days before latest
+    session.add(_snap("gap8b", date(2026, 6, 14), "200.00"))
+    session.commit()
+    assert compute_balance_alerts(date(2026, 6, 14), session) == []
+
+
+def test_gap_account_1d_no_note_and_gap_field_is_1(session: Session) -> None:
+    """A normal prior-calendar-day baseline carries baseline_gap_days=1 and no note."""
+    session.add(
+        Account(id="normal", broker="chase", account_number="g-3",
+                account_name="Normal Checking", account_type="checking", entity="sparkry")
+    )
+    session.add(_snap("normal", date(2026, 6, 13), "1500.00"))
+    session.add(_snap("normal", date(2026, 6, 14), "900.00"))
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 1
+    assert "data gap" not in alerts[0].message  # no gap note appended
+
+
+def test_stale_cached_balance_widens_gap_note_even_with_a_row_every_day(
+    session: Session,
+) -> None:
+    """REQ-FIX-PLD-001: `/accounts/get` returns Plaid's *cached* balance — a
+    row can exist for every calendar day (row-based gap = 1) while the
+    underlying value itself hasn't actually refreshed in days. When Plaid's
+    `balances.last_updated_datetime` says the latest snapshot's cache is N
+    days old, the gap note must reflect that true cache age (>= N), not just
+    the row-based gap, so a multi-day accumulated move isn't silently
+    attributed to a single day."""
+    session.add(
+        Account(id="stale-cache", broker="chase", account_number="g-4",
+                account_name="Stale Cache Checking", account_type="checking",
+                entity="sparkry")
+    )
+    session.add(_snap("stale-cache", date(2026, 6, 13), "1500.00"))
+    stale_latest = _snap("stale-cache", date(2026, 6, 14), "900.00")
+    stale_latest.raw_data = {
+        "balances": {"last_updated_datetime": "2026-06-10T00:00:00Z"}
+    }
+    session.add(stale_latest)
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 4  # cache age (4d), not row gap (1d)
+    assert "(4d data gap" in alerts[0].message
+
+
+def test_null_last_updated_datetime_keeps_row_based_gap(session: Session) -> None:
+    """When `last_updated_datetime` is null (the common case — most
+    institutions don't populate it), the row-based gap alone still governs,
+    unchanged from before REQ-FIX-PLD-001's cache-age check existed."""
+    session.add(
+        Account(id="null-cache", broker="chase", account_number="g-5",
+                account_name="Null Cache Checking", account_type="checking",
+                entity="sparkry")
+    )
+    session.add(_snap("null-cache", date(2026, 6, 13), "1500.00"))
+    session.add(_snap("null-cache", date(2026, 6, 14), "900.00"))  # raw_data={}
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 1
+    assert "data gap" not in alerts[0].message
+
+
+def test_stale_cached_baseline_widens_gap_even_when_latest_is_fresh(
+    session: Session,
+) -> None:
+    """REQ-FIX-PLD-001/003 regression: the BASELINE row's own Plaid-cached
+    balance can be stale while the latest reading is perfectly fresh (a row
+    exists for every calendar day, so the row-based gap alone is 1). The
+    crossing actually compares the baseline's true cached-as-of value to the
+    latest's fresh value, so the gap must fold in the baseline row's own
+    cache age too — not just the latest row's — or a multi-day accumulated
+    move gets silently attributed to a single day."""
+    session.add(
+        Account(id="stale-baseline", broker="chase", account_number="g-6",
+                account_name="Stale Baseline Checking", account_type="checking",
+                entity="sparkry")
+    )
+    stale_baseline = _snap("stale-baseline", date(2026, 6, 13), "1500.00")
+    stale_baseline.raw_data = {
+        "balances": {"last_updated_datetime": "2026-06-05T00:00:00Z"}
+    }
+    session.add(stale_baseline)
+    session.add(_snap("stale-baseline", date(2026, 6, 14), "900.00"))  # fresh, raw_data={}
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    # baseline's own cache is 8d stale (6/5 -> 6/13) + 1d row gap (6/13 -> 6/14) = 9
+    assert alerts[0].baseline_gap_days == 9
+    assert "(9d data gap" in alerts[0].message
+
+
+# --- REQ-FIX-ALR-008: $0 strict crossing -----------------------------------
+
+
+def test_checking_zero_exact_does_not_fire_but_below_1k_does() -> None:
+    # baseline $1,500 -> current $0.00 crosses the $1k floor (fires) but must
+    # NOT fire the $0 floor — an exact zero balance is not an overdraft.
+    alerts = _eval("depository", "checking", 1500, "0.00")
+    assert [a.level for a in alerts] == ["1000"]
+
+
+def test_checking_negative_cent_fires_zero_floor_sev2() -> None:
+    alerts = _eval("depository", "checking", 1500, "-0.01")
+    levels = {a.level: a.severity for a in alerts}
+    assert levels["1000"] == SEV3
+    assert levels["0"] == SEV2
+
+
+def test_checking_subcent_residual_does_not_fire_zero_floor() -> None:
+    # Snapshots store Numeric(18,4); a scale-4 residual like -0.0001 quantizes
+    # to $0.00 and must not fire an overdraft that would render as "$0.00".
+    alerts = _eval("depository", "checking", 1500, "-0.0001")
+    assert "0" not in {a.level for a in alerts}
+    # ...but it still crosses the $1k floor like an exact zero does.
+    assert {a.level for a in alerts} == {"1000"}
+
+
+def test_one_account_exception_does_not_block_others(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the per-account try/except in compute_balance_alerts:
+    a raise while processing one account (e.g. a corrupted row) must not
+    blank alert computation for every other account."""
+    import src.balance_alerts.rules as rules_mod
+
+    for aid, name in (("bad", "Bad Acct"), ("good", "Good Acct")):
+        session.add(
+            Account(id=aid, broker="chase", account_number=f"k-{aid}",
+                     account_name=name, account_type="checking", entity="sparkry")
+        )
+        session.add(_snap(aid, date(2026, 6, 13), "1500.00"))
+    session.add(_snap("bad", date(2026, 6, 14), "900.00"))
+    session.add(_snap("good", date(2026, 6, 14), "900.00"))
+    session.commit()
+
+    orig_evaluate_account = rules_mod.evaluate_account
+
+    def _evaluate_account(*, account_id: str, **kwargs: object) -> list[BalanceAlert]:
+        if account_id == "bad":
+            raise RuntimeError("boom")
+        return orig_evaluate_account(account_id=account_id, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(rules_mod, "evaluate_account", _evaluate_account)
+
+    alerts = rules_mod.compute_balance_alerts(date(2026, 6, 14), session)
+
+    assert len(alerts) == 1
+    assert alerts[0].account_name == "Good Acct"
 
 
 def test_multiple_accounts_attributed_correctly(session: Session) -> None:

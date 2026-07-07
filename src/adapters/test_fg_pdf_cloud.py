@@ -12,12 +12,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.adapters.fg_pdf import (
-    SOURCE_TAG,
     _CLOUD_INGEST_SOURCE,
+    SOURCE_TAG,
     _default_target,
     import_pdf_cloud,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -191,6 +190,7 @@ def test_cloud_parse_failure_yields_error_no_post(tmp_path, monkeypatch, mock_po
 
 def test_cloud_post_failure_yields_error_no_raise(tmp_path, monkeypatch):
     from decimal import Decimal
+
     from src.adapters._shared.wealth_client import WealthHTTPError
 
     monkeypatch.setattr("src.adapters.fg_pdf.pdftotext_layout", lambda p: ANNUAL_PDF_TEXT)

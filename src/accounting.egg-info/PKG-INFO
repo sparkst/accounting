@@ -6,7 +6,7 @@ Requires-Python: >=3.12
 Requires-Dist: fastapi>=0.115.0
 Requires-Dist: uvicorn[standard]>=0.32.0
 Requires-Dist: sqlalchemy>=2.0.0
-Requires-Dist: anthropic>=0.40.0
+Requires-Dist: google-genai<3,>=2.8
 Requires-Dist: pydantic>=2.10.0
 Requires-Dist: httpx>=0.28.0
 Requires-Dist: yfinance>=0.2.40
@@ -14,7 +14,16 @@ Requires-Dist: plaid-python<25.0.0,>=18.0.0
 Requires-Dist: cryptography>=43.0.0
 Requires-Dist: fpdf2>=2.7
 Requires-Dist: jinja2>=3.1
+Requires-Dist: stripe>=14.0
+Requires-Dist: openpyxl>=3.1
+Requires-Dist: chardet>=5.0
+Requires-Dist: icalendar>=6.0
+Requires-Dist: resend>=2.0
+Requires-Dist: alembic>=1.13
+Requires-Dist: python-multipart>=0.0.22
+Requires-Dist: numpy<3,>=1.26
+Requires-Dist: pandas<4,>=2.0
 Provides-Extra: dev
-Requires-Dist: ruff>=0.8.0; extra == "dev"
-Requires-Dist: mypy>=1.13.0; extra == "dev"
-Requires-Dist: pytest>=8.3.0; extra == "dev"
+Requires-Dist: ruff~=0.15.6; extra == "dev"
+Requires-Dist: mypy~=1.19; extra == "dev"
+Requires-Dist: pytest~=9.0; extra == "dev"

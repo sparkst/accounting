@@ -8,13 +8,12 @@ DELETE /api/tax-year-locks/{id}      — Remove a lock (e.g. to allow amendment)
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.exc import IntegrityError
-from collections.abc import Generator
-
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal

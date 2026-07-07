@@ -10,6 +10,7 @@ to load realistic JSON-shaped responses.
 from __future__ import annotations
 
 import json
+from datetime import date
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
@@ -27,7 +28,7 @@ from src.adapters.plaid_balance import (
 )
 from src.models.base import Base
 from src.models.brokerage import Account
-from src.models.history import ExpectedAccount  # noqa: F401 — register on metadata
+from src.models.history import ExpectedAccount
 from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidAccountBalanceSnapshot, PlaidItem
 from src.utils.plaid_crypto import encrypt_token
@@ -96,16 +97,16 @@ def _make_account(
 
 def _mock_client_returning(fixture_name: str) -> MagicMock:
     client = MagicMock()
-    client.accounts_balance_get.return_value = make_response_from_fixture(fixture_name)
+    client.accounts_get.return_value = make_response_from_fixture(fixture_name)
     return client
 
 
 def _mock_client_raising(error_code: str) -> MagicMock:
-    """Return a client whose accounts_balance_get raises a Plaid ApiException."""
+    """Return a client whose accounts_get raises a Plaid ApiException."""
     client = MagicMock()
     exc = ApiException(status=400, reason="Test")
     exc.body = json.dumps({"error_code": error_code, "error_message": f"mock {error_code}"})
-    client.accounts_balance_get.side_effect = exc
+    client.accounts_get.side_effect = exc
     return client
 
 
@@ -307,7 +308,7 @@ def test_per_account_exception_isolation(session: Session) -> None:
     poisoned.to_dict = _explode  # type: ignore[attr-defined]
 
     client = MagicMock()
-    client.accounts_balance_get.return_value = resp
+    client.accounts_get.return_value = resp
 
     result = sync_one_item(session, item, client=client)
     session.commit()
@@ -346,7 +347,7 @@ def test_per_item_exception_isolation(session: Session) -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def accounts_balance_get(self, _req: Any) -> Any:
+        def accounts_get(self, _req: Any) -> Any:
             self.calls += 1
             if self.calls == 1:
                 exc = ApiException(status=400, reason="?")
@@ -387,7 +388,7 @@ def test_invalid_ciphertext_treated_as_terminal(
     assert result.status == "error"
     assert result.error_code == "INVALID_ACCESS_TOKEN"
     # We did NOT call Plaid because we couldn't decrypt.
-    client.accounts_balance_get.assert_not_called()
+    client.accounts_get.assert_not_called()
 
 
 def test_ingestion_log_written_per_item_run(session: Session) -> None:
@@ -454,4 +455,129 @@ def test_disconnected_items_skipped(session: Session) -> None:
 
     batch = sync_all_active(session, client=client, dry_run=False)
     assert batch.items == []
-    client.accounts_balance_get.assert_not_called()
+    client.accounts_get.assert_not_called()
+
+
+# ── REQ-FIX-PLD-001: /accounts/get request construction ─────────────────────
+
+
+def test_accounts_request_returns_accounts_get_request_with_token() -> None:
+    from plaid.model.accounts_get_request import AccountsGetRequest
+
+    from src.adapters.plaid_balance import _accounts_request
+
+    req = _accounts_request("access-sandbox-test-token")
+    assert isinstance(req, AccountsGetRequest)
+    assert req.access_token == "access-sandbox-test-token"
+
+
+def test_sync_calls_accounts_get_never_accounts_balance_get(session: Session) -> None:
+    item = _make_item(session, institution_name="Chase")
+    _make_account(
+        session, item=item, plaid_account_id="plaid_acct_chase_checking_0001", account_number="1111"
+    )
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    sync_one_item(session, item, client=client)
+
+    client.accounts_get.assert_called_once()
+    # accounts_balance_get is a MagicMock auto-attribute — assert it was never
+    # invoked (would auto-create if accessed, so we check call count instead).
+    assert client.accounts_balance_get.call_count == 0
+
+
+def test_accounts_get_with_null_last_updated_datetime_stamps_run_date(
+    session: Session,
+) -> None:
+    """REQ-FIX-PLD-001: /accounts/get's balances.last_updated_datetime is
+    typically None (non-Capital-One institutions) — snapshot_date must still be
+    stamped as the run date (today), never derived from that field, and the
+    snapshot writes normally even when the underlying value is unchanged from
+    a prior day (freshness is a digest-level concern, not a write-time one)."""
+    item = _make_item(session, institution_name="Chase")
+    _make_account(
+        session, item=item, plaid_account_id="plaid_acct_chase_checking_0001", account_number="1111"
+    )
+    client = _mock_client_returning("accounts_get_null_last_updated")
+
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert result.status == "ok"
+    assert result.accounts_processed == 1
+    snap = session.query(PlaidAccountBalanceSnapshot).one()
+    assert snap.snapshot_date == date.today()
+    assert snap.current_balance == Decimal("4523.18")
+
+
+# ── REQ-FIX-PLD-004: dead placeholder items excluded from rotation ──────────
+
+
+def test_placeholder_item_excluded_from_sync_rotation(session: Session) -> None:
+    """A placeholder item (item_id LIKE 'placeholder_%') is never synced, even
+    if its status is still 'active' (query-parity fix, independent of the
+    one-time data-fix script that flips it to disconnected)."""
+    item = PlaidItem(
+        item_id="placeholder_abc123",
+        institution_id="ins_9",
+        institution_name="Dead Placeholder",
+        access_token_encrypted=encrypt_token("access-sandbox-test-token"),
+        status="active",
+    )
+    session.add(item)
+    session.commit()
+    client = MagicMock()
+
+    batch = sync_all_active(session, client=client, dry_run=False)
+
+    assert batch.items == []
+    client.accounts_get.assert_not_called()
+
+
+# ── REQ-FIX-PLD-005: unmapped-account detail + ignore-list ──────────────────
+
+
+def test_unmapped_accounts_logged_with_name_mask_subtype(session: Session) -> None:
+    item = _make_item(session, institution_name="Chase")
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert result.accounts_skipped_unmapped == 3
+    assert len(result.unmapped) == 3
+    assert "Chase Total Checking ·0123· checking" in result.unmapped
+    assert "Chase Sapphire Preferred ·4567· credit card" in result.unmapped
+    log = session.query(IngestionLog).filter_by(
+        source=f"plaid_balance:{item.institution_name}"
+    ).one()
+    assert log.error_detail is not None
+    assert "unmapped_skipped=3" in log.error_detail
+    assert "Chase Total Checking ·0123· checking" in log.error_detail
+
+
+def test_ignored_expected_account_not_counted_as_unmapped(session: Session) -> None:
+    """REQ-FIX-PLD-005: an account flipped to status='ignored' stops counting
+    as unmapped on subsequent syncs."""
+    item = _make_item(session, institution_name="Chase")
+    session.add(
+        ExpectedAccount(
+            institution="Chase",
+            account_name="Chase Total Checking",
+            last_4="0123",
+            status="ignored",
+            source="plaid",
+        )
+    )
+    session.commit()
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+
+    # 2 of the 3 fixture accounts remain unmapped; the ignored one is excluded.
+    assert result.accounts_skipped_unmapped == 2
+    assert not any("Chase Total Checking" in u for u in result.unmapped)
+    # The ignored row itself is untouched (still 'ignored', not overwritten).
+    ignored = session.query(ExpectedAccount).filter_by(account_name="Chase Total Checking").one()
+    assert ignored.status == "ignored"

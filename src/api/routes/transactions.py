@@ -12,6 +12,7 @@ POST /api/transactions/{id}/link-reimbursement  — Link an expense to its reimb
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -20,8 +21,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func
-from collections.abc import Generator
-
 from sqlalchemy.orm import Session
 
 from src.api.routes.tax_year_locks import check_lock

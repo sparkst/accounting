@@ -15,7 +15,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from sqlalchemy.orm import Session
 

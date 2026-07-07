@@ -13,12 +13,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.adapters.nw_mutual_xlsx import (
-    SOURCE_TAG,
     _CLOUD_INGEST_SOURCE,
+    SOURCE_TAG,
     _default_target,
     import_balances_cloud,
 )
-
 
 # ── Sample parsed workbook data ───────────────────────────────────────────────
 
@@ -121,9 +120,6 @@ def test_cloud_balance_is_decimal_string(tmp_path, mock_workbook, mock_post):
     import_balances_cloud(xlsx, as_of=date(2025, 12, 31))
 
     payload = mock_post.call_args[0][0]
-    rows_by_policy = {
-        r["raw_account_name"]: r for r in payload["rows"]
-    }
     for row in payload["rows"]:
         assert isinstance(row["balance"], str)
         # Must have exactly 2 decimal places

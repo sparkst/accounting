@@ -16,7 +16,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
 import src.db.connection as _conn  # noqa: F401
 from src.models.base import Base

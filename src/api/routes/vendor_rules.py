@@ -10,14 +10,13 @@ DELETE /api/vendor-rules/{id}      — Delete rule.
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
-from collections.abc import Generator
-
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal

@@ -256,7 +256,7 @@ class TestConfirmInteractive:
             output_fn=outputs.append,
         )
         assert counts == {
-            "active": 1, "closed": 1, "skipped": 1, "accounts_created": 0,
+            "active": 1, "closed": 1, "ignored": 0, "skipped": 1, "accounts_created": 0,
         }
 
         statuses = {
@@ -264,6 +264,23 @@ class TestConfirmInteractive:
             for row in session.query(ExpectedAccount).all()
         }
         assert statuses == {"X": "active", "Y": "closed", "Z": "unconfirmed"}
+
+    def test_ignore_response_sets_ignored_status(self, session: Session) -> None:
+        """REQ-FIX-PLD-005: the `i` response ignore-lists the account."""
+        e = ExpectedAccount(
+            institution="A", account_name="Never Mine", source="manual", status="unconfirmed"
+        )
+        session.add(e)
+        session.commit()
+
+        counts = seeder.confirm_interactive(
+            session,
+            input_fn=lambda _prompt: "i",
+            output_fn=lambda _s: None,
+        )
+        assert counts["ignored"] == 1
+        session.refresh(e)
+        assert e.status == "ignored"
 
     def test_no_unconfirmed_rows_is_a_noop(self, session: Session) -> None:
         outputs: list[str] = []
@@ -273,7 +290,7 @@ class TestConfirmInteractive:
             output_fn=outputs.append,
         )
         assert counts == {
-            "active": 0, "closed": 0, "skipped": 0, "accounts_created": 0,
+            "active": 0, "closed": 0, "ignored": 0, "skipped": 0, "accounts_created": 0,
         }
         assert any("No unconfirmed" in s for s in outputs)
 

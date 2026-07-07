@@ -11,14 +11,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.adapters.brokerage_csv import (
+    _CLOUD_INGEST_SOURCE,
     ETRADE,
     SCHWAB,
-    VANGUARD,
-    _CLOUD_INGEST_SOURCE,
     _default_target,
     import_csv_cloud,
 )
-
 
 # ── Sample CSV content ────────────────────────────────────────────────────────
 

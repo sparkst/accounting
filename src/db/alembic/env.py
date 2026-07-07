@@ -11,13 +11,14 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from src.alerts.models import AlertDispatch  # noqa: F401
+
 # ---------------------------------------------------------------------------
 # Import all models so their tables are registered on Base.metadata before
 # autogenerate inspects it.  Mirror the imports in src/db/connection.py.
 # ---------------------------------------------------------------------------
 from src.models.audit_event import AuditEvent  # noqa: F401
 from src.models.base import Base
-from src.models.plaid import PlaidItem, PlaidAccountBalanceSnapshot  # noqa: F401
 from src.models.brokerage import (  # noqa: F401
     Account,
     BrokerageTransaction,
@@ -35,12 +36,12 @@ from src.models.ingested_file import IngestedFile  # noqa: F401
 from src.models.ingestion_log import IngestionLog  # noqa: F401
 from src.models.invoice import Customer, Invoice, InvoiceLineItem  # noqa: F401
 from src.models.llm_usage import LLMUsageLog  # noqa: F401
+from src.models.plaid import PlaidAccountBalanceSnapshot, PlaidItem  # noqa: F401
 from src.models.tax_document import TaxDocument  # noqa: F401
 from src.models.tax_year_lock import TaxYearLock  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
 from src.planning.models import PlanningRun  # noqa: F401
-from src.alerts.models import AlertDispatch  # noqa: F401
 
 # Alembic Config object — provides access to values within alembic.ini.
 config = context.config

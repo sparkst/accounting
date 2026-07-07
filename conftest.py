@@ -14,6 +14,14 @@ with the current schema.
 import glob
 import os
 
+# Register every model on the shared Base BEFORE any test module runs its
+# import-time create_all(). Without this, a module whose create_all() ran
+# before some other module imported src.planning.models gets a shared-cache
+# DB missing planning_runs, and its per-test cleanup (which iterates the
+# now-larger Base.metadata) fails with "no such table: planning_runs".
+import src.models  # noqa: E402, F401
+import src.planning.models  # noqa: E402, F401
+
 
 def pytest_configure(config):  # noqa: ARG001
     """Delete leftover shared-cache test database files before test collection."""

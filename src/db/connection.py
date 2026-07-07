@@ -15,6 +15,7 @@ from pathlib import Path
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from src.alerts.models import AlertDispatch  # noqa: F401
 from src.models.audit_event import AuditEvent  # noqa: F401
 
 # Import all models so their tables are registered on Base.metadata before
@@ -48,8 +49,6 @@ from src.models.plaid import (  # noqa: F401
 from src.models.tax_year_lock import TaxYearLock  # noqa: F401
 from src.models.transaction import Transaction  # noqa: F401
 from src.models.vendor_rule import VendorRule  # noqa: F401
-
-from src.alerts.models import AlertDispatch  # noqa: F401
 
 _DEFAULT_DB_PATH = "data/accounting.db"
 

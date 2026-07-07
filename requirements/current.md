@@ -545,3 +545,201 @@ Spec: `docs/superpowers/specs/2026-06-14-balance-milestone-alerts-design.md`.
 | REQ-BAL-008 | A daily `info` account-pulse digest fires ~14:00 UTC listing every monitored account, its current balance, and any breached-state flag. |
 | REQ-BAL-009 | Box prerequisites: the disconnected Chase business Plaid Item is re-authed (human action) AND a daily `plaid_balance_sync` systemd timer writes fresh snapshots, before business-account alerts are enabled. |
 | REQ-BAL-010 | DRY-RUN is the default for the box dispatcher (`--apply` opts into POSTing); per-alert error isolation — one failed POST never halts the batch. |
+
+---
+
+# Program 2026-07: Remediation + Feature Program (RFP)
+
+Source: four-lens system audit of 2026-07-07 (alerts pipeline, ingestion/classification,
+invoicing/tax export, wealth analytics) + live-box verification. Every REQ-FIX below traces
+to a verified finding with file:line evidence recorded in the audit transcript.
+
+**Model policy (locked):** development agents run Opus 4.8 / Sonnet / Haiku; any *runtime*
+LLM usage (classification, extraction, narratives) uses Gemini/OpenAI (cheap tiers) behind a
+provider-configurable boundary; Fable is used only for design authorship and the final
+delivery review — never in production.
+
+**Decisions locked 2026-07-07 (Travis):** delivery split by type (Telegram: pulse + sev
+alerts; email: WBR/close/tax reports) · unmapped Chase accounts surfaced by name before
+mapping · concentration glide AMZN+MSFT ≤35% by 2031-07, intl target 10% of equity ·
+auto-confirm Tier-1 ≥0.90 with weekly digest + undo · AR reminders draft-for-approval always ·
+EA alert recipient stays `ea-alerts@sparkry.com` · Tier-3 classifier stays Gemini (fix docs +
+prompt) · tax forecaster is full-household MFJ with a one-time config file.
+
+## REQ-FIX-PLD-* — Plaid repair (balance sync down since 2026-06-25)
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-PLD-001 | Balance sync calls `/accounts/get` (cached balances, covered by the Transactions product) instead of `/accounts/balance/get` (paid Balance product; the source of the live `INVALID_PRODUCT` outage). Snapshot write path and schema unchanged. Test asserts request construction. |
+| REQ-FIX-PLD-002 | Balance-sync exit policy mirrors transactions sync: any item `status=error` OR `accounts_failed>0` → exit non-zero → OnFailure alert. Retryable failures are never silently exit-0. |
+| REQ-FIX-PLD-003 | Milestone dispatcher baseline fallback: when the prior-calendar-day snapshot is missing, use the most recent snapshot ≤7 days old as baseline and include a `baseline_gap_days` note in the alert payload. A data gap must not mute crossing detection (supersedes the null-baseline clause of REQ-BAL-005 for gaps ≤7d). |
+| REQ-FIX-PLD-004 | The two dead `pending` items (INVALID_ACCESS_TOKEN since 2026-06-02, status=disconnected) are excluded from sync rotation and daily error output; they remain visible in the reconciliation endpoint as disconnected. |
+| REQ-FIX-PLD-005 | Unmapped Plaid accounts are surfaced, not silently skipped: sync logs name+mask+subtype per unmapped account into `ingestion_log` detail; the daily pulse lists them until each is mapped or added to an explicit ignore-list. Ignore-listed accounts stop counting as unmapped. |
+| REQ-FIX-PLD-006 | Post-deploy live smoke: one manual `--apply` run writes snapshots dated today for all 4 mapped accounts; the pulse renders them without stale markers. The Jun-25→fix balance-history gap is documented in the runbook (Plaid cannot backfill balances). |
+
+## REQ-FIX-ALR-* — Alert delivery reliability
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-ALR-001 | Both webhook clients (`src/balance_alerts/webhook.py`, `src/alerts/webhook.py`) retry failed POSTs: 3 attempts, exponential backoff with jitter, on connect error/timeout/5xx; no retry on 4xx. |
+| REQ-FIX-ALR-002 | `alert_dispatch` rows store the full payload JSON. At dispatch start, rows with `status='failed'` from the last 7 days are re-POSTed and transitioned to `sent` on success. A transient webhook failure can no longer permanently lose an alert. |
+| REQ-FIX-ALR-003 | EA alert recipient/sender allowlists move from hardcoded literals to env-configured values defaulting to the current literals (`ea-alerts@sparkry.com` / `Travis@sparkry.com`). `N8N_ALERTS_WEBHOOK_URL`, `N8N_ALERTS_WEBHOOK_SECRET`, `ALERT_FROM_EMAIL`, `ALERT_TO_EMAIL` are provisioned in `accounting/srv` and `accounting/dev`. |
+| REQ-FIX-ALR-004 | Date-keyed EA rules evaluate every day since the last successful run (from the ledger), so a `Persistent=true` catch-up after downtime still fires last-day-of-month and fixed-day reminders. |
+| REQ-FIX-ALR-005 | Pulse staleness: any balance whose snapshot is older than yesterday renders `(as of <date>)` + a stale marker; the footer counts stale accounts. Confidently-stale data is never presented as current. |
+| REQ-FIX-ALR-006 | The OnFailure alert email includes the failing unit's last ~15 journal lines and, for dispatcher units, the titles of failed alerts from the ledger. |
+| REQ-FIX-ALR-007 | `accounting-balance-alerts.service` orders `After=plaid-balance-sync.service` (ordering only) so boot catch-up evaluates the fresh snapshot. |
+| REQ-FIX-ALR-008 | The $0 floor fires on `current < 0` (strict), matching REQ-BAL-001 "<$0"; a balance of exactly $0.00 does not alert as an overdraft. |
+
+## REQ-FIX-TAX-* — Tax & B&O correctness
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-TAX-001 | Shopify payouts are `direction=transfer` with no income tax category (mirroring Stripe payouts). A backfill reclassifies existing payout rows with audit events; payout↔order pairs are reconciliation pairs, never P&L. Gross receipts stop double-counting Shopify sales. |
+| REQ-FIX-TAX-002 | All export surfaces (summary B&O CSVs, FreeTaxUSA, TaxAct) report `SALES_INCOME` on the pre-tax basis via the retail-facts computation; collected WA sales tax is excluded from gross receipts everywhere, not just the DOR upload. |
+| REQ-FIX-TAX-003 | `OTHER_EXPENSE` maps to Schedule C L27a and Form 1065 other deductions in both exporters (Shopify refunds currently vanish from filed numbers). |
+| REQ-FIX-TAX-004 | `WHOLESALE_INCOME` is included in `SCHEDULE_C_LINES` gross receipts. |
+| REQ-FIX-TAX-005 | 1099-B export handles `tax_subcategory=None` and matches term case-insensitively (no 500 on personal exports). |
+| REQ-FIX-TAX-006 | B&O CSV grand totals equal the sum of the displayed (per-row-rounded) values. |
+| REQ-FIX-TAX-007 | DOR upload hard-fails with an actionable error when any row carries the unmapped `____` location code. |
+
+## REQ-FIX-INV-* — Invoicing integrity
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-INV-001 | When invoice email send fails after payment-link creation, the persisted link fields are cleared along with deactivation; a retry creates a fresh link. A customer can never receive a deactivated link. |
+| REQ-FIX-INV-002 | `PATCH /invoices/{id}` deactivates and clears the stored payment link whenever the total changes; link reuse verifies amount. |
+| REQ-FIX-INV-003 | `match_payment` guards: invoice must be SENT/PARTIAL; transaction must be income-direction and not already linked to another invoice; the audit event records the true prior value. |
+| REQ-FIX-INV-004 | Calendar invoice generation dedupes sessions within the submitted batch (date+start+end+description), not just against the DB. |
+| REQ-FIX-INV-005 | Line totals and subtotal are quantized to cents at generation; the Stripe link amount is derived by quantization (never `int()` truncation) and always equals the PDF/email amount. |
+
+## REQ-FIX-ING-* — Ingestion & classification
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-ING-001 | bank_csv per-row isolation uses `with session.begin_nested():` correctly; a poisoned row rolls back only itself; `records_created` is accurate. Test: batch with a failing row persists all other rows. |
+| REQ-FIX-ING-002 | Exchange-rate math is Decimal-only in `gmail_n8n.py` and `backfill_currency.py`; a receipt containing USD + foreign amounts ingests successfully. |
+| REQ-FIX-ING-003 | Gmail adapter rolls back the session on per-file failure; one bad file cannot poison the rest of the batch. |
+| REQ-FIX-ING-004 | Confirming a human-edited transaction updates the matched vendor rule's category/direction/deductible_pct; a divergent correction resets rule confidence to base. Test: a correction flips the classification of the next matching transaction. |
+| REQ-FIX-ING-005 | Vendor patterns are stored regex-escaped at creation; existing stored patterns are matched literally (substring) unless explicitly flagged as regex. |
+| REQ-FIX-ING-006 | bank_csv dedup key quantizes the amount to cents and appends an occurrence counter for identical same-file tuples; a re-export with different decimal rendering does not duplicate, and two identical same-day charges both import. |
+| REQ-FIX-ING-007 | Plaid `_existing_by_source_id` excludes split children (`parent_id IS NULL`); modified/removed events on a split parent flag it `needs_review` instead of silently mutating a child; pending→posted never flips a human-rejected row's status; first-sync supersede never rejects children of split parents. |
+| REQ-FIX-ING-008 | Classification honors the sign-reconciliation veto end-to-end: `make_transaction` respects `result.status=NEEDS_REVIEW`; a mirror veto routes expense-on-inflow to review; stale mismatch text never persists on auto-classified rows. |
+| REQ-FIX-ING-009 | Tier-1 rule ranking prefers pattern specificity (longer match) before example count, so "amazon web services" beats "amazon" for AWS charges. |
+| REQ-FIX-ING-010 | Tier-3 stays Gemini (decision): docs corrected (CLAUDE.md, engine/classifier docstrings), and the prompt's category list includes every valid enum value (`HEALTH_INSURANCE`, `WHOLESALE_INCOME`, `OTHER_EXPENSE`, `CAPITAL_CONTRIBUTION`). |
+
+## REQ-FIX-WLT-* — Wealth analytics correctness
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-WLT-001 | Historical prices carry a total-return-capable series (adjusted close alongside raw close). Benchmark TWR and the buy-and-hold simulation use the adjusted series; portfolio-vs-benchmark comparisons are total-return-consistent. |
+| REQ-FIX-WLT-002 | Live re-pricing of position snapshots is split-safe: quantity×price uses split-consistent data; a split between snapshot and target date cannot create a value cliff. |
+| REQ-FIX-WLT-003 | E*TRADE imports derive `as_of` from the file (mtime or embedded date, with `--as-of` override), include `as_of` in the dedup hash (a fresh export writes a fresh snapshot), and persist `cost_basis = avg_cost_basis × quantity`. |
+| REQ-FIX-WLT-004 | Local `networth-history` two-tier dedup implements the per-name effective-cutoff (parity with `sparkry-crm`, acceptance per REQ-WD-009..011); a parity fixture guards both codebases from re-diverging; CLAUDE.md "mirrors exactly" claim restored to true. |
+| REQ-FIX-WLT-005 | `holdings/{symbol}/history` forward-fills per account before summing; `current_*` values aggregate each account's latest snapshot, not the single most-recent date bucket. |
+| REQ-FIX-WLT-006 | Benchmark simulation anchors at the first target date having both a portfolio value and a benchmark price, and bounds per-date benchmark lookups at 7 days staleness (gap, not flatline). |
+| REQ-FIX-WLT-007 | `wealth_client` wraps transport errors and non-JSON 2xx bodies in `WealthClientError`; cloud-mode imports write a local IngestionLog row. |
+| REQ-FIX-WLT-008 | `missing-accounts` freshness includes `plaid_account_balance_snapshot`, so Plaid-fed accounts with daily syncs are never reported stale. |
+| REQ-FIX-WLT-009 | The IUL importer merges structured fields without clobbering human-curated `Account.notes`; mtime-defaulting adapters (vanguard/fg/nw_mutual) accept an explicit `--as-of` override. |
+
+## REQ-FIX-API-* — API/report aggregation
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-API-001 | `list_transactions` header totals always exclude `rejected` and `split_parent` rows regardless of caller filters. |
+| REQ-FIX-API-002 | `get_aggregations` excludes `split_parent` rows (no double-count of split transactions in charts/vendor totals/anomaly baselines). |
+| REQ-FIX-API-003 | Weekly P&L nets reimbursable pairs out of revenue/expense and reports an exact 7-day `[Mon, Mon)` window regardless of run day. |
+| REQ-FIX-API-004 | Outbound email sender/contact addresses use the controlled `sparkry.ai` domain via a single constant. |
+
+## REQ-FIX-DAT-* — Account data hygiene
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-DAT-001 | The four Vanguard retirement accounts get correct `account_type` (trad_ira/roth_ira) and `tax_sheltered=true` via audited migration/script; tax-sheltered analytics reflect it. |
+| REQ-FIX-DAT-002 | The unnamed Vanguard taxable account is named or archived; the $50 Fidelity TOD is flagged in the close report for a human closure decision (report-only). |
+| REQ-FIX-DAT-003 | The Microsoft 401k / BrokerageLink relationship is verified via `is_plan_wrapper`/`parent_account_id` with an invariant test proving net-worth counts the pair once. |
+
+## REQ-FIX-N8N-* — n8n alert-path hygiene
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-FIX-N8N-001 | Alert-path workflows get tags, purpose stickies, timezone, and an errorWorkflow on `ET-UT-Shared / Record Error`; the Gmail-trigger workflow prefix is corrected per the naming taxonomy. |
+| REQ-FIX-N8N-002 | Code nodes in the alert delivery path (Validate & Map, Format Alert Message, Derive Severity, should-flush?, Collapse rows, Validate Payload) get extracted local vitest coverage via the n8n-workflow-engineering skill. |
+
+## REQ-WBR-* — Feature: Weekly Business Review scorecard
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-WBR-001 | Monday 06:00 PT email (Resend): per-entity P&L (revenue, expenses, net) with WoW delta and 6-week trend, AR aging buckets, cash positions, review-queue depth, and delivery-health summary — each metric flagged ✅/⚠️ against thresholds. |
+| REQ-WBR-002 | Every number ties out to the corresponding API/report computation (same sign/abs conventions, reimbursables netted); a data-freshness footer states each source's as-of date. |
+| REQ-WBR-003 | Runs via systemd timer with DRY-RUN default and OnFailure alerting; renderable on demand via CLI. |
+
+## REQ-DHL-* — Feature: Delivery-health in the daily pulse
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-DHL-001 | The daily pulse gains a delivery-health block: per-Plaid-item last-success age, yesterday's alert sent/failed/skipped counts, unmapped-account names, and snapshot-gap days — derived from `ingestion_log` + `alert_dispatch`. |
+| REQ-DHL-002 | Any silent-failure mode identified in the 2026-07-07 audit (missed snapshot day, failed POST, unmapped skip, dead item) is visible in this block within 24h of occurring. |
+
+## REQ-ARC-* — Feature: AR chaser (draft-for-approval)
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-ARC-001 | Reminder ladder at 14/30/45 days past `sent_at` for unpaid SENT invoices; each rung drafts a reminder email (tone escalating politely) — nothing sends without explicit approval. |
+| REQ-ARC-002 | Approval flow: draft delivered to Travis (Telegram via n8n callback, or CLI command); on approval the email sends via Resend and is recorded; at most one reminder per invoice per rung. |
+| REQ-ARC-003 | AR aging (current/14/30/45+) appears in the WBR; every reminder action writes an audit event. |
+
+## REQ-TXF-* — Feature: Tax-posture forecaster (household MFJ)
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-TXF-001 | Quarterly (Jan/Apr/Jun/Sep 1) + on-demand forecast: YTD actuals → projected Schedule C (Sparkry), 1065/K-1 share (BlackLine), WA B&O accrual, SE tax, QBI deduction estimate, and household MFJ federal bracket position. |
+| REQ-TXF-002 | Safe-harbor tracker: 110%-of-prior-year target vs YTD withholding+estimates, with a "set aside $X by <due date>" line per quarter. |
+| REQ-TXF-003 | Household inputs (W-2s, expected investment income, prior-year total tax) come from `config/tax_profile.yaml`; until filled, the report runs in business-only mode and says so. All math Decimal, deterministic, no LLM. |
+| REQ-TXF-004 | Delivered by email (Resend) per the delivery-split decision; DRY-RUN default. |
+
+## REQ-MCA-* — Feature: Monthly close agent + auto-confirm
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-MCA-001 | Monthly close job (1st, prior-month scope): Plaid-vs-register reconciliation summary, unconfirmed-backlog sweep, anomaly scan (new vendors, amount outliers, missing expected recurring charges), and a close report email with evidence links. |
+| REQ-MCA-002 | Auto-confirm policy (decision): Tier-1 vendor-rule matches at ≥0.90 confidence auto-confirm with `confirmed_by="auto:rule:<id>"` + audit event; Tier-2/3 always route to human review. Applies to the existing backlog and go-forward. |
+| REQ-MCA-003 | Weekly digest lists everything auto-confirmed that week; a single undo command reverts an auto-confirmation (status + audit event) by transaction id. |
+| REQ-MCA-004 | Narrative summary optionally rendered via Gemini (env-gated, cheap tier); all reconciliation/anomaly math is deterministic and testable without the LLM. DRY-RUN default. |
+
+## REQ-VIS-* — Feature: Vision statement ingestion (shadow mode)
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-VIS-001 | A vision-extraction pipeline (Gemini vision default, OpenAI fallback, provider-configurable) converts statement PDFs/XLSX (F&G, GSK, NW Mutual, Franklin Templeton, NA IUL) to a normalized JSON schema with Decimal quantization at the boundary and per-file error isolation. |
+| REQ-VIS-002 | Shadow mode: vision extraction runs alongside the legacy parser and produces a field-level diff report; it never writes to the register while in shadow. |
+| REQ-VIS-003 | Promotion to primary per institution only after 3 consecutive equal-or-better statement cycles (decision via qdecide, recorded); the legacy parser remains as fallback. |
+| REQ-VIS-004 | Raw extraction stored in `raw_data`; API keys via Doppler; per-run cost logged; documents never leave the two configured providers. |
+
+## REQ-IPD-* — Feature: Investment policy dashboard
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-IPD-001 | `/wealth` policy panel: per-symbol concentration (% of investable assets), AMZN+MSFT combined, international %, cash %, embedded gain per holding — vs configured targets. |
+| REQ-IPD-002 | Targets config (decision): AMZN+MSFT ≤35% by 2031-07 on a linear glide from the 2026-07 baseline; international 10% of equity. Panel shows headroom vs the glide line. |
+| REQ-IPD-003 | WA capital-gains excise headroom: realized LT gains YTD vs the 7% threshold (~$270k) and 9.9% surcharge threshold ($1M), thresholds config-updatable per tax year. |
+| REQ-IPD-004 | Drift alert: closing >3pts above the glide line emits one `info` severity alert per month via the existing webhook. Local dashboard only in v1 (D1 port out of scope). |
+
+## REQ-NWA-* — Feature: Net-worth attribution
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-NWA-001 | Attribution endpoint: ΔNW over a period decomposes into market effect, net flows, and data-coverage change; weekly summary line feeds the WBR. Depends on REQ-FIX-WLT-001/002 (total-return prices). |
+
+## REQ-SEL-* — Feature: Sellability metrics (Sparkry)
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-SEL-001 | Monthly sellability report (with the close email): Sparkry SDE (net income + configured add-backs), revenue by client with top-1/top-3 concentration, recurring-vs-project revenue split, MoM trends; BlackLine tracked as investment-mode burn. |
+| REQ-SEL-002 | Client attribution from invoices/customers; recurring flag configurable per customer or invoice type; add-backs in a config file with audit-friendly listing in the report. |
+
+## REQ-BBT-* — Feature: Bold-bets tracker
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-BBT-001 | A "bold-bet" tag (account tag or symbol watchlist) defines a speculative sleeve; sleeve view shows cost, value, realized+unrealized P&L, % of portfolio, and per-position thesis/exit notes. |
+| REQ-BBT-002 | Sleeve cap $20k (config); breach shows in the policy panel; report copy recommends housing quick-turnaround trades in the Roth (no enforcement). |

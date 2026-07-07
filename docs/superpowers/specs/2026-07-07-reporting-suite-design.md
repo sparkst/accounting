@@ -42,7 +42,16 @@ Conventions (all three, per `src/reports/brokerage_summary.py` house style):
 - **Send ledger**: every apply-mode send recorded in the existing `alert_dispatch` table
   (`alert_type` ∈ `wbr_weekly | tax_forecast | sellability_monthly`, `alert_key` =
   `wbr:2026-W28` / `txf:2026-Q3` / `sel:2026-06`; `UniqueConstraint(alert_key,
-  occurrence_date)` gives idempotent re-runs — a `Persistent=true` catch-up cannot double-send).
+  occurrence_date)` gives idempotent re-runs — a `Persistent=true` catch-up cannot double-send
+  **only if `occurrence_date` is pinned to the canonical period anchor, not the run date**:
+  `occurrence_date = period_start` — the report's own ISO-week Monday / quarter-start / month-1st
+  (America/Los_Angeles calendar date), computed identically whether the timer fires on time or
+  catches up late. This deliberately diverges from `src/alerts/rules.py`'s
+  `occurrence_date=today.isoformat()` convention used by the EA/balance dispatchers — those are
+  daily alerts where "today" *is* the period; these three reports are weekly/quarterly/monthly,
+  so "today" and "the period" differ on a delayed run. A Wednesday catch-up for a missed Monday
+  WBR still writes `occurrence_date=<that Monday>`, colliding with (and being blocked by) the
+  original attempt's row.).
 - **Email guards**: single `FROM_ADDRESS` constant per REQ-FIX-API-004 (`travis@sparkry.ai`);
   recipient from `REPORT_TO_EMAIL` env (default `Travis@sparkry.com`), format-validated and
   allowlisted, mirroring the REQ-FIX-ALR-003 pattern. `RESEND_API_KEY` via Doppler
@@ -259,16 +268,23 @@ default. Built as composable `render_sellability_section(data)` so the monthly-c
   anywhere (assert via Decimal-type checks on TypedDict contents).
 - Edge tests: empty week, missing plaid snapshots (footer stale markers), tax_profile absent
   (business-only banner), seasonality guard trip, unattributed-revenue bucket, DST boundary
-  (window derivation on PST↔PDT transition Mondays), ledger dedup on re-run.
+  (window derivation on PST↔PDT transition Mondays), ledger dedup on re-run, and **delayed
+  catch-up dedup**: simulate a missed Monday run followed by a `Persistent=true` catch-up
+  firing on Wednesday — assert `occurrence_date` on both the (hypothetical) original and the
+  catch-up row is the same Monday period-anchor date, so the UNIQUE constraint blocks the
+  catch-up from double-sending (regression for the run-date-vs-period-anchor confusion).
 - Email sender mocked; webhook/Resend never hit in tests; CLI dry-run smoke test asserts
   exit 0 + no ledger writes.
 
 ## 7. Failure & ops
 
 `OnFailure=accounting-alert@%p.service` on all three services (journal-tail email per
-REQ-FIX-ALR-006). Send failures: Resend exception → ledger row `status='failed'` + non-zero
-exit (never silent); the REQ-FIX-ALR-002 replay loop excludes report types — re-running the
-timer/CLI regenerates fresher data instead. Rollout: manual `--apply` smoke on box → enable timers.
+REQ-FIX-ALR-006). Send failures: Resend exception → ledger row `status='failed'`,
+`delivery_channel="resend_email"`, `payload_json=NULL` (per the plaid-alert-reliability spec
+§8 channel discriminator) + non-zero exit (never silent); the REQ-FIX-ALR-002 replay loop
+excludes report types **explicitly by `delivery_channel != 'n8n_webhook'`**, not by an
+incidental NULL payload — re-running the timer/CLI regenerates fresher data instead of
+replaying a stale rendered report. Rollout: manual `--apply` smoke on box → enable timers.
 
 ## 8. REQ traceability
 
@@ -292,8 +308,11 @@ REQ-ARC reminder ladder (separate spec — WBR only displays aging).
 
 ## 10. Open items
 
-1. REQ-FIX-API-003 must land `pl_engine.compute_entity_pl` extraction first; if it ships
-   script-internal, WBR's first task is the extraction (same tests).
+1. ~~REQ-FIX-API-003 must land `pl_engine.compute_entity_pl` extraction first~~ — **resolved**:
+   the tax-invoicing spec (§11) now owns `src/reports/pl_engine.py::compute_entity_pl` as an
+   explicit REQ-FIX-API-003 deliverable, with its own test (`weekly-pl-report.py` output ==
+   `compute_entity_pl` output). WBR/SEL/TXF import the module directly; no extraction task
+   remains for WS5.
 2. Verify 2026 IRS constants (brackets, standard deduction, SS wage base, QBI thresholds)
    against Rev. Proc. before enabling the timer — values in YAML are placeholders until then.
 3. NIIT (3.8%) on expected investment income — likely add to §4.2 step 6; confirm with EA.

@@ -50,6 +50,18 @@ unchanged**; `Decimal(str(...))` boundary conversion, `raw_data=to_dict()`, and 
 `UNIQUE(account_id, snapshot_date)` idempotency key stay as-is. `call_with_retry` (RATE_LIMIT etc.)
 unchanged. Cached daily-granularity balances are sufficient: the alerting model is day-over-day.
 
+**Freshness of the cached value (new, since `balances.last_updated_datetime` is typically `None`
+per the table above and must not be relied on):** `snapshot_date` is always the **run date**
+(unchanged — it's a daily job stamping "as of today's sync"), never derived from
+`last_updated_datetime`; the cached balance's *actual* underlying freshness is instead surfaced
+downstream by REQ-FIX-ALR-005's staleness marker (§10), which compares `snapshot_date` across
+runs, not within one. This means a run can write a snapshot whose underlying institution value
+is a day or two stale (Plaid hasn't re-pulled it yet) without that staleness being visible at
+write time — it only becomes visible once the pulse/WBR notices consecutive snapshots holding
+an identical value for longer than expected. Documented here so PLD-001's test (§12) and
+REQ-FIX-ALR-005's staleness test both cover this interaction rather than assuming
+`last_updated_datetime` carries the signal.
+
 ## 3. Fix 2 — exit-code policy unification (REQ-FIX-PLD-002)
 
 `scripts/plaid_balance_sync.py` L77 exits 0 unless a failure is *terminal*
@@ -116,10 +128,13 @@ Today (`plaid_balance.py` L124-155, L319-325) unmapped accounts upsert an `Expec
    join logic for one bit of state; a config file is invisible to the dashboard missing-accounts
    panel, unaudited, and drifts from the DB. Adding one CHECK-constraint value is additive and the
    existing `seed_expected_accounts confirm` walkthrough already mutates this status field — it
-   gains an `i = ignore` choice. Migration: batch-alter `ck_expected_account_status` to
-   `('active','closed','unconfirmed','ignored')`. Downgrade: flip `ignored` rows back to
-   `unconfirmed` (UPDATE, no deletes), then restore the old constraint. The missing-accounts panel
-   and pulse both exclude `status IN ('closed','ignored')`.
+   gains an `i = ignore` choice. Migration, revision id `pld05_expected_account_ignored_status`
+   (named up front per the cross-workstream migration ledger — plan §Migration ledger):
+   batch-alter `ck_expected_account_status` to `('active','closed','unconfirmed','ignored')`.
+   Downgrade: flip `ignored` rows back to `unconfirmed` (UPDATE, no deletes), then restore the
+   old constraint. The missing-accounts panel and pulse both exclude `status IN ('closed','ignored')`.
+   This migration precedes `alr01_alert_dispatch_payload` (§8) in the WS1 chain (ledger order 1
+   then 2).
 
 ## 7. Fix 6 — webhook retry with backoff + jitter (REQ-FIX-ALR-001)
 
@@ -144,20 +159,45 @@ messages, never interpolate `exc`, secret only in `X-Webhook-Secret`). Tests inj
 **Migration** (additive, per the alembic-migration skill; `alert_dispatch` is not a protected table
 but rows are never deleted):
 
-- `alr01_alert_dispatch_payload`: `ALTER TABLE alert_dispatch ADD COLUMN payload_json TEXT NULL`.
-  Downgrade: batch-mode drop of the column only — real downgrade, no row loss on protected tables
-  (none touched).
+- `alr01_alert_dispatch_payload`: `ALTER TABLE alert_dispatch ADD COLUMN payload_json TEXT NULL`
+  and `ALTER TABLE alert_dispatch ADD COLUMN delivery_channel TEXT NULL` (values:
+  `n8n_webhook` | `resend_email`). Downgrade: batch-mode drop of both columns — real downgrade,
+  no row loss on protected tables (none touched).
+
+**Channel discriminator (closes the program-wide coupling gap):** `alert_dispatch` is now shared
+by every alert/report emitter added in this program (EA/balance dispatchers, the WBR/TXF/SEL
+report ledger — reporting spec §2, the auto-confirm digest and monthly-close and AR-chaser
+emails — agent-features spec, and the policy-drift alert — wealth spec §11.4). Retry only
+applies to the webhook channel; Resend emails are regenerated fresh by their own timer, not
+replayed stale. Every write path sets `delivery_channel` explicitly (no inferring it from
+whether `payload_json` happens to be NULL): **every** `n8n_webhook` emitter — including
+`policy_drift_dispatch.py` (wealth §11.4) and the AR-chaser Telegram draft-notification POST
+(agent-features §3.3) — MUST persist `payload_json`; every `resend_email` emitter (reports,
+autoconfirm digest, monthly close, the AR-chaser reminder-email send) MUST leave `payload_json`
+NULL and rely on the channel filter, not a NULL-payload accident, to stay out of the sweep.
+The AR chaser is dual-channel: its approval-request webhook rows are `n8n_webhook`
+(persisted + swept per agent-features §3.3); only its reminder-email rows are `resend_email`.
 
 **Write path:** `_record` in both `src/alerts/dispatcher.py` and
-`src/balance_alerts/dispatcher.py` (and `digest._record_pulse`) stores
-`payload_json=json.dumps(payload)` — the exact dict handed to `httpx.post`.
+`src/balance_alerts/dispatcher.py` (and `digest._record_pulse`, and the new
+`policy_drift_dispatch.py`) stores `delivery_channel="n8n_webhook"`,
+`payload_json=json.dumps(payload)` — the exact dict handed to `httpx.post`. Resend-backed
+emitters (`src/reports/report_email.py`, autoconfirm digest, monthly-close, the AR-chaser
+reminder-email send) record `delivery_channel="resend_email"`, `payload_json=NULL`; the
+AR-chaser's Telegram draft-notification POST records `delivery_channel="n8n_webhook"` with
+its payload persisted (agent-features §3.3 owns that contract).
 
 **Sweep:** at the top of each `--apply` dispatch run, before computing today's alerts:
-select rows `status='failed' AND occurrence_date >= (today - 7d).isoformat() AND payload_json IS
-NOT NULL`, re-POST via the same retrying client, and on success update the row in place →
-`status='sent'`, `http_status`, `error_detail=None`. Pre-migration failed rows (`payload_json`
-NULL) are skipped. Per-row isolation: one raising re-POST never halts the sweep or the main run.
-DRY-RUN performs and prints the sweep query but neither POSTs nor writes.
+select rows `(delivery_channel='n8n_webhook' OR delivery_channel IS NULL) AND status='failed'
+AND occurrence_date >= (today - 7d).isoformat() AND payload_json IS NOT NULL`, re-POST via the
+same retrying client, and on success update the row in place → `status='sent'`, `http_status`,
+`error_detail=None`. The explicit `IS NULL` arm makes the query match the stated intent:
+pre-migration failed rows (`delivery_channel` NULL, legacy — every pre-migration emitter was
+webhook-only) participate in the sweep, gated on `payload_json IS NOT NULL`, so they are
+skipped until a payload exists for them (test asserts a NULL-channel + non-NULL-payload row IS
+swept). Per-row
+isolation: one raising re-POST never halts the sweep or the main run. DRY-RUN performs and
+prints the sweep query but neither POSTs nor writes.
 
 ## 9. Fix 8 — EA allowlist env-config (REQ-FIX-ALR-003) + catch-up (REQ-FIX-ALR-004)
 
@@ -233,13 +273,13 @@ Delivery
 
 | REQ | Test (file · approach) |
 |---|---|
-| PLD-001 | `src/adapters/test_plaid_balance.py`: `_accounts_request` returns `AccountsGetRequest` with the token; mock client asserts `accounts_get` called, `accounts_balance_get` never; snapshot row fields unchanged vs golden fixture. |
+| PLD-001 | `src/adapters/test_plaid_balance.py`: `_accounts_request` returns `AccountsGetRequest` with the token; mock client asserts `accounts_get` called, `accounts_balance_get` never; snapshot row fields unchanged vs golden fixture. **New case:** mock `/accounts/get` response with `balances.last_updated_datetime=None` and a value unchanged from the prior day's cached balance → assert `snapshot_date` is still stamped as the run date (not derived from `last_updated_datetime`), the snapshot writes normally, and a follow-up REQ-FIX-ALR-005 digest test (`src/balance_alerts/test_digest.py`) confirms two identical consecutive daily snapshots do NOT themselves trigger a false staleness marker (staleness is snapshot-recency-based, not value-based) — pinning the freshness-regression boundary this switch introduces. |
 | PLD-002 | `scripts/test_plaid_balance_sync.py`: batch with retryable `institution_down` item → exit 1; `accounts_failed>0` → exit 1; all-ok double-run → exit 0. |
 | PLD-003 | `src/balance_alerts/test_rules.py`: gap-3d baseline found, `baseline_gap_days=3`, message note appended; gap-8d → no alert; gap-1d payload carries `"1"`, no note. |
 | PLD-004 | adapter test: placeholder item excluded from rotation; API test: reconciliation summary includes disconnected items. |
 | PLD-005 | adapter test: unmapped account writes name·mask·subtype into `error_detail`; digest test: unconfirmed listed, `ignored` not; migration test (`src/db/`): CHECK accepts `ignored`, downgrade flips rows and preserves count. |
 | ALR-001 | `src/alerts/test_retry.py`: fake sleep — 5xx→5xx→200 succeeds with 2 sleeps and jittered exponential delays; 4xx returns after 1 attempt; timeout×3 raises. |
-| ALR-002 | dispatcher tests both modules: failed row with payload re-POSTs and flips to `sent`; NULL-payload and >7d rows skipped; sweep failure isolates; DRY-RUN writes nothing. |
+| ALR-002 | dispatcher tests both modules: failed row with payload re-POSTs and flips to `sent`; NULL-payload and >7d rows skipped; a `resend_email`-channel failed row (report/digest/close/AR-chaser reminder-email) with a payload is NOT swept (channel filter, regression for the cross-emitter coupling gap); a `policy_drift` webhook failure with payload IS swept; an AR-chaser Telegram draft-notification (`n8n_webhook`) failed row with payload IS swept (agent-features §3.3 contract); a legacy NULL-channel row with a payload IS swept; sweep failure isolates; DRY-RUN writes nothing. |
 | ALR-003 | webhook test: env-overridden allowlists honored; defaults match literals; non-allowlisted → `failed` without POST. |
 | ALR-004 | dispatcher test: marker at D-3 → days D-2..D evaluated, month-end sweep for the missed day fires once; 20-day gap capped at 14; no marker → today only. |
 | ALR-005 | digest test: 3-day-old snapshot renders `(as of …) ⏳`, footer `1 stale`; fresh renders bare. |
@@ -282,7 +322,7 @@ no row deletion anywhere, additive migration with a real downgrade, secrets via 
 | REQ-FIX-PLD-005 | §6 | `plaid_balance.py`, `expected_account` migration, `seed_expected_accounts`, digest |
 | REQ-FIX-PLD-006 | §13.5-6 | runbook + live smoke |
 | REQ-FIX-ALR-001 | §7 | `src/alerts/retry.py` (new), both webhook clients |
-| REQ-FIX-ALR-002 | §8 | `alr01` migration, both dispatchers, digest |
+| REQ-FIX-ALR-002 | §8 | `alr01` migration (`payload_json` + `delivery_channel`), both dispatchers, digest, `policy_drift_dispatch.py` (wealth §11.4), reporting/agent-features Resend emitters (channel='resend_email', excluded from sweep) |
 | REQ-FIX-ALR-003 | §9 | `src/alerts/webhook.py`, Doppler `srv`+`dev` |
 | REQ-FIX-ALR-004 | §9 | `src/alerts/dispatcher.py` |
 | REQ-FIX-ALR-005 | §10 | `src/balance_alerts/digest.py` |

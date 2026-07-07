@@ -179,14 +179,14 @@ Loaded via a typed loader (`src/analytics/policy_config.py`), Decimal at the YAM
 Computed from the latest per-account positions (same inclusion rules as net worth: closed excluded, 401k wrapper counted once per §10):
 - **Investable base** = Σ market value of brokerage/retirement accounts (excludes 529s and insurance-balance accounts — beneficiary money and non-tradeable CSV).
 - Per-symbol concentration %, **AMZN+MSFT combined** (includes RSU accounts), **international %** of equity, **cash %**, **embedded gain** per holding = `market_value − cost_basis` (post-§3 basis fix; `null` basis → flagged, not treated as 0).
-- **Glide line:** `glide(m) = baseline_pct − (baseline_pct − 35) × months_since(2026-07, m) / 60`, Decimal, clamped at 35 after 2031-07. Response: `current_pct`, `glide_pct`, `headroom_pts = glide − current`, plus the glide series for charting.
+- **Glide line (REQ-IPD-002):** `glide(m) = baseline_pct − (baseline_pct − 35) × months_since(2026-07, m) / 60`, Decimal, clamped at 35 after 2031-07. Response: `current_pct`, `glide_pct`, `headroom_pts = glide − current`, plus the glide series for charting. International target tracked separately (§11.1 config: `international_target_pct_of_equity: 10`).
 - **WA excise headroom (REQ-IPD-003):** realized **LT** gains YTD = Σ `RealizedGainLoss.lt_gain_loss` (fallback `gain_loss where term='LT'`), `closed_date` in the tax year, **taxable accounts only** (`tax_sheltered=0`, correct after §10). Headroom vs `threshold` and `surcharge_threshold` from config.
 
 ### 11.3 Svelte panel (local dashboard only, v1)
 `dashboard/src/routes/wealth/` gains a Policy panel (`PolicyPanel.svelte`): stat cards (AMZN+MSFT vs glide with headroom badge, intl %, cash %, excise headroom meter), a small glide-vs-actual line chart, an embedded-gains table sorted by gain, and the bold-bets cap status (§13). Reuses existing `/wealth` fetch + formatting helpers; no D1 port.
 
 ### 11.4 Drift alert (REQ-IPD-004)
-`scripts/policy_drift_dispatch.py` (DRY-RUN default; box timer monthly or piggybacked on `accounting-balance-alerts`): if `current_pct − glide_pct > 3`, POST one `info`-severity payload to the existing n8n severity webhook (`src/balance_alerts/webhook.py`), deduped to **one per calendar month** via the `alert_dispatch` ledger (key `policy_drift:<YYYY-MM>`).
+`scripts/policy_drift_dispatch.py` (DRY-RUN default; box timer monthly or piggybacked on `accounting-balance-alerts`): if `current_pct − glide_pct > 3`, POST one `info`-severity payload to the existing n8n severity webhook (`src/balance_alerts/webhook.py`), deduped to **one per calendar month** via the `alert_dispatch` ledger (key `policy_drift:<YYYY-MM>`). Per the plaid-alert-reliability spec §8 channel discriminator (REQ-FIX-ALR-002), this dispatcher writes `delivery_channel="n8n_webhook"` and **must persist `payload_json`** on every write — it is a webhook emitter like the balance-alerts dispatcher, so a transient n8n failure must be retriable by that spec's failed-row sweep rather than permanently lost.
 
 ---
 
@@ -243,7 +243,10 @@ Gates: `pytest && ruff check src/ && mypy src/`. Feature phases run `/qpipeline 
 | REQ-FIX-WLT-008 | §8 | `src/api/routes/brokerage.py:1090-1116` |
 | REQ-FIX-WLT-009 | §9 | `src/adapters/north_american_iul.py`, `src/adapters/_shared/notes_merge.py`, vanguard/fg/nw_mutual adapters |
 | REQ-FIX-DAT-001..003 | §10 | migration `wa2607c`, `src/api/routes/brokerage.py` invariant tests, close report |
-| REQ-IPD-001..004 | §11 | `src/analytics/policy_config.py`, `/api/brokerage/policy`, `dashboard/.../PolicyPanel.svelte`, `scripts/policy_drift_dispatch.py` |
+| REQ-IPD-001 | §11.2–11.3 | `/api/brokerage/policy`, `dashboard/.../PolicyPanel.svelte` (per-symbol concentration, AMZN+MSFT combined, intl/cash %, embedded gain) |
+| REQ-IPD-002 | §11.1–11.2 | `src/analytics/policy_config.py` (baseline/target config), `/api/brokerage/policy` (glide-line formula to 35% by 2031-07) |
+| REQ-IPD-003 | §11.2 | `/api/brokerage/policy` (WA excise headroom: realized LT gains vs 7%/$270k and 9.9%/$1M thresholds) |
+| REQ-IPD-004 | §11.4 | `scripts/policy_drift_dispatch.py` (monthly drift alert when >3pts above glide) |
 | REQ-NWA-001 | §12 | `/api/brokerage/networth-attribution`, WBR line helper |
 | REQ-BBT-001..002 | §13 | `/api/brokerage/bold-bets`, `AccountTag`, `investment_policy.yaml`, `BoldBetsCard.svelte` |
 

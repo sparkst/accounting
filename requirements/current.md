@@ -634,7 +634,7 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-FIX-WLT-001 | Historical prices carry a total-return-capable series (adjusted close alongside raw close). Benchmark TWR and the buy-and-hold simulation use the adjusted series; portfolio-vs-benchmark comparisons are total-return-consistent. |
 | REQ-FIX-WLT-002 | Live re-pricing of position snapshots is split-safe: quantity×price uses split-consistent data; a split between snapshot and target date cannot create a value cliff. |
 | REQ-FIX-WLT-003 | E*TRADE imports derive `as_of` from the file (mtime or embedded date, with `--as-of` override), include `as_of` in the dedup hash (a fresh export writes a fresh snapshot), and persist `cost_basis = avg_cost_basis × quantity`. |
-| REQ-FIX-WLT-004 | Local `networth-history` two-tier dedup implements the per-name effective-cutoff (parity with `sparkry-crm`, acceptance per REQ-WD-009..011); a parity fixture guards both codebases from re-diverging; CLAUDE.md "mirrors exactly" claim restored to true. |
+| REQ-FIX-WLT-004 | Local `networth-history` two-tier dedup implements the per-name effective-cutoff (parity with `sparkry-crm`, acceptance per REQ-WD-009..011); a SHA-guarded parity fixture is checked in here with the local pytest assertion IN this program's scope; wiring the same fixture's vitest assertion into `sparkry-crm` is a tracked follow-up in that repo (out of this program's scope — this program changes no sparkry-crm code); CLAUDE.md "mirrors exactly" claim restored to true. |
 | REQ-FIX-WLT-005 | `holdings/{symbol}/history` forward-fills per account before summing; `current_*` values aggregate each account's latest snapshot, not the single most-recent date bucket. |
 | REQ-FIX-WLT-006 | Benchmark simulation anchors at the first target date having both a portfolio value and a benchmark price, and bounds per-date benchmark lookups at 7 days staleness (gap, not flatline). |
 | REQ-FIX-WLT-007 | `wealth_client` wraps transport errors and non-JSON 2xx bodies in `WealthClientError`; cloud-mode imports write a local IngestionLog row. |
@@ -713,7 +713,7 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-VIS-001 | A vision-extraction pipeline (Gemini vision default, OpenAI fallback, provider-configurable) converts statement PDFs/XLSX (F&G, GSK, NW Mutual, Franklin Templeton, NA IUL) to a normalized JSON schema with Decimal quantization at the boundary and per-file error isolation. |
 | REQ-VIS-002 | Shadow mode: vision extraction runs alongside the legacy parser and produces a field-level diff report; it never writes to the register while in shadow. |
 | REQ-VIS-003 | Promotion to primary per institution only after 3 consecutive equal-or-better statement cycles (decision via qdecide, recorded); the legacy parser remains as fallback. |
-| REQ-VIS-004 | Raw extraction stored in `raw_data`; API keys via Doppler; per-run cost logged; documents never leave the two configured providers. |
+| REQ-VIS-004 | Raw extraction stored in `raw_data`; API keys via Doppler; per-run cost logged AND capped — the shadow harness enforces a configurable per-run cost ceiling and `--max-files` bound, aborting on a pre-run projection or mid-run breach; documents never leave the two configured providers. |
 
 ## REQ-IPD-* — Feature: Investment policy dashboard
 

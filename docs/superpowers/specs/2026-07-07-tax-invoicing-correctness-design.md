@@ -55,8 +55,10 @@ correct:** `src/utils/reconciliation.py` treats Shopify as a payout source
 
 ### 2.2 Backfill migration (existing rows)
 
-Alembic **data migration** (validated with the `alembic-migration` skill invariants:
-no deletes, no raw DELETE on protected tables, real downgrade).
+Alembic **data migration**, revision id `tax001_shopify_payout_backfill` (named up
+front per the cross-workstream migration ledger — plan §Migration ledger; `down_revision`
+is pinned there, not left as "off head"). Validated with the `alembic-migration` skill
+invariants: no deletes, no raw DELETE on protected tables, real downgrade.
 
 - **Selection:** `source='shopify' AND source_id LIKE 'payout_%' AND direction='income'`
   (the `direction` predicate makes both directions idempotent on re-run).
@@ -129,8 +131,9 @@ converge onto the same figure. Expense categories are unaffected
 
 New invariant: **persisted link fields (`payment_link_url`, `payment_link_id`,
 new column `payment_link_amount`) are either all set and the link is active at the
-current total, or all NULL.** Additive Alembic migration adds
-`invoice.payment_link_amount NUMERIC NULL`.
+current total, or all NULL.** Additive Alembic migration, revision id
+`inv002_payment_link_amount` (named up front per the cross-workstream migration
+ledger — plan §Migration ledger), adds `invoice.payment_link_amount NUMERIC NULL`.
 
 ```
                       create_payment_link(inv)
@@ -218,7 +221,18 @@ them when the caller filters for them; **money aggregates never include them.**
   `!= REJECTED`. Time-series, vendor totals, category totals, and anomaly baselines
   all inherit it.
 
-## 11. REQ-FIX-API-003 — weekly P&L window + reimbursable netting
+## 11. REQ-FIX-API-003 — weekly P&L window + reimbursable netting + `pl_engine` extraction
+
+**Deliverable (owns the reporting spec's dependency):** the corrected computation below
+ships as a new reusable module `src/reports/pl_engine.py`, function
+`compute_entity_pl(session, start, end, entity) -> EntityPL` (window bounds, reimbursable
+netting, `rejected`/`split_parent` exclusion, `abs(amount)` by direction, all Decimal).
+`scripts/weekly-pl-report.py` is refactored to import and call it rather than
+re-deriving the arithmetic — the script becomes a thin render+dispatch wrapper.
+`src/reports/wbr.py`, `sellability.py`, and `tax_forecast.py` (reporting-suite spec §2)
+import this same function; no workstream re-derives entity P&L. This resolves the reporting
+spec's open item 10.1 — the extraction is explicitly in scope here, not an implicit
+follow-on WS5 task.
 
 - **Window:** exact half-open `[last_monday, this_monday)` (7 days) regardless of run
   day: `this_monday = today - timedelta(days=today.weekday())`; `week_start =
@@ -263,7 +277,7 @@ checked-in script; diffs reviewed like code.
 | INV-004 | Batch with an exact duplicate session → one line item + drop count; distinct-time same-description pair → two items. |
 | INV-005 | 1.333h × $150 → line 199.95 exact; subtotal == Σ lines; mocked Stripe receives `unit_amount` == `total*100` (regression: value that truncates under `int()`). |
 | API-001/002 | Seed rejected + split parent/children; header totals and every aggregation bucket count children only, with and without caller status filters. |
-| API-003 | Freeze clock on Wed + Mon: window always exactly `[Mon,Mon)`; linked reimbursable pair nets to zero in both revenue and expenses. |
+| API-003 | Freeze clock on Wed + Mon: window always exactly `[Mon,Mon)`; linked reimbursable pair nets to zero in both revenue and expenses. `src/reports/test_pl_engine.py` (new, co-located with the extracted module): `compute_entity_pl` unit tests for the same cases, plus a test asserting `scripts/weekly-pl-report.py` output for a fixed window equals `compute_entity_pl` output byte-for-byte (the single-source-of-truth regression the reporting spec's WBR tie-out test depends on). |
 | API-004 | Import-level constant assertions + `grep`-style test over `src/` for `@sparkry.com` (allowlist: `src/alerts/`). |
 
 Gates before commit: `pytest && ruff check src/ && mypy src/`; multi-file phases via `/qpipeline thorough` per CLAUDE.md.
@@ -286,7 +300,7 @@ Gates before commit: `pytest && ruff check src/ && mypy src/`; multi-file phases
 | REQ-FIX-INV-005 | §9 | `src/invoicing/generator.py`, `payment_link.py`, `invoices.py` PATCH |
 | REQ-FIX-API-001 | §10 | `src/api/routes/transactions.py` |
 | REQ-FIX-API-002 | §10 | `transactions.py` |
-| REQ-FIX-API-003 | §11 | `scripts/weekly-pl-report.py` |
+| REQ-FIX-API-003 | §11 | new `src/reports/pl_engine.py` (`compute_entity_pl`); `scripts/weekly-pl-report.py` refactored to call it |
 | REQ-FIX-API-004 | §12 | new `src/utils/constants.py`; `email_sender.py`, `bno_tax.py` |
 
 ## 15. Rollout & invariants

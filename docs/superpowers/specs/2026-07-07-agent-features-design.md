@@ -91,6 +91,12 @@ Tight layout: one line per finding, each with an **evidence link** to the dashbo
 `/wealth/accounts/<id>`. Sender uses the single `sparkry.ai` constant (REQ-FIX-API-004).
 Recipient: `ALERT_TO_EMAIL`.
 
+**Ledger recording:** each send is recorded in `alert_dispatch` (`alert_type="monthly_close"`,
+`alert_key="close:<YYYY-MM>"`) with `delivery_channel="resend_email"`, `payload_json=NULL` —
+per the plaid-alert-reliability spec §8 channel discriminator, this keeps monthly-close out of
+the REQ-FIX-ALR-002 webhook-only replay sweep (a failed send is fixed by re-running the CLI
+against fresher data, not by replaying a stale rendered email).
+
 Systemd (deploy/, cloned from `accounting-balance-alerts.*` hardening): `accounting-monthly-close.timer`
 `OnCalendar=*-*-01 15:00:00 UTC`, `Persistent=true`, `OnFailure=accounting-alert@%p.service`;
 service runs `doppler run -- env -u DOPPLER_TOKEN … python -m scripts.monthly_close --apply`.
@@ -150,7 +156,9 @@ per-row `begin_nested()` isolation. Supersedes and deletes `scripts/auto-confirm
 `python -m scripts.autoconfirm digest [--apply]` — emails (Resend) all transactions with
 `confirmed_by LIKE 'auto:rule:%'` confirmed in the trailing 7 days (via AuditEvent `changed_at`),
 grouped by vendor with counts/totals and per-row undo command lines. Timer
-`accounting-autoconfirm-digest.timer` Mon 14:10 UTC, same hardening/OnFailure as §1.4.
+`accounting-autoconfirm-digest.timer` Mon 14:10 UTC, same hardening/OnFailure as §1.4. Same
+ledger convention as §1.4: `alert_dispatch` row with `delivery_channel="resend_email"`,
+`payload_json=NULL` — excluded from the REQ-FIX-ALR-002 webhook sweep by channel.
 
 ### 2.5 Undo
 
@@ -193,7 +201,14 @@ at day 46 gets one 45-day draft, not three). A paid/void invoice dismisses all o
 **Primary (Telegram, via existing n8n `WH-Telegram / Bot Callback Router`):** on draft creation the job
 POSTs `{type:"info", title:"AR reminder draft", message:<preview>, alert_key:"ar:<invoice>:<rung>",
 callback:{approve_url, dismiss_url, token}}` through the severity-webhook client pattern
-(`src/balance_alerts/webhook.py` — HTTPS-only, secret header, static error strings). n8n renders a
+(`src/balance_alerts/webhook.py` — HTTPS-only, secret header, static error strings), retried
+per REQ-FIX-ALR-001. This POST is itself an `n8n_webhook`-channel emitter, so per the
+plaid-alert-reliability spec §8 channel discriminator it records an `alert_dispatch` row
+(`alert_type="ar_reminder_notify"`, `alert_key="ar:<invoice>:<rung>"`,
+`delivery_channel="n8n_webhook"`, `payload_json` set) — a transient failure here inherits the
+REQ-FIX-ALR-002 replay sweep rather than silently leaving a `drafted` row with no operator
+notification (the draft itself is never lost — it lives in `ar_reminder` regardless — but
+without this the operator may never see it to approve). n8n renders a
 Telegram inline keyboard [Approve] [Dismiss]; the callback router POSTs back to
 `POST /api/ar/reminders/{id}/approve|dismiss` with header `X-Webhook-Secret: $N8N_ALERTS_WEBHOOK_SECRET`
 **and** body `{"token": <approval_token>}`. Edge auth: a new scoped Cloudflare Access service token
@@ -253,6 +268,13 @@ mirroring the adapters' per-record rule).
    line (`n match / n mismatch / clean=bool / provider / cost`) in `error_detail`.
 5. **Never writes register, brokerage, or history tables — enforced by construction (shadow.py opens no
    write path to them) and by test.**
+6. **Cost ceiling (REQ-VIS-004):** the harness enforces `--max-files` (default 10) and a per-run cost
+   cap `VISION_RUN_COST_CAP_USD` (config default $2.00). Before any provider call, it prints a dry-run
+   estimate (`files × est. tokens/file × provider rate`, rates in `config/vision.yaml`) and aborts if the
+   projection exceeds the cap; during the run it tracks cumulative cost from provider usage metadata and
+   stops the batch (per-file isolation preserved, remaining files marked `skipped_cost_cap`) the moment
+   the running total would cross the cap. The existing error-tripped circuit breaker does not bound
+   spend; this cap does. Tests: projection-abort, mid-run stop, and `--max-files` truncation.
 
 ### 4.3 Promotion ledger (REQ-VIS-003)
 
@@ -275,6 +297,11 @@ row (model, tokens, `cost_estimate`, duration) and shadow reports embed per-run 
 preserved in the diff report file (and in `raw_data` when vision becomes primary post-promotion).
 
 ## 5. Schema changes (one additive Alembic migration, real downgrade)
+
+Revision id `mca01_confirmed_by_widen_ar_vision` (named up front per the cross-workstream
+migration ledger — plan §Migration ledger; this is the last migration in the program's
+linear chain, landing after WS3's and WS5's — WS5 ships no migration — per the plan's
+workstream dependency order).
 
 1. `transactions.confirmed_by` `String(8) → String(64)` (widen only; comment updated to
    `auto | human | auto:rule:<id>`). No CHECK change.

@@ -94,7 +94,7 @@ baseline_row = session.scalars(
 ```
 
 `BalanceAlert` gains `baseline_gap_days: int` (1 = normal); it is added to the n8n payload
-(`build_payload`) always, and appended to `message` as `" (baseline N days old)"` only when > 1.
+(`build_payload`) always, and appended to `message` as `" ({baseline_gap_days}d data gap)"` only when > 1.
 Gap > 7d → baseline None → no fire (REQ-BAL-005 null-baseline clause still governs beyond 7d).
 `alert_key` unchanged, so dedup semantics are untouched.
 

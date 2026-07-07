@@ -73,9 +73,14 @@ def main(argv: list[str] | None = None) -> int:
             r.accounts_skipped_non_usd,
             r.error_code or "-",
         )
-    # Exit non-zero if any Item failed terminally (institution_down is transient).
-    terminal_failures = [r for r in batch.items if r.status == "error" and not r.retryable]
-    return 1 if terminal_failures else 0
+    # REQ-FIX-PLD-002: mirror plaid_transactions_sync.py's exit policy — any
+    # accounts_failed>0 OR any Item not in a clean 'ok' state is a failure.
+    # The prior policy (only terminal, non-retryable errors) silently exited 0
+    # on a retryable INSTITUTION_DOWN or a partial per-account failure, hiding
+    # them from the OnFailure alert. Idempotent double-runs stay exit-0
+    # (IntegrityError collisions count as accounts_processed, not accounts_failed).
+    has_failures = batch.total_failed > 0 or any(r.status != "ok" for r in batch.items)
+    return 1 if has_failures else 0
 
 
 if __name__ == "__main__":

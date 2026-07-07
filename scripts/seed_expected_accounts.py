@@ -18,7 +18,8 @@ Modes:
 
 * ``seed --file <xlsx-path>``: dry-run by default; pass ``--apply`` to commit.
 * ``confirm``: walk every ``unconfirmed`` row and prompt
-  ``"Active or closed? [a/c/s=skip]"``.
+  ``"Active, closed, or ignore? [a/c/i/s=skip]"`` (REQ-FIX-PLD-005: ``i``
+  ignore-lists the account so it stops counting as unmapped).
 
 Idempotent: the natural-key UNIQUE constraint
 ``(institution, account_name, last_4)`` rejects duplicate rows. The seeder
@@ -445,15 +446,17 @@ def confirm_interactive(
 ) -> dict[str, int]:
     """Walk every ``unconfirmed`` ExpectedAccount and prompt the user.
 
-    Response codes: ``a`` → active, ``c`` → closed, ``s`` (or anything else)
-    → skip (leave as ``unconfirmed``).
+    Response codes: ``a`` → active, ``c`` → closed, ``i`` → ignore
+    (REQ-FIX-PLD-005: stops counting as unmapped in the sync log detail and
+    the daily pulse), ``s`` (or anything else) → skip (leave as
+    ``unconfirmed``).
 
     For rows marked ``a`` whose ``resolved_account_id`` is None and whose
     ``institution`` maps to a known ``Broker``, the operator is additionally
     prompted to create the missing ``Account`` row.
     """
     counts: dict[str, int] = {
-        "active": 0, "closed": 0, "skipped": 0, "accounts_created": 0,
+        "active": 0, "closed": 0, "ignored": 0, "skipped": 0, "accounts_created": 0,
     }
     rows = (
         session.query(ExpectedAccount)
@@ -469,7 +472,7 @@ def confirm_interactive(
         last_4_disp = f" ...{row.last_4}" if row.last_4 else ""
         prompt = (
             f"[{row.source}] {row.institution} / {row.account_name}{last_4_disp}\n"
-            "  Active or closed? [a/c/s=skip]: "
+            "  Active, closed, or ignore? [a/c/i/s=skip]: "
         )
         try:
             answer = input_fn(prompt).strip().lower()
@@ -485,13 +488,16 @@ def confirm_interactive(
         elif answer == "c":
             row.status = "closed"
             counts["closed"] += 1
+        elif answer == "i":
+            row.status = "ignored"
+            counts["ignored"] += 1
         else:
             counts["skipped"] += 1
 
     session.commit()
     output_fn(
         f"Confirmed: {counts['active']} active, {counts['closed']} closed, "
-        f"{counts['skipped']} skipped, "
+        f"{counts['ignored']} ignored, {counts['skipped']} skipped, "
         f"{counts['accounts_created']} accounts created."
     )
     return counts

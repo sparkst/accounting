@@ -691,6 +691,31 @@ def test_reconciliation_exceeds_pct_threshold(client: TestClient, db: Session) -
     assert body[0]["exceeds_threshold"] is True
 
 
+def test_reconciliation_includes_disconnected_items(client: TestClient, db: Session) -> None:
+    """REQ-FIX-PLD-004: a disconnected Item's account remains visible in the
+    reconciliation endpoint (it's keyed off snapshot rows, not item status —
+    dead/disconnected items are excluded from future sync rotation, not from
+    this read-only summary of whatever snapshots already exist)."""
+    item = _make_item(db, institution_name="Dead Bank", status="disconnected")
+    acct = _make_account(db, item=item, plaid_account_id="p_dead")
+    db.add(
+        PlaidAccountBalanceSnapshot(
+            account_id=acct.id,
+            snapshot_date=date.today(),
+            plaid_account_type="depository",
+            current_balance=Decimal("100.00"),
+            pulled_at=datetime.now(UTC).replace(tzinfo=None),
+            raw_data={},
+        )
+    )
+    db.commit()
+    resp = client.get("/api/plaid/reconciliation/summary")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert Decimal(body[0]["plaid_total"]) == Decimal("100.0000")
+
+
 def test_reconciliation_negates_credit_balance(client: TestClient, db: Session) -> None:
     """Credit card balance is a liability — Plaid returns positive, recon must negate.
 

@@ -1,0 +1,31 @@
+{
+  "accounts": [
+    {
+      "account_id": "plaid_acct_chase_checking_0001",
+      "balances": {
+        "available": 4523.18,
+        "current": 4523.18,
+        "iso_currency_code": "USD",
+        "limit": null,
+        "unofficial_currency_code": null,
+        "last_updated_datetime": null
+      },
+      "mask": "0123",
+      "name": "Chase Total Checking",
+      "official_name": "CHASE TOTAL CHECKING",
+      "subtype": "checking",
+      "type": "depository"
+    }
+  ],
+  "item": {
+    "available_products": ["investments", "transactions"],
+    "billed_products": ["transactions"],
+    "consent_expiration_time": null,
+    "error": null,
+    "institution_id": "ins_3",
+    "item_id": "plaid_item_chase_xyz",
+    "update_type": "background",
+    "webhook": ""
+  },
+  "request_id": "req_accounts_get_null_last_updated_test"
+}

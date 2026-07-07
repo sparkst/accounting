@@ -17,6 +17,7 @@ import os
 
 import httpx
 
+from src.alerts.retry import post_with_retry
 from src.alerts.webhook import WebhookResult
 from src.balance_alerts.rules import SOURCE, BalanceAlert
 
@@ -52,7 +53,9 @@ def post_payload(
     headers = {"X-Webhook-Secret": secret, "Content-Type": "application/json"}
     logger.debug("POST n8n severity webhook key=%s type=%s", key, payload.get("type"))
     try:
-        resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        resp = post_with_retry(
+            lambda: httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        )
     except httpx.HTTPError as exc:
         # Static message — never interpolate `exc` (it can carry the URL).
         logger.debug("n8n webhook network error key=%s: %s", key, exc)
@@ -72,6 +75,7 @@ def build_payload_dict(
     account: str | None = None,
     balance: str | None = None,
     level: str | None = None,
+    baseline_gap_days: str | None = None,
 ) -> dict[str, str | None]:
     """The n8n `UT-Send Alert Message` contract. `type` drives channel routing."""
     return {
@@ -83,11 +87,17 @@ def build_payload_dict(
         "balance": balance,
         "level": level,
         "alert_key": alert_key,
+        "baseline_gap_days": baseline_gap_days,
     }
 
 
 def build_payload(alert: BalanceAlert) -> dict[str, str | None]:
-    """Payload for one fired BalanceAlert."""
+    """Payload for one fired BalanceAlert.
+
+    REQ-FIX-PLD-003: `baseline_gap_days` always rides along in the payload
+    (1 = normal prior-calendar-day baseline); the message note is appended
+    only when it's > 1 (see rules.py `_gap_note`).
+    """
     return build_payload_dict(
         severity=alert.severity,
         title=alert.title,
@@ -96,6 +106,7 @@ def build_payload(alert: BalanceAlert) -> dict[str, str | None]:
         account=alert.account_name,
         balance=alert.new_balance,
         level=alert.level,
+        baseline_gap_days=str(alert.baseline_gap_days),
     )
 
 

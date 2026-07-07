@@ -40,7 +40,9 @@ def _now() -> datetime:
 
 
 # Status values for expected_account.status
-_EXPECTED_STATUS_VALUES = "'active', 'closed', 'unconfirmed'"
+# 'ignored' added by migration pld05_expected_account_ignored_status (REQ-FIX-PLD-005):
+# the ignore-list mechanism for unmapped Plaid accounts the user never wants surfaced.
+_EXPECTED_STATUS_VALUES = "'active', 'closed', 'unconfirmed', 'ignored'"
 
 
 class HistoricalPrice(Base):

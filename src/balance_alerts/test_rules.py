@@ -337,20 +337,67 @@ def _snap(account_id: str, d: date, bal: str, ptype: str = "depository",
     )
 
 
-def test_gap_account_no_prior_calendar_day_does_not_fire(session: Session) -> None:
-    """An account with a snapshot gap (Fri→Mon, no row on latest-1) never fires.
-
-    REQ-BAL-005 keys strictly on the prior CALENDAR day; this pins that intended
-    (and operationally sharp) behavior so a future change is a conscious choice.
+def test_gap_account_within_7d_falls_back_and_fires_with_gap_note(session: Session) -> None:
+    """REQ-FIX-PLD-003: a snapshot gap (Fri→Mon, no row on latest-1) falls back to
+    the most recent snapshot within 7 days instead of muting the crossing — a
+    data gap must not permanently swallow milestone alerts.
     """
     session.add(
         Account(id="gap", broker="chase", account_number="g-1",
                 account_name="Gap Checking", account_type="checking", entity="sparkry")
     )
     session.add(_snap("gap", date(2026, 6, 10), "5000.00"))   # earlier row exists
-    session.add(_snap("gap", date(2026, 6, 14), "200.00"))    # no June 13 row
+    session.add(_snap("gap", date(2026, 6, 14), "200.00"))    # no June 11-13 rows
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 4
+    assert "(baseline 4 days old)" in alerts[0].message
+
+
+def test_gap_account_beyond_7d_still_does_not_fire(session: Session) -> None:
+    """REQ-FIX-PLD-003: the fallback window is bounded at 7 days — beyond that,
+    REQ-BAL-005's null-baseline clause still governs (no fire)."""
+    session.add(
+        Account(id="gap8", broker="chase", account_number="g-2",
+                account_name="Gap8 Checking", account_type="checking", entity="sparkry")
+    )
+    session.add(_snap("gap8", date(2026, 6, 5), "5000.00"))   # 9 days before latest
+    session.add(_snap("gap8", date(2026, 6, 14), "200.00"))
     session.commit()
     assert compute_balance_alerts(date(2026, 6, 14), session) == []
+
+
+def test_gap_account_1d_no_note_and_gap_field_is_1(session: Session) -> None:
+    """A normal prior-calendar-day baseline carries baseline_gap_days=1 and no note."""
+    session.add(
+        Account(id="normal", broker="chase", account_number="g-3",
+                account_name="Normal Checking", account_type="checking", entity="sparkry")
+    )
+    session.add(_snap("normal", date(2026, 6, 13), "1500.00"))
+    session.add(_snap("normal", date(2026, 6, 14), "900.00"))
+    session.commit()
+    alerts = compute_balance_alerts(date(2026, 6, 14), session)
+    assert len(alerts) == 1
+    assert alerts[0].baseline_gap_days == 1
+    assert "baseline" not in alerts[0].message  # no gap note appended
+
+
+# --- REQ-FIX-ALR-008: $0 strict crossing -----------------------------------
+
+
+def test_checking_zero_exact_does_not_fire_but_below_1k_does() -> None:
+    # baseline $1,500 -> current $0.00 crosses the $1k floor (fires) but must
+    # NOT fire the $0 floor — an exact zero balance is not an overdraft.
+    alerts = _eval("depository", "checking", 1500, "0.00")
+    assert [a.level for a in alerts] == ["1000"]
+
+
+def test_checking_negative_cent_fires_zero_floor_sev2() -> None:
+    alerts = _eval("depository", "checking", 1500, "-0.01")
+    levels = {a.level: a.severity for a in alerts}
+    assert levels["1000"] == SEV3
+    assert levels["0"] == SEV2
 
 
 def test_multiple_accounts_attributed_correctly(session: Session) -> None:

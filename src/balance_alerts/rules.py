@@ -77,6 +77,10 @@ class BalanceAlert:
     new_balance: str
     title: str
     message: str
+    # REQ-FIX-PLD-003: 1 = normal prior-calendar-day baseline; >1 means the
+    # dispatcher fell back to an older snapshot (data gap ≤7d). Defaulted so
+    # existing callers/tests that don't care about gap semantics are unaffected.
+    baseline_gap_days: int = 1
 
 
 def _q2(d: Decimal) -> Decimal:
@@ -122,13 +126,33 @@ def _fmt(d: Decimal) -> str:
     return f"${_q2(d):,.2f}"
 
 
+def _gap_note(baseline_gap_days: int) -> str:
+    """REQ-FIX-PLD-003: appended to the message only when the baseline fell
+    back to an older-than-yesterday snapshot (data gap)."""
+    if baseline_gap_days > 1:
+        return f" (baseline {baseline_gap_days} days old)"
+    return ""
+
+
 def _checking_alerts(
-    account_id: str, account_name: str, entity: str, occ: str, baseline: Decimal, current: Decimal
+    account_id: str,
+    account_name: str,
+    entity: str,
+    occ: str,
+    baseline: Decimal,
+    current: Decimal,
+    baseline_gap_days: int = 1,
 ) -> list[BalanceAlert]:
     out: list[BalanceAlert] = []
     for level in CHECKING_MILESTONES:
-        # Downward crossing: was above L yesterday, at/below L today.
-        if baseline > level and current <= level:
+        if level == Decimal("0"):
+            # REQ-FIX-ALR-008: an exact $0.00 balance is not an overdraft —
+            # strict negative-only crossing at the zero floor.
+            crossed = baseline >= Decimal("0") and current < Decimal("0")
+        else:
+            # Downward crossing: was above L yesterday, at/below L today.
+            crossed = baseline > level and current <= level
+        if crossed:
             sev = _checking_severity(level)
             out.append(
                 BalanceAlert(
@@ -147,14 +171,22 @@ def _checking_alerts(
                     message=(
                         f"{account_name} fell from {_fmt(baseline)} to "
                         f"{_fmt(current)}, crossing the {_fmt(level)} floor."
+                        f"{_gap_note(baseline_gap_days)}"
                     ),
+                    baseline_gap_days=baseline_gap_days,
                 )
             )
     return out
 
 
 def _savings_alerts(
-    account_id: str, account_name: str, entity: str, occ: str, baseline: Decimal, current: Decimal
+    account_id: str,
+    account_name: str,
+    entity: str,
+    occ: str,
+    baseline: Decimal,
+    current: Decimal,
+    baseline_gap_days: int = 1,
 ) -> list[BalanceAlert]:
     if baseline > SAVINGS_FLOOR and current <= SAVINGS_FLOOR:
         return [
@@ -174,7 +206,9 @@ def _savings_alerts(
                 message=(
                     f"{account_name} fell from {_fmt(baseline)} to "
                     f"{_fmt(current)}, below the {_fmt(SAVINGS_FLOOR)} minimum."
+                    f"{_gap_note(baseline_gap_days)}"
                 ),
+                baseline_gap_days=baseline_gap_days,
             )
         ]
     return []
@@ -191,7 +225,13 @@ def _credit_milestones_up_to(value: Decimal) -> list[Decimal]:
 
 
 def _credit_alerts(
-    account_id: str, account_name: str, entity: str, occ: str, baseline: Decimal, current: Decimal
+    account_id: str,
+    account_name: str,
+    entity: str,
+    occ: str,
+    baseline: Decimal,
+    current: Decimal,
+    baseline_gap_days: int = 1,
 ) -> list[BalanceAlert]:
     # Credit balances are the positive amount owed; alert as the owed amount climbs.
     out: list[BalanceAlert] = []
@@ -215,14 +255,22 @@ def _credit_alerts(
                     message=(
                         f"{account_name} rose from {_fmt(baseline)} to "
                         f"{_fmt(current)}, crossing {_fmt(level)} owed."
+                        f"{_gap_note(baseline_gap_days)}"
                     ),
+                    baseline_gap_days=baseline_gap_days,
                 )
             )
     return out
 
 
 def _investment_alerts(
-    account_id: str, account_name: str, entity: str, occ: str, baseline: Decimal, current: Decimal
+    account_id: str,
+    account_name: str,
+    entity: str,
+    occ: str,
+    baseline: Decimal,
+    current: Decimal,
+    baseline_gap_days: int = 1,
 ) -> list[BalanceAlert]:
     # REQ-BAL-004: drift, tightened to 15% AND $25k.
     if baseline == Decimal("0") and current == Decimal("0"):
@@ -253,7 +301,9 @@ def _investment_alerts(
             message=(
                 f"{account_name} drifted from {_fmt(baseline)} to {_fmt(current)} "
                 f"(Δ {_q2(delta):+,.2f}, {pct_str})."
+                f"{_gap_note(baseline_gap_days)}"
             ),
+            baseline_gap_days=baseline_gap_days,
         )
     ]
 
@@ -268,11 +318,13 @@ def evaluate_account(
     baseline: Decimal | None,
     current: Decimal,
     occurrence_date: str,
+    baseline_gap_days: int = 1,
 ) -> list[BalanceAlert]:
     """Pure crossing evaluation for one account. No DB, no network.
 
-    `baseline` is the prior-calendar-day balance, or None when there is no
-    prior-day row (REQ-BAL-005: never fire without a baseline).
+    `baseline` is the most recent snapshot strictly before `occurrence_date`
+    within the fallback window (REQ-FIX-PLD-003), or None when there is no
+    such row (REQ-BAL-005: never fire without a baseline).
     """
     if baseline is None:
         return []
@@ -280,19 +332,33 @@ def evaluate_account(
     if kind is None:
         return []
     if kind == "checking":
-        return _checking_alerts(account_id, account_name, entity, occurrence_date, baseline, current)
+        return _checking_alerts(
+            account_id, account_name, entity, occurrence_date, baseline, current, baseline_gap_days
+        )
     if kind == "savings":
-        return _savings_alerts(account_id, account_name, entity, occurrence_date, baseline, current)
+        return _savings_alerts(
+            account_id, account_name, entity, occurrence_date, baseline, current, baseline_gap_days
+        )
     if kind == "credit":
-        return _credit_alerts(account_id, account_name, entity, occurrence_date, baseline, current)
+        return _credit_alerts(
+            account_id, account_name, entity, occurrence_date, baseline, current, baseline_gap_days
+        )
     if kind == "investment":
-        return _investment_alerts(account_id, account_name, entity, occurrence_date, baseline, current)
+        return _investment_alerts(
+            account_id, account_name, entity, occurrence_date, baseline, current, baseline_gap_days
+        )
     return []
+
+
+# REQ-FIX-PLD-003: a missing prior-calendar-day snapshot must not mute crossing
+# detection — fall back to the most recent snapshot within this many days.
+BASELINE_FALLBACK_MAX_DAYS = 7
 
 
 def compute_balance_alerts(today: date, session: Session) -> list[BalanceAlert]:
     """DB layer: for every Plaid-linked account, read the latest snapshot and the
-    prior-calendar-day snapshot, then evaluate crossings (REQ-BAL-001..006)."""
+    most recent baseline within the fallback window, then evaluate crossings
+    (REQ-BAL-001..006, REQ-FIX-PLD-003)."""
     from src.models.brokerage import Account
     from src.models.plaid import PlaidAccountBalanceSnapshot as Snap
 
@@ -307,12 +373,22 @@ def compute_balance_alerts(today: date, session: Session) -> list[BalanceAlert]:
         ).first()
         if latest is None:
             continue
-        prior_day = latest.snapshot_date - timedelta(days=1)
         baseline_row = session.scalars(
-            select(Snap).where(
-                Snap.account_id == account_id, Snap.snapshot_date == prior_day
+            select(Snap)
+            .where(
+                Snap.account_id == account_id,
+                Snap.snapshot_date < latest.snapshot_date,
+                Snap.snapshot_date
+                >= latest.snapshot_date - timedelta(days=BASELINE_FALLBACK_MAX_DAYS),
             )
+            .order_by(Snap.snapshot_date.desc())
+            .limit(1)
         ).first()
+        gap_days = (
+            (latest.snapshot_date - baseline_row.snapshot_date).days
+            if baseline_row is not None
+            else 1
+        )
         account = session.get(Account, account_id)
         name = account.account_name if account and account.account_name else account_id
         name = name[:80]  # Plaid/institution-controlled — cap before it enters subject/payload
@@ -327,6 +403,7 @@ def compute_balance_alerts(today: date, session: Session) -> list[BalanceAlert]:
                 baseline=(baseline_row.current_balance if baseline_row else None),
                 current=latest.current_balance,
                 occurrence_date=latest.snapshot_date.isoformat(),
+                baseline_gap_days=gap_days,
             )
         )
     return alerts

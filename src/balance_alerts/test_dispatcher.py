@@ -114,6 +114,63 @@ def test_failed_post_not_marked_sent_so_retries(
     assert s2.skipped == 0
 
 
+def test_apply_records_payload_json_and_delivery_channel(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-FIX-ALR-002: every written row persists the exact payload + channel."""
+    monkeypatch.setattr(disp, "compute_balance_alerts", lambda today, s: [_alert()])
+    monkeypatch.setattr(
+        disp, "post_balance_alert", lambda a, apply: WebhookResult("sent", 200, None)
+    )
+    dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+    row = session.query(AlertDispatch).filter_by(
+        alert_key="balance:acc:checking:1000"
+    ).one()
+    assert row.delivery_channel == "n8n_webhook"
+    assert row.payload_json is not None
+    import json
+
+    payload = json.loads(row.payload_json)
+    assert payload["alert_key"] == "balance:acc:checking:1000"
+
+
+def test_apply_sweeps_prior_failed_row_before_computing_today(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-FIX-ALR-002: a failed row from a prior day is resent at the top of
+    the next --apply run."""
+    session.add(
+        AlertDispatch(
+            alert_key="balance:acc:checking:5000",
+            occurrence_date="2026-06-13",
+            alert_type="balance_milestone",
+            entity="sparkry",
+            subject="Sparkry checking below $5,000.00",
+            status="failed",
+            delivery_channel="n8n_webhook",
+            payload_json='{"alert_key": "balance:acc:checking:5000"}',
+        )
+    )
+    session.commit()
+    monkeypatch.setattr(disp, "compute_balance_alerts", lambda today, s: [])
+    posted_keys: list[str] = []
+
+    def _fake_post_payload(payload, *, key, apply, timeout=10.0):  # type: ignore[no-untyped-def]
+        posted_keys.append(key)
+        from src.alerts.webhook import WebhookResult as WR
+
+        return WR("sent", 200, None)
+
+    monkeypatch.setattr(disp, "post_payload", _fake_post_payload)
+    dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+
+    assert "balance:acc:checking:5000" in posted_keys
+    row = session.query(AlertDispatch).filter_by(
+        alert_key="balance:acc:checking:5000"
+    ).one()
+    assert row.status == "sent"
+
+
 def test_same_key_different_day_both_send(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

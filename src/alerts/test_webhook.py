@@ -126,6 +126,33 @@ def test_build_payload_body_html_passes_through() -> None:
     assert payload["body_html"] == "<p>html body</p>"
 
 
+def test_env_override_allowlist_honored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """REQ-FIX-ALR-003: ALERT_ALLOWED_TO/FROM override the default allowlist."""
+    monkeypatch.setenv("ALERT_ALLOWED_TO", "ea-alerts@sparkry.com,ops@sparkry.com")
+    monkeypatch.setenv("ALERT_ALLOWED_FROM", "Travis@sparkry.com,Bot@sparkry.com")
+    monkeypatch.setenv("ALERT_TO_EMAIL", "ops@sparkry.com")
+    monkeypatch.setenv("ALERT_FROM_EMAIL", "Bot@sparkry.com")
+    result = post_alert(_ALERT, apply=False)
+    assert result.status == "dry_run"
+
+
+def test_env_allowlist_defaults_match_literals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No env override → allowlist defaults to the historical hardcoded literals."""
+    monkeypatch.delenv("ALERT_ALLOWED_TO", raising=False)
+    monkeypatch.delenv("ALERT_ALLOWED_FROM", raising=False)
+    result = post_alert(_ALERT, apply=False)
+    assert result.status == "dry_run"
+
+
+def test_env_allowlist_rejects_recipient_not_in_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALERT_ALLOWED_TO", "ops@sparkry.com")
+    result = post_alert(_ALERT, apply=False)  # default ALERT_TO_EMAIL not in override
+    assert result.status == "failed"
+    assert result.error == "recipient not allowlisted"
+
+
 def test_apply_non_2xx_is_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Resp:
         status_code: int = 500

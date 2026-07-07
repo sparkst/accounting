@@ -3,10 +3,15 @@
 Reuses the `alert_dispatch` ledger. Its UNIQUE(alert_key, occurrence_date) gives
 the per-(account, level, UTC-day) dedup for free. Per-alert error isolation: one
 raising/failed POST never blocks the rest. DRY-RUN (apply=False) writes nothing.
+
+REQ-FIX-ALR-002: at the top of every --apply run, failed n8n_webhook rows from
+the last 7 days (own alert_types) are re-POSTed via the shared sweep before
+computing today's alerts.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import date
@@ -15,11 +20,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.alerts.models import AlertDispatch
+from src.alerts.sweep import sweep_failed_rows
 from src.alerts.webhook import WebhookResult
 from src.balance_alerts.rules import BalanceAlert, compute_balance_alerts
-from src.balance_alerts.webhook import post_balance_alert
+from src.balance_alerts.webhook import build_payload, post_balance_alert, post_payload
 
 logger = logging.getLogger(__name__)
+
+# Every alert_type this dispatcher (+ the digest pulse, which shares the same
+# ledger and webhook) can emit — scopes the sweep to this dispatcher's own
+# n8n webhook target (N8N_SEVERITY_WEBHOOK_URL/SECRET).
+ALERT_TYPES = ("balance_milestone", "balance_drift", "balance_pulse")
 
 
 @dataclass
@@ -44,12 +55,15 @@ def _record(
     result: WebhookResult,
     existing: AlertDispatch | None = None,
 ) -> None:
+    payload_json = json.dumps(build_payload(alert))
     if existing is None:
         existing = _already_sent(session, alert)
     if existing is not None:
         existing.status = result.status
         existing.http_status = result.http_status
         existing.error_detail = result.error
+        existing.delivery_channel = "n8n_webhook"
+        existing.payload_json = payload_json
         session.commit()
         return
     row = AlertDispatch(
@@ -61,6 +75,8 @@ def _record(
         status=result.status,
         http_status=result.http_status,
         error_detail=result.error,
+        delivery_channel="n8n_webhook",
+        payload_json=payload_json,
     )
     try:
         with session.begin_nested():
@@ -71,11 +87,21 @@ def _record(
         session.rollback()
 
 
+def _sweep_post(payload: dict[str, object]) -> WebhookResult:
+    return post_payload(payload, key=str(payload.get("alert_key", "")), apply=True)  # type: ignore[arg-type]
+
+
 def dispatch_balance_alerts(
     today: date, session: Session, *, apply: bool
 ) -> DispatchSummary:
     """Compute today's balance alerts, skip ones already sent, POST the rest."""
     summary = DispatchSummary()
+
+    if apply:
+        sweep_failed_rows(
+            session, today, post=_sweep_post, apply=True, alert_types=ALERT_TYPES
+        )
+
     alerts = compute_balance_alerts(today, session)
     for alert in alerts:
         try:

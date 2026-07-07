@@ -2,7 +2,11 @@
 
 For every active PlaidItem:
   1. Decrypt the access_token.
-  2. Call /accounts/balance/get (with retry on RATE_LIMIT etc).
+  2. Call /accounts/get (with retry on RATE_LIMIT etc). REQ-FIX-PLD-001:
+     switched from /accounts/balance/get (paid Balance product, lapsed
+     2026-06-25) to /accounts/get, which returns cached balances refreshed by
+     Plaid's regular Transactions syncs and needs no extra product
+     entitlement. Response shape and snapshot write path are unchanged.
   3. For each Plaid account in the response:
       - If mapped to a local Account → INSERT a row in plaid_account_balance_snapshot
         (UNIQUE(account_id, snapshot_date) makes double-runs idempotent).
@@ -64,6 +68,9 @@ class ItemSyncResult:
     accounts_skipped_non_usd: int = 0
     error_code: str | None = None
     retryable: bool = False
+    # REQ-FIX-PLD-005: "name ·mask· subtype" per truly-unmapped account (ignore-
+    # listed accounts are excluded — they no longer count as unmapped).
+    unmapped: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -121,28 +128,52 @@ def _build_snapshot(
     )
 
 
+def _plaid_account_name(plaid_account: Any) -> str:
+    return (
+        getattr(plaid_account, "name", None)
+        or getattr(plaid_account, "official_name", None)
+        or "Unknown"
+    )
+
+
+def _unmapped_label(plaid_account: Any) -> str:
+    """REQ-FIX-PLD-005: "name ·mask· subtype" for the ingestion-log detail."""
+    name = _plaid_account_name(plaid_account)
+    mask = getattr(plaid_account, "mask", None) or "----"
+    subtype = getattr(plaid_account, "subtype", None)
+    subtype_str = str(subtype) if subtype else ""
+    return f"{name} ·{mask}· {subtype_str}".rstrip()
+
+
+def _existing_expected_account(
+    session: Session, *, item: PlaidItem, plaid_account: Any
+) -> ExpectedAccount | None:
+    mask = getattr(plaid_account, "mask", None) or None
+    name = _plaid_account_name(plaid_account)
+    return (
+        session.query(ExpectedAccount)
+        .filter_by(institution=item.institution_name, account_name=name, last_4=mask)
+        .first()
+    )
+
+
 def _upsert_unconfirmed_expected_account(
     session: Session,
     *,
     item: PlaidItem,
     plaid_account: Any,
+    existing: ExpectedAccount | None,
 ) -> None:
     """Surface an unmapped Plaid account in the missing-accounts panel.
 
     Idempotent on the natural key (institution, account_name, last_4). If a row
-    already exists we leave it alone — the user may have already triaged it.
+    already exists we leave it alone — the user may have already triaged it
+    (including flipping it to `ignored`, REQ-FIX-PLD-005).
     """
-    mask = getattr(plaid_account, "mask", None) or None
-    name = getattr(plaid_account, "name", None) or getattr(
-        plaid_account, "official_name", None
-    ) or "Unknown"
-    existing = (
-        session.query(ExpectedAccount)
-        .filter_by(institution=item.institution_name, account_name=name, last_4=mask)
-        .first()
-    )
     if existing is not None:
         return
+    mask = getattr(plaid_account, "mask", None) or None
+    name = _plaid_account_name(plaid_account)
     session.add(
         ExpectedAccount(
             institution=item.institution_name,
@@ -194,7 +225,7 @@ def sync_one_item(
             ) from exc
 
         resp = call_with_retry(
-            lambda: client.accounts_balance_get(_balance_request(access_token))
+            lambda: client.accounts_get(_accounts_request(access_token))
         )
 
         for plaid_account in resp.accounts:
@@ -232,10 +263,15 @@ def sync_one_item(
             if result.accounts_failed
             else IngestionStatus.SUCCESS.value
         )
-        log_row.error_detail = (
+        detail = (
             f"unmapped_skipped={result.accounts_skipped_unmapped}"
             f" non_usd_skipped={result.accounts_skipped_non_usd}"
         )
+        if result.unmapped:
+            # REQ-FIX-PLD-005: name+mask+subtype per unmapped account, so the
+            # pulse/operator can see exactly which accounts need triage.
+            detail += f" [{'; '.join(result.unmapped)}]"
+        log_row.error_detail = detail
 
     except RetryablePlaidError as exc:
         # All retries exhausted — keep the Item active, mark transient error.
@@ -317,11 +353,16 @@ def _process_plaid_account(
         .first()
     )
     if account is None:
-        # Unmapped — surface in missing-accounts panel.
+        # Unmapped — surface in missing-accounts panel, unless the user has
+        # already ignore-listed this exact account (REQ-FIX-PLD-005).
+        existing = _existing_expected_account(session, item=item, plaid_account=plaid_account)
+        if existing is not None and existing.status == "ignored":
+            return
         _upsert_unconfirmed_expected_account(
-            session, item=item, plaid_account=plaid_account
+            session, item=item, plaid_account=plaid_account, existing=existing
         )
         result.accounts_skipped_unmapped += 1
+        result.unmapped.append(_unmapped_label(plaid_account))
         return
 
     snap = _build_snapshot(
@@ -335,13 +376,20 @@ def _process_plaid_account(
     result.accounts_processed += 1
 
 
-def _balance_request(access_token: str) -> Any:
-    """Construct the SDK's AccountsBalanceGetRequest. Isolated for testability."""
-    # Import locally so unit tests that pass a mock client never need plaid installed
-    # under test isolation paths (it's a real dep, but keeps the module's surface light).
-    from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+def _accounts_request(access_token: str) -> Any:
+    """Construct the SDK's AccountsGetRequest (REQ-FIX-PLD-001).
 
-    return AccountsBalanceGetRequest(access_token=access_token)
+    ``/accounts/get`` returns cached balances refreshed by Plaid's regular
+    Transactions syncs — no paid Balance-product entitlement required (that
+    product lapsed 2026-06-25, causing the balance-sync outage this fixes).
+    Response shape (``resp.accounts[]`` of ``AccountBase``) is identical to
+    ``/accounts/balance/get``; every field ``_build_snapshot`` consumes is
+    unaffected. Isolated for testability — imported locally so unit tests that
+    pass a mock client never need the real SDK request object.
+    """
+    from plaid.model.accounts_get_request import AccountsGetRequest
+
+    return AccountsGetRequest(access_token=access_token)
 
 
 # ── Batch driver ─────────────────────────────────────────────────────────────
@@ -360,7 +408,14 @@ def sync_all_active(
     polluting the DB.
     """
     batch = BatchResult(dry_run=dry_run)
-    items = session.query(PlaidItem).filter_by(status="active").all()
+    # REQ-FIX-PLD-004: query parity with plaid_transactions.py's rotation —
+    # dead abandoned-OAuth placeholder rows (item_id LIKE 'placeholder_%')
+    # never enter the sync loop even if their status is still 'active'.
+    items = (
+        session.query(PlaidItem)
+        .filter(PlaidItem.status == "active", ~PlaidItem.item_id.like("placeholder_%"))
+        .all()
+    )
     pulled_at = _utcnow()
 
     for item in items:

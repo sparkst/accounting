@@ -15,10 +15,23 @@ Ops prerequisite (deploy step, not yet applied): `travis` must join the
 `systemd-journal` group on the box (`usermod -aG systemd-journal travis`) for
 `journalctl -u <unit>` to read other units' logs without sudo — otherwise (a)
 above silently degrades to "no journal tail" (still a valid, sent email).
+
+Security invariant (this forwards a unit's raw journal output to Resend +
+Gmail, a broader exposure surface than the box journal itself): the journal
+tail is passed through `_redact()` before it ever enters the email body, which
+masks (i) verbatim values of known-secret env vars present in *this* process's
+environment and (ii) `key=`/`token=`/`secret=`/`password=`-style query-string
+params. That is best-effort, not a guarantee — it cannot mask a secret this
+process doesn't itself hold (e.g. a value baked into another unit's own env).
+The safety of this feature ultimately also rests on: no unit under
+`OnFailure=accounting-alert@%n` may log a secret value to its own journal, and
+none may run with a locals-printing traceback formatter (plain Python
+tracebacks do not print locals by default — keep it that way).
 """
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -34,6 +47,55 @@ _JOURNAL_TIMEOUT_SECONDS = 10
 _DISPATCHER_UNITS = frozenset(
     {"accounting-balance-alerts.service", "accounting-ea-alerts.service"}
 )
+
+# REQ-FIX-ALR-006 hardening (P3-001): env vars whose verbatim values must
+# never leak into the journal tail forwarded to the OnFailure alert email.
+# Best-effort — masks whichever of these this process actually has set.
+_SECRET_ENV_VARS = (
+    "RESEND_API_KEY",
+    "STRIPE_API_KEY",
+    "STRIPE_RESTRICTED_KEY",
+    "SHOPIFY_API_KEY",
+    "N8N_WEBHOOK_SECRET",
+    "N8N_ALERTS_WEBHOOK_URL",
+    "N8N_ALERTS_WEBHOOK_SECRET",
+    "N8N_SEVERITY_WEBHOOK_URL",
+    "N8N_SEVERITY_WEBHOOK_SECRET",
+    "API_KEY",
+    "INGEST_API_KEY",
+    "PLAID_CLIENT_ID",
+    "PLAID_SANDBOX_SECRET",
+    "PLAID_PRODUCTION_SECRET",
+    "PLAID_FERNET_KEY",
+    "PLAID_TOKEN_ENC_KEY",
+    "WEALTH_INTERNAL_KEY",
+)
+
+# Common key=value secret patterns in URLs/log lines (webhook query strings,
+# "Authorization: <scheme> <token>", etc.) — masked regardless of whether the
+# value matches a known env var, since a rotated/derived secret wouldn't.
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)\b([\w-]*(?:key|token|secret|password))\s*[=:]\s*(\S+)"
+)
+# "Authorization: Bearer <token>" / "Authorization: Basic <creds>" — the
+# secret is the token *after* the auth scheme, not the scheme word itself.
+_AUTH_HEADER_RE = re.compile(r"(?i)\b(authorization\s*:\s*\S+\s+)(\S+)")
+
+
+def _redact(text: str) -> str:
+    """Best-effort scrub of secret values before the journal tail enters the
+    alert email body (REQ-FIX-ALR-006 / P3-001). Masks (a) verbatim values of
+    `_SECRET_ENV_VARS` present in this process's own environment and (b)
+    key=/token=/secret=/password=/Authorization-header-style parameters. Not
+    a substitute for the invariant documented in the module docstring — only
+    a defense-in-depth layer on top of it."""
+    redacted = text
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name)
+        if value and len(value) >= 6 and value in redacted:
+            redacted = redacted.replace(value, "***REDACTED***")
+    redacted = _AUTH_HEADER_RE.sub(r"\1***REDACTED***", redacted)
+    return _QUERY_SECRET_RE.sub(r"\1=***REDACTED***", redacted)
 
 
 class _Client:
@@ -86,7 +148,7 @@ def _journal_tail(unit: str) -> str | None:
             check=False,
         )
         output = result.stdout.strip()
-        return output or None
+        return _redact(output) or None
     except Exception:  # noqa: BLE001 — best-effort only, never blocks the alert
         return None
 

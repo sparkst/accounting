@@ -102,7 +102,15 @@ def dispatch_balance_alerts(
             session, today, post=_sweep_post, apply=True, alert_types=ALERT_TYPES
         )
 
-    alerts = compute_balance_alerts(today, session)
+    try:
+        alerts = compute_balance_alerts(today, session)
+    except Exception:  # noqa: BLE001 — a compute-phase failure must not crash
+        # the whole run (mirrors src/alerts/dispatcher.py's per-day guard);
+        # return an empty summary and write nothing rather than propagate.
+        logger.exception("compute_balance_alerts raised; returning empty summary")
+        session.rollback()
+        return summary
+
     for alert in alerts:
         try:
             prior = _already_sent(session, alert)

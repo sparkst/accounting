@@ -58,7 +58,7 @@ def post_payload(
         )
     except httpx.HTTPError as exc:
         # Static message — never interpolate `exc` (it can carry the URL).
-        logger.debug("n8n webhook network error key=%s: %s", key, exc)
+        logger.debug("n8n webhook network error key=%s: %s", key, type(exc).__name__)
         return WebhookResult("failed", None, "network error")
     if resp.status_code // 100 != 2:
         logger.debug("n8n webhook non-2xx key=%s status=%s", key, resp.status_code)

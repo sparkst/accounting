@@ -9,6 +9,14 @@ REQ-FIX-ALR-005: a balance line whose snapshot is older than yesterday renders
 `(as of <date>) ⏳` and counts toward the footer's stale total — confidently
 stale data is never presented as current.
 
+REQ-FIX-PLD-001: `/accounts/get` returns Plaid's *cached* balance, refreshed
+only by Transactions syncs — a snapshot written today can carry a value from
+days ago. When the Plaid response carries `balances.last_updated_datetime`
+(populated for some institutions, e.g. Capital One; typically null for
+others), that date — not the write-time `snapshot_date` — drives staleness
+and the `as of` marker, so a stale cached value is never shown as current and
+a multi-day move isn't mis-attributed to the single day it was re-written.
+
 REQ-DHL-001/002: a "Delivery" block surfaces the four silent-failure modes
 from the 2026-07-07 audit — missed snapshot day, failed webhook POST, unmapped
 account skip, dead item — derived from `ingestion_log` + `alert_dispatch` +
@@ -33,6 +41,7 @@ from src.balance_alerts.rules import (
     CHECKING_MILESTONES,
     CREDIT_STEP,
     SAVINGS_FLOOR,
+    cache_last_updated,
     classify,
 )
 from src.balance_alerts.webhook import build_payload_dict, post_payload
@@ -55,9 +64,19 @@ class PulseLine:
     balance: Decimal
     breached: bool
     snapshot_date: date
+    cache_last_updated: date | None = None
+
+    @property
+    def effective_date(self) -> date:
+        """The date staleness/`as of` should key off: the cache's own
+        last-refresh date when Plaid supplies one and it's older than the
+        write-time `snapshot_date`, otherwise `snapshot_date` itself."""
+        if self.cache_last_updated is not None and self.cache_last_updated < self.snapshot_date:
+            return self.cache_last_updated
+        return self.snapshot_date
 
     def stale(self, today: date) -> bool:
-        return self.snapshot_date < today - timedelta(days=STALE_AFTER_DAYS)
+        return self.effective_date < today - timedelta(days=STALE_AFTER_DAYS)
 
 
 def _breached(kind: str, balance: Decimal) -> bool:
@@ -77,24 +96,36 @@ def build_pulse(today: date, session: Session) -> list[PulseLine]:
     lines: list[PulseLine] = []
     account_ids = session.scalars(select(Snap.account_id).distinct()).all()
     for account_id in account_ids:
-        latest = session.scalars(
-            select(Snap)
-            .where(Snap.account_id == account_id, Snap.snapshot_date <= today)
-            .order_by(Snap.snapshot_date.desc())
-            .limit(1)
-        ).first()
-        if latest is None:
-            continue
-        kind = classify(latest.plaid_account_type, latest.plaid_account_subtype)
-        if kind is None:
-            continue
-        account = session.get(Account, account_id)
-        name = account.account_name if account and account.account_name else account_id
-        name = name[:80]  # Plaid/institution-controlled — cap before display
-        bal = latest.current_balance  # already a Decimal (Numeric asdecimal=True)
-        lines.append(
-            PulseLine(name, kind, bal, _breached(kind, bal), latest.snapshot_date)
-        )
+        try:
+            latest = session.scalars(
+                select(Snap)
+                .where(Snap.account_id == account_id, Snap.snapshot_date <= today)
+                .order_by(Snap.snapshot_date.desc())
+                .limit(1)
+            ).first()
+            if latest is None:
+                continue
+            kind = classify(latest.plaid_account_type, latest.plaid_account_subtype)
+            if kind is None:
+                continue
+            account = session.get(Account, account_id)
+            name = account.account_name if account and account.account_name else account_id
+            name = name[:80]  # Plaid/institution-controlled — cap before display
+            bal = latest.current_balance  # already a Decimal (Numeric asdecimal=True)
+            lines.append(
+                PulseLine(
+                    name,
+                    kind,
+                    bal,
+                    _breached(kind, bal),
+                    latest.snapshot_date,
+                    cache_last_updated(latest.raw_data),
+                )
+            )
+        except Exception:  # noqa: BLE001 — one bad account snapshot must not
+            # blank the daily pulse for every other monitored account.
+            logger.exception("build_pulse: account %s raised; skipping", account_id)
+            session.rollback()
     return sorted(lines, key=lambda x: (not x.breached, x.account_name))
 
 
@@ -120,7 +151,7 @@ def render_pulse(lines: list[PulseLine], today: date) -> str:
         group.sort(key=lambda x: (not x.breached, -x.balance))
         rows = []
         for ln in group:
-            as_of = f" (as of {ln.snapshot_date.isoformat()}) ⏳" if ln.stale(today) else ""
+            as_of = f" (as of {ln.effective_date.isoformat()}) ⏳" if ln.stale(today) else ""
             warn = " ⚠️" if ln.breached else ""
             rows.append(f"  {ln.account_name} — ${ln.balance:,.2f}{as_of}{warn}")
         blocks.append(_PULSE_KIND_LABEL[kind] + "\n" + "\n".join(rows))
@@ -225,9 +256,9 @@ def build_delivery_health(
     unmapped = [f"{r.account_name} ·{r.last_4 or '----'}·" for r in unmapped_rows]
 
     gaps = [
-        (ln.account_name, (today - ln.snapshot_date).days)
+        (ln.account_name, (today - ln.effective_date).days)
         for ln in lines
-        if (today - ln.snapshot_date).days >= 2
+        if (today - ln.effective_date).days >= 2
     ]
 
     return DeliveryHealth(
@@ -312,9 +343,22 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
     """
     occ = today.isoformat()
     key = f"balance:pulse:{occ}"
-    lines = build_pulse(today, session)
-    health = build_delivery_health(today, session, lines)
-    message = render_pulse(lines, today) + "\n\n" + render_delivery_health(health)
+    try:
+        lines = build_pulse(today, session)
+    except Exception:
+        logger.exception("pulse compute failed; skipping digest send")
+        session.rollback()
+        return WebhookResult("failed", None, "digest compute error")
+    # The pulse must still go out even if the delivery-health block can't be
+    # computed — degrade to a pulse without the block rather than losing the day.
+    try:
+        health = build_delivery_health(today, session, lines)
+        health_text = "\n\n" + render_delivery_health(health)
+    except Exception:
+        logger.exception("delivery-health compute failed; sending degraded pulse")
+        session.rollback()
+        health_text = "\n\n⚠️ Delivery-health block unavailable (compute error — check logs)"
+    message = render_pulse(lines, today) + health_text
     payload = build_payload_dict(
         severity="info",
         title=f"📊 Business Account Snapshot · {today:%b} {today.day}",

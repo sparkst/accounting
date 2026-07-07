@@ -42,6 +42,8 @@ LOOKBACK_DAYS = 7
 class SweepSummary:
     resent: int = 0
     still_failed: int = 0
+    # DRY-RUN only: rows that WOULD be re-POSTed (query runs, nothing sent/written).
+    candidates: int = 0
 
 
 def sweep_failed_rows(
@@ -61,14 +63,12 @@ def sweep_failed_rows(
     The explicit IS NULL arm captures pre-migration legacy rows (every
     pre-migration emitter was webhook-only) once a payload exists for them.
 
-    DRY-RUN (`apply=False`) makes no POST and no write — it's a no-op here
-    (the caller is expected to log the dry-run intent itself if desired).
+    DRY-RUN (`apply=False`) makes no POST and no write, but DOES run the sweep
+    query and reports the would-be-resent rows in `summary.candidates` (and a
+    log line per row), so an operator can see what a real run would replay.
     Per-row isolation: one raising re-POST never halts the sweep.
     """
     summary = SweepSummary()
-    if not apply:
-        return summary
-
     cutoff = (today - timedelta(days=lookback_days)).isoformat()
     query = session.query(AlertDispatch).filter(
         or_(
@@ -81,6 +81,14 @@ def sweep_failed_rows(
     )
     if alert_types is not None:
         query = query.filter(AlertDispatch.alert_type.in_(alert_types))
+
+    if not apply:
+        for row in query.all():
+            summary.candidates += 1
+            logger.info(
+                "sweep DRY-RUN would resend %s@%s", row.alert_key, row.occurrence_date
+            )
+        return summary
 
     for row in query.all():
         try:

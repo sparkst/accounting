@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
@@ -77,9 +77,19 @@ class BalanceAlert:
     new_balance: str
     title: str
     message: str
-    # REQ-FIX-PLD-003: 1 = normal prior-calendar-day baseline; >1 means the
-    # dispatcher fell back to an older snapshot (data gap ≤7d). Defaulted so
-    # existing callers/tests that don't care about gap semantics are unaffected.
+    # REQ-FIX-PLD-003: 1 = normal prior-calendar-day baseline; >1 means either
+    # the dispatcher fell back to an older snapshot row (data gap ≤7d,
+    # REQ-FIX-PLD-003) or, on institutions that populate
+    # `balances.last_updated_datetime`, the *cached* balance backing the
+    # baseline and/or the latest row was itself older than its own
+    # snapshot_date (REQ-FIX-PLD-001). `compute_balance_alerts` takes the max
+    # across the row gap, the latest row's cache age, and the baseline row's
+    # own cache age (measured back to the latest snapshot_date) — a
+    # conservative max so the crossing's day-attribution is never understated
+    # by the *row-gap-and-latest-cache* calculation alone. It can still be a
+    # lower bound if an institution's `last_updated_datetime` is itself wrong;
+    # that is outside what this field can detect. Defaulted so existing
+    # callers/tests that don't care about gap semantics are unaffected.
     baseline_gap_days: int = 1
 
 
@@ -127,11 +137,36 @@ def _fmt(d: Decimal) -> str:
 
 
 def _gap_note(baseline_gap_days: int) -> str:
-    """REQ-FIX-PLD-003: appended to the message only when the baseline fell
-    back to an older-than-yesterday snapshot (data gap)."""
+    """REQ-FIX-PLD-003 / REQ-FIX-PLD-001: appended to the message only when
+    the effective gap between the two readings being compared exceeds one
+    calendar day — whether from a missing row (fell back to an
+    older-than-yesterday snapshot) or from a stale Plaid-cached balance on
+    either end of the crossing."""
     if baseline_gap_days > 1:
-        return f" (baseline {baseline_gap_days} days old)"
+        return f" ({baseline_gap_days}d data gap)"
     return ""
+
+
+def cache_last_updated(raw_data: object) -> date | None:
+    """REQ-FIX-PLD-001: extract Plaid's `balances.last_updated_datetime` from
+    a snapshot's stored `raw_data`, when the institution populates it (e.g.
+    Capital One; typically null elsewhere). `/accounts/get` returns Plaid's
+    *cached* balance — refreshed only by Transactions syncs — so a row
+    written today can carry a value that hasn't actually changed in days.
+    Returns None on any missing/malformed field, in which case callers fall
+    back to row-based (`snapshot_date`) gap semantics."""
+    if not isinstance(raw_data, dict):
+        return None
+    balances = raw_data.get("balances")
+    if not isinstance(balances, dict):
+        return None
+    raw = balances.get("last_updated_datetime")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
+    except (ValueError, TypeError):
+        return None
 
 
 def _checking_alerts(
@@ -328,6 +363,11 @@ def evaluate_account(
     """
     if baseline is None:
         return []
+    # Compare at cents (REQ-BAL-005 scale-2 quantization): snapshots store
+    # Numeric(18,4), and a sub-cent residual like -0.0001 must not fire an
+    # overdraft that renders as "$0.00".
+    baseline = _q2(baseline)
+    current = _q2(current)
     kind = classify(plaid_account_type, plaid_account_subtype)
     if kind is None:
         return []
@@ -355,55 +395,91 @@ def evaluate_account(
 BASELINE_FALLBACK_MAX_DAYS = 7
 
 
+def _cache_gap_days(row: object, row_snapshot_date: date) -> int:
+    """REQ-FIX-PLD-001: how many days older a row's Plaid-*cached* balance is
+    than its own `snapshot_date`, or 0 when there's no usable
+    `last_updated_datetime` (the common case) or the cache is not stale."""
+    cached_as_of = cache_last_updated(getattr(row, "raw_data", None))
+    if cached_as_of is not None and cached_as_of < row_snapshot_date:
+        return (row_snapshot_date - cached_as_of).days
+    return 0
+
+
 def compute_balance_alerts(today: date, session: Session) -> list[BalanceAlert]:
     """DB layer: for every Plaid-linked account, read the latest snapshot and the
     most recent baseline within the fallback window, then evaluate crossings
-    (REQ-BAL-001..006, REQ-FIX-PLD-003)."""
+    (REQ-BAL-001..006, REQ-FIX-PLD-003, REQ-FIX-PLD-001).
+
+    Per-account try/except: one account raising (e.g. a malformed
+    `raw_data`) must not blank alert computation for every other monitored
+    account."""
     from src.models.brokerage import Account
     from src.models.plaid import PlaidAccountBalanceSnapshot as Snap
 
     alerts: list[BalanceAlert] = []
     account_ids = session.scalars(select(Snap.account_id).distinct()).all()
     for account_id in account_ids:
-        latest = session.scalars(
-            select(Snap)
-            .where(Snap.account_id == account_id, Snap.snapshot_date <= today)
-            .order_by(Snap.snapshot_date.desc())
-            .limit(1)
-        ).first()
-        if latest is None:
-            continue
-        baseline_row = session.scalars(
-            select(Snap)
-            .where(
-                Snap.account_id == account_id,
-                Snap.snapshot_date < latest.snapshot_date,
-                Snap.snapshot_date
-                >= latest.snapshot_date - timedelta(days=BASELINE_FALLBACK_MAX_DAYS),
+        try:
+            latest = session.scalars(
+                select(Snap)
+                .where(Snap.account_id == account_id, Snap.snapshot_date <= today)
+                .order_by(Snap.snapshot_date.desc())
+                .limit(1)
+            ).first()
+            if latest is None:
+                continue
+            baseline_row = session.scalars(
+                select(Snap)
+                .where(
+                    Snap.account_id == account_id,
+                    Snap.snapshot_date < latest.snapshot_date,
+                    Snap.snapshot_date
+                    >= latest.snapshot_date - timedelta(days=BASELINE_FALLBACK_MAX_DAYS),
+                )
+                .order_by(Snap.snapshot_date.desc())
+                .limit(1)
+            ).first()
+            row_gap_days = (
+                (latest.snapshot_date - baseline_row.snapshot_date).days
+                if baseline_row is not None
+                else 1
             )
-            .order_by(Snap.snapshot_date.desc())
-            .limit(1)
-        ).first()
-        gap_days = (
-            (latest.snapshot_date - baseline_row.snapshot_date).days
-            if baseline_row is not None
-            else 1
-        )
-        account = session.get(Account, account_id)
-        name = account.account_name if account and account.account_name else account_id
-        name = name[:80]  # Plaid/institution-controlled — cap before it enters subject/payload
-        entity = account.entity if account else "personal"
-        alerts.extend(
-            evaluate_account(
-                account_id=account_id,
-                account_name=name,
-                entity=entity,
-                plaid_account_type=latest.plaid_account_type,
-                plaid_account_subtype=latest.plaid_account_subtype,
-                baseline=(baseline_row.current_balance if baseline_row else None),
-                current=latest.current_balance,
-                occurrence_date=latest.snapshot_date.isoformat(),
-                baseline_gap_days=gap_days,
+            # REQ-FIX-PLD-001: a row can exist for every calendar day
+            # (row_gap=1) while the underlying Plaid-cached value itself
+            # hasn't refreshed in days — on EITHER end of the crossing. Fold
+            # in the cache age of the latest row directly, and the baseline
+            # row's own cache age plus the row gap back to `latest` (the
+            # calendar span the crossing actually spans when the baseline's
+            # cached figure is the stale one) so the reported gap isn't
+            # understated in either direction.
+            latest_cache_gap_days = _cache_gap_days(latest, latest.snapshot_date)
+            baseline_cache_gap_days = 0
+            if baseline_row is not None:
+                baseline_own_cache_gap = _cache_gap_days(
+                    baseline_row, baseline_row.snapshot_date
+                )
+                if baseline_own_cache_gap:
+                    baseline_cache_gap_days = baseline_own_cache_gap + row_gap_days
+            gap_days = max(row_gap_days, latest_cache_gap_days, baseline_cache_gap_days)
+            account = session.get(Account, account_id)
+            name = account.account_name if account and account.account_name else account_id
+            name = name[:80]  # Plaid/institution-controlled — cap before it enters subject/payload
+            entity = account.entity if account else "personal"
+            alerts.extend(
+                evaluate_account(
+                    account_id=account_id,
+                    account_name=name,
+                    entity=entity,
+                    plaid_account_type=latest.plaid_account_type,
+                    plaid_account_subtype=latest.plaid_account_subtype,
+                    baseline=(baseline_row.current_balance if baseline_row else None),
+                    current=latest.current_balance,
+                    occurrence_date=latest.snapshot_date.isoformat(),
+                    baseline_gap_days=gap_days,
+                )
             )
-        )
+        except Exception:  # noqa: BLE001 — one bad account snapshot must not
+            # blank alert computation for every other monitored account.
+            logger.exception("compute_balance_alerts: account %s raised; skipping", account_id)
+            session.rollback()
     return alerts

@@ -112,6 +112,54 @@ def test_journal_tail_returns_none_on_subprocess_error(monkeypatch: pytest.Monke
     assert alert_mod._journal_tail("some.service") is None
 
 
+def test_journal_tail_redacts_known_secret_env_var_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3-001 / REQ-FIX-ALR-006 hardening: if a failing unit's journal output
+    happens to contain the verbatim value of a secret env var this process
+    holds (e.g. accidentally logged by the failing unit itself), that value
+    must never reach the email body unmasked."""
+    monkeypatch.setenv("RESEND_API_KEY", "re_supersecret_abc123")
+
+    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="oops: sent with key re_supersecret_abc123 to endpoint\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    tail = alert_mod._journal_tail("some.service")
+    assert tail is not None
+    assert "re_supersecret_abc123" not in tail
+    assert "***REDACTED***" in tail
+
+
+def test_journal_tail_redacts_query_string_secret_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Query-string-style secrets (webhook URLs, Authorization headers) are
+    masked even when the value doesn't match a known env var — e.g. a
+    rotated/derived token this process doesn't itself hold."""
+
+    def _fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="POST https://n8n.example/hook?token=abcDEF123 failed\n"
+            "Authorization: Bearer zzz999\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    tail = alert_mod._journal_tail("some.service")
+    assert tail is not None
+    assert "abcDEF123" not in tail
+    assert "zzz999" not in tail
+    assert "***REDACTED***" in tail
+
+
 def test_dispatcher_unit_includes_failed_alert_subjects(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

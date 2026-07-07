@@ -143,7 +143,13 @@ def dispatch_alerts(session: Session, today: date, *, apply: bool) -> DispatchSu
         )
 
     for day in _catch_up_days(session, today):
-        alerts = compute_tax_alerts(day) + compute_invoice_alerts(day, session)
+        try:
+            alerts = compute_tax_alerts(day) + compute_invoice_alerts(day, session)
+        except Exception:  # noqa: BLE001 — one bad day never halts the catch-up
+            # loop or blocks the run-marker write for later (working) days.
+            logger.exception("alert computation for %s raised; skipping that day", day)
+            session.rollback()
+            continue
 
         for alert in alerts:
             existing = _already_sent(session, alert)

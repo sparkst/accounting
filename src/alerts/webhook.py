@@ -48,6 +48,10 @@ def resolve_to_email() -> str:
 
 
 def _allowed_to() -> set[str]:
+    # Deliberately independent of ALERT_TO_EMAIL: the allowlist is
+    # defense-in-depth against a tampered recipient env value. A mismatch is
+    # a LOUD failure (failed ledger row + OnFailure email naming both vars),
+    # never a silent mute.
     raw = os.environ.get(ALLOWED_TO_ENV, DEFAULT_TO)
     return {e.strip() for e in raw.split(",") if e.strip()}
 
@@ -86,9 +90,17 @@ def post_raw_payload(
     to_email = payload.get("to")
     from_email = payload.get("from")
     if to_email not in _allowed_to():
-        return WebhookResult("failed", None, "recipient not allowlisted")
+        return WebhookResult(
+            "failed",
+            None,
+            "recipient not allowlisted (ALERT_TO_EMAIL must appear in ALERT_ALLOWED_TO)",
+        )
     if from_email not in _allowed_from():
-        return WebhookResult("failed", None, "sender not allowlisted")
+        return WebhookResult(
+            "failed",
+            None,
+            "sender not allowlisted (ALERT_FROM_EMAIL must appear in ALERT_ALLOWED_FROM)",
+        )
 
     if not apply:
         logger.debug("DRY-RUN alert %s", payload.get("alert_key"))
@@ -112,8 +124,11 @@ def post_raw_payload(
             lambda: httpx.post(url, json=payload, headers=headers, timeout=timeout)
         )
     except httpx.HTTPError as exc:
+        # Static message — never interpolate `exc` (it can carry the URL).
         logger.debug(
-            "n8n webhook network error key=%s: %s", payload.get("alert_key"), exc
+            "n8n webhook network error key=%s: %s",
+            payload.get("alert_key"),
+            type(exc).__name__,
         )
         return WebhookResult("failed", None, "network error")
 

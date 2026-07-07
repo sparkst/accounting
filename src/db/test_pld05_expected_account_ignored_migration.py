@@ -8,7 +8,6 @@ preserving the row count.
 
 from __future__ import annotations
 
-import os
 import uuid
 from pathlib import Path
 
@@ -26,8 +25,8 @@ def _run_alembic(*args: str) -> None:
     alembic_main(list(args))
 
 
-def _stamp_at(db_path: Path, revision: str) -> None:
-    os.environ["DATABASE_PATH"] = str(db_path)
+def _stamp_at(db_path: Path, revision: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(db_path))
     engine = sa.create_engine(f"sqlite:///{db_path}")
     with engine.begin() as conn:
         conn.execute(
@@ -73,60 +72,57 @@ def _insert(engine: sa.Engine, *, name: str, status: str) -> None:
         )
 
 
-def test_pld05_ignored_status_round_trip(tmp_path: Path) -> None:
+def test_pld05_ignored_status_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_path = tmp_path / "test_pld05.db"
-    try:
-        _stamp_at(db_path, _PREV_REVISION)
+    _stamp_at(db_path, _PREV_REVISION, monkeypatch)
 
-        pre_engine = sa.create_engine(f"sqlite:///{db_path}")
-        _insert(pre_engine, name="Existing Unconfirmed", status="unconfirmed")
-        pre_engine.dispose()
+    pre_engine = sa.create_engine(f"sqlite:///{db_path}")
+    _insert(pre_engine, name="Existing Unconfirmed", status="unconfirmed")
+    pre_engine.dispose()
 
-        # 1. Upgrade.
-        _run_alembic("upgrade", _REVISION)
+    # 1. Upgrade.
+    _run_alembic("upgrade", _REVISION)
 
-        engine = sa.create_engine(f"sqlite:///{db_path}")
-        with engine.connect() as conn:
-            rows = conn.execute(
-                sa.text("SELECT account_name, status FROM expected_account")
-            ).fetchall()
-        assert len(rows) == 1  # pre-existing row survived
-        assert rows[0] == ("Existing Unconfirmed", "unconfirmed")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("SELECT account_name, status FROM expected_account")
+        ).fetchall()
+    assert len(rows) == 1  # pre-existing row survived
+    assert rows[0] == ("Existing Unconfirmed", "unconfirmed")
 
-        # 2. 'ignored' now accepted.
-        _insert(engine, name="Ignore Me", status="ignored")
-        # 3. Old values still accepted.
-        _insert(engine, name="Still Active", status="active")
-        # 4. Bogus value still rejected.
-        with pytest.raises((IntegrityError, sa.exc.IntegrityError)):
-            _insert(engine, name="Bogus", status="bogus_status")
-        engine.dispose()
+    # 2. 'ignored' now accepted.
+    _insert(engine, name="Ignore Me", status="ignored")
+    # 3. Old values still accepted.
+    _insert(engine, name="Still Active", status="active")
+    # 4. Bogus value still rejected.
+    with pytest.raises((IntegrityError, sa.exc.IntegrityError)):
+        _insert(engine, name="Bogus", status="bogus_status")
+    engine.dispose()
 
-        total_before_downgrade = 3
+    total_before_downgrade = 3
 
-        # 5. Downgrade flips 'ignored' -> 'unconfirmed' (UPDATE, no DELETE) and
-        #    preserves the row count.
-        _run_alembic("downgrade", "-1")
+    # 5. Downgrade flips 'ignored' -> 'unconfirmed' (UPDATE, no DELETE) and
+    #    preserves the row count.
+    _run_alembic("downgrade", "-1")
 
-        engine2 = sa.create_engine(f"sqlite:///{db_path}")
-        with engine2.connect() as conn:
-            rows2 = conn.execute(
-                sa.text("SELECT account_name, status FROM expected_account ORDER BY account_name")
-            ).fetchall()
-        assert len(rows2) == total_before_downgrade
-        statuses = {name: status for name, status in rows2}
-        assert statuses["Ignore Me"] == "unconfirmed"  # flipped, not deleted
-        assert statuses["Still Active"] == "active"
+    engine2 = sa.create_engine(f"sqlite:///{db_path}")
+    with engine2.connect() as conn:
+        rows2 = conn.execute(
+            sa.text("SELECT account_name, status FROM expected_account ORDER BY account_name")
+        ).fetchall()
+    assert len(rows2) == total_before_downgrade
+    statuses = {name: status for name, status in rows2}
+    assert statuses["Ignore Me"] == "unconfirmed"  # flipped, not deleted
+    assert statuses["Still Active"] == "active"
 
-        # 'ignored' rejected again post-downgrade.
-        with pytest.raises((IntegrityError, sa.exc.IntegrityError)):
-            _insert(engine2, name="Reject Ignored", status="ignored")
-        engine2.dispose()
+    # 'ignored' rejected again post-downgrade.
+    with pytest.raises((IntegrityError, sa.exc.IntegrityError)):
+        _insert(engine2, name="Reject Ignored", status="ignored")
+    engine2.dispose()
 
-        # 6. Re-upgrade — round-trip OK.
-        _run_alembic("upgrade", _REVISION)
-        engine3 = sa.create_engine(f"sqlite:///{db_path}")
-        _insert(engine3, name="Ignored Again", status="ignored")
-        engine3.dispose()
-    finally:
-        os.environ.pop("DATABASE_PATH", None)
+    # 6. Re-upgrade — round-trip OK.
+    _run_alembic("upgrade", _REVISION)
+    engine3 = sa.create_engine(f"sqlite:///{db_path}")
+    _insert(engine3, name="Ignored Again", status="ignored")
+    engine3.dispose()

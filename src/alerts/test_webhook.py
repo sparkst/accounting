@@ -95,14 +95,14 @@ def test_apply_rejects_non_allowlisted_recipient(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("ALERT_TO_EMAIL", "attacker@evil.com")
     result = post_alert(_ALERT, apply=False)
     assert result.status == "failed"
-    assert result.error == "recipient not allowlisted"
+    assert (result.error or "").startswith("recipient not allowlisted")
 
 
 def test_apply_rejects_non_allowlisted_sender(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ALERT_FROM_EMAIL", "spoofed@evil.com")
     result = post_alert(_ALERT, apply=False)
     assert result.status == "failed"
-    assert result.error == "sender not allowlisted"
+    assert (result.error or "").startswith("sender not allowlisted")
 
 
 def test_build_payload_body_html_is_none_by_default() -> None:
@@ -150,7 +150,7 @@ def test_env_allowlist_rejects_recipient_not_in_override(
     monkeypatch.setenv("ALERT_ALLOWED_TO", "ops@sparkry.com")
     result = post_alert(_ALERT, apply=False)  # default ALERT_TO_EMAIL not in override
     assert result.status == "failed"
-    assert result.error == "recipient not allowlisted"
+    assert (result.error or "").startswith("recipient not allowlisted")
 
 
 def test_apply_non_2xx_is_failed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -97,6 +97,28 @@ def test_per_alert_error_isolation(
     assert summary.failed == 1
 
 
+def test_earlier_committed_alert_survives_later_exception(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-BAL-010: the later raise's session.rollback() must not undo the
+    earlier alert's already-committed AlertDispatch row."""
+    good = _alert(key="balance:a:checking:1000")
+    bad = _alert(key="balance:b:checking:1000")
+    # Good FIRST, bad second — proves commit-then-rollback ordering.
+    monkeypatch.setattr(disp, "compute_balance_alerts", lambda today, s: [good, bad])
+
+    def _post(a: BalanceAlert, apply: bool) -> WebhookResult:
+        if a.alert_key == "balance:b:checking:1000":
+            raise RuntimeError("boom")
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(disp, "post_balance_alert", _post)
+    summary = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+    assert (summary.sent, summary.failed) == (1, 1)
+    rows = session.query(AlertDispatch).filter_by(alert_key="balance:a:checking:1000").all()
+    assert len(rows) == 1 and rows[0].status == "sent"
+
+
 def test_failed_post_not_marked_sent_so_retries(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -112,6 +134,25 @@ def test_failed_post_not_marked_sent_so_retries(
     s2 = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
     assert s2.failed == 1
     assert s2.skipped == 0
+
+
+def test_compute_balance_alerts_exception_returns_empty_summary(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the compute-phase try/except in dispatch_balance_alerts:
+    a raise from compute_balance_alerts itself (not per-account isolation,
+    which lives inside compute_balance_alerts) must not propagate — the
+    dispatcher returns an empty summary and writes nothing."""
+
+    def _boom(today: date, s: Session) -> list[BalanceAlert]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(disp, "compute_balance_alerts", _boom)
+
+    summary = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+
+    assert (summary.sent, summary.skipped, summary.failed, summary.dry_run) == (0, 0, 0, 0)
+    assert session.query(AlertDispatch).count() == 0
 
 
 def test_apply_records_payload_json_and_delivery_channel(

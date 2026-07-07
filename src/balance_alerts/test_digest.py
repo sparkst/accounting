@@ -129,6 +129,59 @@ def test_checking_breach_uses_1k_floor_not_10k(session: Session) -> None:
     assert line.breached is False
 
 
+def test_one_account_exception_does_not_block_pulse(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the per-account try/except in build_pulse: a raise
+    while processing one account's snapshot must not blank the daily pulse
+    for every other monitored account."""
+    import src.balance_alerts.digest as digest_mod
+    from src.balance_alerts.rules import cache_last_updated as orig_cache_last_updated
+
+    session.add(
+        Account(id="bad", broker="chase", account_number="n-bad",
+                account_name="Bad Acct", account_type="checking", entity="sparkry")
+    )
+    session.add(
+        Snap(
+            account_id="bad",
+            snapshot_date=date(2026, 6, 14),
+            plaid_account_type="depository",
+            plaid_account_subtype="checking",
+            current_balance=Decimal("500.00"),
+            pulled_at=datetime(2026, 6, 14, 5, 0),
+            raw_data={"trigger": "raise"},
+        )
+    )
+    session.add(
+        Account(id="good", broker="chase", account_number="n-good",
+                account_name="Good Acct", account_type="checking", entity="sparkry")
+    )
+    session.add(
+        Snap(
+            account_id="good",
+            snapshot_date=date(2026, 6, 14),
+            plaid_account_type="depository",
+            plaid_account_subtype="checking",
+            current_balance=Decimal("900.00"),
+            pulled_at=datetime(2026, 6, 14, 5, 0),
+            raw_data={},
+        )
+    )
+    session.commit()
+
+    def _cache_last_updated(raw_data: object) -> date | None:
+        if isinstance(raw_data, dict) and raw_data.get("trigger") == "raise":
+            raise RuntimeError("boom")
+        return orig_cache_last_updated(raw_data)
+
+    monkeypatch.setattr(digest_mod, "cache_last_updated", _cache_last_updated)
+
+    lines = digest_mod.build_pulse(date(2026, 6, 14), session)
+
+    assert {ln.account_name for ln in lines} == {"Good Acct"}
+
+
 def test_post_pulse_dry_run(session: Session) -> None:
     _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
     session.commit()
@@ -243,6 +296,81 @@ def test_1_day_old_snapshot_is_not_stale(session: Session) -> None:
     text = render_pulse(build_pulse(today, session), today)
     assert "⏳" not in text
     assert "0 stale" in text
+
+
+def test_two_identical_consecutive_snapshots_do_not_trigger_stale_marker(
+    session: Session,
+) -> None:
+    """REQ-FIX-PLD-001 / REQ-FIX-ALR-005 regression: `/accounts/get` returns
+    Plaid's *cached* balance, so a re-written snapshot can carry the exact
+    same `current_balance` as yesterday's. Staleness must be driven purely by
+    `snapshot_date` recency, never by whether the value changed — two
+    consecutive daily snapshots with an identical balance must still render
+    as fresh (no `⏳` marker, 0 stale)."""
+    today = date(2026, 7, 6)
+    yesterday = today - timedelta(days=1)
+    session.add(
+        Account(
+            id="a",
+            broker="chase",
+            account_number="n-a",
+            account_name="Fresh Checking",
+            account_type="checking",
+            entity="sparkry",
+        )
+    )
+    for d in (yesterday, today):
+        session.add(
+            Snap(
+                account_id="a",
+                snapshot_date=d,
+                plaid_account_type="depository",
+                plaid_account_subtype="checking",
+                current_balance=Decimal("5000.00"),
+                pulled_at=datetime(2026, 6, 14, 5, 0),
+                raw_data={},
+            )
+        )
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "⏳" not in text
+    assert "0 stale" in text
+
+
+def test_stale_cached_balance_marks_stale_even_when_snapshot_date_is_today(
+    session: Session,
+) -> None:
+    """REQ-FIX-PLD-001: a snapshot written today can carry a Plaid *cached*
+    balance that hasn't actually refreshed in days. When
+    `balances.last_updated_datetime` says so, the pulse must render the `⏳`
+    marker keyed off that true cache date — snapshot_date=today alone must
+    not present a days-old cached value as current."""
+    today = date(2026, 7, 6)
+    session.add(
+        Account(
+            id="a",
+            broker="chase",
+            account_number="n-a",
+            account_name="Stale Cache Checking",
+            account_type="checking",
+            entity="sparkry",
+        )
+    )
+    session.add(
+        Snap(
+            account_id="a",
+            snapshot_date=today,
+            plaid_account_type="depository",
+            plaid_account_subtype="checking",
+            current_balance=Decimal("5000.00"),
+            pulled_at=datetime(2026, 7, 6, 5, 0),
+            raw_data={"balances": {"last_updated_datetime": "2026-07-02T00:00:00Z"}},
+        )
+    )
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "(as of 2026-07-02) ⏳" in text
+    assert "1 stale" in text
 
 
 # ── REQ-DHL-001/002: delivery-health block ──────────────────────────────────
@@ -409,3 +537,56 @@ def test_dhl_stale_sync_produces_sync_line_with_hourglass(session: Session) -> N
     assert health.healthy is False
     text = render_delivery_health(health)
     assert "sync: chase ⏳5d" in text
+
+
+def test_post_pulse_pulse_compute_failure_degrades_not_crashes(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DHL-001/REQ-BAL-010 isolation: a raise inside build_pulse must not
+    propagate out of post_pulse (the live timer runs --apply --digest; an
+    uncaught raise would trip OnFailure after the milestone dispatch already
+    committed)."""
+    import src.balance_alerts.digest as digest_mod
+
+    def _boom(today: date, session: Session) -> list[object]:
+        raise RuntimeError("pulse compute exploded")
+
+    monkeypatch.setattr(digest_mod, "build_pulse", _boom)
+    res = post_pulse(date(2026, 7, 7), session, apply=True)
+    assert res.status == "failed"
+    assert "digest compute error" in (res.error or "")
+
+
+def test_post_pulse_health_compute_failure_sends_degraded_pulse(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DHL-002: a delivery-health compute failure degrades to a pulse
+    without the block — the day's digest still sends."""
+    import src.balance_alerts.digest as digest_mod
+
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+
+    def _boom(today: date, session: Session, lines: object) -> object:
+        raise RuntimeError("health compute exploded")
+
+    monkeypatch.setattr(digest_mod, "build_delivery_health", _boom)
+
+    sent: dict[str, object] = {}
+
+    class _Resp:
+        status_code: int = 200
+
+    def _fake_post(
+        url: str, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> _Resp:
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setenv(wh.URL_ENV, "https://n8n.example/webhook/alert")
+    monkeypatch.setenv(wh.SECRET_ENV, "s3cret")
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    res = post_pulse(date(2026, 7, 7), session, apply=True)
+    assert res.status == "sent"
+    assert "Delivery-health block unavailable" in str(sent.get("message", ""))

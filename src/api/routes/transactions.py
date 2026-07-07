@@ -471,7 +471,20 @@ def list_transactions(
         # Use direction-based aggregation because income transactions may be
         # stored with negative amounts (raw Gmail data).  Income amounts are
         # reported as positive (abs), expenses as negative.
-        _ids_subq = query.with_entities(Transaction.id)
+        #
+        # REQ-FIX-API-001: header totals always exclude rejected and
+        # split_parent rows, independent of the caller's own status filter —
+        # `rejected` is an excluded ledger row and `split_parent` is a
+        # container whose children carry the amounts; summing either would
+        # double-count or count dead rows. The paged `items` and `total`
+        # count above still honor the caller's filter (you can still list
+        # rejected/split_parent rows; the header just never sums them).
+        _ids_subq = query.with_entities(Transaction.id).filter(
+            Transaction.status.notin_([
+                TransactionStatus.REJECTED.value,
+                TransactionStatus.SPLIT_PARENT.value,
+            ])
+        )
         raw_income: float = (
             session.query(func.sum(func.abs(Transaction.amount)))
             .filter(Transaction.id.in_(_ids_subq))
@@ -533,13 +546,16 @@ def get_aggregations(
     """Return time-series, top-vendor, and month-over-month aggregation data.
 
     Buckets by month when the date range exceeds 14 days, otherwise by day.
-    Rejected transactions are excluded from all aggregations.
+    Rejected AND split_parent transactions are excluded from all
+    aggregations (REQ-FIX-API-002) — a split parent's children carry the
+    actual amounts, so including both double-counts.
     """
     from datetime import date as _date
 
     try:
         query = session.query(Transaction).filter(
             Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.status != TransactionStatus.SPLIT_PARENT.value,
         )
         if entity is not None:
             query = query.filter(Transaction.entity == entity)
@@ -573,10 +589,14 @@ def get_aggregations(
         vendor_expense: dict[str, float] = {}
         category_totals: dict[str, float] = {}
 
-        # Per-vendor historical amounts across ALL non-rejected expense records
-        # (not filtered to current date range — used as baseline for anomaly detection)
+        # Per-vendor historical amounts across ALL non-rejected, non-split-parent
+        # expense records (not filtered to current date range — used as
+        # baseline for anomaly detection). REQ-FIX-API-002: a split parent
+        # left in this baseline would skew the historical average alongside
+        # its own children.
         all_expense_q = session.query(Transaction).filter(
             Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.status != TransactionStatus.SPLIT_PARENT.value,
             Transaction.direction.in_([Direction.EXPENSE.value, Direction.REIMBURSABLE.value]),
         )
         if entity is not None:

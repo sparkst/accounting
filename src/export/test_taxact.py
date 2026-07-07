@@ -48,6 +48,12 @@ SPARKRY_TRANSACTIONS = [
     _tx("MEALS", "-300.00", deductible_pct="0.5"),
 ]
 
+# REQ-FIX-TAX-003/004: wholesale income + Shopify-refund contra-revenue.
+BLACKLINE_WITH_WHOLESALE_AND_REFUND = BLACKLINE_TRANSACTIONS + [
+    _tx("WHOLESALE_INCOME", "3000.00"),
+    _tx("OTHER_EXPENSE", "-400.00"),
+]
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_form_1065_summary
@@ -120,6 +126,19 @@ class TestBuildForm1065Summary:
         assert "FORM 1065" in out
         assert "0.00" in out
 
+    def test_wholesale_income_included_in_gross_receipts(self):
+        """REQ-FIX-TAX-004: WHOLESALE_INCOME contributes to Line 1a gross."""
+        out = build_form_1065_summary(BLACKLINE_WITH_WHOLESALE_AND_REFUND, 2025)
+        # gross = 25000 (sales) + 5000 (consulting) + 3000 (wholesale) = 33000
+        assert "33,000.00" in out
+
+    def test_other_expense_maps_to_line_21(self):
+        """REQ-FIX-TAX-003: Shopify refund (OTHER_EXPENSE) reduces ordinary
+        income via Line 21, not silently dropped."""
+        out = build_form_1065_summary(BLACKLINE_WITH_WHOLESALE_AND_REFUND, 2025)
+        assert "Line 21" in out
+        assert "400.00" in out
+
 
 # ---------------------------------------------------------------------------
 # Tests: build_schedule_c_summary_taxact
@@ -159,6 +178,18 @@ class TestBuildScheduleCSummaryTaxAct:
         out = build_schedule_c_summary_taxact(SPARKRY_TRANSACTIONS, "sparkry", 2025)
         # income 12000 - (500 + 800 + 150) = 10550
         assert "10,550.00" in out
+
+    def test_wholesale_and_other_expense_via_shared_schedule_c_lines(self):
+        """REQ-FIX-TAX-004: TaxAct inherits SCHEDULE_C_LINES from
+        freetaxusa.py, so one edit there covers both exporters."""
+        txs = SPARKRY_TRANSACTIONS + [
+            _tx("WHOLESALE_INCOME", "1000.00"),
+            _tx("OTHER_EXPENSE", "-250.00"),
+        ]
+        out = build_schedule_c_summary_taxact(txs, "sparkry", 2025)
+        assert "L27a" in out
+        assert "1,000.00" in out
+        assert "250.00" in out
 
 
 # ---------------------------------------------------------------------------

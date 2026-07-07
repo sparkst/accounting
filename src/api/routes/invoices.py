@@ -24,6 +24,7 @@ import logging
 import os
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import ROUND_HALF_UP
 from typing import Any
 
 import stripe as _stripe
@@ -53,6 +54,10 @@ from src.models.vendor_rule import VendorRule
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["invoices"])
+
+# REQ-FIX-INV-005: cent quantization applied at exactly three points (line
+# items here + generator.py + payment_link.py) — never int() truncation.
+CENT = decimal.Decimal("0.01")
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +189,7 @@ class InvoiceOut(BaseModel):
     payment_transaction_id: str | None = None
     payment_link_url: str | None = None
     payment_link_id: str | None = None
+    payment_link_amount: Any | None = None
     sent_at: datetime | None = None
     sent_to: str | None = None
     sap_instructions: Any | None = None
@@ -197,10 +203,15 @@ class InvoiceOut(BaseModel):
     days_outstanding: int | None = None
     expected_payment_date: str | None = None
 
+    # REQ-FIX-INV-004: count of sessions dropped as within-batch duplicates
+    # during calendar invoice generation (computed, not on model; None on
+    # every other endpoint).
+    duplicate_sessions_dropped: int | None = None
+
     # Nested line items (populated on detail endpoint)
     line_items: list[LineItemOut] | None = None
 
-    @field_validator("subtotal", "adjustments", "tax", "total", mode="before")
+    @field_validator("subtotal", "adjustments", "tax", "total", "payment_link_amount", mode="before")
     @classmethod
     def coerce_decimal(cls, v: Any) -> str | None:
         if v is None:
@@ -253,6 +264,11 @@ class CalendarSession(BaseModel):
     description: str
     hours: float
     rate: float
+    # REQ-FIX-INV-004: the iCal parser already knows these; the manual UI
+    # leaves them null. Used to disambiguate genuinely-distinct same-day,
+    # same-description sessions from within-batch duplicates.
+    start_time: str | None = None
+    end_time: str | None = None
 
 
 class GenerateCalendarRequest(BaseModel):
@@ -585,6 +601,8 @@ def patch_invoice(
 
     # Update line items if provided
     if body.line_items is not None:
+        old_total = inv.total
+
         # Delete existing line items
         session.query(InvoiceLineItem).filter(
             InvoiceLineItem.invoice_id == invoice_id
@@ -594,7 +612,9 @@ def patch_invoice(
         for i, li in enumerate(body.line_items):
             qty = decimal.Decimal(str(li.quantity or 1))
             price = decimal.Decimal(str(li.unit_price or 0))
-            total_price = qty * price
+            # REQ-FIX-INV-005: quantize to cents at generation, same rule as
+            # the calendar/flat generators — never leave sub-cent residue.
+            total_price = (qty * price).quantize(CENT, rounding=ROUND_HALF_UP)
             subtotal += total_price
 
             item = InvoiceLineItem(
@@ -610,7 +630,30 @@ def patch_invoice(
             session.add(item)
 
         inv.subtotal = subtotal
-        inv.total = subtotal + inv.adjustments + inv.tax
+        inv.total = (subtotal + inv.adjustments + inv.tax).quantize(CENT, rounding=ROUND_HALF_UP)
+
+        # REQ-FIX-INV-002: whenever the recomputed total differs and a
+        # payment link is still persisted, it no longer matches the new
+        # total — deactivate (best-effort) and clear all three fields so the
+        # next send mints a fresh link at the correct amount, unconditionally
+        # on total-change (not just when the invoice happens to be sent —
+        # this also guards against stray link fields left on a draft by any
+        # earlier bug, see REQ-FIX-INV-001).
+        if inv.total != old_total and inv.payment_link_id:
+            old_link_id = inv.payment_link_id
+            try:
+                _stripe_deactivate_link(old_link_id)
+            except Exception:
+                logger.warning(
+                    "Failed to deactivate payment link %s during total-changing PATCH",
+                    old_link_id,
+                )
+            inv.payment_link_url = None
+            inv.payment_link_id = None
+            inv.payment_link_amount = None
+            _create_invoice_audit_event(
+                session, invoice_id, "payment_link_id", old_link_id, None,
+            )
 
     inv.updated_at = _now()
     session.commit()
@@ -762,7 +805,6 @@ def send_invoice(
 
     pdf_bytes = render_pdf(inv, line_items, customer)
 
-    freshly_created = not inv.payment_link_id
     try:
         link_result = create_payment_link(inv)
     except Exception as exc:
@@ -773,6 +815,7 @@ def send_invoice(
 
     inv.payment_link_url = link_result.url
     inv.payment_link_id = link_result.link_id
+    inv.payment_link_amount = link_result.amount
     inv.updated_at = _now()
     session.commit()
     session.refresh(inv)
@@ -787,11 +830,26 @@ def send_invoice(
             to_email=to_email,
         )
     except Exception as exc:
-        if freshly_created:
-            try:
-                _stripe_deactivate_link(link_result.link_id)
-            except Exception:
-                logger.warning("Failed to deactivate payment link after email failure")
+        # REQ-FIX-INV-001: a customer must never receive a deactivated link.
+        # Deactivate at Stripe (best-effort, logged) AND clear all three
+        # persisted fields — unconditionally, regardless of whether this
+        # link was freshly created or reused — so a retry always mints a
+        # fresh link instead of reusing the one we just deactivated.
+        try:
+            _stripe_deactivate_link(link_result.link_id)
+        except Exception:
+            logger.warning("Failed to deactivate payment link after email failure")
+
+        old_link_id = inv.payment_link_id
+        inv.payment_link_url = None
+        inv.payment_link_id = None
+        inv.payment_link_amount = None
+        inv.updated_at = _now()
+        _create_invoice_audit_event(
+            session, invoice_id, "payment_link_id", old_link_id, None,
+        )
+        session.commit()
+
         raise HTTPException(
             status_code=502,
             detail=f"Payment link created but email failed: {exc}",
@@ -880,6 +938,24 @@ def generate_calendar_invoice(
     if not body.sessions:
         raise HTTPException(status_code=422, detail="At least one session is required.")
 
+    # REQ-FIX-INV-004: dedupe within the submitted batch. The DB-side
+    # double-billing guard in generate_calendar_invoice() only checks
+    # already-persisted invoices — it cannot catch two identical sessions
+    # submitted together in one request (both would insert, double billing).
+    # First occurrence wins; genuinely distinct same-day sessions must be
+    # disambiguated by time or description — that's the guard working as
+    # intended.
+    seen_keys: set[tuple[str, str, str, str]] = set()
+    deduped_sessions: list[CalendarSession] = []
+    duplicate_count = 0
+    for s in body.sessions:
+        key = (s.date, s.start_time or "", s.end_time or "", s.description.strip())
+        if key in seen_keys:
+            duplicate_count += 1
+            continue
+        seen_keys.add(key)
+        deduped_sessions.append(s)
+
     # Adapt CalendarSession objects to duck-typed interface expected by generator
     class _SessionAdapter:
         def __init__(self, cs: CalendarSession) -> None:
@@ -888,10 +964,10 @@ def generate_calendar_invoice(
             self.duration_hours = cs.hours
             self.rate = cs.rate
 
-    adapted = [_SessionAdapter(s) for s in body.sessions]
+    adapted = [_SessionAdapter(s) for s in deduped_sessions]
 
     # Use the rate from the first session (all sessions in one request share a rate)
-    rate = body.sessions[0].rate if body.sessions else None
+    rate = deduped_sessions[0].rate if deduped_sessions else None
 
     try:
         invoice = _gen_calendar(session, customer, adapted, rate=rate)
@@ -913,6 +989,7 @@ def generate_calendar_invoice(
 
     data = _enrich_with_aging(invoice)
     data["line_items"] = [LineItemOut.model_validate(li) for li in line_items]
+    data["duplicate_sessions_dropped"] = duplicate_count
     return InvoiceOut.model_validate(data)
 
 
@@ -1117,6 +1194,9 @@ def get_payment_suggestions(
     ]
 
 
+_MATCH_PAYMENT_ELIGIBLE_STATUSES = {InvoiceStatus.SENT.value, InvoiceStatus.OVERDUE.value}
+
+
 @router.post("/invoices/{invoice_id}/match-payment", response_model=MatchPaymentResponse)
 def match_payment(
     invoice_id: str,
@@ -1125,11 +1205,21 @@ def match_payment(
 ) -> MatchPaymentResponse:
     """Link an income transaction to an invoice as payment.
 
+    REQ-FIX-INV-003 guards (each a distinct 422; 404s unchanged):
+      1. Invoice must be SENT or OVERDUE (DRAFT/PAID/VOID rejected). There is
+         no PARTIAL enum value — a partially-paid invoice remains 'sent' with
+         payment_transaction_id set, so re-matching a better transaction is
+         allowed.
+      2. Transaction must be income-direction and not already rejected.
+      3. Uniqueness: no *other* invoice already has this transaction as its
+         payment_transaction_id — one bank credit pays at most one invoice.
+
     - Sets payment_transaction_id and paid_date on the invoice.
     - If transaction amount == invoice total (within $0.01): transitions to 'paid'.
     - If transaction amount < invoice total: invoice stays 'sent', returns partial warning.
     - If transaction amount > invoice total: marks paid, returns overpayment warning.
-    - Creates AuditEvent for the match.
+    - Creates AuditEvent for the match, with the TRUE prior payment_transaction_id
+      as old_value in both branches.
     """
     inv: Invoice | None = session.get(Invoice, invoice_id)
     if inv is None:
@@ -1139,9 +1229,51 @@ def match_payment(
     if tx is None:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
+    # Guard 1: invoice status.
+    if inv.status not in _MATCH_PAYMENT_ELIGIBLE_STATUSES:
+        if inv.status == InvoiceStatus.DRAFT.value:
+            detail = "Cannot match a payment to a draft invoice — send the invoice first."
+        elif inv.status == InvoiceStatus.PAID.value:
+            detail = "Invoice is already paid — void first to re-match a payment."
+        else:
+            detail = f"Cannot match a payment to a '{inv.status}' invoice."
+        raise HTTPException(status_code=422, detail=detail)
+
+    # Guard 2: transaction direction + status.
+    if tx.direction != "income":
+        raise HTTPException(
+            status_code=422,
+            detail="Transaction must be income-direction to match as a payment.",
+        )
+    if tx.status == "rejected":
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot match a rejected transaction as a payment.",
+        )
+
+    # Guard 3: uniqueness — no other invoice already claims this transaction.
+    other_claim = (
+        session.query(Invoice)
+        .filter(Invoice.payment_transaction_id == tx.id, Invoice.id != invoice_id)
+        .first()
+    )
+    if other_claim is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Transaction is already linked to invoice "
+                f"{other_claim.invoice_number} — one transaction pays at most one invoice."
+            ),
+        )
+
     invoice_total = decimal.Decimal(str(inv.total))
     tx_amount = decimal.Decimal(str(tx.amount)) if tx.amount is not None else decimal.Decimal("0.00")
     tolerance = decimal.Decimal("0.01")
+
+    # Guard 4 / audit truth: capture the true prior value BEFORE any
+    # assignment — both branches pass this as old_value (fixes the partial
+    # branch's self-referential audit and the full branch's hardcoded None).
+    old_payment_id = inv.payment_transaction_id
 
     warning: str | None = None
 
@@ -1152,7 +1284,7 @@ def match_payment(
         inv.updated_at = _now()
         _create_invoice_audit_event(
             session, invoice_id,
-            "payment_transaction_id", inv.payment_transaction_id, tx.id,
+            "payment_transaction_id", old_payment_id, tx.id,
         )
     else:
         # Full payment or overpayment
@@ -1167,7 +1299,7 @@ def match_payment(
 
         _create_invoice_audit_event(
             session, invoice_id,
-            "payment_transaction_id", None, tx.id,
+            "payment_transaction_id", old_payment_id, tx.id,
         )
         _create_invoice_audit_event(
             session, invoice_id,

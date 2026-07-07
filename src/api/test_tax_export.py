@@ -457,3 +457,65 @@ class TestUndocumentedIncomeWarning:
         warnings = data["warnings"]
         doc_warnings = [w for w in warnings if "1099" in w.get("warning", "")]
         assert doc_warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: GET /api/export/bno?format=dor hard-fails on unmapped WA locality
+# (REQ-FIX-TAX-007)
+# ---------------------------------------------------------------------------
+
+
+class TestDorUploadUnmappedLocalityHardFail:
+    """REQ-FIX-TAX-007: an unmapped WA locality is a 422, not a 500 or a
+    silently-emitted '____' sentinel line."""
+
+    def _make_locality_tx(self, session: Session, *, city: str) -> Transaction:
+        tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-15",
+            description=f"Shopify Order — {city}",
+            amount=Decimal("100.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=TransactionStatus.CONFIRMED.value,
+            confidence=0.95,
+            raw_data={
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": city},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": f"{city} City Tax"},
+                ],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add(tx)
+        session.commit()
+        return tx
+
+    def test_dor_upload_returns_422(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            self._make_locality_tx(s, city="Nowhereville")
+
+        resp = client.get(
+            "/api/export/bno",
+            params={"entity": "blackline", "year": 2026, "format": "dor", "quarter": 1},
+        )
+        assert resp.status_code == 422
+        assert "____" in resp.json()["detail"]
+
+    def test_mapped_locality_still_succeeds(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            self._make_locality_tx(s, city="Sammamish")
+
+        resp = client.get(
+            "/api/export/bno",
+            params={"entity": "blackline", "year": 2026, "format": "dor", "quarter": 1},
+        )
+        assert resp.status_code == 200

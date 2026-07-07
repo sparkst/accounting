@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+from decimal import Decimal
 
 import pytest
 
@@ -235,6 +236,103 @@ class TestGenerateBnoExport:
 # ---------------------------------------------------------------------------
 # Tests: generate_dor_upload (WA DOR My DOR data-upload file)
 # ---------------------------------------------------------------------------
+
+
+class TestGrandTotalsMatchSummedRows:
+    """REQ-FIX-TAX-006: quantize before accumulate — the TOTAL row must equal
+    the sum of the displayed (per-row-rounded) values, not a separately
+    rounded sum of unquantized Decimals (which drift by a cent)."""
+
+    # Engineered amounts: unquantized accumulation of amt*0.015 rounds to
+    # 947.21 while summing the per-row-quantized tax values gives 947.22 —
+    # this pins the old off-by-a-cent drift as a regression.
+    _DRIFT_AMOUNTS = [
+        "4452.40", "620.81", "8671.17", "5930.21", "1299.15", "9935.73",
+        "2341.83", "6613.59", "6580.11", "6114.16", "9938.44", "649.67",
+    ]
+
+    def test_sparkry_monthly_total_equals_sum_of_rows(self) -> None:
+        txs = [
+            _income_tx("CONSULTING_INCOME", amt, f"2025-{m:02d}-15")
+            for m, amt in enumerate(self._DRIFT_AMOUNTS, start=1)
+        ]
+        out = build_sparkry_bno_csv(txs, 2025)
+        rows = list(csv.reader(io.StringIO(out)))
+        data_rows = [r for r in rows[1:] if any(r) and "TOTAL" not in str(r)]
+        total_row = next(r for r in rows if "TOTAL" in str(r))
+
+        summed_tax = sum((Decimal(r[5]) for r in data_rows), Decimal("0"))
+        summed_revenue = sum((Decimal(r[3]) for r in data_rows), Decimal("0"))
+
+        assert Decimal(total_row[5]) == summed_tax
+        assert Decimal(total_row[3]) == summed_revenue
+
+    def test_blackline_quarterly_total_equals_sum_of_rows(self) -> None:
+        txs = [
+            _income_tx("SALES_INCOME", amt, f"2025-{m:02d}-15")
+            for m, amt in enumerate(self._DRIFT_AMOUNTS, start=1)
+        ]
+        out = build_blackline_bno_csv(txs, 2025)
+        rows = list(csv.reader(io.StringIO(out)))
+        data_rows = [r for r in rows[1:] if any(r) and "TOTAL" not in str(r)]
+        total_row = next(r for r in rows if "TOTAL" in str(r))
+
+        summed_tax = sum((Decimal(r[5]) for r in data_rows), Decimal("0"))
+        assert Decimal(total_row[5]) == summed_tax
+
+
+class TestDorUploadHardFailOnUnmappedLocation:
+    """REQ-FIX-TAX-007: generate_dor_upload must hard-fail rather than
+    silently emit the sentinel '____' location code."""
+
+    def _unmapped_wa_order(self) -> dict:
+        return {
+            "date": "2026-02-10",
+            "amount": "100.00",
+            "tax_category": "SALES_INCOME",
+            "source": "shopify",
+            "raw_data": {
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": "Nowhereville"},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": "Nowhereville City Tax"},
+                ],
+            },
+        }
+
+    def test_raises_value_error_naming_unmapped_locality(self) -> None:
+        with pytest.raises(ValueError, match="____"):
+            generate_dor_upload(
+                [self._unmapped_wa_order()], "blackline", 2026, quarter=1
+            )
+
+    def test_mapped_only_input_still_emits_code_45_lines(self) -> None:
+        """Regression: the hard-fail must not break the happy path."""
+        content, _ = generate_dor_upload(
+            [
+                {
+                    "date": "2026-01-15",
+                    "amount": "100.00",
+                    "tax_category": "SALES_INCOME",
+                    "source": "shopify",
+                    "raw_data": {
+                        "total_price": "100.00",
+                        "total_tax": "9.30",
+                        "shipping_address": {"province_code": "WA", "city": "Sammamish"},
+                        "tax_lines": [
+                            {"title": "Washington State Tax"},
+                            {"title": "Sammamish City Tax"},
+                        ],
+                    },
+                }
+            ],
+            "blackline",
+            2026,
+            quarter=1,
+        )
+        assert any(line.startswith("TAX,45,1739,") for line in content.splitlines())
 
 
 class TestDorUploadLineCodes:

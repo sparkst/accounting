@@ -22,6 +22,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
+from src.export.basis import pretax_abs_amount
 from src.export.bno_tax import generate_bno_export, generate_dor_upload
 from src.export.freetaxusa import generate_freetaxusa_export
 from src.export.retail_sales_tax import compute_retail_detail
@@ -858,15 +859,16 @@ def get_tax_summary(
     transactions = _fetch_transactions(session, entity, year)
     readiness = _readiness(transactions)
 
-    # Aggregate totals per category (absolute deductible amounts)
+    # Aggregate totals per category (absolute deductible amounts).
+    # REQ-FIX-TAX-002: pretax_abs_amount reports SALES_INCOME on the pre-tax
+    # basis (collected WA sales tax excluded), matching the DOR upload figure
+    # instead of double-counting the tax as gross receipts.
     category_totals: dict[str, Decimal] = {}
     for tx in transactions:
         cat = tx.tax_category
         if not cat or cat in ("PERSONAL_NON_DEDUCTIBLE", "CAPITAL_CONTRIBUTION"):
             continue
-        amt = Decimal(str(tx.amount)) if tx.amount is not None else Decimal("0")
-        pct = Decimal(str(tx.deductible_pct))
-        deductible = abs(amt) * pct
+        deductible = pretax_abs_amount(_tx_to_dict(tx))
         category_totals[cat] = category_totals.get(cat, Decimal("0")) + deductible
 
     # Build line items
@@ -903,6 +905,8 @@ def get_tax_summary(
         warnings.append(warn)
 
     # ── Per-month / per-quarter income breakdown for B&O table ────────────
+    # REQ-FIX-TAX-002: same pre-tax basis as above, not the tax-inclusive
+    # stored amount.
     monthly_income: dict[int, float] = {m: 0.0 for m in range(1, 13)}
     for tx in transactions:
         cat = tx.tax_category
@@ -913,7 +917,7 @@ def get_tax_summary(
             month_num = int(date_str[5:7])
         except (IndexError, ValueError):
             continue
-        amt = abs(float(tx.amount)) if tx.amount is not None else 0.0
+        amt = float(pretax_abs_amount(_tx_to_dict(tx)))
         monthly_income[month_num] += amt
 
     bno_monthly = [
@@ -1121,9 +1125,14 @@ def export_bno(
                 status_code=422,
                 detail="DOR upload requires exactly one of month or quarter.",
             )
-        content, filename = generate_dor_upload(
-            tx_dicts, entity, year, month=month, quarter=quarter
-        )
+        try:
+            content, filename = generate_dor_upload(
+                tx_dicts, entity, year, month=month, quarter=quarter
+            )
+        except ValueError as exc:
+            # REQ-FIX-TAX-007: unmapped WA locality is an actionable filing
+            # error, not a server fault.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return Response(
             content=content,
             media_type="text/csv; charset=utf-8",

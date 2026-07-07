@@ -232,7 +232,11 @@ def _parse_refund(refund: dict[str, Any], order: dict[str, Any]) -> dict[str, An
 def _parse_payout(payout: dict[str, Any]) -> dict[str, Any]:
     """Convert a Shopify Payments payout object to a Transaction field dict.
 
-    Payouts represent net bank deposits from Shopify Payments.
+    Payouts represent net bank deposits from Shopify Payments — a transfer of
+    money already recognized as income via the individual orders, never
+    income itself (REQ-FIX-TAX-001). Mirrors ``stripe_adapter._map_payout``
+    exactly: booking payouts as income double-counted every dollar (once as
+    the order, again as the payout), inflating WA B&O gross and Form 1065 L1a.
 
     Args:
         payout: Raw payout dict from the Shopify Payments API.
@@ -262,9 +266,14 @@ def _parse_payout(payout: dict[str, Any]) -> dict[str, Any]:
         "amount": amount,
         "currency": currency,
         "entity": Entity.BLACKLINE.value,
-        "direction": Direction.INCOME.value,
-        "tax_category": TaxCategory.SALES_INCOME.value,
-        "status": TransactionStatus.NEEDS_REVIEW.value,
+        "direction": Direction.TRANSFER.value,
+        "tax_category": None,
+        # AUTO_CLASSIFIED, NOT needs_review: a payout is unambiguously a
+        # transfer (money moving Shopify Payments→bank), never income.
+        # needs_review would expose it to the ingest reclassify pass, where
+        # the Tier-3 LLM mislabels "Shopify Payout" as SALES_INCOME — the
+        # engine can't represent a transfer so it must never re-touch one.
+        "status": TransactionStatus.AUTO_CLASSIFIED.value,
         "confidence": 0.9,
         "raw_data": payout,
     }

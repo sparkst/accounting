@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import csv
 import io
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
+
+from src.export.basis import pretax_abs_amount
+from src.utils.constants import SPARKRY_CONTACT_EMAIL
 
 # ---------------------------------------------------------------------------
 # WA B&O classification codes
@@ -75,7 +78,12 @@ def _aggregate_income_by_month(
     transactions: list[dict[str, Any]],
     year: int,
 ) -> dict[int, dict[str, Decimal]]:
-    """Return {month: {bo_code: total_revenue}} for the given year."""
+    """Return {month: {bo_code: total_revenue}} for the given year.
+
+    REQ-FIX-TAX-002: uses ``pretax_abs_amount`` so SALES_INCOME rows report
+    the pre-tax figure (collected WA sales tax excluded), matching the DOR
+    upload basis instead of double-counting the tax as gross receipts.
+    """
     result: dict[int, dict[str, Decimal]] = {m: {} for m in range(1, 13)}
     for tx in transactions:
         cat = tx.get("tax_category", "")
@@ -88,7 +96,7 @@ def _aggregate_income_by_month(
         if month is None:
             continue
         bo_code, _ = BO_CLASSIFICATION[cat]
-        amt = abs(_to_decimal(tx.get("amount")))
+        amt = pretax_abs_amount(tx)
         result[month][bo_code] = result[month].get(bo_code, Decimal("0")) + amt
     return result
 
@@ -134,9 +142,15 @@ def build_sparkry_bno_csv(
     for month_idx, name in enumerate(MONTH_NAMES, start=1):
         month_data = monthly[month_idx]
         for bo_code in sorted(all_codes):
-            amt = month_data.get(bo_code, Decimal("0"))
+            # REQ-FIX-TAX-006: quantize BEFORE accumulate so the TOTAL row is
+            # the exact sum of the displayed (already-rounded) rows — not a
+            # separately-rounded sum of unquantized Decimals, which drifts by
+            # a cent when many rows round in different directions.
+            amt = month_data.get(bo_code, Decimal("0")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
             rate = BO_RATE.get(bo_code, Decimal("0.015"))
-            tax = amt * rate
+            tax = (amt * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             _, classification_label = next(
                 (v for k, v in BO_CLASSIFICATION.items() if v[0] == bo_code),
                 (bo_code, bo_code),
@@ -219,9 +233,13 @@ def build_blackline_bno_csv(
     for q_idx, q_name in enumerate(QUARTER_NAMES, start=1):
         q_data = quarterly[q_idx]
         for bo_code in sorted(all_codes):
-            amt = q_data.get(bo_code, Decimal("0"))
+            # REQ-FIX-TAX-006: quantize before accumulate — see comment in
+            # build_sparkry_bno_csv.
+            amt = q_data.get(bo_code, Decimal("0")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
             rate = BO_RATE.get(bo_code, Decimal("0.015"))
-            tax = amt * rate
+            tax = (amt * rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             _, classification_label = next(
                 (v for k, v in BO_CLASSIFICATION.items() if v[0] == bo_code),
                 (bo_code, bo_code),
@@ -327,6 +345,7 @@ def generate_dor_upload(
 
     Returns (file_content, filename).
     """
+    from src.export.basis import UNKNOWN_WA_LOCATION
     from src.export.retail_sales_tax import compute_retail_detail
 
     if (month is None) == (quarter is None):
@@ -354,13 +373,26 @@ def generate_dor_upload(
             period_income[bo_code] = period_income.get(bo_code, Decimal("0")) + amt
 
     detail = compute_retail_detail(transactions, year, month=month, quarter=quarter)
+
+    # REQ-FIX-TAX-007: never silently emit the sentinel '____' location code —
+    # hard-fail with an actionable error naming the unmapped locality so a
+    # human adds it to WA_LOCATION_CODES before the upload is generated.
+    unmapped = [loc for loc in detail.by_location if loc.location_code == UNKNOWN_WA_LOCATION[0]]
+    if unmapped:
+        localities = ", ".join(sorted({loc.location_name for loc in unmapped}))
+        raise ValueError(
+            f"DOR upload blocked: {len(unmapped)} order(s) map to unmapped WA "
+            f"locality '{UNKNOWN_WA_LOCATION[0]}' — add the locality to "
+            f"WA_LOCATION_CODES: {localities}"
+        )
+
     state_taxable = sum(
         (loc.taxable_amount for loc in detail.by_location), Decimal("0")
     )
 
     lines: list[str] = [
         f"ACCOUNT,{account_id},{period},"
-        f"Travis Sparks,travis@sparkry.com,919-491-3894"
+        f"Travis Sparks,{SPARKRY_CONTACT_EMAIL},919-491-3894"
     ]
 
     emitted = False

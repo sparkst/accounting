@@ -17,9 +17,12 @@ from typing import Any
 
 import resend
 
+from src.utils.constants import INVOICE_FROM_ADDRESS, SPARKRY_CONTACT_EMAIL
+
 _LOGO_PATH = Path(__file__).parent / "assets" / "sparkry-logo.png"
 
-FROM_ADDRESS = "Sparkry LLC <travis@sparkry.ai>"
+# REQ-FIX-API-004: single controlled-domain constant, not a local literal.
+FROM_ADDRESS = INVOICE_FROM_ADDRESS
 
 _FONT_STACK = (
     "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
@@ -190,7 +193,7 @@ Please find attached invoice <strong>{safe_number}</strong> for your review.
 <tr>
 <td style="font-family: {f}; font-size: 12px; color: #86868b; line-height: 1.5;">
 Sparkry LLC<br>
-travis@sparkry.com<br>
+{SPARKRY_CONTACT_EMAIL}<br>
 <br>
 A PDF copy of this invoice is attached for your records.
 </td>
@@ -251,7 +254,7 @@ def _build_plain_text(
             "",
             "---",
             "Sparkry LLC",
-            "travis@sparkry.com",
+            SPARKRY_CONTACT_EMAIL,
         ]
     )
 

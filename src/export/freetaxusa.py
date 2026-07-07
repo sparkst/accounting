@@ -16,6 +16,8 @@ import io
 from decimal import Decimal
 from typing import Any
 
+from src.export.basis import pretax_abs_amount
+
 # ---------------------------------------------------------------------------
 # IRS Schedule C line mapping (Tax Category → line label)
 # ---------------------------------------------------------------------------
@@ -36,6 +38,15 @@ SCHEDULE_C_LINES: dict[str, tuple[str, str]] = {
     "CONSULTING_INCOME": ("Gross receipts", "Consulting income"),
     "SUBSCRIPTION_INCOME": ("Gross receipts", "Subscription income"),
     "SALES_INCOME": ("Gross receipts", "Sales income"),
+    # REQ-FIX-TAX-004: wholesale income was in INCOME_CATEGORIES but absent
+    # from SCHEDULE_C_LINES, so it was silently filtered before summation.
+    "WHOLESALE_INCOME": ("Gross receipts", "Wholesale income"),
+    # REQ-FIX-TAX-003: Shopify refunds (contra-revenue) vanished from filed
+    # numbers without this line. Sch C Part V flows to L27a. Strictly, sales
+    # refunds are Sch C L2 "Returns and allowances" — net income is identical
+    # either way; L27a chosen per REQ to avoid restructuring the L1a/L3
+    # arithmetic (documented here for a future filer).
+    "OTHER_EXPENSE": ("L27a", "Other expenses"),
 }
 
 # Schedule A personal deduction labels
@@ -70,13 +81,14 @@ def _to_decimal(value: Any) -> Decimal:
 
 
 def _abs_amount(tx: dict[str, Any]) -> Decimal:
-    """Return the absolute deductible amount for a transaction.
+    """Return the canonical gross/deductible amount for a transaction.
 
-    Applies deductible_pct (e.g. 0.5 for meals).
+    REQ-FIX-TAX-002: delegates to ``pretax_abs_amount`` so SALES_INCOME rows
+    report the pre-tax figure (collected WA sales tax excluded) instead of
+    the tax-inclusive stored amount; other categories still apply
+    deductible_pct (e.g. 0.5 for meals) via ``abs(amount) * deductible_pct``.
     """
-    raw = _to_decimal(tx.get("amount"))
-    pct = _to_decimal(tx.get("deductible_pct", "1.0"))
-    return abs(raw) * pct
+    return pretax_abs_amount(tx)
 
 
 def build_1099b_csv(transactions: list[dict[str, Any]]) -> str:
@@ -103,8 +115,12 @@ def build_1099b_csv(transactions: list[dict[str, Any]]) -> str:
         cost_basis = _to_decimal(raw.get("cost_basis", 0))
         gain_loss = proceeds - cost_basis
 
-        # Determine short vs long term from subcategory
-        subcategory = tx.get("tax_subcategory", "")
+        # Determine short vs long term from subcategory.
+        # REQ-FIX-TAX-005: tax_subcategory may be present-but-null (not just
+        # absent) — ``tx.get("tax_subcategory", "")`` returns None in that
+        # case, and ``"long" in None`` raised a TypeError (500 on personal
+        # exports). Case-insensitive match so "LONG-TERM" also maps correctly.
+        subcategory = (tx.get("tax_subcategory") or "").lower()
         term = "Long" if "long" in subcategory else "Short"
 
         writer.writerow(
@@ -278,6 +294,9 @@ def build_form_1065_summary(
         "MEALS": ("L20", "Other deductions — Meals (50% deductible)"),
         "CAR_AND_TRUCK": ("L20", "Other deductions — Car and truck"),
         "CONTRACT_LABOR": ("L21", "Other deductions — Contract labor"),
+        # REQ-FIX-TAX-003: Shopify refunds (contra-revenue) — see
+        # SCHEDULE_C_LINES comment for the L1b/L27a-equivalence note.
+        "OTHER_EXPENSE": ("L21", "Other deductions — other expenses"),
     }
 
     totals: dict[str, Decimal] = {}

@@ -6,7 +6,9 @@ import csv
 import io
 
 from src.export.freetaxusa import (
+    SCHEDULE_C_LINES,
     build_1099b_csv,
+    build_form_1065_summary,
     build_schedule_a_summary,
     build_schedule_c_summary,
     generate_freetaxusa_export,
@@ -45,6 +47,15 @@ SPARKRY_TRANSACTIONS = [
     _tx("SUPPLIES", "-400.00"),
     _tx("REIMBURSABLE", "-100.00"),          # should be excluded
     _tx("PERSONAL_NON_DEDUCTIBLE", "-50.00"),  # should be excluded
+]
+
+# REQ-FIX-TAX-003/004: Shopify refund contra-revenue (OTHER_EXPENSE) and
+# wholesale income must flow through to the filed numbers.
+BLACKLINE_TRANSACTIONS = [
+    _tx("SALES_INCOME", "20000.00"),
+    _tx("WHOLESALE_INCOME", "5000.00"),
+    _tx("OTHER_EXPENSE", "-750.00"),  # Shopify refund, contra-revenue
+    _tx("COGS", "-8000.00"),
 ]
 
 PERSONAL_TRANSACTIONS = [
@@ -161,6 +172,45 @@ class TestBuildScheduleASummary:
 
 
 # ---------------------------------------------------------------------------
+# Tests: REQ-FIX-TAX-003/004 — OTHER_EXPENSE + WHOLESALE_INCOME line mapping
+# ---------------------------------------------------------------------------
+
+
+class TestOtherExpenseAndWholesaleLineMapping:
+    def test_other_expense_maps_to_l27a(self):
+        assert SCHEDULE_C_LINES["OTHER_EXPENSE"] == ("L27a", "Other expenses")
+
+    def test_wholesale_income_in_schedule_c_lines(self):
+        assert SCHEDULE_C_LINES["WHOLESALE_INCOME"][0] == "Gross receipts"
+
+    def test_schedule_c_wholesale_income_included_in_gross(self):
+        out = build_schedule_c_summary(BLACKLINE_TRANSACTIONS, "blackline", 2025)
+        assert "5,000.00" in out  # wholesale income line
+
+    def test_schedule_c_other_expense_reduces_net(self):
+        """Shopify refund (OTHER_EXPENSE) must reduce filed net income by its
+        amount — previously it vanished because OTHER_EXPENSE wasn't in
+        SCHEDULE_C_LINES at all."""
+        out = build_schedule_c_summary(BLACKLINE_TRANSACTIONS, "blackline", 2025)
+        assert "L27a" in out
+        # gross = 20000 (sales) + 5000 (wholesale) = 25000
+        # expenses = 750 (other_expense/refund) + 8000 (cogs) = 8750
+        # net = 25000 - 8750 = 16250.00
+        assert "16,250.00" in out
+
+    def test_form_1065_other_expense_maps_to_l21(self):
+        out = build_form_1065_summary(BLACKLINE_TRANSACTIONS, 2025)
+        assert "L21" in out
+        assert "750.00" in out
+
+    def test_form_1065_refund_reduces_ordinary_income(self):
+        out = build_form_1065_summary(BLACKLINE_TRANSACTIONS, 2025)
+        # gross = 20000 + 5000 = 25000; deductions = 8000 (cogs) + 750 (other) = 8750
+        # ordinary income = 25000 - 8750 = 16250.00
+        assert "16,250.00" in out
+
+
+# ---------------------------------------------------------------------------
 # Tests: build_1099b_csv
 # ---------------------------------------------------------------------------
 
@@ -219,6 +269,36 @@ class TestBuild1099BCSV:
         out = build_1099b_csv([])
         rows = [r for r in csv.reader(io.StringIO(out)) if any(r)]
         assert len(rows) == 1  # just header
+
+    def test_none_subcategory_does_not_raise(self):
+        """REQ-FIX-TAX-005: a present-but-null tax_subcategory must not 500
+        on the personal export (regression: `"long" in None` TypeError)."""
+        tx = {
+            "date": "2025-05-01",
+            "description": "Unknown lot sale",
+            "amount": "1000.00",
+            "tax_category": "INVESTMENT_INCOME",
+            "tax_subcategory": None,
+            "raw_data": {"proceeds": "1000.00", "cost_basis": "900.00"},
+        }
+        out = build_1099b_csv([tx])
+        rows = [r for r in csv.reader(io.StringIO(out)) if any(r)]
+        assert len(rows) == 2
+        assert rows[1][5] == "Short"  # default term when subcategory absent
+
+    def test_term_matched_case_insensitively(self):
+        """REQ-FIX-TAX-005: "LONG-TERM" (any casing) still maps to Long."""
+        tx = {
+            "date": "2025-05-02",
+            "description": "Uppercase subcategory",
+            "amount": "1000.00",
+            "tax_category": "INVESTMENT_INCOME",
+            "tax_subcategory": "LONG-TERM",
+            "raw_data": {"proceeds": "1000.00", "cost_basis": "900.00"},
+        }
+        out = build_1099b_csv([tx])
+        rows = [r for r in csv.reader(io.StringIO(out)) if any(r)]
+        assert rows[1][5] == "Long"
 
 
 # ---------------------------------------------------------------------------

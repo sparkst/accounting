@@ -12,6 +12,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+from src.export.basis import pretax_abs_amount
 from src.export.freetaxusa import INCOME_CATEGORIES, SCHEDULE_C_LINES
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,9 @@ FORM_1065_LINES: dict[str, tuple[str, str, bool]] = {
     "TAXES_AND_LICENSES": ("15", "Taxes and licenses", False),
     "TRAVEL": ("20", "Travel and entertainment", False),
     "MEALS": ("20", "Travel and entertainment — meals (50% deductible)", False),
+    # REQ-FIX-TAX-003: Shopify refunds (contra-revenue) — mirrors
+    # freetaxusa.py's OTHER_EXPENSE→L21 mapping.
+    "OTHER_EXPENSE": ("21", "Other deductions — other expenses", False),
 }
 
 SKIP_CATEGORIES = {"REIMBURSABLE", "PERSONAL_NON_DEDUCTIBLE"}
@@ -68,9 +72,9 @@ def _to_decimal(value: Any) -> Decimal:
 
 
 def _abs_deductible(tx: dict[str, Any]) -> Decimal:
-    raw = _to_decimal(tx.get("amount"))
-    pct = _to_decimal(tx.get("deductible_pct", "1.0"))
-    return abs(raw) * pct
+    """REQ-FIX-TAX-002: delegates to ``pretax_abs_amount`` for the pre-tax
+    SALES_INCOME basis; other categories unchanged (abs(amount) * deductible_pct)."""
+    return pretax_abs_amount(tx)
 
 
 def _aggregate(

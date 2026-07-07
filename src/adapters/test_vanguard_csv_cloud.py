@@ -12,12 +12,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.adapters.vanguard_csv import (
-    SOURCE_TAG,
     _CLOUD_INGEST_SOURCE,
+    SOURCE_TAG,
     _default_target,
     import_positions_cloud,
 )
-
 
 # ── Sample CSV ────────────────────────────────────────────────────────────────
 

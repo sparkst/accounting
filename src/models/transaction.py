@@ -4,7 +4,15 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, Float, ForeignKey, Numeric, String, Text  # Float kept for confidence/deductible_pct
+from sqlalchemy import (  # Float kept for confidence/deductible_pct
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Numeric,
+    String,
+    Text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 

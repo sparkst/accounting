@@ -6,20 +6,18 @@ All network calls are mocked — no real Workers endpoint is required.
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.adapters.gsk_pdf import (
+    _CLOUD_INGEST_SOURCE,
     GSK_RAW_ACCOUNT_NAME,
     SOURCE_TAG,
-    _CLOUD_INGEST_SOURCE,
     _default_target,
     import_pdf_cloud,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 

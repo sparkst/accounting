@@ -87,8 +87,9 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
 
     sess = _open_session()
     try:
+        as_of = dt.date.fromisoformat(args.as_of) if args.as_of else dt.date.today()
         try:
-            live = load_live(sess, today=dt.date.today())
+            live = load_live(sess, today=as_of)
         except RuntimeError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
@@ -228,6 +229,10 @@ def main(argv: list[str] | None = None) -> int:
     sim.add_argument("--note", default=None, help="tag the persisted run")
     sim.add_argument("--source", default="cli", choices=list(VALID_SOURCES))
     sim.add_argument("--n-sims", type=int, default=None, help="override n_sims")
+    sim.add_argument(
+        "--as-of", default=None,
+        help="ISO date anchoring the live-input TTM windows (default: today)",
+    )
     sim.add_argument("--seed", type=int, default=42)
     sim.set_defaults(func=_cmd_simulate)
 

@@ -5,17 +5,16 @@ Revises: 1c8d9ab67214
 Create Date: 2026-03-24 14:23:52.302780
 
 """
-from typing import Sequence, Union
+from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = 'a2ad1082b755'
-down_revision: Union[str, Sequence[str], None] = '1c8d9ab67214'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = '1c8d9ab67214'
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 _ENTITY_VALUES = "', '".join(["sparkry", "blackline", "personal"])

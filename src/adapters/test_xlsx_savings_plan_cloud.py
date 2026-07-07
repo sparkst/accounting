@@ -13,14 +13,15 @@ Tests mock ``post_to_wealth`` to verify:
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 import openpyxl
 import pytest
 
+from src.adapters._shared.wealth_client import WealthHTTPError
 from src.adapters.xlsx_savings_plan import (
     _CLOUD_INGEST_SOURCE_BALANCES,
     _CLOUD_INGEST_SOURCE_LOTS,
@@ -31,8 +32,6 @@ from src.adapters.xlsx_savings_plan import (
     import_historical_prices_cloud,
     main,
 )
-from src.adapters._shared.wealth_client import WealthClientError, WealthHTTPError
-
 
 # ---------------------------------------------------------------------------
 # Fixture: minimal XLSX workbook
@@ -224,7 +223,7 @@ def test_prices_cloud_posts_to_correct_slug(tmp_path: Path) -> None:
 
     with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
         mock_post.return_value = {}
-        result = import_historical_prices_cloud(str(xlsx))
+        import_historical_prices_cloud(str(xlsx))
 
     for c in mock_post.call_args_list:
         assert c.args[1] == _CLOUD_INGEST_SOURCE_PRICES
@@ -280,7 +279,7 @@ def test_lots_cloud_posts_to_correct_slug(tmp_path: Path) -> None:
 
     with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
         mock_post.return_value = {}
-        result = import_cost_basis_lots_cloud(str(xlsx))
+        import_cost_basis_lots_cloud(str(xlsx))
 
     for c in mock_post.call_args_list:
         assert c.args[1] == _CLOUD_INGEST_SOURCE_LOTS
@@ -307,7 +306,7 @@ def test_lots_cloud_payload_shape(tmp_path: Path) -> None:
         assert "cost_total" in row
         assert "source" in row
         assert "source_row_hash" in row
-        assert isinstance(row["quantity"], str), f"quantity must be a string"
+        assert isinstance(row["quantity"], str), "quantity must be a string"
         assert isinstance(row["cost_per_share"], str), "cost_per_share must be a string"
 
 

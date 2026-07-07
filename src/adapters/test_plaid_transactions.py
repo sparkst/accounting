@@ -404,7 +404,7 @@ def test_modified_same_amount_no_audit_event(db):
     with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
         process_added(db, item, [_plaid_txn(transaction_id="sa1", amount=10.0)],
                       account_index={"acc_1": acct})
-    row = db.query(Transaction).filter_by(source_id="sa1").one()
+    db.query(Transaction).filter_by(source_id="sa1").one()
     before = db.query(AuditEvent).filter_by(field_changed="amount").count()
     # Re-send the same amount — _apply_update must not audit.
     process_modified(db, [_plaid_txn(transaction_id="sa1", amount=10.0)])

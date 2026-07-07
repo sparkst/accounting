@@ -34,7 +34,10 @@ def test_simulate_writes_exactly_one_row(db_with_planning_table: Path) -> None:
         Sess = sessionmaker(bind=engine)
         open_session.return_value = Sess()
 
-        rc = cli_main(["simulate", "--n-sims", "300"])
+        # --as-of pins the TTM window to the fixture DB's era (12x$20k spanning
+        # 2025-07-06..2026-06-01); without it the expected 240k decays as months
+        # age out of a real-today window.
+        rc = cli_main(["simulate", "--n-sims", "300", "--as-of", "2026-06-15"])
         assert rc == 0
 
     # Verify exactly one row

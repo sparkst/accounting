@@ -74,7 +74,7 @@ def _load_keys() -> list[str]:
     keys = [k.strip() for k in raw.split(",") if k.strip()]
     if not keys:
         raise MissingKeyError(
-            f"Plaid Fernet key env var is set but empty after parsing."
+            "Plaid Fernet key env var is set but empty after parsing."
         )
     return keys
 
@@ -85,7 +85,7 @@ def _multi_fernet() -> MultiFernet:
         return MultiFernet([Fernet(k.encode("utf-8")) for k in keys])
     except (ValueError, TypeError) as exc:
         raise PlaidCryptoError(
-            f"Plaid Fernet key is not valid (expected base64-urlsafe 32 bytes)."
+            "Plaid Fernet key is not valid (expected base64-urlsafe 32 bytes)."
         ) from exc
 
 

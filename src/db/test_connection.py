@@ -102,10 +102,9 @@ class TestPreventTransactionDelete:
             tx_id = tx.id
 
         # The trigger must fire and prevent the DELETE.
-        with SessionCls() as s:
-            with pytest.raises(Exception, match="cannot be deleted"):
-                s.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": tx_id})
-                s.commit()
+        with SessionCls() as s, pytest.raises(Exception, match="cannot be deleted"):
+            s.execute(text("DELETE FROM transactions WHERE id = :id"), {"id": tx_id})
+            s.commit()
 
     def test_update_and_insert_still_work(self, tmp_path: Path) -> None:
         """The trigger does not affect INSERT or UPDATE operations."""

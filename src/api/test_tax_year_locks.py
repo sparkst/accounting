@@ -13,6 +13,7 @@ REQ-ID: TYL-009  After unlock, PATCH succeeds again.
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from collections.abc import Generator
 from typing import Any
@@ -99,10 +100,8 @@ def db_session() -> Generator[Session, None, None]:
     try:
         yield session
     finally:
-        try:
+        with contextlib.suppress(Exception):
             session.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------

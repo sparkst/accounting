@@ -528,14 +528,14 @@ def _update_foreign_currency_from_statement(
     foreign_txn.exchange_rate_source = "credit_card_statement"
 
     # Log audit events
-    for field, old_val, new_val in [
+    for field_changed, old_val, new_val in [
         ("amount", old_amount, str(foreign_txn.amount)),
         ("exchange_rate", old_rate, str(foreign_txn.exchange_rate)),
         ("exchange_rate_source", old_source, "credit_card_statement"),
     ]:
         session.add(AuditEvent(
             transaction_id=foreign_txn.id,
-            field_changed=field,
+            field_changed=field_changed,
             old_value=old_val,
             new_value=new_val,
             changed_by="auto",

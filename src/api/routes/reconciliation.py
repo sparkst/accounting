@@ -14,11 +14,10 @@ see cross-source pairs as duplicates.
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from collections.abc import Generator
-
 from sqlalchemy.orm import Session
 
 from src.db.connection import SessionLocal

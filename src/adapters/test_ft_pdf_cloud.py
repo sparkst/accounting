@@ -11,13 +11,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.adapters.ft_pdf import (
+    _CLOUD_INGEST_SOURCE,
     FT_RAW_ACCOUNT_NAME,
     SOURCE_TAG,
-    _CLOUD_INGEST_SOURCE,
     _default_target,
     import_statements_cloud,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 

@@ -26,6 +26,7 @@ REQ-INV-003: Flat-rate invoice generation with duplicate guard.
 from __future__ import annotations
 
 import calendar
+import contextlib
 import decimal
 import uuid
 from datetime import UTC, date, datetime, timedelta
@@ -269,10 +270,8 @@ def generate_calendar_invoice(
     today = date.today()
     terms_days = 14
     if customer.payment_terms:
-        try:
+        with contextlib.suppress(ValueError):
             terms_days = int("".join(c for c in customer.payment_terms if c.isdigit()))
-        except ValueError:
-            pass
 
     invoice = Invoice(
         id=invoice_id,
@@ -378,10 +377,8 @@ def generate_flat_invoice(
     today = date.today()
     flat_terms_days = 14
     if customer.payment_terms:
-        try:
+        with contextlib.suppress(ValueError):
             flat_terms_days = int("".join(c for c in customer.payment_terms if c.isdigit()))
-        except ValueError:
-            pass
 
     invoice = Invoice(
         id=invoice_id,

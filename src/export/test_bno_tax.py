@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+from decimal import Decimal
 
 import pytest
 
@@ -203,6 +204,78 @@ class TestBuildBlacklineBnoCsv:
 
 
 # ---------------------------------------------------------------------------
+# Tests: confirmed out-of-state retail sales excluded from Retailing basis
+# (REQ-FIX-TAX-002 / REQ-020) — parity with generate_dor_upload's wa_taxable.
+# ---------------------------------------------------------------------------
+
+
+class TestBlacklineRetailingExcludesConfirmedOutOfState:
+    def _wa_and_oos_tx(self) -> list[dict]:
+        wa_tx = {
+            "date": "2025-01-15",
+            "description": "WA retail order",
+            "amount": "109.30",
+            "tax_category": "SALES_INCOME",
+            "deductible_pct": "1.0",
+            "raw_data": {
+                "total_price": "109.30",
+                "total_tax": "9.30",
+                "tax_lines": [{"title": "WA State Tax"}],
+                "shipping_address": {"province_code": "WA"},
+            },
+        }
+        oos_tx = {
+            "date": "2025-01-20",
+            "description": "Out-of-state retail order",
+            "amount": "250.00",
+            "tax_category": "SALES_INCOME",
+            "deductible_pct": "1.0",
+            "raw_data": {
+                "total_price": "250.00",
+                "total_tax": "0.00",
+                "tax_lines": [],
+                "shipping_address": {"province_code": "OR"},
+            },
+        }
+        return [wa_tx, oos_tx]
+
+    def test_confirmed_oos_sale_excluded_from_retailing_gross(self):
+        rows = list(
+            csv.reader(io.StringIO(build_blackline_bno_csv(self._wa_and_oos_tx(), 2025)))
+        )
+        q1_rows = [r for r in rows if "Q1" in str(r) and "Retailing" in str(r)]
+        assert q1_rows, "Expected a Q1 Retailing row"
+        # Only the WA order's pre-tax amount (109.30 - 9.30 = 100.00) counts —
+        # the $250 confirmed-out-of-state order is excluded entirely,
+        # mirroring compute_retail_detail's wa_taxable deduction.
+        assert q1_rows[0][3] == "100.00"
+
+    def test_estimated_bo_tax_matches_dor_wa_taxable_basis(self):
+        from src.export.retail_sales_tax import compute_retail_detail
+
+        transactions = self._wa_and_oos_tx()
+        detail = compute_retail_detail(transactions, 2025, quarter=1)
+
+        rows = list(
+            csv.reader(io.StringIO(build_blackline_bno_csv(transactions, 2025)))
+        )
+        q1_rows = [r for r in rows if "Q1" in str(r) and "Retailing" in str(r)]
+        assert Decimal(q1_rows[0][3]) == detail.wa_taxable == Decimal("100.00")
+
+    def test_retailing_estimated_bo_tax_pinned(self):
+        """REQ-FIX-TAX-002 / REQ-FIX-TAX-006: Retailing tax-owed cell (col 5)
+        is pinned to prevent BO_RATE['Retailing'] drift from
+        RETAILING_BO_RATE undetected. $90.70 wa_taxable * 0.00471 = $0.43."""
+        rows = list(
+            csv.reader(io.StringIO(build_blackline_bno_csv(self._wa_and_oos_tx(), 2025)))
+        )
+        q1_rows = [r for r in rows if "Q1" in str(r) and "Retailing" in str(r)]
+        assert q1_rows, "Expected a Q1 Retailing row"
+        # $100.00 wa_taxable * 0.00471 = $0.471 → $0.47
+        assert q1_rows[0][5] == "0.47"
+
+
+# ---------------------------------------------------------------------------
 # Tests: generate_bno_export
 # ---------------------------------------------------------------------------
 
@@ -235,6 +308,103 @@ class TestGenerateBnoExport:
 # ---------------------------------------------------------------------------
 # Tests: generate_dor_upload (WA DOR My DOR data-upload file)
 # ---------------------------------------------------------------------------
+
+
+class TestGrandTotalsMatchSummedRows:
+    """REQ-FIX-TAX-006: quantize before accumulate — the TOTAL row must equal
+    the sum of the displayed (per-row-rounded) values, not a separately
+    rounded sum of unquantized Decimals (which drift by a cent)."""
+
+    # Engineered amounts: unquantized accumulation of amt*0.015 rounds to
+    # 947.21 while summing the per-row-quantized tax values gives 947.22 —
+    # this pins the old off-by-a-cent drift as a regression.
+    _DRIFT_AMOUNTS = [
+        "4452.40", "620.81", "8671.17", "5930.21", "1299.15", "9935.73",
+        "2341.83", "6613.59", "6580.11", "6114.16", "9938.44", "649.67",
+    ]
+
+    def test_sparkry_monthly_total_equals_sum_of_rows(self) -> None:
+        txs = [
+            _income_tx("CONSULTING_INCOME", amt, f"2025-{m:02d}-15")
+            for m, amt in enumerate(self._DRIFT_AMOUNTS, start=1)
+        ]
+        out = build_sparkry_bno_csv(txs, 2025)
+        rows = list(csv.reader(io.StringIO(out)))
+        data_rows = [r for r in rows[1:] if any(r) and "TOTAL" not in str(r)]
+        total_row = next(r for r in rows if "TOTAL" in str(r))
+
+        summed_tax = sum((Decimal(r[5]) for r in data_rows), Decimal("0"))
+        summed_revenue = sum((Decimal(r[3]) for r in data_rows), Decimal("0"))
+
+        assert Decimal(total_row[5]) == summed_tax
+        assert Decimal(total_row[3]) == summed_revenue
+
+    def test_blackline_quarterly_total_equals_sum_of_rows(self) -> None:
+        txs = [
+            _income_tx("SALES_INCOME", amt, f"2025-{m:02d}-15")
+            for m, amt in enumerate(self._DRIFT_AMOUNTS, start=1)
+        ]
+        out = build_blackline_bno_csv(txs, 2025)
+        rows = list(csv.reader(io.StringIO(out)))
+        data_rows = [r for r in rows[1:] if any(r) and "TOTAL" not in str(r)]
+        total_row = next(r for r in rows if "TOTAL" in str(r))
+
+        summed_tax = sum((Decimal(r[5]) for r in data_rows), Decimal("0"))
+        assert Decimal(total_row[5]) == summed_tax
+
+
+class TestDorUploadHardFailOnUnmappedLocation:
+    """REQ-FIX-TAX-007: generate_dor_upload must hard-fail rather than
+    silently emit the sentinel '____' location code."""
+
+    def _unmapped_wa_order(self) -> dict:
+        return {
+            "date": "2026-02-10",
+            "amount": "100.00",
+            "tax_category": "SALES_INCOME",
+            "source": "shopify",
+            "raw_data": {
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": "Nowhereville"},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": "Nowhereville City Tax"},
+                ],
+            },
+        }
+
+    def test_raises_value_error_naming_unmapped_locality(self) -> None:
+        with pytest.raises(ValueError, match="____"):
+            generate_dor_upload(
+                [self._unmapped_wa_order()], "blackline", 2026, quarter=1
+            )
+
+    def test_mapped_only_input_still_emits_code_45_lines(self) -> None:
+        """Regression: the hard-fail must not break the happy path."""
+        content, _ = generate_dor_upload(
+            [
+                {
+                    "date": "2026-01-15",
+                    "amount": "100.00",
+                    "tax_category": "SALES_INCOME",
+                    "source": "shopify",
+                    "raw_data": {
+                        "total_price": "100.00",
+                        "total_tax": "9.30",
+                        "shipping_address": {"province_code": "WA", "city": "Sammamish"},
+                        "tax_lines": [
+                            {"title": "Washington State Tax"},
+                            {"title": "Sammamish City Tax"},
+                        ],
+                    },
+                }
+            ],
+            "blackline",
+            2026,
+            quarter=1,
+        )
+        assert any(line.startswith("TAX,45,1739,") for line in content.splitlines())
 
 
 class TestDorUploadLineCodes:

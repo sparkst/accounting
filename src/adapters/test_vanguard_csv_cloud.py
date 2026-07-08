@@ -10,12 +10,21 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.vanguard_csv import (
     _CLOUD_INGEST_SOURCE,
+    _CLOUD_LOG_SOURCE,
     SOURCE_TAG,
     _default_target,
     import_positions_cloud,
+)
+from src.models.base import Base
+from src.models.enums import IngestionStatus
+from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
 
 # ── Sample CSV ────────────────────────────────────────────────────────────────
@@ -186,18 +195,102 @@ def test_cloud_post_failure_yields_error_no_raise(brokerage_csv, monkeypatch):
     assert result.imported == 0
 
 
+# ── REQ-FIX-WLT-007: cloud import writes a local IngestionLog row ─────────────
+#
+# Mirrors src/adapters/test_north_american_iul.py's cloud-log tests — every
+# cloud-mode importer run should write exactly one local IngestionLog row.
+
+
+@pytest.fixture()
+def log_session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def test_cloud_import_writes_ingestion_log_on_success(
+    brokerage_csv, mock_post, log_session: Session
+) -> None:
+    result = import_positions_cloud(
+        brokerage_csv, as_of=date(2025, 12, 31), session=log_session
+    )
+    assert result.errors == []
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_cloud_import_writes_ingestion_log_on_error(
+    brokerage_csv, log_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.adapters._shared.wealth_client import WealthHTTPError
+
+    monkeypatch.setattr(
+        "src.adapters.vanguard_csv.post_to_wealth",
+        lambda payload, source, **kw: (_ for _ in ()).throw(WealthHTTPError(422, "bad")),
+    )
+    result = import_positions_cloud(
+        brokerage_csv, as_of=date(2025, 12, 31), session=log_session
+    )
+    assert result.imported == 0
+    assert result.errors
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_cloud_import_without_session_skips_log(brokerage_csv, mock_post) -> None:
+    """Backward-compat: no session → no IngestionLog attempted, still returns result."""
+    result = import_positions_cloud(brokerage_csv, as_of=date(2025, 12, 31))
+    assert result.errors == []
+    assert result.imported == 2
+
+
 # ── CLI tests ─────────────────────────────────────────────────────────────────
+#
+# CLI apply+cloud tests stub ``get_session`` (never open the real on-disk
+# DB) — REQ-FIX-WLT-007's IngestionLog write happens through the same real
+# session the local-write path uses, so an unmocked test here would silently
+# write into ``data/accounting.db``.
+
+
+def _fake_session_ctx():
+    """Mock session + context-manager stand-in for ``get_session()``."""
+    import unittest.mock as um
+    from contextlib import contextmanager
+
+    mock_session = um.MagicMock()
+    mock_session.execute.return_value.first.return_value = None
+
+    @contextmanager
+    def _fake_get_session():
+        yield mock_session
+
+    return mock_session, _fake_get_session
+
 
 def test_cli_target_cloud_calls_cloud_function(brokerage_csv, mock_post):
+    import unittest.mock as um
+
     from src.adapters.vanguard_csv import main
 
-    rc = main([
-        "import-positions", "--file", str(brokerage_csv),
-        "--apply", "--target", "cloud",
-        "--as-of", "2025-12-31",
-    ])
+    mock_session, _fake_get_session = _fake_session_ctx()
+    with um.patch("src.db.connection.get_session", _fake_get_session):
+        rc = main([
+            "import-positions", "--file", str(brokerage_csv),
+            "--apply", "--target", "cloud",
+            "--as-of", "2025-12-31",
+        ])
     assert rc == 0
     mock_post.assert_called_once()
+    # REQ-FIX-WLT-007: the CLI cloud path threads a session through so an
+    # IngestionLog row gets added+committed (mocked session — no real DB).
+    assert mock_session.add.called
+    assert mock_session.commit.called
 
 
 def test_cli_target_cloud_no_apply_no_post(brokerage_csv, mock_post):
@@ -230,12 +323,16 @@ def test_cli_target_cloud_no_apply_no_post(brokerage_csv, mock_post):
 
 def test_cli_default_target_env_cloud(brokerage_csv, mock_post, monkeypatch):
     """WEALTH_TARGET_DEFAULT=cloud + --apply uses cloud without explicit --target."""
+    import unittest.mock as um
+
     monkeypatch.setenv("WEALTH_TARGET_DEFAULT", "cloud")
     from src.adapters.vanguard_csv import main
 
-    rc = main([
-        "import-positions", "--file", str(brokerage_csv),
-        "--apply", "--as-of", "2025-12-31",
-    ])
+    _mock_session, _fake_get_session = _fake_session_ctx()
+    with um.patch("src.db.connection.get_session", _fake_get_session):
+        rc = main([
+            "import-positions", "--file", str(brokerage_csv),
+            "--apply", "--as-of", "2025-12-31",
+        ])
     assert rc == 0
     mock_post.assert_called_once()

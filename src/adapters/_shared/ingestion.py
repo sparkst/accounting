@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from src.models.enums import IngestionStatus
 from src.models.ingestion_log import IngestionLog
@@ -35,6 +35,21 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+class _CloudImportResultLike(Protocol):
+    """Structural type for ``write_cloud_ingestion_log``'s ``result`` arg.
+
+    Every adapter's cloud-mode result type — whether it subclasses the shared
+    ``BaseImportResult`` (most Phase-4 adapters) or defines its own dataclass
+    (``xlsx_savings_plan.ImportResult``, ``brokerage_csv.CloudImportResult``)
+    — carries these two fields with these semantics. Protocol (structural)
+    typing here avoids forcing every adapter's result dataclass to share a
+    common base class just to satisfy this one helper.
+    """
+
+    imported: int
+    errors: list[str]
 
 
 def write_ingestion_log(
@@ -74,3 +89,41 @@ def write_ingestion_log(
         logger.exception("failed to write IngestionLog for %s", source)
         with contextlib.suppress(Exception):
             session.rollback()
+
+
+def write_cloud_ingestion_log(
+    session: Session | None,
+    *,
+    source: str,
+    result: _CloudImportResultLike,
+) -> None:
+    """Write ONE local IngestionLog row summarizing a cloud-mode push
+    (REQ-FIX-WLT-007).
+
+    Every cloud-mode importer run gets exactly one local IngestionLog row —
+    same as the local-write path — so cloud pushes surface in delivery-health
+    exactly like local imports. No-op when ``session`` is None (keeps the
+    ``*_cloud`` functions importable/callable without a DB, e.g. from the
+    n8n/agent callers that only pass a session when one is available).
+
+    status derivation mirrors the local-write convention:
+    * FAILURE          — errors present and nothing imported.
+    * PARTIAL_FAILURE  — some imported, but errors also present.
+    * SUCCESS          — no errors.
+    """
+    if session is None:
+        return
+    if result.errors and result.imported == 0:
+        status = IngestionStatus.FAILURE
+    elif result.errors:
+        status = IngestionStatus.PARTIAL_FAILURE
+    else:
+        status = IngestionStatus.SUCCESS
+    write_ingestion_log(
+        session,
+        source=source,
+        records_processed=result.imported,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail="\n".join(result.errors) or None,
+    )

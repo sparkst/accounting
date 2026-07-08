@@ -601,6 +601,7 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-FIX-TAX-005 | 1099-B export handles `tax_subcategory=None` and matches term case-insensitively (no 500 on personal exports). |
 | REQ-FIX-TAX-006 | B&O CSV grand totals equal the sum of the displayed (per-row-rounded) values. |
 | REQ-FIX-TAX-007 | DOR upload hard-fails with an actionable error when any row carries the unmapped `____` location code. |
+| REQ-FIX-TAX-008 | **DEFERRED follow-up (P3-302, 2026-07 review):** net confirmed sales refunds (OTHER_EXPENSE) against Retailing B&O gross receipts as a returns-and-allowances deduction. Until shipped, `bno_tax.py` documents the gap and the filer applies the deduction manually at DOR. |
 
 ## REQ-FIX-INV-* — Invoicing integrity
 
@@ -619,7 +620,7 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-FIX-ING-001 | bank_csv per-row isolation uses `with session.begin_nested():` correctly; a poisoned row rolls back only itself; `records_created` is accurate. Test: batch with a failing row persists all other rows. |
 | REQ-FIX-ING-002 | Exchange-rate math is Decimal-only in `gmail_n8n.py` and `backfill_currency.py`; a receipt containing USD + foreign amounts ingests successfully. |
 | REQ-FIX-ING-003 | Gmail adapter rolls back the session on per-file failure; one bad file cannot poison the rest of the batch. |
-| REQ-FIX-ING-004 | Confirming a human-edited transaction updates the matched vendor rule's category/direction/deductible_pct; a divergent correction resets rule confidence to base. Test: a correction flips the classification of the next matching transaction. |
+| REQ-FIX-ING-004 | Confirming a human-edited transaction updates the matched vendor rule's category/direction/deductible_pct; a divergent correction resets learned-rule confidence to base (0.80), and human-source rules retain their 0.95 confidence (human correcting human-authored rules is fully trusted). Test: a correction flips the classification of the next matching transaction. |
 | REQ-FIX-ING-005 | Vendor patterns are stored regex-escaped at creation; existing stored patterns are matched literally (substring) unless explicitly flagged as regex. |
 | REQ-FIX-ING-006 | bank_csv dedup key quantizes the amount to cents and appends an occurrence counter for identical same-file tuples; a re-export with different decimal rendering does not duplicate, and two identical same-day charges both import. |
 | REQ-FIX-ING-007 | Plaid `_existing_by_source_id` excludes split children (`parent_id IS NULL`); modified/removed events on a split parent flag it `needs_review` instead of silently mutating a child; pending→posted never flips a human-rejected row's status; first-sync supersede never rejects children of split parents. |

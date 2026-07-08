@@ -20,9 +20,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from src.adapters.north_american_iul import import_policy
 from src.models.base import Base
 from src.models.brokerage import Account
-from src.models.enums import AccountType, Broker, Entity
+from src.models.enums import AccountType, Broker, Entity, IngestionStatus
 from src.models.history import AccountBalanceSnapshot
-from src.models.ingestion_log import IngestionLog  # noqa: F401 — register table for create_all
+from src.models.ingestion_log import IngestionLog
 from src.models.plaid import (
     PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
@@ -166,4 +166,133 @@ def test_string_input_preserves_precision(session: Session) -> None:
     )
     snap = session.scalars(select(AccountBalanceSnapshot)).one()
     assert snap.balance == Decimal("466928.72")
+    assert result.errors == []
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-WLT-009: notes merge — human text survives, machine block replaced once
+# ---------------------------------------------------------------------------
+
+
+def test_notes_written_as_delimited_machine_block(session: Session) -> None:
+    """The importer records its figures inside a `--- [na_iul auto ...]` block."""
+    import_policy(
+        policy_number=_POLICY,
+        as_of=_AS_OF,
+        surrender_value=Decimal("100.00"),
+        accumulation_value=Decimal("110.00"),
+        dry_run=False,
+        session=session,
+    )
+    acct = session.scalars(select(Account)).one()
+    assert acct.notes is not None
+    assert acct.notes.startswith("--- [na_iul auto ")
+    assert "accumulation=110.00" in acct.notes
+
+
+def test_human_notes_survive_repeated_imports(session: Session) -> None:
+    """REQ-FIX-WLT-009: operator free text is preserved; machine block replaced once."""
+    # First import creates the account + machine block.
+    import_policy(
+        policy_number=_POLICY,
+        as_of=date(2026, 1, 1),
+        surrender_value=Decimal("100.00"),
+        accumulation_value=Decimal("110.00"),
+        dry_run=False,
+        session=session,
+    )
+    acct = session.scalars(select(Account)).one()
+
+    # Operator prepends free text above the machine block.
+    human = "REVIEW: confirm beneficiary designation with Amy before EOY"
+    acct.notes = f"{human}\n{acct.notes}"
+    session.commit()
+
+    # Second import (new date + value → new snapshot, so _upsert_account runs).
+    import_policy(
+        policy_number=_POLICY,
+        as_of=date(2026, 2, 1),
+        surrender_value=Decimal("120.00"),
+        accumulation_value=Decimal("130.00"),
+        dry_run=False,
+        session=session,
+    )
+    session.refresh(acct)
+
+    assert acct.notes is not None
+    # Human text intact.
+    assert acct.notes.startswith(human)
+    # Exactly one machine block — the old one was replaced, not appended.
+    assert acct.notes.count("--- [na_iul auto") == 1
+    # And it reflects the LATEST import.
+    assert "accumulation=130.00" in acct.notes
+    assert "accumulation=110.00" not in acct.notes
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-WLT-007: cloud import writes a local IngestionLog row
+# ---------------------------------------------------------------------------
+
+
+def test_cloud_import_writes_ingestion_log_on_success(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful cloud push writes one IngestionLog row (source-tagged)."""
+    from src.adapters import north_american_iul as mod
+
+    monkeypatch.setattr(mod, "post_to_wealth", lambda payload, source: {"ok": True})
+    result = mod.import_policy_cloud(
+        policy_number=_POLICY,
+        as_of=_AS_OF,
+        surrender_value="$100.00",
+        session=session,
+    )
+    assert result.imported == 1
+    assert result.errors == []
+
+    logs = session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == "wealth_cloud:north_american_iul"
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_cloud_import_writes_ingestion_log_on_error(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed cloud push still writes one IngestionLog row (status=error)."""
+    from src.adapters import north_american_iul as mod
+    from src.adapters._shared.wealth_client import WealthTransportError
+
+    def _boom(payload, source):  # type: ignore[no-untyped-def]
+        raise WealthTransportError("connection refused")
+
+    monkeypatch.setattr(mod, "post_to_wealth", _boom)
+    result = mod.import_policy_cloud(
+        policy_number=_POLICY,
+        as_of=_AS_OF,
+        surrender_value="$100.00",
+        session=session,
+    )
+    assert result.imported == 0
+    assert result.errors
+
+    logs = session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == "wealth_cloud:north_american_iul"
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_cloud_import_without_session_skips_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backward-compat: no session → no IngestionLog attempted, still returns result."""
+    from src.adapters import north_american_iul as mod
+
+    monkeypatch.setattr(mod, "post_to_wealth", lambda payload, source: {"ok": True})
+    result = mod.import_policy_cloud(
+        policy_number=_POLICY,
+        as_of=_AS_OF,
+        surrender_value="$100.00",
+    )
+    assert result.imported == 1
     assert result.errors == []

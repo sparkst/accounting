@@ -31,7 +31,14 @@ from src.adapters.shopify_adapter import (
     _parse_payout,
 )
 from src.models.base import Base
-from src.models.enums import Direction, Entity, IngestionStatus, Source, TaxCategory
+from src.models.enums import (
+    Direction,
+    Entity,
+    IngestionStatus,
+    Source,
+    TaxCategory,
+    TransactionStatus,
+)
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
 
@@ -201,17 +208,28 @@ class TestParseRefund:
 
 
 class TestParsePayout:
-    def test_payout_is_income(self) -> None:
+    """REQ-FIX-TAX-001: payouts mirror the Stripe payout classification —
+    direction=transfer, no income tax_category — so gross receipts stop
+    double-counting Shopify sales (once as the order, again as the payout)."""
+
+    def test_payout_is_transfer_not_income(self) -> None:
         tx = _parse_payout(SAMPLE_PAYOUT)
         assert tx["amount"] == decimal.Decimal("210.50")
-        assert tx["direction"] == Direction.INCOME.value
+        assert tx["direction"] == Direction.TRANSFER.value
         assert tx["entity"] == Entity.BLACKLINE.value
         assert tx["source_id"] == "payout_7000001"
         assert tx["date"] == "2025-03-07"
 
-    def test_payout_tax_category(self) -> None:
+    def test_payout_has_no_tax_category(self) -> None:
         tx = _parse_payout(SAMPLE_PAYOUT)
-        assert tx["tax_category"] == TaxCategory.SALES_INCOME.value
+        assert tx["tax_category"] is None
+
+    def test_payout_is_auto_classified_not_needs_review(self) -> None:
+        """Regression: a payout must NOT be needs_review — that would expose
+        it to the ingest reclassify pass, where the Tier-3 LLM mislabels
+        "Shopify Payout" as SALES_INCOME (mirrors the Stripe payout fix)."""
+        tx = _parse_payout(SAMPLE_PAYOUT)
+        assert tx["status"] == TransactionStatus.AUTO_CLASSIFIED.value
 
     def test_payout_raw_data_preserved(self) -> None:
         tx = _parse_payout(SAMPLE_PAYOUT)

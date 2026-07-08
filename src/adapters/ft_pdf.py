@@ -34,7 +34,7 @@ from typing import Final
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.ingestion import write_cloud_ingestion_log, write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.adapters._shared.result import BaseImportResult
@@ -59,6 +59,8 @@ FT_ACCOUNT_NUMBER: Final[str] = "8291"
 FT_RAW_ACCOUNT_NAME: Final[str] = "Franklin Templeton — Templeton Growth Fund 8291"
 
 _CLOUD_INGEST_SOURCE: Final[str] = "xlsx-snapshot"
+_CLOUD_LOG_SOURCE: Final[str] = "wealth_cloud:ft_pdf"
+"""``ingestion_log.source`` for the cloud-push path (REQ-FIX-WLT-007)."""
 """Workers ingest slug — FT snapshots are AccountBalanceSnapshot rows."""
 
 _CLOUD_BATCH_SIZE: Final[int] = 100
@@ -314,15 +316,24 @@ def import_statements(
 # ── Cloud import ─────────────────────────────────────────────────────────────
 
 
-def import_statements_cloud(directory: Path) -> ImportResult:
+def import_statements_cloud(
+    directory: Path, *, session: Session | None = None
+) -> ImportResult:
     """Walk ``directory`` for ``*.pdf`` statements and POST snapshots to the cloud.
 
-    Does NOT require a DB session — all writes go to the Workers ingest endpoint.
-    Per-file error isolation: parse failures append to ``result.errors`` and the
-    batch continues. Network errors are also isolated per-batch.
+    The cloud DATA write does NOT require a DB session — all writes go to the
+    Workers ingest endpoint. Per-file error isolation: parse failures append
+    to ``result.errors`` and the batch continues. Network errors are also
+    isolated per-batch.
+
+    ``session``, when supplied, is used only to write one local IngestionLog
+    row per run (success and error paths alike) so cloud pushes surface in
+    delivery-health exactly like local imports (REQ-FIX-WLT-007). Backward
+    compatible: with no session the log write is skipped.
 
     Args:
         directory: Path containing the ``*.pdf`` statements.
+        session: Optional local session, used only for the IngestionLog write.
 
     Returns:
         :class:`ImportResult` with counts and per-record errors.
@@ -377,6 +388,7 @@ def import_statements_cloud(directory: Path) -> ImportResult:
                 result.errors.append(f"{label}: cloud POST failed: {exc}")
             logger.warning("ft_pdf: cloud POST failed for batch: %s", exc)
 
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
     return result
 
 
@@ -442,7 +454,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if target == "cloud":
-        result = import_statements_cloud(directory)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = import_statements_cloud(directory, session=None)
+        else:
+            with get_session() as session:
+                result = import_statements_cloud(directory, session=session)
         _print_summary(result, dry_run=False)
         return 0
 

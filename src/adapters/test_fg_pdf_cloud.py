@@ -10,12 +10,21 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.fg_pdf import (
     _CLOUD_INGEST_SOURCE,
+    _CLOUD_LOG_SOURCE,
     SOURCE_TAG,
     _default_target,
     import_pdf_cloud,
+)
+from src.models.base import Base
+from src.models.enums import IngestionStatus
+from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -211,7 +220,86 @@ def test_cloud_post_failure_yields_error_no_raise(tmp_path, monkeypatch):
     assert result.imported == 0
 
 
+# ── REQ-FIX-WLT-007: cloud import writes a local IngestionLog row ─────────────
+
+
+@pytest.fixture()
+def log_session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def test_cloud_import_writes_ingestion_log_on_success(
+    tmp_path, monkeypatch, mock_post, log_session: Session
+) -> None:
+    from decimal import Decimal
+    monkeypatch.setattr("src.adapters.fg_pdf.pdftotext_layout", lambda p: ANNUAL_PDF_TEXT)
+    monkeypatch.setattr("src.adapters.fg_pdf.detect_template", lambda text: "annual")
+    monkeypatch.setattr(
+        "src.adapters.fg_pdf.extract_annual_statement",
+        lambda text: ("12345678", date(2025, 12, 31), Decimal("125000.00")),
+    )
+    pdf = _make_fake_pdf(tmp_path)
+    result = import_pdf_cloud(pdf, session=log_session)
+    assert result.errors == []
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_cloud_import_writes_ingestion_log_on_error(
+    tmp_path, monkeypatch, log_session: Session
+) -> None:
+    from decimal import Decimal
+
+    from src.adapters._shared.wealth_client import WealthHTTPError
+
+    monkeypatch.setattr("src.adapters.fg_pdf.pdftotext_layout", lambda p: ANNUAL_PDF_TEXT)
+    monkeypatch.setattr("src.adapters.fg_pdf.detect_template", lambda text: "annual")
+    monkeypatch.setattr(
+        "src.adapters.fg_pdf.extract_annual_statement",
+        lambda text: ("12345678", date(2025, 12, 31), Decimal("125000.00")),
+    )
+    monkeypatch.setattr(
+        "src.adapters.fg_pdf.post_to_wealth",
+        lambda payload, source, **kw: (_ for _ in ()).throw(WealthHTTPError(422, "bad")),
+    )
+    pdf = _make_fake_pdf(tmp_path)
+    result = import_pdf_cloud(pdf, session=log_session)
+    assert result.imported == 0
+    assert result.errors
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_cloud_import_without_session_skips_log(tmp_path, monkeypatch, mock_post) -> None:
+    """Backward-compat: no session → no IngestionLog attempted, still returns result."""
+    from decimal import Decimal
+    monkeypatch.setattr("src.adapters.fg_pdf.pdftotext_layout", lambda p: ANNUAL_PDF_TEXT)
+    monkeypatch.setattr("src.adapters.fg_pdf.detect_template", lambda text: "annual")
+    monkeypatch.setattr(
+        "src.adapters.fg_pdf.extract_annual_statement",
+        lambda text: ("12345678", date(2025, 12, 31), Decimal("125000.00")),
+    )
+    pdf = _make_fake_pdf(tmp_path)
+    result = import_pdf_cloud(pdf)
+    assert result.errors == []
+    assert result.imported == 1
+
+
 # ── CLI tests ─────────────────────────────────────────────────────────────────
+#
+# The apply+cloud CLI test stubs ``get_session`` — REQ-FIX-WLT-007's
+# IngestionLog write happens through the same real session the local-write
+# path uses, so an unmocked test here would silently write into
+# ``data/accounting.db``.
+
 
 def test_cli_dry_run_does_not_post(tmp_path, monkeypatch, mock_post):
     from decimal import Decimal
@@ -229,7 +317,10 @@ def test_cli_dry_run_does_not_post(tmp_path, monkeypatch, mock_post):
 
 
 def test_cli_target_cloud_calls_cloud_function(tmp_path, monkeypatch, mock_post):
+    import unittest.mock as um
+    from contextlib import contextmanager
     from decimal import Decimal
+
     monkeypatch.setattr("src.adapters.fg_pdf.pdftotext_layout", lambda p: ANNUAL_PDF_TEXT)
     monkeypatch.setattr("src.adapters.fg_pdf.detect_template", lambda text: "annual")
     monkeypatch.setattr(
@@ -237,7 +328,17 @@ def test_cli_target_cloud_calls_cloud_function(tmp_path, monkeypatch, mock_post)
         lambda text: ("12345678", date(2025, 12, 31), Decimal("125000.00")),
     )
     from src.adapters.fg_pdf import main
+
+    mock_session = um.MagicMock()
+
+    @contextmanager
+    def _fake_get_session():
+        yield mock_session
+
     pdf = _make_fake_pdf(tmp_path)
-    rc = main(["import-pdf", "--file", str(pdf), "--apply", "--target", "cloud"])
+    with um.patch("src.db.connection.get_session", _fake_get_session):
+        rc = main(["import-pdf", "--file", str(pdf), "--apply", "--target", "cloud"])
     assert rc == 0
     mock_post.assert_called_once()
+    assert mock_session.add.called
+    assert mock_session.commit.called

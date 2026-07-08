@@ -1,0 +1,65 @@
+# Investment policy config — REQ-IPD-001..004, REQ-BBT-001..002.
+#
+# Single source of truth for the /wealth policy panel, the drift alert, the
+# WA capital-gains-excise headroom meter, and the bold-bets sleeve. Loaded via
+# src/analytics/policy_config.py with Decimal() applied at this YAML boundary.
+# All percentages are whole-number points (51 == 51%), all money is USD.
+
+concentration:
+  symbols: [AMZN, MSFT]        # combined-concentration sleeve (includes RSU accounts)
+  baseline_pct: 51             # 2026-07 measured baseline, pinned
+  baseline_month: 2026-07
+  target_pct: 35               # ≤35% by target_month on a linear glide
+  target_month: 2031-07        # 60-month glide from baseline_month
+  drift_alert_threshold_pts: 3 # alert when current_pct − glide_pct > this
+
+# International target as a percent of *equity* (tracked separately from the
+# AMZN+MSFT glide). Symbols are an explicit list — never inferred.
+international_target_pct_of_equity: 10
+international_symbols:
+  - VXUS
+  - VEU
+  - VEA
+  - VWO
+  - IXUS
+  - VTIAX
+  - VTMGX
+  - VEMAX
+  - VFWAX
+
+# Sweep / money-market tickers counted as the cash sleeve. Explicit list.
+cash_symbols:
+  - CASH
+  - SPAXX
+  - FDRXX
+  - FCASH
+  - VMFXX
+  - VMSXX
+  - SWVXX
+  - SWLXX
+  - SWTXX
+  - MMDA1
+
+# WA capital-gains excise thresholds, per tax year (config-updatable).
+# threshold: 7% tier standard deduction (~$270k); surcharge_threshold: 9.9%
+# tier ($1M). Realized LT gains YTD in taxable accounts are measured against these.
+wa_excise:
+  2026:
+    threshold: 270000
+    surcharge_threshold: 1000000
+  2027:
+    threshold: 270000
+    surcharge_threshold: 1000000
+
+# Bold-bets speculative sleeve (REQ-BBT). cap surfaces as a breach chip when the
+# sleeve value exceeds it (display/report only, no enforcement). Per-symbol
+# thesis/exit are human-edited free text surfaced in the sleeve drill-in.
+bold_bets:
+  cap: 20000
+  symbols:
+    TSLA:
+      thesis: "Robotaxi/energy optionality; asymmetric upside."
+      exit: "Trim above cost basis 2x or on autonomy-timeline slip."
+    NVDA:
+      thesis: "AI compute demand; datacenter buildout."
+      exit: "Reassess if hyperscaler capex guidance turns down two quarters."

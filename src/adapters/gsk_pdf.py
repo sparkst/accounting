@@ -37,7 +37,7 @@ from pathlib import Path
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.ingestion import write_cloud_ingestion_log, write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.adapters._shared.result import BaseImportResult
@@ -68,6 +68,9 @@ GSK_RAW_ACCOUNT_NAME = "GSK Cash Balance Pension Plan"
 
 _CLOUD_INGEST_SOURCE = "xlsx-snapshot"
 """Workers ingest slug — GSK snapshots are AccountBalanceSnapshot rows."""
+
+_CLOUD_LOG_SOURCE = "wealth_cloud:gsk_pdf"
+"""``ingestion_log.source`` for the cloud-push path (REQ-FIX-WLT-007)."""
 
 
 def _default_target() -> str:
@@ -283,15 +286,22 @@ def import_pdf_cloud(
     path: Path,
     *,
     as_of: date | None = None,
+    session: Session | None = None,
 ) -> ImportResult:
     """Parse a GSK PDF and POST the snapshot to the Workers ingest endpoint.
 
-    Does NOT require a DB session — all writes go to the cloud Worker.
-    Idempotency is enforced by the Worker (source_row_hash UNIQUE constraint).
+    The cloud DATA write does NOT require a DB session — all writes go to the
+    cloud Worker. Idempotency is enforced by the Worker (source_row_hash
+    UNIQUE constraint). ``session``, when supplied, is used only to write one
+    local IngestionLog row per run (success and error paths alike) so cloud
+    pushes surface in delivery-health exactly like local imports
+    (REQ-FIX-WLT-007). Backward compatible: with no session the log write is
+    skipped.
 
     Args:
         path:  Path to the PDF.
         as_of: Override the as-of date extracted from the PDF.
+        session: Optional local session, used only for the IngestionLog write.
 
     Returns:
         :class:`ImportResult` with counts and per-record errors.
@@ -305,6 +315,7 @@ def import_pdf_cloud(
     except Exception as exc:  # noqa: BLE001 — per-record isolation
         result.errors.append(f"{record_label}: {exc}")
         logger.warning("gsk_pdf: extraction failed for %s: %s", path, exc, exc_info=True)
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     snap_as_of = as_of if as_of is not None else extracted_as_of
@@ -333,6 +344,7 @@ def import_pdf_cloud(
         result.errors.append(f"{record_label}: cloud POST failed: {exc}")
         logger.warning("gsk_pdf: cloud POST failed for %s: %s", record_label, exc)
 
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
     return result
 
 
@@ -406,7 +418,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if target == "cloud":
-        result = import_pdf_cloud(pdf, as_of=as_of)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = import_pdf_cloud(pdf, as_of=as_of, session=None)
+        else:
+            with get_session() as session:
+                result = import_pdf_cloud(pdf, as_of=as_of, session=session)
         _print_summary(result, dry_run=False)
         return 0
 

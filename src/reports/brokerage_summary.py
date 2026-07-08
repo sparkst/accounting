@@ -32,7 +32,7 @@ from src.models.brokerage import (
     RealizedGainLoss,
 )
 from src.models.enums import BrokerageTxStatus, CanonicalAction
-from src.models.history import AccountBalanceSnapshot, HistoricalPrice
+from src.models.history import AccountBalanceSnapshot, HistoricalPrice, StockSplit
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -373,6 +373,9 @@ class _HistoryState(TypedDict):
     balance_snapshots_by_account: dict[str, list[tuple[date, AccountBalanceSnapshot]]]
     # ``[(trade_date, close)]`` per symbol, ascending by date.
     prices_by_symbol: dict[str, list[tuple[date, Decimal]]]
+    # ``[(ex_date, ratio)]`` per symbol, ascending by ex_date. ratio is post/pre
+    # (2:1 -> 2.0). REQ-FIX-WLT-002: split-safe re-pricing.
+    splits_by_symbol: dict[str, list[tuple[date, Decimal]]]
     # All Account rows by id — used for plan-wrapper / metadata lookups.
     accounts_by_id: dict[str, Account]
 
@@ -443,8 +446,20 @@ def _load_history_state(session: Session) -> _HistoryState:
         .order_by(HistoricalPrice.symbol, HistoricalPrice.trade_date)
         .all()
     ):
-        prices_by_symbol.setdefault(hp.symbol, []).append(
+        prices_by_symbol.setdefault(hp.symbol.upper(), []).append(
             (hp.trade_date, Decimal(str(hp.close)))
+        )
+
+    splits_by_symbol: dict[str, list[tuple[date, Decimal]]] = {}
+    for sp in (
+        session.query(StockSplit)
+        .order_by(StockSplit.symbol, StockSplit.ex_date)
+        .all()
+    ):
+        # Keys uppercased to match position-snapshot lookups regardless of the
+        # casing an adapter stored (P3-411).
+        splits_by_symbol.setdefault(sp.symbol.upper(), []).append(
+            (sp.ex_date, Decimal(str(sp.ratio)))
         )
 
     accounts_by_id = {a.id: a for a in session.query(Account).all()}
@@ -453,8 +468,30 @@ def _load_history_state(session: Session) -> _HistoryState:
         position_snapshots_by_account=pos_by_account_sorted,
         balance_snapshots_by_account=bal_by_account,
         prices_by_symbol=prices_by_symbol,
+        splits_by_symbol=splits_by_symbol,
         accounts_by_id=accounts_by_id,
     )
+
+
+def _cumulative_split_ratio(
+    splits: list[tuple[date, Decimal]], after: date
+) -> Decimal:
+    """Product of split ratios with ``ex_date > after`` — NO upper bound.
+
+    REQ-FIX-WLT-002: yfinance ``auto_adjust=False`` "Close" is Yahoo's
+    split-adjusted-to-PRESENT series (only dividends excluded — "Adj Close"
+    additionally adjusts those). Every stored close therefore lives at the
+    present share scale, so a snapshot's (pre-split) quantity must be scaled
+    by every split after the snapshot date regardless of the target date.
+    Bounding the ratio at the target (the previous implementation) understated
+    any pre-split target date by the full split factor (e.g. 20x for
+    AMZN 2022-06-06). Returns Decimal("1") when no split applies.
+    """
+    ratio = Decimal("1")
+    for ex_date, r in splits:
+        if ex_date > after:
+            ratio *= r
+    return ratio
 
 
 def _latest_at_or_before(
@@ -529,6 +566,7 @@ def _per_account_value_at(
     pos_index = state["position_snapshots_by_account"]
     bal_index = state["balance_snapshots_by_account"]
     prices_index = state["prices_by_symbol"]
+    splits_index = state["splits_by_symbol"]
 
     # Union of every account that has any snapshot data at all.
     candidate_account_ids = set(pos_index.keys()) | set(bal_index.keys())
@@ -550,10 +588,16 @@ def _per_account_value_at(
                 close: Decimal | None = None
                 if ps.symbol is not None and ps.quantity is not None:
                     close = _price_at_or_before(
-                        prices_index.get(ps.symbol, []), target_date
+                        prices_index.get(ps.symbol.upper(), []), target_date
                     )
-                if close is not None and ps.quantity is not None:
-                    total += Decimal(str(ps.quantity)) * close
+                if close is not None and ps.quantity is not None and ps.symbol is not None:
+                    # REQ-FIX-WLT-002: closes are split-adjusted-to-present, so
+                    # scale the snapshot quantity by EVERY split after the
+                    # snapshot date (unbounded — see _cumulative_split_ratio).
+                    ratio = _cumulative_split_ratio(
+                        splits_index.get(ps.symbol.upper(), []), latest_pos_date
+                    )
+                    total += Decimal(str(ps.quantity)) * ratio * close
                 else:
                     total += Decimal(str(ps.market_value))
             # Only emit the account if at least one position contributed —

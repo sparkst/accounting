@@ -55,7 +55,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.ingestion import write_cloud_ingestion_log, write_ingestion_log
 from src.adapters._shared.money import (
     parse_currency,
     quantize_balance,
@@ -83,6 +83,8 @@ FLAVOR_529 = "529"
 # Cloud target — uses the brokerage-csv ingest path per REQ-WC-012 spec.
 _CLOUD_INGEST_SOURCE = "brokerage-csv"
 _CLOUD_BATCH_SIZE = 100
+_CLOUD_LOG_SOURCE = "wealth_cloud:vanguard_csv"
+"""``ingestion_log.source`` for the cloud-push path (REQ-FIX-WLT-007)."""
 
 
 def _default_target() -> str:
@@ -524,12 +526,18 @@ def import_positions_cloud(
     path: Path,
     *,
     as_of: date | None = None,
+    session: Session | None = None,
 ) -> ImportResult:
     """Parse positions and POST rows to the Workers brokerage-csv endpoint.
 
     Vanguard CSV uses the brokerage-csv ingest path per REQ-WC-012.
     Amount sign convention is preserved: shares, price, market_value are
     stored as positive quantities (not negated — brokerage data only).
+
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
     """
     result = ImportResult()
     path = Path(path)
@@ -540,11 +548,13 @@ def import_positions_cloud(
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         result.errors.append(f"{source_file}: {exc}")
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     blocks = split_blocks(text)
     if not blocks:
         result.errors.append(f"{source_file}: no blocks parsed")
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     pos_header, pos_rows = blocks[0]
@@ -552,6 +562,7 @@ def import_positions_cloud(
         flavor = detect_csv_flavor(pos_header)
     except ValueError as exc:
         result.errors.append(f"{source_file}: {exc}")
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     if len(blocks) >= 2:
@@ -615,6 +626,7 @@ def import_positions_cloud(
                     type(exc).__name__,
                 )
 
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
     return result
 
 
@@ -712,7 +724,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if target == "cloud":
-        result = import_positions_cloud(path, as_of=as_of)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = import_positions_cloud(path, as_of=as_of, session=None)
+        else:
+            with get_session() as session:
+                result = import_positions_cloud(path, as_of=as_of, session=session)
         _print_summary(result, dry_run=False)
         return 1 if result.errors else 0
 

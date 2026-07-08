@@ -1,6 +1,6 @@
 """Tests for scripts/backfill_historical_prices.py."""
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -17,7 +17,7 @@ from scripts.backfill_historical_prices import (
 from src.adapters.yfinance_prices import HistoricalPriceRow
 from src.models.base import Base
 from src.models.brokerage import Account, BrokerageTransaction, PositionSnapshot
-from src.models.history import HistoricalPrice
+from src.models.history import HistoricalPrice, StockSplit
 
 
 @pytest.fixture
@@ -93,9 +93,9 @@ def test_discover_symbols_skips_total_and_generated(session: Session) -> None:
 def test_persist_rows_inserts_and_skips_existing(session: Session) -> None:
     rows: list[HistoricalPriceRow] = [
         {"symbol": "SPY", "trade_date": date(2024, 6, 1), "close": Decimal("520.55"),
-         "open": None, "high": None, "low": None, "volume": None},
+         "adj_close": None, "open": None, "high": None, "low": None, "volume": None},
         {"symbol": "SPY", "trade_date": date(2024, 6, 2), "close": Decimal("521.10"),
-         "open": None, "high": None, "low": None, "volume": None},
+         "adj_close": None, "open": None, "high": None, "low": None, "volume": None},
     ]
     inserted, skipped = _persist_rows(session, rows)
     session.commit()
@@ -111,9 +111,9 @@ def test_persist_rows_inserts_and_skips_existing(session: Session) -> None:
 def test_backfill_uses_yfinance_adapter_and_persists(session: Session) -> None:
     fake_rows: list[HistoricalPriceRow] = [
         {"symbol": "SPY", "trade_date": date(2024, 6, 1), "close": Decimal("520.55"),
-         "open": None, "high": None, "low": None, "volume": None},
+         "adj_close": None, "open": None, "high": None, "low": None, "volume": None},
         {"symbol": "SPY", "trade_date": date(2024, 6, 2), "close": Decimal("521.10"),
-         "open": None, "high": None, "low": None, "volume": None},
+         "adj_close": None, "open": None, "high": None, "low": None, "volume": None},
     ]
     with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
         summary = backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30), dry_run=False)
@@ -126,7 +126,7 @@ def test_backfill_uses_yfinance_adapter_and_persists(session: Session) -> None:
 def test_backfill_dry_run_writes_nothing(session: Session) -> None:
     fake_rows: list[HistoricalPriceRow] = [
         {"symbol": "SPY", "trade_date": date(2024, 6, 1), "close": Decimal("520.55"),
-         "open": None, "high": None, "low": None, "volume": None},
+         "adj_close": None, "open": None, "high": None, "low": None, "volume": None},
     ]
     with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
         summary = backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30), dry_run=True)
@@ -225,3 +225,93 @@ def test_backfill_dry_run_does_not_write_ingestion_log(session: Session) -> None
     assert (
         session.query(IngestionLog).filter_by(source="yfinance_backfill").count() == 0
     )
+
+
+def test_new_rows_persist_adj_close(session: Session) -> None:
+    """REQ-FIX-WLT-001: adj_close on fetched rows is stored on insert."""
+    fake_rows: list[HistoricalPriceRow] = [
+        {"symbol": "SPY", "trade_date": date(2024, 6, 1), "close": Decimal("520.55"),
+         "adj_close": Decimal("518.20"),
+         "open": None, "high": None, "low": None, "volume": None},
+    ]
+    with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
+        backfill(session, ["SPY"], start=date(2024, 6, 1), end=date(2024, 6, 30),
+                 dry_run=False)
+
+    row = session.get(HistoricalPrice, ("SPY", date(2024, 6, 1)))
+    assert row is not None
+    assert row.close == Decimal("520.55")
+    assert row.adj_close == Decimal("518.20")
+
+
+def test_trailing_window_adj_close_refresh(session: Session) -> None:
+    """REQ-FIX-WLT-001: a pre-existing row inside the trailing window gets its
+    adj_close re-written from the fresh frame (ex-div restatement)."""
+    # Seed a row with a stale adj_close, dated 'today-ish' so it's in the window.
+    seed_day = date.today() - timedelta(days=3)
+    session.add(
+        HistoricalPrice(symbol="SPY", trade_date=seed_day, close=Decimal("500.00"),
+                        adj_close=Decimal("400.00"), source="yfinance")
+    )
+    session.commit()
+
+    fake_rows: list[HistoricalPriceRow] = [
+        {"symbol": "SPY", "trade_date": seed_day, "close": Decimal("500.00"),
+         "adj_close": Decimal("498.75"),  # restated
+         "open": None, "high": None, "low": None, "volume": None},
+    ]
+    with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
+        summary = backfill(session, ["SPY"], start=date(2024, 1, 1),
+                           end=date.today(), dry_run=False, refresh_adj_days=30)
+
+    session.expire_all()
+    row = session.get(HistoricalPrice, ("SPY", seed_day))
+    assert row is not None
+    assert row.adj_close == Decimal("498.75")  # refreshed, not the stale 400
+    assert row.close == Decimal("500.00")  # raw close untouched
+    assert summary["SPY"]["adj_refreshed"] == 1
+
+
+def test_backfill_writes_splits_when_fetcher_supplied(session: Session) -> None:
+    """REQ-FIX-WLT-002: nightly job upserts stock_split via the injected fetcher."""
+    fake_rows: list[HistoricalPriceRow] = [
+        {"symbol": "AAPL", "trade_date": date(2024, 6, 1), "close": Decimal("190.00"),
+         "adj_close": Decimal("188.00"),
+         "open": None, "high": None, "low": None, "volume": None},
+    ]
+    with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
+        summary = backfill(
+            session, ["AAPL"], start=date(2020, 1, 1), end=date(2024, 6, 30),
+            dry_run=False,
+            fetch_splits=lambda sym: [(date(2020, 8, 31), Decimal("4.000000"))],
+        )
+
+    split = session.get(StockSplit, ("AAPL", date(2020, 8, 31)))
+    assert split is not None
+    assert split.ratio == Decimal("4.000000")
+    assert summary["AAPL"]["splits_written"] == 1
+
+
+def test_dry_run_skips_adj_refresh_and_splits(session: Session) -> None:
+    """DRY-RUN must not refresh adj_close or write splits."""
+    seed_day = date.today() - timedelta(days=2)
+    session.add(
+        HistoricalPrice(symbol="AAPL", trade_date=seed_day, close=Decimal("190.00"),
+                        adj_close=Decimal("100.00"), source="yfinance")
+    )
+    session.commit()
+
+    fake_rows: list[HistoricalPriceRow] = [
+        {"symbol": "AAPL", "trade_date": seed_day, "close": Decimal("190.00"),
+         "adj_close": Decimal("188.00"),
+         "open": None, "high": None, "low": None, "volume": None},
+    ]
+    with patch("scripts.backfill_historical_prices.fetch_eod", return_value=fake_rows):
+        backfill(session, ["AAPL"], start=date(2020, 1, 1), end=date.today(),
+                 dry_run=True,
+                 fetch_splits=lambda sym: [(date(2020, 8, 31), Decimal("4"))])
+
+    session.expire_all()
+    row = session.get(HistoricalPrice, ("AAPL", seed_day))
+    assert row is not None and row.adj_close == Decimal("100.00")  # unchanged
+    assert session.query(StockSplit).count() == 0

@@ -34,38 +34,30 @@ from sqlalchemy import func
 from src.db.connection import SessionLocal, init_db
 from src.models.enums import TransactionStatus
 from src.models.transaction import Transaction
+from src.reports.pl_engine import compute_entity_pl, week_window
 
 
 def generate_report() -> str:
-    """Generate the 5-line weekly P&L summary."""
+    """Generate the 5-line weekly P&L summary.
+
+    REQ-FIX-API-003: revenue/expenses come from ``compute_entity_pl`` (all
+    entities combined, ``entity=None``) — the single source of truth shared
+    with the WBR/sellability/tax-forecast reports — over the exact
+    half-open ``[week_start, this_monday)`` 7-day window, regardless of
+    which day of the week this script runs on. Reimbursable pairs are
+    netted out of both sides; rejected/split_parent rows are excluded.
+    """
     init_db()
     session = SessionLocal()
 
     try:
         now = datetime.now()
-        # This week = last 7 days (or since Monday if today is Monday)
-        if now.weekday() == 0:  # Monday
-            week_start = (now - timedelta(days=7)).strftime("%Y-%m-%d")
-        else:
-            # Days since last Monday
-            days_back = now.weekday() + 7
-            week_start = (now - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        week_end = now.strftime("%Y-%m-%d")
+        week_start, week_end = week_window(now.date())
 
         # --- Revenue & Expenses (all entities, this week) ---
-        income = session.query(func.sum(func.abs(Transaction.amount))).filter(
-            Transaction.status != TransactionStatus.REJECTED.value,
-            Transaction.direction == "income",
-            Transaction.date >= week_start,
-            Transaction.date <= week_end,
-        ).scalar() or Decimal("0")
-
-        expenses = session.query(func.sum(func.abs(Transaction.amount))).filter(
-            Transaction.status != TransactionStatus.REJECTED.value,
-            Transaction.direction == "expense",
-            Transaction.date >= week_start,
-            Transaction.date <= week_end,
-        ).scalar() or Decimal("0")
+        pl = compute_entity_pl(session, week_start, week_end, entity=None)
+        income = pl.revenue
+        expenses = pl.expenses
 
         # --- AR Outstanding (sent/overdue invoices) ---
         try:
@@ -102,6 +94,7 @@ def generate_report() -> str:
                 func.count().label("txn_count"),
             ).filter(
                 Transaction.status != TransactionStatus.REJECTED.value,
+                Transaction.status != TransactionStatus.SPLIT_PARENT.value,
                 Transaction.direction == "expense",
                 Transaction.date >= three_months_ago,
                 ~Transaction.date.like(f"{current_month}%"),
@@ -116,6 +109,7 @@ def generate_report() -> str:
                 func.sum(func.abs(Transaction.amount)).label("total"),
             ).filter(
                 Transaction.status != TransactionStatus.REJECTED.value,
+                Transaction.status != TransactionStatus.SPLIT_PARENT.value,
                 Transaction.direction == "expense",
                 Transaction.date >= month_start,
             ).group_by(Transaction.description).all()
@@ -155,7 +149,10 @@ def generate_report() -> str:
             f"AR Outstanding: ${float(ar_total):,.2f}",
             f"Next deadline: {deadline_line}",
             f"Flag: {flag}",
-            f"Week of {week_start} to {week_end}",
+            # REQ-FIX-API-003: both bounds of the exact half-open window,
+            # explicit about end-exclusivity so the printed range is never
+            # ambiguous about whether week_end's date is included.
+            f"Week of {week_start} to {week_end} (exclusive)",
         ]
 
         # Append additional anomalies (beyond the first which is in the flag)

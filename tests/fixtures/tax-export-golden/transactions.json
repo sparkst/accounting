@@ -1,0 +1,137 @@
+{
+  "description": "REQ-FIX-TAX-002..007 frozen synthetic transaction set. One WA-taxed retail order (with tax_lines + shipping_address), one confirmed-out-of-state retail order, a Shopify refund (contra-revenue), a wholesale-income row, a split parent + two children, a rejected row, and a None-tax_subcategory 1099-B row. Regenerate expectations with regenerate.py after any intentional change to the export math; diff the printed values like code.",
+  "year": 2026,
+  "quarter": 1,
+  "transactions": [
+    {
+      "id": "order-wa-001",
+      "date": "2026-01-15",
+      "description": "Shopify Order #1001 — Sammamish",
+      "amount": "100.00",
+      "tax_category": "SALES_INCOME",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "income",
+      "source": "shopify",
+      "raw_data": {
+        "total_price": "100.00",
+        "total_tax": "9.30",
+        "shipping_address": {"province_code": "WA", "city": "Sammamish"},
+        "tax_lines": [
+          {"title": "Washington State Tax"},
+          {"title": "Sammamish City Tax"}
+        ]
+      }
+    },
+    {
+      "id": "order-oos-002",
+      "date": "2026-02-10",
+      "description": "Shopify Order #1002 — Oregon",
+      "amount": "250.00",
+      "tax_category": "SALES_INCOME",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "income",
+      "source": "shopify",
+      "raw_data": {
+        "total_price": "250.00",
+        "total_tax": "0.00",
+        "shipping_address": {"province_code": "OR", "city": "Portland"},
+        "tax_lines": []
+      }
+    },
+    {
+      "id": "refund-003",
+      "date": "2026-01-20",
+      "description": "Shopify Refund for #1001",
+      "amount": "-50.00",
+      "tax_category": "OTHER_EXPENSE",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "expense",
+      "source": "shopify",
+      "raw_data": {}
+    },
+    {
+      "id": "wholesale-004",
+      "date": "2026-03-05",
+      "description": "Wholesale order — Acme Bikes",
+      "amount": "2000.00",
+      "tax_category": "WHOLESALE_INCOME",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "income",
+      "source": "shopify",
+      "raw_data": {}
+    },
+    {
+      "id": "split-parent-005",
+      "date": "2026-01-25",
+      "description": "Hotel stay (split)",
+      "amount": "-500.00",
+      "tax_category": "TRAVEL",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "split_parent",
+      "direction": "expense",
+      "source": "gmail_n8n",
+      "raw_data": {}
+    },
+    {
+      "id": "split-child-006",
+      "date": "2026-01-25",
+      "description": "Hotel stay — lodging",
+      "amount": "-400.00",
+      "tax_category": "TRAVEL",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "expense",
+      "source": "gmail_n8n",
+      "raw_data": {}
+    },
+    {
+      "id": "split-child-007",
+      "date": "2026-01-25",
+      "description": "Hotel stay — meals",
+      "amount": "-100.00",
+      "tax_category": "MEALS",
+      "deductible_pct": "0.5",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "expense",
+      "source": "gmail_n8n",
+      "raw_data": {}
+    },
+    {
+      "id": "rejected-008",
+      "date": "2026-01-01",
+      "description": "Duplicate charge (rejected)",
+      "amount": "-999.00",
+      "tax_category": "SUPPLIES",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "rejected",
+      "direction": "expense",
+      "source": "gmail_n8n",
+      "raw_data": {}
+    },
+    {
+      "id": "brokerage-009",
+      "date": "2026-04-01",
+      "description": "Unknown-lot sale",
+      "amount": "1000.00",
+      "tax_category": "INVESTMENT_INCOME",
+      "deductible_pct": "1.0",
+      "tax_subcategory": null,
+      "status": "confirmed",
+      "direction": "income",
+      "source": "brokerage_csv",
+      "raw_data": {"proceeds": "1000.00", "cost_basis": "900.00"}
+    }
+  ]
+}

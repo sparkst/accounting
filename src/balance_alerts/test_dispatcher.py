@@ -97,6 +97,41 @@ def test_per_alert_error_isolation(
     assert summary.failed == 1
 
 
+def test_failed_policy_drift_row_swept_by_daily_dispatch(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-001-2: a failed monthly policy_drift alert is retried by the DAILY
+    balance-alerts sweep (same webhook), not stranded until next month."""
+    import json as _json
+
+    session.add(
+        AlertDispatch(
+            alert_key="policy:drift:2026-07",
+            occurrence_date="2026-06-13",
+            alert_type="policy_drift",
+            entity="personal",
+            subject="Concentration above glide line",
+            status="failed",
+            payload_json=_json.dumps({"severity": "info", "title": "drift"}),
+            delivery_channel="n8n_webhook",
+        )
+    )
+    session.commit()
+    monkeypatch.setattr(disp, "compute_balance_alerts", lambda today, s: [])
+
+    sent: list[str] = []
+
+    def _sweep_post(payload: dict[str, object]) -> WebhookResult:
+        sent.append(str(payload.get("title")))
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(disp, "_sweep_post", _sweep_post)
+    dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+    row = session.query(AlertDispatch).filter_by(alert_key="policy:drift:2026-07").one()
+    assert row.status == "sent"
+    assert sent == ["drift"]
+
+
 def test_earlier_committed_alert_survives_later_exception(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

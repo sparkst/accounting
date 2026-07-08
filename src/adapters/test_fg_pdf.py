@@ -35,6 +35,9 @@ from src.models.base import Base
 from src.models.brokerage import Account
 from src.models.history import AccountBalanceSnapshot
 from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
+)
 
 # Skip live-PDF tests when pdftotext isn't installed (e.g. some CI images).
 HAS_PDFTOTEXT = shutil.which("pdftotext") is not None
@@ -428,3 +431,30 @@ def test_import_pdf_annual_apply_writes_snapshot(
     logs = session.query(IngestionLog).all()
     assert len(logs) == 1
     assert logs[0].source == ADAPTER_NAME
+
+
+def test_import_pdf_annual_as_of_override_wins(
+    session: Session, tmp_path: Path
+) -> None:
+    """REQ-FIX-WLT-009: --as-of overrides the annual statement's embedded date."""
+    acct = Account(
+        broker=BROKER,
+        account_number="MZ152585",
+        account_type="other",
+        entity="personal",
+    )
+    session.add(acct)
+    session.commit()
+
+    pdf = tmp_path / "annual.pdf"
+    pdf.write_bytes(b"placeholder")
+
+    override = date(2026, 1, 15)
+    with patch("src.adapters.fg_pdf.pdftotext_layout", return_value=ANNUAL_TEXT_FIXTURE):
+        result = import_pdf(pdf, dry_run=False, session=session, as_of=override)
+
+    assert result.imported == 1
+    snap = session.query(AccountBalanceSnapshot).one()
+    # Override wins over the document's 05/01/2026.
+    assert snap.as_of == override
+    assert snap.balance == Decimal("660218.55")

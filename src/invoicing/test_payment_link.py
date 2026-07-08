@@ -22,6 +22,7 @@ def _make_invoice(
     total: Decimal = Decimal("3300.00"),
     payment_link_url: str | None = None,
     payment_link_id: str | None = None,
+    payment_link_amount: Decimal | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=id,
@@ -30,6 +31,7 @@ def _make_invoice(
         total=total,
         payment_link_url=payment_link_url,
         payment_link_id=payment_link_id,
+        payment_link_amount=payment_link_amount,
     )
 
 
@@ -97,18 +99,59 @@ class TestCreatePaymentLink:
         assert mock_stripe.Price.create.call_args.kwargs["unit_amount"] == 3300000
 
     def test_idempotent_reuse(self, mock_stripe):
-        """If payment link already exists on invoice, return it without calling Stripe."""
+        """If payment link already exists AND its recorded amount still
+        matches invoice.total, return it without calling Stripe."""
         inv = _make_invoice(
+            total=Decimal("3300.00"),
             payment_link_url="https://buy.stripe.com/existing",
             payment_link_id="plink_existing",
+            payment_link_amount=Decimal("3300.00"),
         )
         result = create_payment_link(inv)
 
         assert result.url == "https://buy.stripe.com/existing"
         assert result.link_id == "plink_existing"
+        assert result.amount == Decimal("3300.00")
         mock_stripe.Product.create.assert_not_called()
         mock_stripe.Price.create.assert_not_called()
         mock_stripe.PaymentLink.create.assert_not_called()
+
+    def test_reuse_with_mismatched_amount_recreates(self, mock_stripe):
+        """REQ-FIX-INV-002: reuse is only valid when payment_link_amount ==
+        invoice.total. If the total changed since the link was created (e.g.
+        a PATCH that didn't clear stale fields), a fresh link is minted
+        instead of blindly reusing a link for the wrong amount."""
+        mock_stripe.Product.create.return_value = SimpleNamespace(id="prod_new")
+        mock_stripe.Price.create.return_value = SimpleNamespace(id="price_new")
+        mock_stripe.PaymentLink.create.return_value = SimpleNamespace(
+            url="https://buy.stripe.com/fresh", id="plink_fresh"
+        )
+
+        inv = _make_invoice(
+            total=Decimal("5000.00"),
+            payment_link_url="https://buy.stripe.com/existing",
+            payment_link_id="plink_existing",
+            payment_link_amount=Decimal("3300.00"),  # stale — total changed
+        )
+        result = create_payment_link(inv)
+
+        assert result.url == "https://buy.stripe.com/fresh"
+        assert result.link_id == "plink_fresh"
+        assert result.amount == Decimal("5000.00")
+        mock_stripe.Product.create.assert_called_once()
+        mock_stripe.PaymentLink.create.assert_called_once()
+
+    def test_create_returns_amount(self, mock_stripe):
+        """A freshly created link's result carries the invoice total so the
+        route can persist all three fields atomically."""
+        mock_stripe.Product.create.return_value = SimpleNamespace(id="prod_a")
+        mock_stripe.Price.create.return_value = SimpleNamespace(id="price_a")
+        mock_stripe.PaymentLink.create.return_value = SimpleNamespace(
+            url="https://buy.stripe.com/a", id="plink_a"
+        )
+        inv = _make_invoice(total=Decimal("777.00"))
+        result = create_payment_link(inv)
+        assert result.amount == Decimal("777.00")
 
     def test_rejects_zero_amount(self, mock_stripe):
         """Zero total raises ValueError."""
@@ -161,6 +204,21 @@ class TestCreatePaymentLink:
 
         link_meta = mock_stripe.PaymentLink.create.call_args.kwargs["metadata"]
         assert link_meta == expected_metadata
+
+    def test_unit_amount_quantizes_never_truncates(self, mock_stripe):
+        """REQ-FIX-INV-005: unit_amount is derived via Decimal quantization
+        (ROUND_HALF_UP), never int() truncation. Regression value: a total
+        whose cents*100 lands exactly on .5 due to upstream float drift must
+        round, not truncate."""
+        mock_stripe.Product.create.return_value = SimpleNamespace(id="prod_q")
+        mock_stripe.Price.create.return_value = SimpleNamespace(id="price_q")
+        mock_stripe.PaymentLink.create.return_value = SimpleNamespace(
+            url="https://buy.stripe.com/q", id="plink_q"
+        )
+        # 199.995 * 100 = 19999.5 -> ROUND_HALF_UP -> 20000, never int()-truncated to 19999.
+        inv = _make_invoice(total=Decimal("199.995"))
+        create_payment_link(inv)
+        assert mock_stripe.Price.create.call_args.kwargs["unit_amount"] == 20000
 
     def test_payment_link_restrictions(self, mock_stripe):
         """PaymentLink.create is called with single-use restrictions."""

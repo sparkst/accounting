@@ -121,6 +121,14 @@
 				totals.set(c.tax_category, (totals.get(c.tax_category) ?? 0) + c.total);
 			}
 		}
+		// The monthly breakdown reports SALES_INCOME on the INCOME-TAX basis
+		// (pre-tax, INCLUDING out-of-state sales) so the Financials drill-down
+		// reconciles with annual line_items. For B&O the Retailing measure is
+		// wa_taxable (pre-tax, OOS deducted) — substitute the period-scoped
+		// retail detail's corrected basis when we have it.
+		if (retail && totals.has('SALES_INCOME')) {
+			totals.set('SALES_INCOME', retail.wa_taxable);
+		}
 		return [...totals.entries()]
 			.map(([tax_category, total]) => ({ tax_category, total }))
 			.sort((a, b) => a.tax_category.localeCompare(b.tax_category));

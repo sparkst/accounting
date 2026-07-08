@@ -522,6 +522,15 @@ class GmailN8nAdapter(BaseAdapter):
                 try:
                     self._process_file(json_path, session, result)
                 except Exception as exc:
+                    # REQ-FIX-ING-003: discard the poisoned partial file. Without
+                    # this rollback the session is left dirty/failed after a
+                    # mid-_process_file exception (which add/flushes before its
+                    # own commit), so every subsequent file in the batch fails
+                    # too. _process_file commits per successful file, so this
+                    # rollback discards exactly the failed file's partial
+                    # Transaction/IngestedFile rows — no FileStatus.ERROR row is
+                    # written, so a transient failure retries on the next run.
+                    session.rollback()
                     result.record_error(str(json_path), exc)
 
         return result
@@ -676,8 +685,13 @@ class GmailN8nAdapter(BaseAdapter):
             else:
                 # USD amount exists AND foreign currency found — store both for reference.
                 # Compute the implied exchange rate from the USD amount we already have.
+                # REQ-FIX-ING-002: exchange_rate is Numeric(18,8, asdecimal=True) —
+                # both operands must be Decimal (never float) or the assignment
+                # raises TypeError on every receipt carrying both a USD and a
+                # detected foreign amount. best.amount is already Decimal
+                # (CurrencyAmount.amount); amount is Decimal from extract_amount.
                 if best.amount > 0:
-                    exchange_rate = float(abs(amount)) / best.amount
+                    exchange_rate = (abs(amount) / best.amount).quantize(Decimal("1e-8"))
                     exchange_rate_source = "email_extracted"
 
         # Determine status: needs_review when amount could not be extracted.

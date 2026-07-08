@@ -818,3 +818,386 @@ class TestPlaidOwnedSkip:
         assert result.records_created >= 1, (
             "Rows for a non-Plaid-owned payment_method must be created"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests — REQ-FIX-ING-001: per-row savepoint isolation
+# ---------------------------------------------------------------------------
+
+
+class TestPerRowSavepointIsolation:
+    """REQ-FIX-ING-001: a poisoned row rolls back only itself via
+    ``session.begin_nested()``; prior rows in the batch survive and
+    ``records_created`` stays exact."""
+
+    def test_poisoned_row_does_not_wipe_prior_rows(self, session: Session):
+        csv_bytes = b"""Date,Description,Amount
+01/01/2025,Vendor One,-10.00
+01/02/2025,Vendor Two,-20.00
+01/03/2025,Vendor Three,-30.00
+01/04/2025,Vendor Four,-40.00
+01/05/2025,Vendor Five,-50.00
+"""
+        config = BankCsvConfig(
+            bank_name="test_savepoint",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        adapter = BankCsvAdapter(csv_bytes, config, filename="savepoint.csv", dry_run=False)
+
+        orig_add = session.add
+        state = {"tx_count": 0}
+
+        def flaky_add(obj: object) -> None:
+            if isinstance(obj, Transaction):
+                state["tx_count"] += 1
+                if state["tx_count"] == 3:
+                    raise ValueError("forced failure on row 3")
+            orig_add(obj)
+
+        session.add = flaky_add  # type: ignore[assignment]
+        try:
+            result = adapter.run(session)
+        finally:
+            session.add = orig_add  # type: ignore[method-assign]
+
+        assert result.records_created == 4, (
+            "4 of 5 rows should persist despite the forced failure on row 3"
+        )
+        assert result.records_failed == 1
+        # Prior rows (1, 2) and later rows (4, 5) are actually committed —
+        # the savepoint rollback for row 3 must not have wiped them.
+        persisted = session.query(Transaction).filter(Transaction.source == "bank_csv").all()
+        assert len(persisted) == 4
+        descriptions = {tx.description for tx in persisted}
+        assert descriptions == {"Vendor One", "Vendor Two", "Vendor Four", "Vendor Five"}
+
+    def test_dry_run_writes_nothing_even_with_poison(self, session: Session):
+        """Dry-run never touches the DB, regardless of any downstream row issues."""
+        adapter = BankCsvAdapter(CHASE_CSV, CHASE_CONFIG, filename="dry.csv", dry_run=True)
+        result = adapter.run(session)
+        assert session.query(Transaction).count() == 0
+        assert result.records_created == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests — REQ-FIX-ING-006: quantized dedup key + occurrence counter
+# ---------------------------------------------------------------------------
+
+
+class TestQuantizedDedupKey:
+    def test_rerendered_decimal_does_not_duplicate(self, session: Session):
+        """10.5 re-exported as 10.50 must hash identically (quantized to cents)."""
+        config = BankCsvConfig(
+            bank_name="test_quant",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        csv_v1 = b"Date,Description,Amount\n01/05/2025,Vendor Q,-10.5\n"
+        csv_v2 = b"Date,Description,Amount\n01/05/2025,Vendor Q,-10.50\n"
+
+        r1 = BankCsvAdapter(csv_v1, config, filename="q.csv", dry_run=False).run(session)
+        assert r1.records_created == 1
+
+        r2 = BankCsvAdapter(csv_v2, config, filename="q.csv", dry_run=False).run(session)
+        assert r2.records_created == 0
+        assert r2.records_skipped == 1
+
+    def test_identical_same_day_charges_both_import(self, session: Session):
+        """Two legitimate identical same-day charges get distinct occurrence
+        suffixes (:0, :1) and both import."""
+        config = BankCsvConfig(
+            bank_name="test_occurrence",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        csv_bytes = (
+            b"Date,Description,Amount\n"
+            b"01/05/2025,Coffee Shop,-5.00\n"
+            b"01/05/2025,Coffee Shop,-5.00\n"
+        )
+        result = BankCsvAdapter(csv_bytes, config, filename="dup.csv", dry_run=False).run(session)
+        assert result.records_created == 2
+        rows = (
+            session.query(Transaction)
+            .filter(Transaction.description == "Coffee Shop")
+            .all()
+        )
+        assert len(rows) == 2
+        # P3-102: assert behavior, not the source_id encoding — the two rows
+        # must be DISTINCT register entries, and a full re-import of the same
+        # file must match both (0 new), proving the disambiguation is stable.
+        assert rows[0].source_hash != rows[1].source_hash
+        rerun = BankCsvAdapter(
+            csv_bytes, config, filename="dup.csv", dry_run=False
+        ).run(session)
+        assert rerun.records_created == 0
+        assert rerun.records_skipped == 2
+
+    def test_full_reimport_is_idempotent_with_shuffled_order(self, session: Session):
+        """Re-importing the exact same file content (rows shuffled) produces 0
+        new rows — occurrence counters are content-keyed, not position-keyed."""
+        config = BankCsvConfig(
+            bank_name="test_shuffle",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        csv_v1 = (
+            b"Date,Description,Amount\n"
+            b"01/05/2025,Coffee Shop,-5.00\n"
+            b"01/05/2025,Coffee Shop,-5.00\n"
+            b"01/06/2025,Grocery,-40.00\n"
+        )
+        csv_v2 = (
+            b"Date,Description,Amount\n"
+            b"01/06/2025,Grocery,-40.00\n"
+            b"01/05/2025,Coffee Shop,-5.00\n"
+            b"01/05/2025,Coffee Shop,-5.00\n"
+        )
+        r1 = BankCsvAdapter(csv_v1, config, filename="shuffle.csv", dry_run=False).run(session)
+        assert r1.records_created == 3
+
+        r2 = BankCsvAdapter(csv_v2, config, filename="shuffle.csv", dry_run=False).run(session)
+        assert r2.records_created == 0
+        assert r2.records_skipped == 3
+
+    def test_legacy_hash_bridge_skips_occurrence_zero(self, session: Session):
+        """A pre-existing row written under the OLD (pre-ING-006) hash format —
+        unquantized amount, no occurrence suffix — is detected and skipped at
+        occurrence 0 without being rewritten."""
+        filename = "legacy.csv"
+        date = "2025-01-05"
+        amount = Decimal("-10.50")
+        desc = "legacy vendor"
+        legacy_source_id = f"{filename}:{date}:{amount}:{desc}"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+
+        legacy_tx = Transaction(
+            source="bank_csv",
+            source_id=legacy_source_id,
+            source_hash=legacy_hash,
+            date=date,
+            description="Legacy Vendor",
+            amount=amount,
+            currency="USD",
+            status=TransactionStatus.NEEDS_REVIEW.value,
+            confidence=0.0,
+            raw_data={},
+        )
+        session.add(legacy_tx)
+        session.commit()
+
+        config = BankCsvConfig(
+            bank_name="test_legacy",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        # Same content re-exported with the new adapter — quantized amount
+        # matches (10.50 == 10.5 quantized), description matches case-insensitively.
+        csv_bytes = b"Date,Description,Amount\n01/05/2025,Legacy Vendor,-10.50\n"
+        result = BankCsvAdapter(csv_bytes, config, filename=filename, dry_run=False).run(session)
+
+        assert result.records_created == 0
+        assert result.records_skipped == 1
+        # The legacy row itself is never rewritten.
+        still_there = (
+            session.query(Transaction).filter(Transaction.source_hash == legacy_hash).first()
+        )
+        assert still_there is not None
+        assert still_there.id == legacy_tx.id
+
+    def test_legacy_hash_bridge_matches_across_decimal_rendering(self, session: Session):
+        """P2-a1c / REQ-FIX-ING-006: a legacy row hashed from an UNQUANTIZED
+        1-decimal rendering ("-10.5") is still matched when the same
+        statement is re-imported with a 2-decimal rendering ("-10.50") — the
+        two strings are numerically identical but the OLD hash scheme was
+        never quantized, so a naive exact-string bridge would miss this and
+        silently duplicate the row."""
+        filename = "legacy_rendering.csv"
+        date = "2025-01-05"
+        # Legacy hash computed EXACTLY as the pre-ING-006 code did: raw,
+        # unquantized str(Decimal("-10.5")) == "-10.5" (1 decimal place).
+        legacy_amount = Decimal("-10.5")
+        desc = "legacy rendering vendor"
+        legacy_source_id = f"{filename}:{date}:{legacy_amount}:{desc}"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+
+        legacy_tx = Transaction(
+            source="bank_csv",
+            source_id=legacy_source_id,
+            source_hash=legacy_hash,
+            date=date,
+            description="Legacy Rendering Vendor",
+            amount=legacy_amount,
+            currency="USD",
+            status=TransactionStatus.NEEDS_REVIEW.value,
+            confidence=0.0,
+            raw_data={},
+        )
+        session.add(legacy_tx)
+        session.commit()
+
+        config = BankCsvConfig(
+            bank_name="test_legacy_rendering",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        # Re-imported statement renders the SAME amount with 2 decimal places.
+        csv_bytes = (
+            b"Date,Description,Amount\n01/05/2025,Legacy Rendering Vendor,-10.50\n"
+        )
+        result = BankCsvAdapter(
+            csv_bytes, config, filename=filename, dry_run=False
+        ).run(session)
+
+        assert result.records_created == 0
+        assert result.records_skipped == 1
+        # The legacy row itself is never rewritten.
+        still_there = (
+            session.query(Transaction).filter(Transaction.source_hash == legacy_hash).first()
+        )
+        assert still_there is not None
+        assert still_there.id == legacy_tx.id
+
+    def test_legacy_hash_bridge_matches_whole_dollar_rendering(self, session: Session):
+        """P3-101: the ZERO-decimal-place variant — a legacy row hashed from
+        str(Decimal("-10")) == "-10" (whole dollars) is matched, not
+        duplicated, when re-imported rendered as "-10.00"."""
+        filename = "legacy_whole_dollar.csv"
+        date = "2025-01-06"
+        legacy_amount = Decimal("-10")
+        desc = "legacy whole dollar vendor"
+        legacy_source_id = f"{filename}:{date}:{legacy_amount}:{desc}"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+
+        session.add(
+            Transaction(
+                source="bank_csv",
+                source_id=legacy_source_id,
+                source_hash=legacy_hash,
+                date=date,
+                description="Legacy Whole Dollar Vendor",
+                amount=legacy_amount,
+                currency="USD",
+                status=TransactionStatus.NEEDS_REVIEW.value,
+                confidence=0.0,
+                raw_data={},
+            )
+        )
+        session.commit()
+
+        config = BankCsvConfig(
+            bank_name="test_legacy_whole_dollar",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        csv_bytes = (
+            b"Date,Description,Amount\n01/06/2025,Legacy Whole Dollar Vendor,-10.00\n"
+        )
+        result = BankCsvAdapter(
+            csv_bytes, config, filename=filename, dry_run=False
+        ).run(session)
+
+        assert result.records_created == 0
+        assert result.records_skipped == 1
+
+    def test_legacy_hash_bridge_only_covers_occurrence_zero(self, session: Session):
+        """A second identical charge (occurrence 1) is NOT covered by the legacy
+        bridge (the legacy scheme could never have represented it) and imports."""
+        filename = "legacy2.csv"
+        date = "2025-01-05"
+        amount = Decimal("-10.50")
+        desc = "legacy vendor two"
+        legacy_source_id = f"{filename}:{date}:{amount}:{desc}"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+
+        session.add(
+            Transaction(
+                source="bank_csv",
+                source_id=legacy_source_id,
+                source_hash=legacy_hash,
+                date=date,
+                description="Legacy Vendor Two",
+                amount=amount,
+                currency="USD",
+                status=TransactionStatus.NEEDS_REVIEW.value,
+                confidence=0.0,
+                raw_data={},
+            )
+        )
+        session.commit()
+
+        config = BankCsvConfig(
+            bank_name="test_legacy2",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        csv_bytes = (
+            b"Date,Description,Amount\n"
+            b"01/05/2025,Legacy Vendor Two,-10.50\n"
+            b"01/05/2025,Legacy Vendor Two,-10.50\n"
+        )
+        result = BankCsvAdapter(csv_bytes, config, filename=filename, dry_run=False).run(session)
+
+        # occurrence 0 skipped via legacy bridge, occurrence 1 imports fresh.
+        assert result.records_created == 1
+        assert result.records_skipped == 1
+
+    def test_ing006_legacy_bridge_is_permanent_dual_lookup(self, session: Session):
+        """Regression lock (accepted tech debt): the skip predicate is
+        ``new_hash exists OR (occurrence == 0 AND legacy_hash exists)``. This
+        test pins BOTH branches independently so a future "simplification"
+        that drops either one fails loudly instead of silently reintroducing
+        duplicate-import risk on old rows."""
+        config = BankCsvConfig(
+            bank_name="test_dual_lookup",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+
+        # Branch 1: new-format hash exists (row already imported via new code).
+        csv_new = b"Date,Description,Amount\n01/05/2025,Branch One,-1.00\n"
+        r1 = BankCsvAdapter(csv_new, config, filename="dual.csv", dry_run=False).run(session)
+        assert r1.records_created == 1
+        r1b = BankCsvAdapter(csv_new, config, filename="dual.csv", dry_run=False).run(session)
+        assert r1b.records_created == 0, "branch 1 (new_hash exists) must skip"
+
+        # Branch 2: legacy-format hash exists at occurrence 0 only.
+        legacy_source_id = "dual2.csv:2025-01-06:-2.00:branch two"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+        session.add(
+            Transaction(
+                source="bank_csv",
+                source_id=legacy_source_id,
+                source_hash=legacy_hash,
+                date="2025-01-06",
+                description="Branch Two",
+                amount=Decimal("-2.00"),
+                currency="USD",
+                status=TransactionStatus.NEEDS_REVIEW.value,
+                confidence=0.0,
+                raw_data={},
+            )
+        )
+        session.commit()
+        csv_legacy = b"Date,Description,Amount\n01/06/2025,Branch Two,-2.00\n"
+        r2 = BankCsvAdapter(csv_legacy, config, filename="dual2.csv", dry_run=False).run(session)
+        assert r2.records_created == 0, "branch 2 (occurrence 0 legacy_hash exists) must skip"

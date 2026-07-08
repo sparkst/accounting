@@ -1,8 +1,9 @@
 """Classification engine — 3-tier orchestrator.
 
 Runs tiers in order: Tier 1 (vendor rules) → Tier 2 (structural patterns) →
-Tier 3 (LLM via Claude API). Stops at the first result with confidence >= 0.7.
-If no tier reaches the threshold the transaction is flagged needs_review.
+Tier 3 (LLM via Gemini API, ``gemini-2.5-flash-lite``). Stops at the first
+result with confidence >= 0.7. If no tier reaches the threshold the
+transaction is flagged needs_review.
 """
 
 from __future__ import annotations
@@ -78,14 +79,30 @@ _INCOME_TAX_CATEGORIES = frozenset({
 def _reconcile_sign(
     transaction: Transaction, result: ClassificationResult
 ) -> ClassificationResult:
-    """Veto income classification on an authoritative-signed outflow.
+    """Veto income/expense classifications that contradict an authoritative sign.
 
-    A Plaid/bank row with ``amount < 0`` is real money leaving the account, so
-    it can never be income. When a tier nonetheless labels it income (e.g. a
-    vendor keyword like "subscription" or "shopify" on a credit-card *charge*),
-    override to ``OTHER_EXPENSE`` and route to ``needs_review`` so a human picks
-    the real expense category — rather than silently inflating B&O gross via the
-    ``abs(amount)`` tax aggregation. Returns *result* unchanged when consistent.
+    A Plaid/bank row's stored amount sign is ground truth for cash direction.
+    Two mirror-image vetoes (REQ-FIX-ING-008):
+
+    - Outflow (``amount < 0``) classified income: real money left the
+      account, so it can never be income (e.g. a vendor keyword like
+      "subscription" or "shopify" on a credit-card *charge*). Override to
+      ``OTHER_EXPENSE`` and route to ``needs_review`` — the override is safe
+      because an outflow can never legitimately be income.
+    - Inflow (``amount >= 0``) classified expense: money arriving can never
+      be a real outflow. Route to ``needs_review`` WITHOUT overriding
+      category/direction — a positive-amount "expense" is usually a refund,
+      and whether the human wants it recorded as refund-income or a category
+      reversal is a genuine judgment call an automated override would get
+      wrong roughly half the time. This asymmetry (override vs. no-override)
+      is intentional.
+
+    The outflow-on-income veto does NOT explicitly gate on direction, so it can
+    override a TRANSFER or REIMBURSABLE row if assigned an income tax_category
+    (theoretical — reimbursables/transfers never get income categories in practice).
+    The inflow-on-expense veto preserves direction/category without override (kept
+    for human review).
+    Returns *result* unchanged when consistent with the authoritative sign.
     """
     if transaction.source not in _AUTHORITATIVE_SIGN_SOURCES:
         return result
@@ -96,33 +113,63 @@ def _reconcile_sign(
     except (InvalidOperation, ValueError):
         return result
 
-    is_income = (
+    # P3-b2e: transfer/reimbursable rows are EXPLICITLY exempt — the
+    # tax_category disjunct alone would otherwise let an income-category label
+    # on a transfer clobber its direction. The is_expense mirror branch below
+    # is direction-gated and needs no equivalent guard.
+    is_income = result.direction not in (
+        Direction.TRANSFER,
+        Direction.REIMBURSABLE,
+    ) and (
         result.direction == Direction.INCOME
         or result.tax_category in _INCOME_TAX_CATEGORIES
     )
-    if not (is_outflow and is_income):
-        return result
+    if is_outflow and is_income:
+        return replace(
+            result,
+            direction=Direction.EXPENSE,
+            tax_category=TaxCategory.OTHER_EXPENSE,
+            status=TransactionStatus.NEEDS_REVIEW,
+            deductible_pct=1.0,
+            review_reason=(
+                f"Sign/category mismatch: {transaction.source} amount "
+                f"{transaction.amount} is an outflow but was classified as income "
+                f"({result.tax_category.value}, tier {result.tier_used}). Overridden "
+                "to expense for review."
+            ),
+        )
 
-    return replace(
-        result,
-        direction=Direction.EXPENSE,
-        tax_category=TaxCategory.OTHER_EXPENSE,
-        status=TransactionStatus.NEEDS_REVIEW,
-        deductible_pct=1.0,
-        review_reason=(
-            f"Sign/category mismatch: {transaction.source} amount "
-            f"{transaction.amount} is an outflow but was classified as income "
-            f"({result.tax_category.value}, tier {result.tier_used}). Overridden "
-            "to expense for review."
-        ),
-    )
+    # REQ-FIX-ING-008: mirror veto — an authoritative-signed INFLOW classified
+    # as an expense is equally internally contradictory (a positive Plaid/
+    # bank amount can never be a real outflow). Unlike the income-on-outflow
+    # branch above, category/direction are NOT overridden here: a
+    # positive-amount "expense" is usually a refund, and whether the human
+    # wants it recorded as refund-income or a category reversal is a genuine
+    # judgment call an automated override would get wrong half the time.
+    # transfer/reimbursable directions are exempt in both branches (an
+    # inbound transfer or a reimbursement receipt is not a sign mismatch).
+    is_inflow = not is_outflow
+    is_expense = result.direction == Direction.EXPENSE
+    if is_inflow and is_expense:
+        return replace(
+            result,
+            status=TransactionStatus.NEEDS_REVIEW,
+            review_reason=(
+                f"Sign/category mismatch: {transaction.source} amount "
+                f"{transaction.amount} is an inflow but was classified as expense "
+                f"({result.tax_category.value}, tier {result.tier_used}) — likely "
+                "refund or misclassification; confirm."
+            ),
+        )
+
+    return result
 
 
 def classify(
     transaction: Transaction,
     session: Session,
     *,
-    anthropic_api_key: str | None = None,
+    llm_api_key: str | None = None,
 ) -> ClassificationResult:
     """Classify *transaction* using the 3-tier pipeline.
 
@@ -136,9 +183,14 @@ def classify(
             the result back to the model and committing.
         session: An open SQLAlchemy session used by Tier 1 to query
             VendorRule rows.
-        anthropic_api_key: Optional API key override for Tier 3. When *None*
-            the LLM classifier falls back to the ``ANTHROPIC_API_KEY``
-            environment variable.
+        llm_api_key: Optional API key override for Tier 3 (Gemini). When
+            *None* the LLM classifier falls back to the ``GEMINI_API_KEY``
+            environment variable. REQ-FIX-ING-010: renamed from
+            ``anthropic_api_key`` — Tier 3 is Gemini, and the old name let
+            callers accidentally inject an Anthropic key into
+            ``genai.Client(api_key=...)``, clobbering the correct
+            ``GEMINI_API_KEY`` env fallback. No back-compat shim — both
+            call sites are in-repo.
 
     Returns:
         A :class:`ClassificationResult` populated by whichever tier succeeded.
@@ -165,7 +217,7 @@ def classify(
         return _reconcile_sign(transaction, tier2)
 
     # ── Tier 3: LLM classification ──────────────────────────────────────────
-    tier3 = _llm_mod.llm_classify(transaction, api_key=anthropic_api_key, _session=session)
+    tier3 = _llm_mod.llm_classify(transaction, api_key=llm_api_key, _session=session)
     if tier3.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier3.tier_used = 3
         tier3.status = TransactionStatus.AUTO_CLASSIFIED

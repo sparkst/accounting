@@ -44,6 +44,7 @@ import contextlib
 import logging
 import re
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,53 @@ _POS_REQUIRED_COLS = {"Symbol", "Quantity", "Last Price $"}
 # an optional "**" suffix that some E*TRADE exports use for footnoted symbols),
 # so any "symbol" cell that doesn't match this shape is treated as metadata.
 _TICKER_RE = re.compile(r"^[A-Z0-9]{1,5}([.-][A-Z0-9]{1,3})?(\*\*)?$")
+
+# REQ-FIX-WLT-003: the trailing footer row stamps the export time, e.g.
+# "Generated at May 4 2026 02:47 PM ET". We parse the month-name + day + year
+# out of it to derive the snapshot `as_of` (priority 2 in the ladder) — a
+# dateutil-free parse using an explicit month-name map.
+_GENERATED_AT_RE = re.compile(
+    r"Generated at\s+([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})",
+    re.IGNORECASE,
+)
+_MONTH_NAMES: dict[str, int] = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+
+def parse_generated_at_date(rows: list[list[str]]) -> date | None:
+    """Scan raw CSV rows for a ``Generated at <Month> <day> <year> ...`` footer.
+
+    Returns the parsed :class:`date` from the first matching cell, or ``None``
+    if no footer row is present or the month name is unrecognized. Used as
+    priority-2 of the E*TRADE ``as_of`` derivation ladder (REQ-FIX-WLT-003).
+    """
+    for row in rows:
+        for cell in row:
+            if not cell or "generated at" not in cell.lower():
+                continue
+            m = _GENERATED_AT_RE.search(cell)
+            if m is None:
+                continue
+            month = _MONTH_NAMES.get(m.group(1).lower())
+            if month is None:
+                continue
+            try:
+                return date(int(m.group(3)), month, int(m.group(2)))
+            except ValueError:
+                continue
+    return None
 
 # Action mapping (case-sensitive — E*TRADE strings are stable)
 _ACTION_MAP: dict[str, str] = {
@@ -200,8 +248,13 @@ class EtradeCsvAdapter(BaseAdapter):
     PositionSnapshot. Idempotent via (account_id, source_row_hash) UNIQUE.
     """
 
-    def __init__(self, folder: Path | str) -> None:
+    def __init__(
+        self, folder: Path | str, *, as_of_override: date | None = None
+    ) -> None:
         self.folder = Path(folder)
+        # REQ-FIX-WLT-003: optional CLI ``--as-of`` override (priority 1 of the
+        # position-snapshot as_of derivation ladder).
+        self.as_of_override = as_of_override
 
     @property
     def source(self) -> str:
@@ -325,6 +378,33 @@ class EtradeCsvAdapter(BaseAdapter):
     # Positions
     # ----------------------------------------------------------------------
 
+    def _resolve_positions_as_of(
+        self, rows: list[list[str]], path: Path
+    ) -> tuple[datetime, str]:
+        """Derive the positions snapshot ``as_of`` and its provenance label.
+
+        Priority ladder (REQ-FIX-WLT-003):
+            1. ``--as-of`` CLI override            → source "cli"
+            2. embedded "Generated at ..." footer  → source "embedded"
+            3. file mtime (UTC date)               → source "mtime"
+
+        Returns a naive ``datetime`` (midnight of the derived date) so the
+        value round-trips through the ``DateTime`` column, plus the provenance
+        string recorded in ``raw_data["as_of_source"]``.
+        """
+        if self.as_of_override is not None:
+            return datetime.combine(self.as_of_override, datetime.min.time()), "cli"
+
+        embedded = parse_generated_at_date(rows)
+        if embedded is not None:
+            return datetime.combine(embedded, datetime.min.time()), "embedded"
+
+        try:
+            mtime_date = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).date()
+        except OSError:
+            mtime_date = datetime.now(UTC).date()
+        return datetime.combine(mtime_date, datetime.min.time()), "mtime"
+
     def _process_positions(
         self, session: Session, result: AdapterResult, account: Account
     ) -> None:
@@ -347,12 +427,15 @@ class EtradeCsvAdapter(BaseAdapter):
         col = {name.strip(): i for i, name in enumerate(header)}
         data_rows = rows[header_index + 1 :]
 
-        # As-of date: positions file does not stamp a date; use today (UTC).
-        # NOTE: as_of is stored for display/querying but NOT included in the
-        # dedup hash — it changes every day and would break idempotency.
-        from datetime import UTC, datetime
-
-        as_of = datetime.now(UTC).replace(tzinfo=None)
+        # As-of date derivation (REQ-FIX-WLT-003), highest priority first:
+        #   1. CLI --as-of override (self.as_of_override)
+        #   2. embedded "Generated at <Month> <day> <year>" footer row
+        #   3. file mtime (UTC date) — NOT datetime.now, so a re-import of the
+        #      same export is idempotent and a fresh export on a new day writes
+        #      a new snapshot.
+        # as_of is now date-quantized INTO the dedup hash, so intra-day
+        # re-imports stay idempotent while a next-day export inserts fresh rows.
+        as_of, as_of_source = self._resolve_positions_as_of(rows, path)
 
         def _cell(row: list[str], name: str) -> str | None:
             """Defensive column lookup — returns None if the row is shorter
@@ -385,12 +468,22 @@ class EtradeCsvAdapter(BaseAdapter):
                 avg_cost = parse_currency(_cell(row, "Price Paid $"))
                 total_gain = parse_currency(_cell(row, "Total Gain $"))
 
+                # REQ-FIX-WLT-003: derive cost_basis = avg_cost × quantity when
+                # both are present (E*TRADE ships avg cost + qty but no total
+                # basis); quantize to cents. Else leave None.
+                cost_basis: Decimal | None = None
+                if avg_cost is not None and quantity is not None:
+                    cost_basis = (avg_cost * quantity).quantize(Decimal("0.01"))
+
                 row_hash = compute_position_row_hash(
                     broker=Broker.ETRADE.value,
                     account_number=account.account_number,
                     source_file=path.name,
                     row_index=row_index,
-                    as_of_iso="",  # mtime-derived date excluded from hash for idempotency
+                    # REQ-FIX-WLT-003: date-quantized as_of in the hash so a
+                    # fresh export on a new date writes a fresh snapshot while
+                    # intra-day re-imports stay idempotent.
+                    as_of_iso=as_of.date().isoformat(),
                     symbol=symbol,
                     quantity=quantity,
                 )
@@ -417,12 +510,16 @@ class EtradeCsvAdapter(BaseAdapter):
                     quantity=quantity,
                     price=price,
                     market_value=market_value,
-                    cost_basis=None,
+                    cost_basis=cost_basis,
                     avg_cost_basis=avg_cost,
                     unrealized_gain=total_gain,
                     source_file=path.name,
                     source_row_hash=row_hash,
-                    raw_data={"row": row, "header": header},
+                    raw_data={
+                        "row": row,
+                        "header": header,
+                        "as_of_source": as_of_source,
+                    },
                 )
                 session.add(pos)
                 result.records_created += 1
@@ -675,4 +772,5 @@ __all__ = [
     "EtradeCsvAdapter",
     "map_action",
     "parse_account_line",
+    "parse_generated_at_date",
 ]

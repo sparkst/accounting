@@ -42,7 +42,7 @@ from typing import Literal
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.ingestion import write_cloud_ingestion_log, write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.pdf import pdftotext_layout
 from src.adapters._shared.result import BaseImportResult
@@ -63,6 +63,8 @@ ADAPTER_NAME = "fg_pdf"
 
 # Cloud target — uses the xlsx-snapshot ingest path (AccountBalanceSnapshot rows).
 _CLOUD_INGEST_SOURCE = "xlsx-snapshot"
+_CLOUD_LOG_SOURCE = "wealth_cloud:fg_pdf"
+"""``ingestion_log.source`` for the cloud-push path (REQ-FIX-WLT-007)."""
 
 
 def _default_target() -> str:
@@ -374,10 +376,16 @@ def import_pdf_cloud(
     path: Path,
     *,
     as_of: date | None = None,
+    session: Session | None = None,
 ) -> ImportResult:
     """Parse an F&G PDF and POST one AccountBalanceSnapshot row to Workers.
 
     Amount sign convention: balance is a positive monetary value (asset value).
+
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
     """
     result = ImportResult()
 
@@ -385,6 +393,7 @@ def import_pdf_cloud(
         text = pdftotext_layout(path)
     except (FileNotFoundError, RuntimeError) as exc:
         result.errors.append(f"{path.name}: pdftotext failed: {exc}")
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     fallback = as_of or _file_mtime_date(path)
@@ -399,6 +408,7 @@ def import_pdf_cloud(
             contract, snap_as_of, balance = extract_portal_screen(text, fallback)
     except ValueError as exc:
         result.errors.append(f"{path.name}: {exc}")
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     raw_account_name = f"F&G Annuity {contract}"
@@ -423,6 +433,7 @@ def import_pdf_cloud(
             "fg_pdf cloud POST error: %s — %s", label, type(exc).__name__,
         )
 
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
     return result
 
 
@@ -501,7 +512,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if target == "cloud":
-        result = import_pdf_cloud(path, as_of=as_of)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = import_pdf_cloud(path, as_of=as_of, session=None)
+        else:
+            with get_session() as session:
+                result = import_pdf_cloud(path, as_of=as_of, session=session)
         _print_summary(result, dry_run=False)
         return 1 if result.errors else 0
 

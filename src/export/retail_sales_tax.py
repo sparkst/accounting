@@ -23,47 +23,32 @@ from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-# Income categories that are retail sales (Retailing B&O classification).
-RETAIL_CATEGORIES = {"SALES_INCOME"}
+# REQ-FIX-TAX-002: retail_facts/RetailFacts/WA_LOCATION_CODES/UNKNOWN_WA_LOCATION/
+# RETAIL_CATEGORIES moved to src/export/basis.py (the canonical amount-computation
+# module every export surface imports from). Re-exported here verbatim for
+# backward compatibility — existing callers of
+# ``from src.export.retail_sales_tax import retail_facts`` are unaffected.
+from src.export.basis import (
+    RETAIL_CATEGORIES as RETAIL_CATEGORIES,
+)
+from src.export.basis import (
+    UNKNOWN_WA_LOCATION as UNKNOWN_WA_LOCATION,
+)
+from src.export.basis import (
+    WA_LOCATION_CODES as WA_LOCATION_CODES,
+)
+from src.export.basis import (
+    RetailFacts as RetailFacts,
+)
+from src.export.basis import (
+    retail_facts as retail_facts,
+)
 
 RETAILING_BO_RATE = Decimal("0.00471")
-
-# Normalized locality (lowercased tax-line city, "city tax" stripped) → (code, name).
-# Authoritative WA DOR Q2 2026 Local Sales & Use Tax Rates table.
-WA_LOCATION_CODES: dict[str, tuple[str, str]] = {
-    "issaquah": ("1714", "Issaquah"),
-    "kirkland": ("1716", "Kirkland"),
-    "maple valley": ("1720", "Maple Valley"),
-    "sammamish": ("1739", "Sammamish"),
-    "king county unincorp.": ("1700", "King County Unincorp."),
-}
-# Fallback when a WA sale's locality can't be mapped to a known city code.
-UNKNOWN_WA_LOCATION = ("____", "WA — unmapped locality")
-
-
-def _to_decimal(value: Any) -> Decimal:
-    if value is None:
-        return Decimal("0")
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return Decimal("0")
 
 
 def _q2(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
-@dataclass
-class RetailFacts:
-    """Per-transaction retail facts derived from a Shopify order dict."""
-
-    pretax: Decimal
-    sales_tax: Decimal
-    is_wa: bool
-    is_confirmed_oos: bool  # destination known AND outside WA
-    location_code: str
-    location_name: str
 
 
 @dataclass
@@ -82,62 +67,6 @@ class RetailDetail:
     retailing_bo: Decimal  # wa_taxable * retailing rate
     sales_tax_collected: Decimal  # total WA retail sales tax collected (to remit)
     by_location: list[LocationLine] = field(default_factory=list)
-
-
-def _city_locality(raw: dict[str, Any]) -> str | None:
-    """Return the normalized city locality from the order's city tax line."""
-    for tl in raw.get("tax_lines") or []:
-        title = str(tl.get("title") or "")
-        low = title.lower()
-        if "washington state tax" in low or "state tax" in low:
-            continue
-        # "Sammamish City Tax" -> "sammamish"; "... County Tax" handled too.
-        loc = low.replace("city tax", "").replace("county tax", "").replace("tax", "").strip()
-        if loc:
-            return loc
-    return None
-
-
-def retail_facts(tx: dict[str, Any]) -> RetailFacts:
-    """Extract pre-tax amount, collected tax, WA flag, and location code."""
-    raw = tx.get("raw_data") or {}
-    total_price = _to_decimal(raw.get("total_price"))
-    if total_price == 0:
-        total_price = _to_decimal(tx.get("amount"))
-    sales_tax = _to_decimal(raw.get("total_tax"))
-    pretax = _q2(total_price - sales_tax)
-
-    tax_lines = raw.get("tax_lines") or []
-    has_wa_state_line = any(
-        "washington" in str(tl.get("title") or "").lower() for tl in tax_lines
-    )
-    ship = raw.get("shipping_address") or {}
-    bill = raw.get("billing_address") or {}
-    state = (ship.get("province_code") or bill.get("province_code") or "").upper()
-    is_wa = has_wa_state_line or state == "WA"
-    # Only deduct sales we can SUBSTANTIATE as out-of-state. Unknown-destination
-    # sales (e.g. Stripe charges with no ship address) stay WA-taxable — never
-    # claim an interstate deduction we can't prove (that would under-pay B&O).
-    is_confirmed_oos = (not is_wa) and state != "" and state != "WA"
-
-    location_code, location_name = "", ""
-    if is_wa:
-        loc = _city_locality(raw)
-        if loc and loc in WA_LOCATION_CODES:
-            location_code, location_name = WA_LOCATION_CODES[loc]
-        elif loc:
-            location_code, location_name = UNKNOWN_WA_LOCATION[0], f"WA — {loc.title()}"
-        else:
-            location_code, location_name = UNKNOWN_WA_LOCATION
-
-    return RetailFacts(
-        pretax=pretax,
-        sales_tax=_q2(sales_tax),
-        is_wa=is_wa,
-        is_confirmed_oos=is_confirmed_oos,
-        location_code=location_code,
-        location_name=location_name,
-    )
 
 
 def _period_months(month: int | None, quarter: int | None) -> set[int]:

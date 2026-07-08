@@ -40,7 +40,7 @@ import openpyxl
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.ingestion import write_cloud_ingestion_log, write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
 from src.adapters._shared.result import BaseImportResult
 from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
@@ -65,6 +65,8 @@ NW_MUTUAL_BROKER = Broker.NW_MUTUAL.value
 # Cloud target — uses the xlsx-snapshot ingest path (AccountBalanceSnapshot rows).
 _CLOUD_INGEST_SOURCE = "xlsx-snapshot"
 _CLOUD_BATCH_SIZE = 100
+_CLOUD_LOG_SOURCE = "wealth_cloud:nw_mutual_xlsx"
+"""``ingestion_log.source`` for the cloud-push path (REQ-FIX-WLT-007)."""
 
 
 def _default_target() -> str:
@@ -342,11 +344,17 @@ def import_balances_cloud(
     path: Path,
     *,
     as_of: date | None = None,
+    session: Session | None = None,
 ) -> ImportResult:
     """Parse NW Mutual XLSX and POST balance-snapshot rows to Workers.
 
     Amount sign convention: balance (net_accum_value) is a positive monetary
     value (whole-life cash value). N/A policies are still skipped (warnings).
+
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
     """
     result = ImportResult()
     path = Path(path)
@@ -356,12 +364,14 @@ def import_balances_cloud(
             as_of = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).date()
         except OSError as exc:
             result.errors.append(f"stat failed for {path.name}: {exc}")
+            write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
             return result
 
     try:
         rows = parse_workbook(path)
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"parse_workbook failed: {exc}")
+        write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
         return result
 
     result.parsed = len(rows)
@@ -414,6 +424,7 @@ def import_balances_cloud(
                     type(exc).__name__,
                 )
 
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE, result=result)
     return result
 
 
@@ -495,7 +506,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if target == "cloud":
-        result = import_balances_cloud(file_path, as_of=as_of)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = import_balances_cloud(file_path, as_of=as_of, session=None)
+        else:
+            with get_session() as session:
+                result = import_balances_cloud(file_path, as_of=as_of, session=session)
         _print_summary(result, dry_run=False)
         return 1 if result.errors else 0
 

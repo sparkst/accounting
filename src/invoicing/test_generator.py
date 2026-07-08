@@ -271,6 +271,69 @@ class TestGenerateCalendarInvoice:
         assert invoice is not None
         assert invoice.subtotal == decimal.Decimal("300.00")
 
+    def test_fractional_hours_line_total_quantized_to_cents(
+        self, db: Session, hourly_customer: Customer
+    ):
+        """REQ-FIX-INV-005: 1.333h * $150 = $199.95 exact — quantized at
+        generation, not left with sub-cent residue."""
+        sessions = _sessions(("2026-03-05", "Fractional sync", 1.333))
+        invoice = generate_calendar_invoice(db, hourly_customer, sessions, rate=150.0)
+        db.commit()
+        assert invoice is not None
+
+        line_items = (
+            db.query(InvoiceLineItem)
+            .filter(InvoiceLineItem.invoice_id == invoice.id)
+            .all()
+        )
+        assert line_items[0].total_price == decimal.Decimal("199.95")
+        assert invoice.subtotal == decimal.Decimal("199.95")
+        assert invoice.total == decimal.Decimal("199.95")
+
+    def test_half_cent_rounds_up_not_to_even(
+        self, db: Session, hourly_customer: Customer
+    ):
+        """Regression: 1.75h * $220.98 = $386.7150 raw — exactly a half-cent.
+        SQLite's own NUMERIC column affinity rounds half-cents to EVEN
+        ($386.71, since 1 is odd it rounds down... in practice it disagrees
+        with ROUND_HALF_UP), which is why quantization must happen in
+        application code (Decimal.quantize(ROUND_HALF_UP)) at generation
+        time — never left to implicit DB/column coercion. Correct: $386.72."""
+        sessions = _sessions(("2026-03-05", "Half-cent sync", 1.75))
+        invoice = generate_calendar_invoice(db, hourly_customer, sessions, rate=220.98)
+        db.commit()
+        assert invoice is not None
+
+        line_items = (
+            db.query(InvoiceLineItem)
+            .filter(InvoiceLineItem.invoice_id == invoice.id)
+            .all()
+        )
+        raw_product = decimal.Decimal("1.75") * decimal.Decimal("220.98")
+        assert raw_product == decimal.Decimal("386.7150")  # sanity: genuinely a half-cent
+        assert line_items[0].total_price == decimal.Decimal("386.72")
+        assert invoice.subtotal == decimal.Decimal("386.72")
+
+    def test_subtotal_equals_sum_of_quantized_line_items(
+        self, db: Session, hourly_customer: Customer
+    ):
+        """Subtotal is exact by construction: Σ of already-quantized lines."""
+        sessions = _sessions(
+            ("2026-03-05", "A", 1.75),
+            ("2026-03-06", "B", 1.9),
+        )
+        invoice = generate_calendar_invoice(db, hourly_customer, sessions, rate=220.98)
+        db.commit()
+        assert invoice is not None
+
+        line_items = (
+            db.query(InvoiceLineItem)
+            .filter(InvoiceLineItem.invoice_id == invoice.id)
+            .all()
+        )
+        summed = sum((li.total_price for li in line_items), decimal.Decimal("0"))
+        assert invoice.subtotal == summed
+
     def test_service_period_covers_session_range(self, db: Session, hourly_customer: Customer):
         sessions = _sessions(
             ("2026-03-05", "Sync A", 1.0),

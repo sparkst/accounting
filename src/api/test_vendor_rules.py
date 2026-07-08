@@ -355,3 +355,85 @@ def test_delete_vendor_rule_not_found(client: TestClient) -> None:
     """REQ-ID: VR-TEST-010 — DELETE returns 404 for unknown rule."""
     resp = client.delete("/api/vendor-rules/no-such-id")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Tests — REQ-FIX-ING-005: is_regex field + write-time validation
+# ---------------------------------------------------------------------------
+
+
+def test_create_vendor_rule_defaults_is_regex_false(client: TestClient) -> None:
+    payload = {
+        "vendor_pattern": "Anthropic PBC",
+        "entity": "sparkry",
+        "tax_category": "OFFICE_EXPENSE",
+        "direction": "expense",
+    }
+    resp = client.post("/api/vendor-rules", json=payload)
+    assert resp.status_code == 201
+    assert resp.json()["is_regex"] is False
+
+
+def test_create_vendor_rule_valid_regex_accepted(client: TestClient) -> None:
+    payload = {
+        "vendor_pattern": r"amazon.*aws|aws\.amazon",
+        "is_regex": True,
+        "entity": "sparkry",
+        "tax_category": "SUPPLIES",
+        "direction": "expense",
+    }
+    resp = client.post("/api/vendor-rules", json=payload)
+    assert resp.status_code == 201
+    assert resp.json()["is_regex"] is True
+
+
+def test_create_vendor_rule_invalid_regex_returns_422(client: TestClient) -> None:
+    payload = {
+        "vendor_pattern": r"amazon(unclosed",
+        "is_regex": True,
+        "entity": "sparkry",
+        "tax_category": "SUPPLIES",
+        "direction": "expense",
+    }
+    resp = client.post("/api/vendor-rules", json=payload)
+    assert resp.status_code == 422
+
+
+def test_create_vendor_rule_invalid_regex_but_not_flagged_is_ok(client: TestClient) -> None:
+    """A literal (is_regex=False, the default) pattern is never regex-validated
+    — any string is a valid literal, even one containing '(' or '.'."""
+    payload = {
+        "vendor_pattern": "A.B Corp (West)",
+        "entity": "sparkry",
+        "tax_category": "SUPPLIES",
+        "direction": "expense",
+    }
+    resp = client.post("/api/vendor-rules", json=payload)
+    assert resp.status_code == 201
+    assert resp.json()["is_regex"] is False
+
+
+def test_patch_is_regex_true_validates_existing_pattern(client: TestClient) -> None:
+    """Flipping is_regex=true on PATCH validates the rule's EXISTING pattern,
+    even when vendor_pattern itself isn't part of this PATCH body."""
+    with _TestSession() as session:
+        rule = _make_rule(session, pattern="amazon(unclosed")
+        rule_id = rule.id
+
+    resp = client.patch(f"/api/vendor-rules/{rule_id}", json={"is_regex": True})
+    assert resp.status_code == 422
+
+
+def test_patch_new_pattern_validated_against_existing_is_regex(client: TestClient) -> None:
+    """PATCHing vendor_pattern on a rule that is already is_regex=true
+    validates the NEW pattern."""
+    with _TestSession() as session:
+        rule = _make_rule(session, pattern="amazon")
+        rule.is_regex = True
+        session.commit()
+        rule_id = rule.id
+
+    resp = client.patch(
+        f"/api/vendor-rules/{rule_id}", json={"vendor_pattern": "amazon(unclosed"}
+    )
+    assert resp.status_code == 422

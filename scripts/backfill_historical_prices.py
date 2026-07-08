@@ -32,6 +32,12 @@ from sqlalchemy import select  # noqa: E402
 from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
+from scripts.backfill_adjusted_closes import (  # noqa: E402
+    FetchSplits,
+    default_fetch_splits,
+    refresh_adj_close_for_symbol,
+    refresh_splits_for_symbol,
+)
 from src.adapters.yfinance_prices import HistoricalPriceRow, fetch_eod  # noqa: E402
 from src.db.connection import SessionLocal  # noqa: E402
 from src.models.brokerage import BrokerageTransaction, PositionSnapshot  # noqa: E402
@@ -89,6 +95,9 @@ def _persist_rows(
                         symbol=row["symbol"],
                         trade_date=row["trade_date"],
                         close=row["close"],
+                        # REQ-FIX-WLT-001: persist the total-return adjusted close
+                        # for new rows going forward (None when the frame lacked it).
+                        adj_close=row.get("adj_close"),
                         open=row["open"],
                         high=row["high"],
                         low=row["low"],
@@ -109,6 +118,8 @@ def backfill(
     end: date,
     *,
     dry_run: bool = True,
+    fetch_splits: FetchSplits | None = None,
+    refresh_adj_days: int = 30,
 ) -> dict[str, dict[str, int]]:
     """Fetch and persist historical prices. Returns per-symbol summary.
 
@@ -116,8 +127,19 @@ def backfill(
     pass ``dry_run=False`` to write. On apply runs, writes one IngestionLog
     audit row regardless of caller (CLI or library), and isolates yfinance
     failures per-symbol so one bad ticker can't kill the whole batch.
+
+    REQ-FIX-WLT-001/-002 go-forward maintenance (apply runs only):
+    - new rows persist ``adj_close`` (via ``_persist_rows``);
+    - the trailing ``refresh_adj_days`` window of ``adj_close`` per symbol is
+      re-written from the fetched frame to capture Yahoo's ex-dividend
+      restatements without a full re-pull;
+    - when ``fetch_splits`` is supplied, ``stock_split`` is upserted from the
+      real splits API. ``fetch_splits`` defaults to ``None`` so library callers
+      (tests) never touch the network unless they opt in; the CLI wires in the
+      real fetcher.
     """
     apply = not dry_run
+    refresh_cutoff = end - timedelta(days=refresh_adj_days)
     summary: dict[str, dict[str, int]] = {}
     failed_symbols: list[str] = []
     for symbol in sorted(symbols):
@@ -128,6 +150,8 @@ def backfill(
             "new": 0,
             "inserted": 0,
             "skipped": 0,
+            "adj_refreshed": 0,
+            "splits_written": 0,
             "errored": 0,
         }
         try:
@@ -147,6 +171,25 @@ def backfill(
             inserted, skipped = _persist_rows(session, new_rows)
             per_symbol["inserted"] = inserted
             per_symbol["skipped"] = skipped
+
+        if apply:
+            # Refresh adj_close on the trailing window (already-present rows —
+            # freshly inserted rows already carry adj_close).
+            trailing = [r for r in all_rows if r["trade_date"] >= refresh_cutoff]
+            if trailing:
+                per_symbol["adj_refreshed"] = refresh_adj_close_for_symbol(
+                    session, symbol, trailing, dry_run=False
+                )
+            if fetch_splits is not None:
+                try:
+                    splits = fetch_splits(symbol)
+                    per_symbol["splits_written"] = refresh_splits_for_symbol(
+                        session, symbol, splits, dry_run=False
+                    )
+                except Exception as exc:  # noqa: BLE001 — per-symbol isolation
+                    logger.warning("backfill: splits fetch failed for %s: %s", symbol, exc)
+                    per_symbol["errored"] = 1
+
         summary[symbol] = per_symbol
         logger.info(
             "%s: fetched=%d already=%d new=%d inserted=%d",
@@ -245,8 +288,14 @@ def main() -> int:
         print(f"{'APPLY' if args.apply else 'DRY-RUN'}: backfilling {len(symbols)} symbols "
               f"from {start} to {end}")
         # backfill() handles its own IngestionLog write on apply runs.
+        # Wire in the real splits fetcher (network) only for the CLI path.
         summary = backfill(
-            session, symbols, start=start, end=end, dry_run=not args.apply
+            session,
+            symbols,
+            start=start,
+            end=end,
+            dry_run=not args.apply,
+            fetch_splits=default_fetch_splits,
         )
 
         total_inserted = sum(s["inserted"] for s in summary.values())

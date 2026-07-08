@@ -30,6 +30,7 @@ import contextlib
 import decimal
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import ROUND_HALF_UP
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -37,6 +38,12 @@ from sqlalchemy.orm import Session
 from src.models.audit_event import AuditEvent
 from src.models.enums import ConfirmedBy, Entity, InvoiceStatus
 from src.models.invoice import Customer, Invoice, InvoiceLineItem
+
+# REQ-FIX-INV-005: cent quantization applied at exactly three points (here +
+# invoices.py PATCH line-item rebuild + payment_link.py) — never int()
+# truncation, and never left to implicit DB/column coercion (SQLite's
+# NUMERIC affinity does not reliably apply ROUND_HALF_UP on half-cents).
+CENT = decimal.Decimal("0.01")
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -250,7 +257,7 @@ def generate_calendar_invoice(
         sess_date = getattr(sess, "date", "")
         sess_desc = getattr(sess, "description", "")
         sess_hours = decimal.Decimal(str(getattr(sess, "duration_hours", 0.0)))
-        total_price = sess_hours * effective_rate
+        total_price = (sess_hours * effective_rate).quantize(CENT, rounding=ROUND_HALF_UP)
 
         li = InvoiceLineItem(
             id=_new_uuid(),
@@ -286,7 +293,9 @@ def generate_calendar_invoice(
         subtotal=subtotal,
         adjustments=decimal.Decimal("0.00"),
         tax=decimal.Decimal("0.00"),
-        total=subtotal,
+        total=(subtotal + decimal.Decimal("0.00") + decimal.Decimal("0.00")).quantize(
+            CENT, rounding=ROUND_HALF_UP
+        ),
         status=InvoiceStatus.DRAFT.value,
         payment_terms=customer.payment_terms,
         late_fee_pct=customer.late_fee_pct,
@@ -393,7 +402,9 @@ def generate_flat_invoice(
         subtotal=subtotal,
         adjustments=decimal.Decimal("0.00"),
         tax=decimal.Decimal("0.00"),
-        total=subtotal,
+        total=(subtotal + decimal.Decimal("0.00") + decimal.Decimal("0.00")).quantize(
+            CENT, rounding=ROUND_HALF_UP
+        ),
         status=InvoiceStatus.DRAFT.value,
         payment_terms=customer.payment_terms,
         late_fee_pct=customer.late_fee_pct,

@@ -389,6 +389,29 @@ def test_modified_amount_change_writes_audit_event(db):
     assert events[0].entity_id is None and events[0].entity_type is None
 
 
+def test_modified_on_rejected_row_refreshes_fields_status_untouched(db):
+    """REQ-FIX-ING-007 decision table: `modified` on a rejected (non-split) row
+    still refreshes volatile fields (audited), but status must NOT change —
+    a human rejection is not a classification the sync should overwrite."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="mr1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="mr1").one()
+    row.status = TransactionStatus.REJECTED.value
+    row.review_reason = "human rejected this charge"
+    db.commit()
+    updated = process_modified(db, [_plaid_txn(transaction_id="mr1", amount=13.25)])
+    assert updated == 1
+    db.refresh(row)
+    assert row.amount == Decimal("-13.25")
+    assert row.status == TransactionStatus.REJECTED.value
+    assert row.review_reason == "human rejected this charge"
+    events = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                            field_changed="amount").all()
+    assert len(events) == 1
+
+
 def test_process_modified_unknown_id_is_noop(db):
     """P2-002-TEST: process_modified on a source_id not in DB returns 0, no-op.
     Mirrors test_removed_unknown_id_is_noop for the analogous removed path."""
@@ -445,6 +468,31 @@ def test_removed_writes_status_audit_event(db):
     assert events[0].entity_id is None and events[0].entity_type is None
 
 
+def test_removed_twice_on_already_rejected_is_noop(db):
+    """REQ-FIX-ING-007 decision table: `removed` on an already-rejected row is a
+    no-op guard (skip re-audit) — Plaid can redeliver a removed entry across
+    syncs. The second call must not write a duplicate status AuditEvent nor
+    count the row as newly-processed."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="rr2", amount=9.0)],
+                      account_index={"acc_1": acct})
+    first = process_removed(db, [{"transaction_id": "rr2"}])
+    assert first == 1
+    row = db.query(Transaction).filter_by(source_id="rr2").one()
+    assert row.status == "rejected"
+    events_before = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                                    field_changed="status").count()
+    second = process_removed(db, [{"transaction_id": "rr2"}])
+    assert second == 0  # no-op: not counted as newly-processed
+    db.refresh(row)
+    assert row.status == "rejected"
+    assert row.review_reason == "plaid_removed"
+    events_after = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                                   field_changed="status").count()
+    assert events_after == events_before  # no duplicate no-op audit event
+
+
 def test_pending_id_in_removed_is_noop_after_promotion(db):
     """REQ-PT-005: after pending→posted promotion the original pending id no
     longer exists, so it arriving in `removed` is a no-op (count 0) and the
@@ -483,6 +531,32 @@ def test_removed_then_readded_is_reactivated(db):
     events = db.query(AuditEvent).filter_by(transaction_id=row.id,
                                             field_changed="status").all()
     assert any(e.new_value == "needs_review" for e in events)
+
+
+def test_added_replay_against_human_rejected_row_is_noop(db):
+    """REQ-FIX-ING-007 decision table: `added` replayed against a row a human
+    rejected (any review_reason other than 'plaid_removed') must NOT be
+    reactivated — a human veto sticks. Only the plaid_removed reactivation
+    path (test_removed_then_readded_is_reactivated) resurrects a row."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="hr1", amount=9.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="hr1").one()
+    row.status = TransactionStatus.REJECTED.value
+    row.review_reason = "human rejected this charge"
+    db.commit()
+    events_before = db.query(AuditEvent).filter_by(transaction_id=row.id).count()
+    # Plaid re-delivers the same id in `added` (e.g. a resync).
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        counts = process_added(db, item, [_plaid_txn(transaction_id="hr1", amount=9.0)],
+                               account_index={"acc_1": acct})
+    db.refresh(row)
+    assert row.status == TransactionStatus.REJECTED.value
+    assert row.review_reason == "human rejected this charge"
+    assert counts.inserted == 0 and counts.reactivated == 0
+    events_after = db.query(AuditEvent).filter_by(transaction_id=row.id).count()
+    assert events_after == events_before  # no audit trail from a skipped no-op
 
 
 def test_process_added_reports_reactivated_count(db):
@@ -1218,3 +1292,239 @@ def test_raw_data_json_safe_with_native_date_objects():
     _json.dumps(f["raw_data"])  # must not raise
     assert f["raw_data"]["date"] == "2026-03-18"
     assert f["raw_data"]["authorized_date"] == "2026-03-17"
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-ING-007: split parent/child handling
+# ---------------------------------------------------------------------------
+
+
+def _make_split_parent_and_child(db, *, source_id="sp_source_1", parent_amount=Decimal("100.00")):
+    """Create a parent (status=split_parent) + one child sharing source_id,
+    mirroring src/classification/splitter.py's convention (child copies
+    parent.source_id; source_hash suffixed to stay unique)."""
+    parent = Transaction(
+        source="plaid",
+        source_id=source_id,
+        source_hash=f"hash_{source_id}",
+        date="2026-05-01",
+        description="Split Parent Vendor",
+        amount=parent_amount,
+        currency="USD",
+        entity="sparkry",
+        status=TransactionStatus.SPLIT_PARENT.value,
+        confidence=0.0,
+        raw_data={},
+    )
+    db.add(parent)
+    db.flush()
+    child = Transaction(
+        source="plaid",
+        source_id=source_id,  # copied from parent — the ING-007 root bug
+        source_hash=f"hash_{source_id}__split_0",
+        date="2026-05-01",
+        description="Room charge",
+        amount=parent_amount,
+        currency="USD",
+        entity="sparkry",
+        status=TransactionStatus.NEEDS_REVIEW.value,
+        confidence=0.0,
+        parent_id=parent.id,
+        raw_data={},
+    )
+    db.add(child)
+    db.commit()
+    return parent, child
+
+
+def test_existing_by_source_id_excludes_children_returns_parent(db):
+    """A split child shares source_id with its parent — the lookup used by
+    every Plaid mutation path must always resolve to the PARENT, never the
+    child (which would otherwise be silently mutated)."""
+    import src.adapters.plaid_transactions as pt_mod
+
+    parent, child = _make_split_parent_and_child(db, source_id="lookup1")
+    found = pt_mod._existing_by_source_id(db, "lookup1")
+    assert found is not None
+    assert found.id == parent.id
+    assert found.id != child.id
+
+
+def test_modified_on_split_parent_flags_parent_and_children(db):
+    parent, child = _make_split_parent_and_child(db, source_id="mod_sp1")
+    original_amount = parent.amount
+
+    count = process_modified(
+        db, [_plaid_txn(transaction_id="mod_sp1", amount=999.0)]
+    )
+    db.refresh(parent)
+    db.refresh(child)
+
+    assert count == 0  # a flag is not counted as a modify
+    assert parent.amount == original_amount  # no amount mutation
+    assert parent.status == TransactionStatus.SPLIT_PARENT.value
+    assert parent.review_reason is not None
+    assert "re-verify split" in parent.review_reason
+
+    assert child.status == TransactionStatus.NEEDS_REVIEW.value
+    assert child.review_reason == parent.review_reason
+
+    # Audit rows exist for the review_reason change.
+    events = db.query(AuditEvent).filter_by(transaction_id=parent.id).all()
+    assert any(e.field_changed == "review_reason" for e in events)
+
+
+def test_modified_on_split_parent_does_not_reactivate_rejected_child(db):
+    """A human-rejected child stays rejected — a stale-split re-verify flag
+    must not resurrect a row the human explicitly threw out."""
+    parent, child = _make_split_parent_and_child(db, source_id="mod_sp2")
+    child.status = TransactionStatus.REJECTED.value
+    db.commit()
+
+    process_modified(db, [_plaid_txn(transaction_id="mod_sp2", amount=42.0)])
+    db.refresh(child)
+    assert child.status == TransactionStatus.REJECTED.value
+
+
+def test_removed_on_split_parent_flags_parent_and_children(db):
+    parent, child = _make_split_parent_and_child(db, source_id="rem_sp1")
+
+    count = process_removed(db, [{"transaction_id": "rem_sp1"}])
+    db.refresh(parent)
+    db.refresh(child)
+
+    assert count == 0
+    assert parent.status == TransactionStatus.SPLIT_PARENT.value  # never rejected
+    assert parent.review_reason is not None
+    assert "re-verify split" in parent.review_reason
+    assert child.status == TransactionStatus.NEEDS_REVIEW.value
+    assert child.review_reason == parent.review_reason
+
+
+def test_pending_posted_prior_split_parent_flags_for_review(db):
+    """A posted txn arriving for a split-then-pending parent must not mutate
+    the parent — it gets flagged, and the posted txn itself is skipped
+    (never inserted as a duplicate, never reconciled onto the parent)."""
+    item, acct = _mapped(db)
+    parent, child = _make_split_parent_and_child(db, source_id="pp_sp1")
+    original_amount = parent.amount
+
+    posted = _plaid_txn(
+        transaction_id="pp_sp1_posted", amount=512.50, pending=False,
+        pending_transaction_id="pp_sp1",
+    )
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        counts = process_added(db, item, [posted], account_index={"acc_1": acct})
+
+    db.refresh(parent)
+    db.refresh(child)
+    assert parent.amount == original_amount
+    assert parent.status == TransactionStatus.SPLIT_PARENT.value
+    assert parent.review_reason is not None
+    assert "re-verify split" in parent.review_reason
+    assert child.status == TransactionStatus.NEEDS_REVIEW.value
+    assert counts.inserted == 0 and counts.reactivated == 0
+    # Posted txn was never inserted.
+    assert db.query(Transaction).filter_by(source_id="pp_sp1_posted").count() == 0
+
+
+def test_pending_posted_prior_human_rejected_status_never_flips(db):
+    """REQ-FIX-ING-007: a human-rejected prior pending row has its id/hash
+    promoted and fields refreshed, but status must NEVER flip back to
+    needs_review — even when the posted txn is transfer-category."""
+    item, acct = _mapped(db)
+    pending = _plaid_txn(transaction_id="hr1", amount=75.00, pending=True)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [pending], account_index={"acc_1": acct})
+    prior = db.query(Transaction).filter_by(source_id="hr1").one()
+    prior.status = TransactionStatus.REJECTED.value
+    prior.review_reason = "human rejected this charge"
+    db.commit()
+
+    posted = _plaid_txn(
+        transaction_id="hr1_posted", amount=75.00, pending=False,
+        pending_transaction_id="hr1",
+        personal_finance_category=SimpleNamespace(primary="TRANSFER_IN_DEPOSIT"),
+    )
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [posted], account_index={"acc_1": acct})
+
+    db.refresh(prior)
+    assert prior.status == TransactionStatus.REJECTED.value
+    # id/hash promoted to prevent a future duplicate insert.
+    assert prior.source_id == "hr1_posted"
+
+
+def test_supersede_excludes_split_children(db):
+    """First-sync supersede must never reject a bank_csv split CHILD — only
+    top-level (parent_id IS NULL) rows are eligible."""
+    parent = Transaction(
+        source="bank_csv", source_id="csv_p1", source_hash="csv_hash_p1",
+        date="2026-05-01", description="CSV Parent", amount=Decimal("100.00"),
+        currency="USD", payment_method="Chase ****1234",
+        status=TransactionStatus.SPLIT_PARENT.value, confidence=0.0, raw_data={},
+    )
+    db.add(parent)
+    db.flush()
+    child = Transaction(
+        source="bank_csv", source_id="csv_p1", source_hash="csv_hash_p1__split_0",
+        date="2026-05-01", description="CSV child", amount=Decimal("100.00"),
+        currency="USD", payment_method="Chase ****1234",
+        status=TransactionStatus.NEEDS_REVIEW.value, confidence=0.0,
+        parent_id=parent.id, raw_data={},
+    )
+    db.add(child)
+    db.commit()
+
+    count = supersede_csv_rows(
+        db, payment_method="Chase ****1234",
+        covered_min="2026-04-01", covered_max="2026-06-01",
+    )
+    db.refresh(parent)
+    db.refresh(child)
+    assert count == 0
+    assert parent.status == TransactionStatus.SPLIT_PARENT.value
+    assert child.status == TransactionStatus.NEEDS_REVIEW.value  # untouched
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-ING-008: make_transaction honors result.status / clears stale reasons
+# ---------------------------------------------------------------------------
+
+
+def test_make_transaction_vetoed_high_confidence_needs_review_with_veto_text(db):
+    """A sign-veto (result.status=NEEDS_REVIEW) with confidence >= threshold
+    must still land as needs_review — never auto_classified — and the veto
+    text must survive in review_reason regardless of the confidence score."""
+    vetoed = ClassificationResult(
+        entity=Entity.SPARKRY, tax_category=TaxCategory.OTHER_EXPENSE,
+        direction=Direction.EXPENSE, confidence=0.95, tier_used=1,
+        reasoning="rule", status=TransactionStatus.NEEDS_REVIEW,
+        review_reason="Sign/category mismatch: outflow classified as income.",
+        deductible_pct=1.0,
+    )
+    txn = _plaid_txn(transaction_id="veto1")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=vetoed):
+        tx = make_transaction(txn, session=db, entity="sparkry", payment_method="Chase ****1234")
+
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+    assert tx.review_reason is not None
+    assert "Sign/category mismatch" in tx.review_reason
+
+
+def test_make_transaction_clean_auto_classified_has_no_stale_review_reason(db):
+    """A clean auto_classified row must have review_reason=None — no stale
+    mismatch/low-confidence text survives from the classifier's internal
+    ClassificationResult.review_reason field."""
+    clean = ClassificationResult(
+        entity=Entity.SPARKRY, tax_category=TaxCategory.SUPPLIES,
+        direction=Direction.EXPENSE, confidence=0.95, tier_used=1,
+        reasoning="rule", status=TransactionStatus.AUTO_CLASSIFIED,
+        review_reason=None, deductible_pct=1.0,
+    )
+    txn = _plaid_txn(transaction_id="clean1")
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=clean):
+        tx = make_transaction(txn, session=db, entity="sparkry", payment_method="Chase ****1234")
+
+    assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
+    assert tx.review_reason is None

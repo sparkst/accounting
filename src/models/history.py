@@ -62,6 +62,13 @@ class HistoricalPrice(Base):
     close: Mapped[Decimal] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=False
     )
+    # REQ-FIX-WLT-001: total-return-capable adjusted close. NULL when the source
+    # (XLSX seed) has no adjusted series or backfill hasn't run yet. This is a
+    # DERIVED analytics column — Yahoo restates it after every dividend/split, so
+    # idempotent overwrites are sanctioned (raw ``close`` is never touched).
+    adj_close: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=18, scale=8, asdecimal=True), nullable=True
+    )
     open: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=18, scale=8, asdecimal=True), nullable=True
     )
@@ -213,6 +220,54 @@ class CostBasisLot(Base):
     )
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     source_row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+
+    account = relationship("Account")
+
+
+class StockSplit(Base):
+    """Corporate stock-split events, keyed on (symbol, ex_date).
+
+    REQ-FIX-WLT-002: split-safe re-pricing. ``ratio`` is post/pre (a 2:1 forward
+    split → ``2.000000``; a 1:10 reverse split → ``0.100000``). Populated from
+    the real yfinance ``Ticker.splits`` API — **never** derived from a
+    close/adj_close ratio (that ratio also embeds dividends and can't be
+    separated). When no rows exist for a symbol the cumulative ratio is 1
+    (today's behaviour); correctness improves monotonically as split data lands.
+    """
+
+    __tablename__ = "stock_split"
+    __table_args__ = (
+        Index("ix_stock_split_symbol", "symbol"),
+    )
+
+    symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
+    ex_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    ratio: Mapped[Decimal] = mapped_column(
+        Numeric(precision=12, scale=6, asdecimal=True), nullable=False
+    )
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="yfinance", server_default="yfinance"
+    )
+    ingested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
+
+
+class AccountAlias(Base):
+    """Legacy XLSX ``raw_account_name`` → live ``account.id`` mapping.
+
+    REQ-FIX-WLT-004: mirrors the sparkry-crm D1 ``account_alias`` schema so the
+    local networth-history dedup can compute a *per-name* effective cutoff
+    (earliest PositionSnapshot.as_of of the aliased account) instead of a single
+    global cutoff. ``raw_account_name`` is stored **lowercased** (the PK) per the
+    REQ-WD-009 key-casing contract.
+    """
+
+    __tablename__ = "account_alias"
+
+    raw_account_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    account_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("account.id"), nullable=False, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
 
     account = relationship("Account")

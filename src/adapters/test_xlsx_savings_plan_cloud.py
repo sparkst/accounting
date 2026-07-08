@@ -20,17 +20,28 @@ from unittest.mock import patch
 
 import openpyxl
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters._shared.wealth_client import WealthHTTPError
 from src.adapters.xlsx_savings_plan import (
     _CLOUD_INGEST_SOURCE_BALANCES,
     _CLOUD_INGEST_SOURCE_LOTS,
     _CLOUD_INGEST_SOURCE_PRICES,
+    _CLOUD_LOG_SOURCE_BALANCES,
+    _CLOUD_LOG_SOURCE_LOTS,
+    _CLOUD_LOG_SOURCE_PRICES,
     _default_target,
     import_account_balances_cloud,
     import_cost_basis_lots_cloud,
     import_historical_prices_cloud,
     main,
+)
+from src.models.base import Base
+from src.models.enums import IngestionStatus
+from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
 
 # ---------------------------------------------------------------------------
@@ -324,6 +335,120 @@ def test_lots_cloud_missing_both_sheets(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tests: REQ-FIX-WLT-007 — cloud import writes a local IngestionLog row
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def log_session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def test_balances_cloud_writes_ingestion_log_on_success(
+    tmp_path: Path, log_session: Session
+) -> None:
+    xlsx = tmp_path / "test.xlsx"
+    _build_balances_workbook(xlsx)
+
+    with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
+        mock_post.return_value = {}
+        result = import_account_balances_cloud(str(xlsx), session=log_session)
+
+    assert result.errors == []
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE_BALANCES
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_balances_cloud_writes_ingestion_log_on_error(
+    tmp_path: Path, log_session: Session
+) -> None:
+    xlsx = tmp_path / "test.xlsx"
+    _build_balances_workbook(xlsx)
+
+    with patch(
+        "src.adapters.xlsx_savings_plan.post_to_wealth",
+        side_effect=WealthHTTPError(422, "bad"),
+    ):
+        result = import_account_balances_cloud(str(xlsx), session=log_session)
+
+    assert result.imported == 0
+    assert result.errors
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE_BALANCES
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_prices_cloud_writes_ingestion_log_on_success(
+    tmp_path: Path, log_session: Session
+) -> None:
+    xlsx = tmp_path / "prices.xlsx"
+    _build_prices_workbook(xlsx)
+
+    with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
+        mock_post.return_value = {}
+        result = import_historical_prices_cloud(str(xlsx), session=log_session)
+
+    assert result.errors == []
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE_PRICES
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_lots_cloud_writes_ingestion_log_on_success(
+    tmp_path: Path, log_session: Session
+) -> None:
+    xlsx = tmp_path / "lots.xlsx"
+    _build_lots_workbook(xlsx)
+
+    with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
+        mock_post.return_value = {}
+        result = import_cost_basis_lots_cloud(str(xlsx), session=log_session)
+
+    assert result.errors == []
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE_LOTS
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_lots_cloud_missing_both_sheets_still_logs(
+    tmp_path: Path, log_session: Session
+) -> None:
+    """Even the early-return error path writes exactly one IngestionLog row."""
+    xlsx = tmp_path / "empty.xlsx"
+    wb = openpyxl.Workbook()
+    wb.save(str(xlsx))
+
+    with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
+        result = import_cost_basis_lots_cloud(str(xlsx), session=log_session)
+
+    mock_post.assert_not_called()
+    assert result.errors
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE_LOTS
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_balances_cloud_without_session_skips_log(tmp_path: Path) -> None:
+    """Backward-compat: no session → no IngestionLog attempted, still returns result."""
+    xlsx = tmp_path / "test.xlsx"
+    _build_balances_workbook(xlsx)
+
+    with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
+        mock_post.return_value = {}
+        result = import_account_balances_cloud(str(xlsx))
+
+    assert result.errors == []
+
+
+# ---------------------------------------------------------------------------
 # Tests: CLI --target flag
 # ---------------------------------------------------------------------------
 
@@ -344,19 +469,38 @@ def test_cli_target_cloud_flag_calls_cloud_function(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """--target cloud calls the cloud import function instead of DB write."""
+    """--target cloud calls the cloud import function instead of DB write.
+
+    Stubs ``get_session`` — REQ-FIX-WLT-007's IngestionLog write happens
+    through the same real session the local-write path uses, so an unmocked
+    test here would silently write into ``data/accounting.db``.
+    """
+    import unittest.mock as um
+    from contextlib import contextmanager
+
     xlsx = tmp_path / "test.xlsx"
     _build_balances_workbook(xlsx)
 
     monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
     monkeypatch.setenv("WEALTH_INTERNAL_KEY", "test-key")
 
-    with patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post:
+    mock_session = um.MagicMock()
+
+    @contextmanager
+    def _fake_get_session():
+        yield mock_session
+
+    with (
+        patch("src.adapters.xlsx_savings_plan.post_to_wealth") as mock_post,
+        um.patch("src.db.connection.get_session", _fake_get_session),
+    ):
         mock_post.return_value = {}
         rc = main(["import-balances", "--file", str(xlsx), "--apply", "--target", "cloud"])
 
     assert mock_post.called, "Expected post_to_wealth to be called in cloud mode"
     assert rc == 0
+    assert mock_session.add.called
+    assert mock_session.commit.called
 
 
 def test_cli_dry_run_does_not_call_cloud(

@@ -387,6 +387,31 @@ def test_shopify_payout_matched_to_bank(session: Session) -> None:
     assert result.matched[0].bank.id == bank.id
 
 
+def test_shopify_payout_reclassified_as_transfer_still_pairs(session: Session) -> None:
+    """REQ-FIX-TAX-001 regression: post-fix, ``_parse_payout`` stores
+    direction=transfer/tax_category=None (mirroring Stripe). Reconciliation
+    pairing was already correct pre-fix (keys off description/direction, not
+    tax_category) — this pins that a transfer-direction, no-tax-category
+    payout still pairs with its bank deposit unchanged."""
+    payout = _make_txn(
+        session,
+        source=Source.SHOPIFY,
+        date="2026-09-01",
+        amount=Decimal("500.25"),
+        description="Shopify Payout #7000099 (paid)",
+        direction="transfer",
+    )
+    bank = _make_txn(
+        session, source=Source.BANK_CSV, date="2026-09-03", amount=Decimal("500.25")
+    )
+
+    result = find_matches(session)
+
+    assert len(result.matched) == 1
+    assert result.matched[0].payout.id == payout.id
+    assert result.matched[0].bank.id == bank.id
+
+
 # ---------------------------------------------------------------------------
 # remove_manual_match (unlink)
 # ---------------------------------------------------------------------------

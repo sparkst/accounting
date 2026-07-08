@@ -358,6 +358,75 @@ class TestInvoicePatch:
         # subtotal should be 2*100 + 1*200 = 400
         assert float(data["subtotal"]) == 400.0
 
+    def test_patch_line_item_totals_quantized_to_cents(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """REQ-FIX-INV-005: 1.333 * 150 = 199.95 exact, not truncated."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(db_session, cust.id)
+
+        r = client.patch(f"/api/invoices/{inv.id}", json={
+            "line_items": [
+                {"description": "Fractional hours", "quantity": 1.333, "unit_price": 150.0},
+            ]
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["line_items"][0]["total_price"] == "199.95"
+        assert data["subtotal"] == "199.95"
+
+    def test_patch_total_change_clears_stale_payment_link(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """REQ-FIX-INV-002: whenever the recomputed total differs and a
+        payment link is persisted, it's deactivated and cleared —
+        unconditionally on total-change."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(db_session, cust.id, subtotal="1000.00")
+        inv.payment_link_url = "https://buy.stripe.com/stale"
+        inv.payment_link_id = "plink_stale"
+        inv.payment_link_amount = decimal.Decimal("1000.00")
+        db_session.commit()
+
+        with patch("src.api.routes.invoices._stripe_deactivate_link") as mock_deactivate:
+            r = client.patch(f"/api/invoices/{inv.id}", json={
+                "line_items": [
+                    {"description": "New total", "quantity": 1.0, "unit_price": 500.0},
+                ]
+            })
+            assert r.status_code == 200
+            mock_deactivate.assert_called_once_with("plink_stale")
+
+        data = r.json()
+        assert data["payment_link_url"] is None
+        assert data["payment_link_id"] is None
+        assert data["payment_link_amount"] is None
+
+    def test_patch_no_total_change_keeps_payment_link(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """A line-item PATCH that lands on the SAME total must not disturb
+        an existing payment link."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(db_session, cust.id, subtotal="500.00")
+        inv.payment_link_url = "https://buy.stripe.com/unchanged"
+        inv.payment_link_id = "plink_unchanged"
+        inv.payment_link_amount = decimal.Decimal("500.00")
+        db_session.commit()
+
+        with patch("src.api.routes.invoices._stripe_deactivate_link") as mock_deactivate:
+            r = client.patch(f"/api/invoices/{inv.id}", json={
+                "line_items": [
+                    {"description": "Same total, different shape", "quantity": 5.0, "unit_price": 100.0},
+                ]
+            })
+            assert r.status_code == 200
+            mock_deactivate.assert_not_called()
+
+        data = r.json()
+        assert data["payment_link_url"] == "https://buy.stripe.com/unchanged"
+        assert data["payment_link_id"] == "plink_unchanged"
+
 
 # ---------------------------------------------------------------------------
 # Status transition tests
@@ -575,6 +644,73 @@ class TestGenerateCalendar:
             "sessions": [{"date": "2026-03-12", "description": "S2", "hours": 1.0, "rate": 100.0}],
         })
         assert r2.json()["invoice_number"] == "202603-002"
+
+    def test_batch_duplicate_session_collapses_to_one_line_item(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """REQ-FIX-INV-004: an exact duplicate session within one submitted
+        batch collapses to a single line item (first occurrence wins) before
+        the DB-side double-billing guard ever runs — no double billing."""
+        cust = _make_customer(
+            db_session,
+            billing_model=BillingModel.HOURLY.value,
+            invoice_prefix="",
+        )
+        sessions = [
+            {"date": "2026-04-05", "description": "Duplicate session", "hours": 1.0, "rate": 100.0},
+            {"date": "2026-04-05", "description": "Duplicate session", "hours": 1.0, "rate": 100.0},
+        ]
+        r = client.post("/api/invoices/generate-calendar", json={
+            "customer_id": cust.id, "sessions": sessions,
+        })
+        assert r.status_code == 201
+        data = r.json()
+        assert len(data["line_items"]) == 1
+        assert float(data["total"]) == 100.0
+        assert data["duplicate_sessions_dropped"] == 1
+
+    def test_batch_distinct_time_same_description_both_kept(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """Two same-day, same-description sessions disambiguated by
+        start_time are NOT duplicates — both must be billed."""
+        cust = _make_customer(
+            db_session,
+            billing_model=BillingModel.HOURLY.value,
+            invoice_prefix="",
+        )
+        sessions = [
+            {
+                "date": "2026-04-06", "description": "Standup", "hours": 0.5, "rate": 100.0,
+                "start_time": "09:00", "end_time": "09:30",
+            },
+            {
+                "date": "2026-04-06", "description": "Standup", "hours": 0.5, "rate": 100.0,
+                "start_time": "14:00", "end_time": "14:30",
+            },
+        ]
+        r = client.post("/api/invoices/generate-calendar", json={
+            "customer_id": cust.id, "sessions": sessions,
+        })
+        assert r.status_code == 201
+        data = r.json()
+        assert len(data["line_items"]) == 2
+        assert data["duplicate_sessions_dropped"] == 0
+
+    def test_no_duplicates_reports_zero_dropped(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(
+            db_session,
+            billing_model=BillingModel.HOURLY.value,
+            invoice_prefix="",
+        )
+        r = client.post("/api/invoices/generate-calendar", json={
+            "customer_id": cust.id,
+            "sessions": [
+                {"date": "2026-04-07", "description": "Solo session", "hours": 1.0, "rate": 100.0},
+            ],
+        })
+        assert r.status_code == 201
+        assert r.json()["duplicate_sessions_dropped"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1112,6 +1248,203 @@ class TestOverpayment:
         assert data["invoice"]["paid_date"] is not None
 
 
+class TestMatchPaymentGuards:
+    """REQ-FIX-INV-003: match_payment guard matrix + audit-truth regression."""
+
+    def test_draft_invoice_rejected(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G001", status=InvoiceStatus.DRAFT.value,
+        )
+        tx = _make_transaction(db_session, amount="1000.00", direction=Direction.INCOME.value)
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 422
+        assert "send the invoice first" in r.json()["detail"].lower()
+
+    def test_paid_invoice_rejected(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G002", status=InvoiceStatus.PAID.value,
+        )
+        tx = _make_transaction(db_session, amount="1000.00", direction=Direction.INCOME.value)
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 422
+        assert "void first" in r.json()["detail"].lower()
+
+    def test_void_invoice_rejected(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G003", status=InvoiceStatus.VOID.value,
+        )
+        tx = _make_transaction(db_session, amount="1000.00", direction=Direction.INCOME.value)
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 422
+
+    def test_overdue_invoice_allowed(self, client: TestClient, db_session: Session) -> None:
+        """OVERDUE is a valid state to match a payment against (no PARTIAL
+        enum value exists — a partially-paid invoice stays 'sent')."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G004",
+            status=InvoiceStatus.OVERDUE.value, subtotal="1000.00",
+        )
+        tx = _make_transaction(db_session, amount="1000.00", direction=Direction.INCOME.value)
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 200
+        assert r.json()["invoice"]["status"] == "paid"
+
+    def test_expense_transaction_rejected(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G005", status=InvoiceStatus.SENT.value,
+        )
+        tx = _make_transaction(db_session, amount="-1000.00", direction=Direction.EXPENSE.value)
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 422
+        assert "income" in r.json()["detail"].lower()
+
+    def test_rejected_transaction_rejected(self, client: TestClient, db_session: Session) -> None:
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G006", status=InvoiceStatus.SENT.value,
+        )
+        tx = _make_transaction(
+            db_session, amount="1000.00", direction=Direction.INCOME.value,
+            status=TransactionStatus.REJECTED.value,
+        )
+
+        r = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx.id})
+        assert r.status_code == 422
+
+    def test_transaction_already_linked_to_another_invoice_rejected(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """One bank credit can pay at most one invoice."""
+        cust = _make_customer(db_session)
+        inv_a = _make_invoice(
+            db_session, cust.id, invoice_number="G007A",
+            status=InvoiceStatus.SENT.value, subtotal="1000.00",
+        )
+        inv_b = _make_invoice(
+            db_session, cust.id, invoice_number="G007B",
+            status=InvoiceStatus.SENT.value, subtotal="1000.00",
+        )
+        tx = _make_transaction(db_session, amount="1000.00", direction=Direction.INCOME.value)
+
+        r1 = client.post(f"/api/invoices/{inv_a.id}/match-payment", json={"transaction_id": tx.id})
+        assert r1.status_code == 200
+
+        r2 = client.post(f"/api/invoices/{inv_b.id}/match-payment", json={"transaction_id": tx.id})
+        assert r2.status_code == 422
+        assert "already" in r2.json()["detail"].lower()
+
+    def test_rematching_same_invoice_with_better_transaction_allowed(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """A partially-paid invoice re-matched with a better transaction is
+        allowed (the uniqueness guard only blocks *other* invoices)."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G008",
+            status=InvoiceStatus.SENT.value, subtotal="1000.00",
+        )
+        tx_partial = _make_transaction(
+            db_session, amount="500.00", direction=Direction.INCOME.value,
+        )
+        r1 = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx_partial.id})
+        assert r1.status_code == 200
+        assert r1.json()["invoice"]["status"] == "sent"
+
+        tx_full = _make_transaction(
+            db_session, amount="1000.00", direction=Direction.INCOME.value,
+        )
+        r2 = client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx_full.id})
+        assert r2.status_code == 200
+        assert r2.json()["invoice"]["status"] == "paid"
+        assert r2.json()["invoice"]["payment_transaction_id"] == tx_full.id
+
+    def test_audit_old_value_is_true_prior_id_on_full_payment(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """Regression: the full/overpayment branch hardcoded old_value=None
+        instead of the true prior payment_transaction_id."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G009",
+            status=InvoiceStatus.SENT.value, subtotal="1000.00",
+        )
+        tx_partial = _make_transaction(
+            db_session, amount="500.00", direction=Direction.INCOME.value,
+        )
+        client.post(f"/api/invoices/{inv.id}/match-payment", json={"transaction_id": tx_partial.id})
+
+        tx_full = _make_transaction(
+            db_session, amount="1000.00", direction=Direction.INCOME.value,
+        )
+        inv_id = inv.id
+        client.post(f"/api/invoices/{inv_id}/match-payment", json={"transaction_id": tx_full.id})
+
+        verify = _TestSession()
+        try:
+            events = (
+                verify.query(AuditEvent)
+                .filter(
+                    AuditEvent.transaction_id == inv_id,
+                    AuditEvent.field_changed == "payment_transaction_id",
+                )
+                .order_by(AuditEvent.changed_at)
+                .all()
+            )
+            assert len(events) == 2
+            # First match: old=None (no prior payment), new=tx_partial.id
+            assert events[0].old_value is None
+            assert events[0].new_value == tx_partial.id
+            # Second match: old=tx_partial.id (the TRUE prior value), new=tx_full.id
+            assert events[1].old_value == tx_partial.id
+            assert events[1].new_value == tx_full.id
+        finally:
+            verify.close()
+
+    def test_audit_old_value_is_true_prior_id_on_partial_payment(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """Regression: the partial branch's audit read the *new* value as
+        old_value (assignment preceded the audit call)."""
+        cust = _make_customer(db_session)
+        inv = _make_invoice(
+            db_session, cust.id, invoice_number="G010",
+            status=InvoiceStatus.SENT.value, subtotal="1000.00",
+        )
+        tx1 = _make_transaction(db_session, amount="200.00", direction=Direction.INCOME.value)
+        inv_id = inv.id
+        client.post(f"/api/invoices/{inv_id}/match-payment", json={"transaction_id": tx1.id})
+
+        tx2 = _make_transaction(db_session, amount="400.00", direction=Direction.INCOME.value)
+        client.post(f"/api/invoices/{inv_id}/match-payment", json={"transaction_id": tx2.id})
+
+        verify = _TestSession()
+        try:
+            events = (
+                verify.query(AuditEvent)
+                .filter(
+                    AuditEvent.transaction_id == inv_id,
+                    AuditEvent.field_changed == "payment_transaction_id",
+                )
+                .order_by(AuditEvent.changed_at)
+                .all()
+            )
+            assert len(events) == 2
+            assert events[1].old_value == tx1.id  # true prior value, not tx2.id
+            assert events[1].new_value == tx2.id
+        finally:
+            verify.close()
+
+
 # ---------------------------------------------------------------------------
 # AR Aging Report
 # ---------------------------------------------------------------------------
@@ -1269,6 +1602,7 @@ class TestSendInvoice:
             mock_link.return_value = PaymentLinkResult(
                 url="https://buy.stripe.com/test_123",
                 link_id="plink_test_123",
+                amount=decimal.Decimal("500.00"),
             )
 
             r = client.post(f"/api/invoices/{inv.id}/send", json={})
@@ -1301,7 +1635,9 @@ class TestSendInvoice:
             patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
         ):
             from src.invoicing.payment_link import PaymentLinkResult
-            mock_link.return_value = PaymentLinkResult(url="https://buy.stripe.com/x", link_id="plink_x")
+            mock_link.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/x", link_id="plink_x", amount=decimal.Decimal("1000.00")
+            )
 
             r = client.post(
                 f"/api/invoices/{inv.id}/send",
@@ -1399,7 +1735,9 @@ class TestSendInvoice:
             patch("src.api.routes.invoices._stripe_deactivate_link") as mock_deactivate,
         ):
             from src.invoicing.payment_link import PaymentLinkResult
-            mock_link.return_value = PaymentLinkResult(url="https://buy.stripe.com/y", link_id="plink_y")
+            mock_link.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/y", link_id="plink_y", amount=decimal.Decimal("500.00")
+            )
 
             r = client.post(f"/api/invoices/{inv.id}/send", json={})
             assert r.status_code == 502
@@ -1413,9 +1751,13 @@ class TestSendInvoice:
         assert inv_after.status == InvoiceStatus.DRAFT.value
         assert inv_after.sent_at is None
         assert inv_after.sent_to is None
-        # Payment link is persisted even on email failure (crash safety)
-        assert inv_after.payment_link_url == "https://buy.stripe.com/y"
-        assert inv_after.payment_link_id == "plink_y"
+        # REQ-FIX-INV-001: a customer must never receive a deactivated link —
+        # the persisted fields are cleared on email failure (regardless of
+        # freshly_created) so a retry mints a fresh link instead of reusing
+        # the one we just deactivated at Stripe.
+        assert inv_after.payment_link_url is None
+        assert inv_after.payment_link_id is None
+        assert inv_after.payment_link_amount is None
 
     def test_send_creates_audit_event(self, client: TestClient, db_session: Session) -> None:
         cust = _make_customer(db_session)
@@ -1435,7 +1777,9 @@ class TestSendInvoice:
             patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
         ):
             from src.invoicing.payment_link import PaymentLinkResult
-            mock_link.return_value = PaymentLinkResult(url="https://buy.stripe.com/z", link_id="plink_z")
+            mock_link.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/z", link_id="plink_z", amount=decimal.Decimal("500.00")
+            )
 
             client.post(f"/api/invoices/{inv_id}/send", json={})
 
@@ -1464,6 +1808,7 @@ class TestSendInvoice:
         )
         inv.payment_link_url = "https://buy.stripe.com/existing"
         inv.payment_link_id = "plink_existing"
+        inv.payment_link_amount = decimal.Decimal("500.00")
         db_session.commit()
 
         with (
@@ -1475,6 +1820,7 @@ class TestSendInvoice:
             mock_link.return_value = PaymentLinkResult(
                 url="https://buy.stripe.com/existing",
                 link_id="plink_existing",
+                amount=decimal.Decimal("500.00"),
             )
 
             r = client.post(
@@ -1487,6 +1833,52 @@ class TestSendInvoice:
 
             passed_inv = mock_link.call_args[0][0]
             assert passed_inv.payment_link_id == "plink_existing"
+
+    def test_send_retry_after_email_failure_creates_fresh_link(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """REQ-FIX-INV-001 regression: after an email-failure clears the
+        persisted fields, retrying the send must call create_payment_link
+        again (which mints a fresh link since no fields are persisted to
+        reuse) rather than short-circuiting on stale/deactivated data."""
+        cust = _make_customer(db_session)
+        cust.contact_email = "ben@benthole.com"
+        db_session.commit()
+
+        inv = _make_invoice(
+            db_session, cust.id,
+            invoice_number="SEND012",
+            subtotal="500.00",
+        )
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link,
+            patch("src.api.routes.invoices.send_invoice_email", side_effect=Exception("Resend down")),
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+            patch("src.api.routes.invoices._stripe_deactivate_link"),
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/first", link_id="plink_first",
+                amount=decimal.Decimal("500.00"),
+            )
+            r1 = client.post(f"/api/invoices/{inv.id}/send", json={})
+            assert r1.status_code == 502
+
+        with (
+            patch("src.api.routes.invoices.create_payment_link") as mock_link2,
+            patch("src.api.routes.invoices.send_invoice_email"),
+            patch("src.api.routes.invoices.render_pdf", return_value=b"%PDF-fake"),
+        ):
+            from src.invoicing.payment_link import PaymentLinkResult
+            mock_link2.return_value = PaymentLinkResult(
+                url="https://buy.stripe.com/second", link_id="plink_second",
+                amount=decimal.Decimal("500.00"),
+            )
+            r2 = client.post(f"/api/invoices/{inv.id}/send", json={})
+            assert r2.status_code == 200
+            assert r2.json()["invoice"]["payment_link_url"] == "https://buy.stripe.com/second"
+            mock_link2.assert_called_once()
 
     def test_send_invoice_not_found(self, client: TestClient) -> None:
         r = client.post(f"/api/invoices/{uuid.uuid4()}/send", json={"to_email": "x@x.com"})

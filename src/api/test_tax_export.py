@@ -11,6 +11,8 @@ REQ-1099: Tax summary includes income_1099_breakdown array grouping income
 
 from __future__ import annotations
 
+import csv
+import io
 import uuid
 from collections.abc import Generator
 from decimal import Decimal
@@ -457,3 +459,367 @@ class TestUndocumentedIncomeWarning:
         warnings = data["warnings"]
         doc_warnings = [w for w in warnings if "1099" in w.get("warning", "")]
         assert doc_warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: GET /api/export/bno?format=dor hard-fails on unmapped WA locality
+# (REQ-FIX-TAX-007)
+# ---------------------------------------------------------------------------
+
+
+class TestDorUploadUnmappedLocalityHardFail:
+    """REQ-FIX-TAX-007: an unmapped WA locality is a 422, not a 500 or a
+    silently-emitted '____' sentinel line."""
+
+    def _make_locality_tx(self, session: Session, *, city: str) -> Transaction:
+        tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-15",
+            description=f"Shopify Order — {city}",
+            amount=Decimal("100.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=TransactionStatus.CONFIRMED.value,
+            confidence=0.95,
+            raw_data={
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": city},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": f"{city} City Tax"},
+                ],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add(tx)
+        session.commit()
+        return tx
+
+    def test_dor_upload_returns_422(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            self._make_locality_tx(s, city="Nowhereville")
+
+        resp = client.get(
+            "/api/export/bno",
+            params={"entity": "blackline", "year": 2026, "format": "dor", "quarter": 1},
+        )
+        assert resp.status_code == 422
+        assert "____" in resp.json()["detail"]
+
+    def test_mapped_locality_still_succeeds(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            self._make_locality_tx(s, city="Sammamish")
+
+        resp = client.get(
+            "/api/export/bno",
+            params={"entity": "blackline", "year": 2026, "format": "dor", "quarter": 1},
+        )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Tests: GET /api/tax-summary/monthly reports SALES_INCOME on the pre-tax
+# basis (REQ-FIX-TAX-002)
+# ---------------------------------------------------------------------------
+
+
+class TestMonthlyBreakdownExcludesCollectedSalesTax:
+    """REQ-FIX-TAX-002: collected WA sales tax must be excluded from gross
+    receipts 'everywhere, not just the DOR upload' — including the monthly
+    breakdown that drives the B&O wizard's period-scoped readiness warning."""
+
+    def _make_sales_tx(self, session: Session) -> Transaction:
+        tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-15",
+            description="Shopify Order — WA retail",
+            amount=Decimal("109.30"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=TransactionStatus.CONFIRMED.value,
+            confidence=0.95,
+            raw_data={
+                "total_price": "109.30",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA"},
+                "tax_lines": [{"title": "Washington State Tax"}],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add(tx)
+        session.commit()
+        return tx
+
+    def test_monthly_sales_income_total_is_pretax(self, client: TestClient) -> None:
+        with _TestSession() as s:
+            self._make_sales_tx(s)
+
+        resp = client.get(
+            "/api/tax-summary/monthly",
+            params={"entity": "blackline", "year": 2026},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        jan = next(m for m in body["months"] if m["month"] == "2026-01")
+        sales = next(
+            c for c in jan["categories"] if c["tax_category"] == "SALES_INCOME"
+        )
+        # $109.30 total_price - $9.30 total_tax = $100.00 pre-tax — NOT the
+        # tax-inclusive $109.30 stored amount.
+        assert sales["total"] == 100.00
+
+    def test_monthly_total_matches_tax_summary_pretax_figure(
+        self, client: TestClient
+    ) -> None:
+        """The monthly breakdown and /api/tax-summary must agree on the same
+        pre-tax SALES_INCOME figure — both derive from pretax_abs_amount."""
+        with _TestSession() as s:
+            self._make_sales_tx(s)
+
+        monthly_resp = client.get(
+            "/api/tax-summary/monthly",
+            params={"entity": "blackline", "year": 2026},
+        )
+        summary_resp = client.get(
+            "/api/tax-summary",
+            params={"entity": "blackline", "year": 2026},
+        )
+        assert monthly_resp.status_code == 200
+        assert summary_resp.status_code == 200
+
+        jan = next(
+            m for m in monthly_resp.json()["months"] if m["month"] == "2026-01"
+        )
+        monthly_sales = next(
+            c for c in jan["categories"] if c["tax_category"] == "SALES_INCOME"
+        )
+        summary_sales = next(
+            li
+            for li in summary_resp.json()["line_items"]
+            if li["tax_category"] == "SALES_INCOME"
+        )
+        assert monthly_sales["total"] == summary_sales["total"] == 100.00
+
+    def _make_oos_sales_tx(self, session: Session) -> Transaction:
+        tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-20",
+            description="Shopify Order — shipped to Portland OR",
+            amount=Decimal("250.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=TransactionStatus.CONFIRMED.value,
+            confidence=0.95,
+            raw_data={
+                "total_price": "250.00",
+                "total_tax": "0.00",
+                "shipping_address": {"province_code": "OR"},
+                "tax_lines": [],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add(tx)
+        session.commit()
+        return tx
+
+    def test_monthly_cells_sum_to_annual_with_confirmed_oos_order(
+        self, client: TestClient
+    ) -> None:
+        """P2-201 regression: the monthly drill-down uses the INCOME-TAX basis
+        (pre-tax, INCLUDING out-of-state sales) — the sum of monthly
+        SALES_INCOME cells must equal the annual line_items cell beside them
+        on the Financials page. OOS deduction is a B&O concept and belongs to
+        compute_retail_detail, never to this endpoint."""
+        with _TestSession() as s:
+            self._make_sales_tx(s)
+            self._make_oos_sales_tx(s)
+
+        monthly_resp = client.get(
+            "/api/tax-summary/monthly",
+            params={"entity": "blackline", "year": 2026},
+        )
+        summary_resp = client.get(
+            "/api/tax-summary",
+            params={"entity": "blackline", "year": 2026},
+        )
+        assert monthly_resp.status_code == 200
+        assert summary_resp.status_code == 200
+
+        monthly_total = sum(
+            c["total"]
+            for m in monthly_resp.json()["months"]
+            for c in m["categories"]
+            if c["tax_category"] == "SALES_INCOME"
+        )
+        summary_sales = next(
+            li
+            for li in summary_resp.json()["line_items"]
+            if li["tax_category"] == "SALES_INCOME"
+        )
+        # $100.00 pre-tax WA + $250.00 OOS = $350.00 on BOTH surfaces.
+        assert monthly_total == summary_sales["total"] == 350.00
+
+
+# ---------------------------------------------------------------------------
+# Tests: /tax-summary bno_monthly and /tax-summary/monthly reconcile with the
+# B&O CSV on confirmed out-of-state SALES_INCOME (REQ-FIX-TAX-002 / REQ-020 /
+# REQ-016 — P2-b1c)
+# ---------------------------------------------------------------------------
+
+
+class TestBnoSurfacesExcludeConfirmedOutOfStateSales:
+    """The round-1 fix made the B&O CSV/DOR upload exclude confirmed
+    out-of-state retail sales from the Retailing basis. This must also hold
+    for /api/tax-summary's bno_monthly/bno_quarterly (the dashboard's
+    'B&O subtotals', REQ-016) and /api/tax-summary/monthly (the B&O wizard's
+    readiness surface) — otherwise the dashboard shows a different B&O gross
+    receipts figure than the downloaded CSV/DOR upload for the same period.
+    The income-tax line_items/gross_income, by contrast, must stay on the
+    gross-incl-out-of-state basis (correct for Schedule C / 1065 gross
+    receipts)."""
+
+    def _make_wa_and_oos_sales(self, session: Session) -> None:
+        wa_tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-10",
+            description="Shopify Order — WA retail",
+            amount=Decimal("100.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=TransactionStatus.CONFIRMED.value,
+            confidence=0.95,
+            raw_data={
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA"},
+                "tax_lines": [{"title": "Washington State Tax"}],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        oos_tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-15",
+            description="Shopify Order — OR (confirmed out-of-state)",
+            amount=Decimal("250.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=TransactionStatus.CONFIRMED.value,
+            confidence=0.95,
+            raw_data={
+                "total_price": "250.00",
+                "total_tax": "0.00",
+                "shipping_address": {"province_code": "OR"},
+                "tax_lines": [],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add_all([wa_tx, oos_tx])
+        session.commit()
+
+    def test_tax_summary_bno_monthly_excludes_confirmed_oos(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            self._make_wa_and_oos_sales(s)
+
+        resp = client.get(
+            "/api/tax-summary", params={"entity": "blackline", "year": 2026}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        jan = next(m for m in body["bno_monthly"] if m["month"] == "2026-01")
+        # WA-only pretax ($100 - $9.30 tax = $90.70) — the $250 OOS order is
+        # excluded, matching the B&O CSV/DOR wa_taxable basis.
+        assert jan["income"] == 90.70
+
+        # The income-tax line_items stay on the gross-incl-OOS basis:
+        # $90.70 (WA) + $250.00 (OOS) = $340.70.
+        sales_line_item = next(
+            li for li in body["line_items"] if li["tax_category"] == "SALES_INCOME"
+        )
+        assert sales_line_item["total"] == 340.70
+
+    def test_tax_summary_monthly_uses_income_basis_including_oos(
+        self, client: TestClient
+    ) -> None:
+        """P2-201: /tax-summary/monthly serves the income-tax Financials
+        drill-down and must INCLUDE out-of-state sales (pre-tax) so monthly
+        cells reconcile with annual line_items. The B&O wizard gets its
+        OOS-deducted Retailing basis from compute_retail_detail instead."""
+        with _TestSession() as s:
+            self._make_wa_and_oos_sales(s)
+
+        resp = client.get(
+            "/api/tax-summary/monthly",
+            params={"entity": "blackline", "year": 2026},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        jan = next(m for m in body["months"] if m["month"] == "2026-01")
+        sales = next(
+            c for c in jan["categories"] if c["tax_category"] == "SALES_INCOME"
+        )
+        # $90.70 pre-tax WA + $250.00 OOS = $340.70 (income basis, not the
+        # B&O wa_taxable $90.70).
+        assert sales["total"] == 340.70
+
+    def test_bno_csv_retailing_total_matches_tax_summary_bno_monthly(
+        self, client: TestClient
+    ) -> None:
+        """The downloaded B&O CSV and the dashboard's bno_monthly must
+        report the same Retailing gross receipts for the same period."""
+        with _TestSession() as s:
+            self._make_wa_and_oos_sales(s)
+
+        summary_resp = client.get(
+            "/api/tax-summary", params={"entity": "blackline", "year": 2026}
+        )
+        csv_resp = client.get(
+            "/api/export/bno",
+            params={"entity": "blackline", "year": 2026, "quarter": 1},
+        )
+        assert summary_resp.status_code == 200
+        assert csv_resp.status_code == 200
+
+        jan = next(
+            m
+            for m in summary_resp.json()["bno_monthly"]
+            if m["month"] == "2026-01"
+        )
+
+        rows = list(csv.reader(io.StringIO(csv_resp.text)))
+        csv_retailing_total = Decimal("0")
+        for r in rows[1:]:
+            if len(r) > 2 and r[2] == "Retailing" and "TOTAL" not in r[0]:
+                csv_retailing_total += Decimal(r[3])
+
+        assert Decimal(str(jan["income"])) == csv_retailing_total == Decimal("90.70")

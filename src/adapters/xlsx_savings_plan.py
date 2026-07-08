@@ -37,7 +37,7 @@ import openpyxl
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.adapters._shared.ingestion import write_ingestion_log
+from src.adapters._shared.ingestion import write_cloud_ingestion_log, write_ingestion_log
 from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.enums import IngestionStatus
 from src.models.history import AccountBalanceSnapshot, CostBasisLot, HistoricalPrice
@@ -109,6 +109,11 @@ _CLOUD_INGEST_SOURCE_PRICES = "historical-prices"
 
 _CLOUD_INGEST_SOURCE_LOTS = "cost-basis-lot"
 """Workers ingest slug for cost-basis-lot rows (REQ-WC-012)."""
+
+_CLOUD_LOG_SOURCE_BALANCES = "wealth_cloud:xlsx_savings_plan:balances"
+_CLOUD_LOG_SOURCE_PRICES = "wealth_cloud:xlsx_savings_plan:prices"
+_CLOUD_LOG_SOURCE_LOTS = "wealth_cloud:xlsx_savings_plan:lots"
+"""``ingestion_log.source`` for each cloud-push path (REQ-FIX-WLT-007)."""
 
 _CLOUD_BATCH_SIZE = 100
 """Max rows per POST to the Workers endpoint (REQ-WC-012: 100 rows max)."""
@@ -868,49 +873,86 @@ def _post_prices_cloud(
 # ── Cloud-mode top-level import functions ─────────────────────────────────────
 
 
-def import_account_balances_cloud(file_path: str) -> ImportResult:
-    """Parse the Account Summary sheet and POST rows to the Workers endpoint."""
+def import_account_balances_cloud(
+    file_path: str, *, session: Session | None = None
+) -> ImportResult:
+    """Parse the Account Summary sheet and POST rows to the Workers endpoint.
+
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
+    """
     result = ImportResult()
     wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
     if SHEET_NAME not in wb.sheetnames:
         result.errors.append(f"workbook missing sheet '{SHEET_NAME}'")
+        write_cloud_ingestion_log(
+            session, source=_CLOUD_LOG_SOURCE_BALANCES, result=result
+        )
         return result
     ws = wb[SHEET_NAME]
     date_cols = _read_header_dates(ws)
     if not date_cols:
         result.errors.append("no date columns found in header row")
+        write_cloud_ingestion_log(
+            session, source=_CLOUD_LOG_SOURCE_BALANCES, result=result
+        )
         return result
     rows = _iter_snapshot_rows(ws, date_cols)
     result.distinct_accounts = sorted({name for name, _, _ in rows})
     result.unmatched = len(rows)
     _post_balances_cloud(rows, result)
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE_BALANCES, result=result)
     return result
 
 
-def import_historical_prices_cloud(file_path: str) -> ImportResult:
-    """Parse the Historical Prices sheet and POST rows to the Workers endpoint."""
+def import_historical_prices_cloud(
+    file_path: str, *, session: Session | None = None
+) -> ImportResult:
+    """Parse the Historical Prices sheet and POST rows to the Workers endpoint.
+
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
+    """
     result = ImportResult()
     wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
     if PRICES_SHEET_NAME not in wb.sheetnames:
         result.errors.append(f"workbook missing sheet '{PRICES_SHEET_NAME}'")
+        write_cloud_ingestion_log(
+            session, source=_CLOUD_LOG_SOURCE_PRICES, result=result
+        )
         return result
     ws = wb[PRICES_SHEET_NAME]
     date_cols = _read_price_date_columns(ws)
     if not date_cols:
         result.errors.append("no date columns found in Historical Prices row 3")
+        write_cloud_ingestion_log(
+            session, source=_CLOUD_LOG_SOURCE_PRICES, result=result
+        )
         return result
     rows = _iter_price_rows(ws, date_cols)
     result.distinct_accounts = sorted({sym for sym, _, _ in rows})
     result.unmatched = len(rows)
     _post_prices_cloud(rows, result)
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE_PRICES, result=result)
     return result
 
 
-def import_cost_basis_lots_cloud(file_path: str) -> ImportResult:
+def import_cost_basis_lots_cloud(
+    file_path: str, *, session: Session | None = None
+) -> ImportResult:
     """Parse lot sheets and POST rows to the Workers endpoint.
 
     Processes TD Ameritrade and Sharebuilder lot sheets, preserving the
     per-sheet source_tag so the Workers endpoint can track provenance.
+
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
     """
     result = ImportResult()
     wb = openpyxl.load_workbook(file_path, data_only=True, keep_links=False)
@@ -984,6 +1026,7 @@ def import_cost_basis_lots_cloud(file_path: str) -> ImportResult:
         result.errors.append(
             f"workbook missing both '{TD_LOTS_SHEET_NAME}' and '{SB_LOTS_SHEET_NAME}'"
         )
+    write_cloud_ingestion_log(session, source=_CLOUD_LOG_SOURCE_LOTS, result=result)
     return result
 
 
@@ -1074,7 +1117,15 @@ def main(argv: list[str] | None = None) -> int:
     # Cloud target — POST rows to Workers instead of writing to SQLite.
     if target == "cloud":
         cloud_func, cloud_label = _CLOUD_DISPATCH[args.cmd]
-        result = cloud_func(args.file)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = cloud_func(args.file, session=None)
+        else:
+            with get_session() as session:
+                result = cloud_func(args.file, session=session)
         _print_summary(result, dry_run=False, label=cloud_label)
         return 1 if result.errors else 0
 

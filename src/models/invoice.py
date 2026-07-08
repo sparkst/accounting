@@ -335,6 +335,16 @@ class Invoice(Base):
         nullable=True,
         comment="Stripe payment link ID (for deactivation on void)",
     )
+    payment_link_amount: Mapped[Any | None] = mapped_column(
+        Numeric(precision=12, scale=2, asdecimal=True),
+        nullable=True,
+        comment=(
+            "invoice.total at the moment the current payment_link was created "
+            "(REQ-FIX-INV-002). Reuse is only valid when this equals the "
+            "current total; the three payment_link_* fields are either all "
+            "set (link active at this amount) or all NULL."
+        ),
+    )
     sent_at: Mapped[datetime | None] = mapped_column(
         DateTime,
         nullable=True,

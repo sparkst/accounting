@@ -143,6 +143,46 @@ def test_sweep_apply_never_touches_vendor_rules(session: Session) -> None:
     assert persisted_rule.last_matched is None
 
 
+def test_sweep_apply_isolates_row_failure_and_continues(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-002: a raising row must not abort the whole --apply backlog run.
+
+    Mirrors the repo's per-record-isolation pattern (src/alerts/sweep.py):
+    one bad row is caught, logged, and skipped; the rest of the backlog still
+    confirms.
+    """
+    import scripts.autoconfirm as cli_mod
+
+    _rule(session, confidence=0.95)
+    tx1 = _tx(session, source_hash="h-r1", date="2026-06-01")
+    tx2 = _tx(session, source_hash="h-r2", date="2026-06-02")
+    tx3 = _tx(session, source_hash="h-r3", date="2026-06-03")
+    session.commit()
+
+    real_auto_confirm = cli_mod.auto_confirm_if_eligible
+    calls = {"n": 0}
+
+    def _flaky(session: Session, tx: Transaction, cls: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom")
+        return real_auto_confirm(session, tx, cls)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli_mod, "auto_confirm_if_eligible", _flaky)
+
+    result = cli.sweep(session, apply=True)
+
+    assert result.scanned == 3
+    assert result.confirmed == 2
+    assert result.failed == 1
+
+    session.expire_all()
+    assert session.get(Transaction, tx1.id).status == TransactionStatus.CONFIRMED.value
+    assert session.get(Transaction, tx2.id).status == TransactionStatus.AUTO_CLASSIFIED.value
+    assert session.get(Transaction, tx3.id).status == TransactionStatus.CONFIRMED.value
+
+
 def test_sweep_skips_row_whose_stored_classification_diverges_from_rule(
     session: Session,
 ) -> None:

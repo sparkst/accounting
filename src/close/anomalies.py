@@ -254,12 +254,16 @@ def scan_anomalies(
         prior6 = sorted(
             (g for g in group if prior6_iso <= g.date < first_iso), key=lambda g: g.date
         )
-        if len(prior6) >= 3 and not close_rows:
+        if not close_rows:
+            # P2-002: gate on DISTINCT charge dates, not raw row count — a
+            # same-day duplicate (e.g. a retried/duplicated charge) must not
+            # count as a second distinct occurrence toward the >=3 cadence
+            # minimum.
             day_dates = sorted({date.fromisoformat(g.date) for g in prior6})
             intervals = [
                 (day_dates[i + 1] - day_dates[i]).days for i in range(len(day_dates) - 1)
             ]
-            if intervals and 25 <= statistics.median(intervals) <= 35:
+            if len(day_dates) >= 3 and intervals and 25 <= statistics.median(intervals) <= 35:
                 typical = statistics.median([_abs(g.amount) for g in prior6])
                 report.missing_recurring.append(
                     MissingRecurring(

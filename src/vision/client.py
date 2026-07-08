@@ -52,6 +52,15 @@ _OPENAI_SUPPORTED_IMAGE_MIMES = frozenset(
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
 
+# P2-201: application/pdf is the shadow pipeline's only current mime
+# (src/vision/shadow.py). The chat.completions vision API path is image-only
+# — a PDF cannot be attached at all — so this is called out explicitly and
+# loudly, ahead of the generic unsupported-mime rejection below, rather than
+# left to surface as a generic/confusing failure.
+_OPENAI_PDF_ERROR = (
+    "OpenAI vision fallback supports images only; PDFs require the gemini provider"
+)
+
 # Circuit breaker settings (mirrors llm_classifier).
 _CB_FAILURE_THRESHOLD = 3
 _CB_RECOVERY_TIMEOUT_S = 60.0
@@ -307,6 +316,13 @@ class OpenAIVisionProvider:
         *,
         session: Session | None = None,
     ) -> VisionExtraction:
+        # P2-201: fail loudly and immediately, before the circuit breaker and
+        # before any client construction/API call/cost — a PDF is a
+        # permanent input-shape problem, not a transient provider fault, and
+        # must not consume a circuit-breaker failure slot.
+        if mime == "application/pdf":
+            raise ValueError(_OPENAI_PDF_ERROR)
+
         if not self._circuit.allow_attempt():
             raise VisionCircuitOpen("openai circuit breaker open")
 

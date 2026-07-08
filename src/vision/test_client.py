@@ -106,6 +106,26 @@ def test_gemini_circuit_breaker_opens_after_three_failures() -> None:
     assert failing.models.generate_content.call_count == 3
 
 
+def test_gemini_provider_sends_document_bytes() -> None:
+    """P3-201: the outbound Gemini request must actually carry the document
+    bytes/mime, not just the prompt text (call_args gap regression, mirrors
+    the OpenAI hallucination fix)."""
+    fake_client = _make_gemini_client()
+    provider = GeminiVisionProvider(_client=fake_client)
+    file_bytes = b"%PDF-1.4 fake statement bytes"
+    provider.extract(file_bytes, "application/pdf", {}, "extract the fields")
+
+    _, kwargs = fake_client.models.generate_content.call_args
+    contents = kwargs["contents"]
+    parts_with_data = [
+        c for c in contents if getattr(c, "inline_data", None) is not None
+    ]
+    assert len(parts_with_data) == 1
+    assert parts_with_data[0].inline_data.data == file_bytes
+    assert parts_with_data[0].inline_data.mime_type == "application/pdf"
+    assert "extract the fields" in contents
+
+
 def test_gemini_empty_response_raises() -> None:
     """REQ-VIS-001: an empty provider response is a VisionError."""
     client = MagicMock()
@@ -168,19 +188,37 @@ def test_openai_provider_sends_document_bytes(session: Session) -> None:
 
 
 def test_openai_provider_rejects_unsupported_mime(session: Session) -> None:
-    """P2-001: a mime chat.completions can't attach (e.g. PDF) is refused, not faked.
+    """P2-001: a mime chat.completions can't attach is refused, not faked.
 
-    The shadow pipeline's only current mime is `application/pdf`
-    (src/vision/shadow.py) — the OpenAI fallback cannot attach it to a
+    The OpenAI fallback cannot attach an unsupported mime to a
     chat.completions vision request, so it must raise rather than silently
     complete on the prompt text alone.
     """
     fake_client = _make_openai_client()
     provider = OpenAIVisionProvider(_client=fake_client)
     with pytest.raises(VisionError, match="cannot accept mime type"):
-        provider.extract(b"%PDF-1.4", "application/pdf", {}, "p", session=session)
+        provider.extract(b"data", "text/plain", {}, "p", session=session)
     # No hallucinated completion was ever requested.
     fake_client.chat.completions.create.assert_not_called()
+
+
+def test_openai_provider_rejects_pdf_loudly_before_any_call(session: Session) -> None:
+    """P2-201: application/pdf to the OpenAI fallback fails loudly and
+    immediately with a ValueError naming the fix — before the circuit
+    breaker, before any client construction, before any API call/cost. The
+    shadow pipeline's only current mime is `application/pdf`
+    (src/vision/shadow.py) and the chat.completions image-only API path
+    cannot process it at all.
+    """
+    fake_client = _make_openai_client()
+    provider = OpenAIVisionProvider(_client=fake_client)
+    with pytest.raises(
+        ValueError,
+        match="OpenAI vision fallback supports images only; PDFs require the gemini provider",
+    ):
+        provider.extract(b"%PDF-1.4", "application/pdf", {}, "p", session=session)
+    fake_client.chat.completions.create.assert_not_called()
+    assert session.query(LLMUsageLog).count() == 0
 
 
 def test_select_provider_default_and_named() -> None:

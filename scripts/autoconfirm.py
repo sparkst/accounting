@@ -81,11 +81,20 @@ class SweepResult:
     applied: bool
     scanned: int = 0
     confirmed: int = 0
+    failed: int = 0
     candidates: list[SweepRow] = field(default_factory=list)
 
 
 def sweep(session: Session, *, apply: bool = False, limit: int | None = None) -> SweepResult:
-    """Confirm eligible auto_classified rows. DRY-RUN rolls back everything."""
+    """Confirm eligible auto_classified rows. DRY-RUN rolls back everything.
+
+    P3-002: per-row isolation — one raising row is caught, logged, and
+    skipped; it never aborts the rest of the backlog run (mirrors
+    src/alerts/sweep.py's per-record-error-isolation pattern). Each confirmed
+    row is committed immediately (when ``apply``) rather than batched, so a
+    later row's failure-triggered ``session.rollback()`` can never undo an
+    earlier row's already-applied confirm.
+    """
     query = (
         session.query(Transaction)
         .filter(Transaction.status == TransactionStatus.AUTO_CLASSIFIED.value)
@@ -98,47 +107,61 @@ def sweep(session: Session, *, apply: bool = False, limit: int | None = None) ->
     result = SweepResult(applied=apply)
     for tx in rows:
         result.scanned += 1
-        # touch_last_matched=False: the sweep is a read for eligibility only —
-        # REQ-MCA-002 forbids auto-confirm from mutating vendor_rules, so the
-        # matcher used here must never dirty last_matched (P1-a1c).
-        cls = lookup_vendor_rule(tx.description, session, touch_last_matched=False)
-        if cls is None:
-            continue
-        # P2-b2e: confirmed_by=auto:rule:<id> must stay faithful to what got
-        # confirmed. auto_confirm_if_eligible only confirms the row's
-        # EXISTING stored classification, not cls's — if the current
-        # best-matching rule has since diverged from that stored
-        # entity/tax_category/direction (edited rule, or the row was
-        # originally Tier-2/3), skip rather than attribute the confirm to a
-        # rule whose classification doesn't match the recorded row. Leaves
-        # the row for the next sweep / human review.
-        if (
-            cls.entity.value != tx.entity
-            or cls.tax_category.value != tx.tax_category
-            or cls.direction.value != tx.direction
-        ):
-            continue
-        savepoint = session.begin_nested()
-        confirmed = auto_confirm_if_eligible(session, tx, cls)
-        if confirmed and cls.rule_id is not None:
-            rule = session.get(VendorRule, cls.rule_id)
-            result.candidates.append(
-                SweepRow(
-                    tx_id=tx.id,
-                    date=tx.date,
-                    vendor=tx.description,
-                    amount=_abs(tx.amount),
-                    rule_id=cls.rule_id,
-                    rule_confidence=rule.confidence if rule else 0.0,
+        try:
+            # touch_last_matched=False: the sweep is a read for eligibility
+            # only — REQ-MCA-002 forbids auto-confirm from mutating
+            # vendor_rules, so the matcher used here must never dirty
+            # last_matched (P1-a1c).
+            cls = lookup_vendor_rule(tx.description, session, touch_last_matched=False)
+            if cls is None:
+                continue
+            # P2-b2e: confirmed_by=auto:rule:<id> must stay faithful to what
+            # got confirmed. auto_confirm_if_eligible only confirms the row's
+            # EXISTING stored classification, not cls's — if the current
+            # best-matching rule has since diverged from that stored
+            # entity/tax_category/direction (edited rule, or the row was
+            # originally Tier-2/3), skip rather than attribute the confirm to
+            # a rule whose classification doesn't match the recorded row.
+            # Leaves the row for the next sweep / human review.
+            if (
+                cls.entity.value != tx.entity
+                or cls.tax_category.value != tx.tax_category
+                or cls.direction.value != tx.direction
+            ):
+                continue
+            savepoint = session.begin_nested()
+            confirmed = auto_confirm_if_eligible(session, tx, cls)
+            if confirmed and cls.rule_id is not None:
+                rule = session.get(VendorRule, cls.rule_id)
+                result.candidates.append(
+                    SweepRow(
+                        tx_id=tx.id,
+                        date=tx.date,
+                        vendor=tx.description,
+                        amount=_abs(tx.amount),
+                        rule_id=cls.rule_id,
+                        rule_confidence=rule.confidence if rule else 0.0,
+                    )
                 )
-            )
-            result.confirmed += 1
-            if apply:
-                savepoint.commit()
+                result.confirmed += 1
+                if apply:
+                    savepoint.commit()
+                    # Commit each confirmed row immediately rather than
+                    # batching to one commit at the end: a later row's
+                    # exception handler calls session.rollback(), which would
+                    # otherwise discard every prior row's uncommitted
+                    # savepoint-merged change from this same run.
+                    session.commit()
+                else:
+                    savepoint.rollback()
             else:
                 savepoint.rollback()
-        else:
-            savepoint.rollback()
+        except Exception:  # noqa: BLE001 — per-record isolation: one bad row
+            # never aborts the backlog sweep.
+            logger.exception("autoconfirm sweep: row %s raised, skipping", tx.id)
+            result.failed += 1
+            session.rollback()
+            continue
 
     if apply:
         session.commit()
@@ -152,7 +175,10 @@ def sweep(session: Session, *, apply: bool = False, limit: int | None = None) ->
 
 def _print_sweep(result: SweepResult) -> None:
     mode = "APPLIED" if result.applied else "DRY-RUN"
-    print(f"autoconfirm sweep {mode}: scanned={result.scanned} confirmed={result.confirmed}")
+    print(
+        f"autoconfirm sweep {mode}: scanned={result.scanned} "
+        f"confirmed={result.confirmed} failed={result.failed}"
+    )
     if result.candidates:
         print(f"{'tx_id':38}  {'date':10}  {'vendor':28}  {'amount':>10}  {'rule':38}  conf")
         for c in result.candidates:

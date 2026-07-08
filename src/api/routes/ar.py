@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ar"])
 
-_SECRET_ENV = "N8N_ALERTS_WEBHOOK_SECRET"
+_SECRET_ENV = "AR_APPROVE_SECRET"
+_LEGACY_SECRET_ENV = "N8N_ALERTS_WEBHOOK_SECRET"
 
 # Module-level singleton avoids B008 (function-call-in-default).
 _WEBHOOK_SECRET_HEADER: str | None = Header(default=None, alias="X-Webhook-Secret")
@@ -50,8 +51,16 @@ class ReminderActionResult(BaseModel):
     message_id: str | None = None
 
 
+def _expected_secret() -> str | None:
+    """P3-203: AR_APPROVE_SECRET is the dedicated bearer for these endpoints;
+    falls back to the shared N8N_ALERTS_WEBHOOK_SECRET for backward
+    compatibility with n8n workflows not yet repointed at the dedicated
+    secret. When AR_APPROVE_SECRET is set it takes precedence exclusively."""
+    return os.environ.get(_SECRET_ENV) or os.environ.get(_LEGACY_SECRET_ENV)
+
+
 def _verify_secret(header_secret: str | None) -> None:
-    expected = os.environ.get(_SECRET_ENV)
+    expected = _expected_secret()
     if not expected:
         # Fail closed: without a configured secret these endpoints cannot be
         # authenticated, so refuse rather than accept anonymous callbacks.

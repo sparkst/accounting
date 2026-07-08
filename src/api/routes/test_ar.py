@@ -219,6 +219,54 @@ def test_single_use_token_second_approve_409(
     assert len(resend_calls) == 1
 
 
+def test_approve_falls_back_to_legacy_n8n_secret(
+    client: TestClient, resend_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-203: with AR_APPROVE_SECRET unset, the legacy shared webhook secret
+    still authenticates (backward compatibility)."""
+    monkeypatch.delenv("AR_APPROVE_SECRET", raising=False)
+    reminder = _seed_reminder()
+    resp = client.post(
+        f"/api/ar/reminders/{reminder.id}/approve",
+        headers={"X-Webhook-Secret": SECRET},
+        json={"token": reminder.approval_token},
+    )
+    assert resp.status_code == 200
+    assert len(resend_calls) == 1
+
+
+def test_approve_accepts_dedicated_ar_approve_secret(
+    client: TestClient, resend_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-203: a dedicated AR_APPROVE_SECRET authenticates independently of
+    the legacy N8N_ALERTS_WEBHOOK_SECRET."""
+    monkeypatch.setenv("AR_APPROVE_SECRET", "dedicated-ar-secret")
+    reminder = _seed_reminder()
+    resp = client.post(
+        f"/api/ar/reminders/{reminder.id}/approve",
+        headers={"X-Webhook-Secret": "dedicated-ar-secret"},
+        json={"token": reminder.approval_token},
+    )
+    assert resp.status_code == 200
+    assert len(resend_calls) == 1
+
+
+def test_approve_dedicated_secret_set_rejects_legacy_secret(
+    client: TestClient, resend_calls: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-203: once AR_APPROVE_SECRET is set, it takes precedence — the old
+    legacy secret alone no longer authenticates."""
+    monkeypatch.setenv("AR_APPROVE_SECRET", "dedicated-ar-secret")
+    reminder = _seed_reminder()
+    resp = client.post(
+        f"/api/ar/reminders/{reminder.id}/approve",
+        headers={"X-Webhook-Secret": SECRET},  # legacy N8N_ALERTS_WEBHOOK_SECRET value
+        json={"token": reminder.approval_token},
+    )
+    assert resp.status_code == 401
+    assert len(resend_calls) == 0
+
+
 def test_approve_unknown_reminder_404(client: TestClient) -> None:
     """REQ-ARC-002: an unknown reminder id is 404."""
     resp = client.post(
@@ -227,6 +275,73 @@ def test_approve_unknown_reminder_404(client: TestClient) -> None:
         json={"token": "x"},
     )
     assert resp.status_code == 404
+
+
+def _seed_reminder_for_closed_invoice(invoice_status: str) -> ArReminder:
+    """A pending-approval reminder whose invoice has since closed (paid/void)
+    — reproduces the race where the invoice closes between drafting and the
+    human tapping Approve."""
+    s = _TestSession()
+    try:
+        customer = Customer(
+            name="Acme", contact_email="jane@example.com", billing_model="hourly"
+        )
+        s.add(customer)
+        s.flush()
+        invoice = Invoice(
+            invoice_number="INV-CLOSED",
+            customer_id=customer.id,
+            entity="sparkry",
+            status=invoice_status,
+            subtotal=Decimal("500.00"),
+            total=Decimal("500.00"),
+            paid_date="2026-07-01" if invoice_status == "paid" else None,
+        )
+        s.add(invoice)
+        s.flush()
+        reminder = ArReminder(
+            invoice_id=invoice.id,
+            rung=30,
+            status=AR_STATUS_PENDING_APPROVAL,
+            draft_subject="Second reminder — invoice INV-CLOSED",
+            draft_body="Please pay.",
+        )
+        s.add(reminder)
+        s.commit()
+        s.refresh(reminder)
+        s.expunge(reminder)
+        return reminder
+    finally:
+        s.close()
+
+
+def test_approve_paid_invoice_returns_409_and_does_not_send(
+    client: TestClient, resend_calls: list[dict[str, Any]]
+) -> None:
+    """P2-202: an invoice that closed (paid) between draft and approval is
+    409, and the send function is never invoked."""
+    reminder = _seed_reminder_for_closed_invoice("paid")
+    resp = client.post(
+        f"/api/ar/reminders/{reminder.id}/approve",
+        headers={"X-Webhook-Secret": SECRET},
+        json={"token": reminder.approval_token},
+    )
+    assert resp.status_code == 409
+    assert len(resend_calls) == 0
+
+
+def test_approve_void_invoice_returns_409_and_does_not_send(
+    client: TestClient, resend_calls: list[dict[str, Any]]
+) -> None:
+    """P2-202: a void invoice is also 409, and never sends."""
+    reminder = _seed_reminder_for_closed_invoice("void")
+    resp = client.post(
+        f"/api/ar/reminders/{reminder.id}/approve",
+        headers={"X-Webhook-Secret": SECRET},
+        json={"token": reminder.approval_token},
+    )
+    assert resp.status_code == 409
+    assert len(resend_calls) == 0
 
 
 def test_dismiss_happy_path(

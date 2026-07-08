@@ -738,6 +738,21 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-SEL-001 | Monthly sellability report (with the close email): Sparkry SDE (net income + configured add-backs), revenue by client with top-1/top-3 concentration, recurring-vs-project revenue split, MoM trends; BlackLine tracked as investment-mode burn. |
 | REQ-SEL-002 | Client attribution from invoices/customers; recurring flag configurable per customer or invoice type; add-backs in a config file with audit-friendly listing in the report. |
 
+## Program 2026-07 — tracked follow-ups (deliberately deferred, review-sourced)
+
+| ID | Item |
+|---|---|
+| FUP-01 | REQ-FIX-TAX-008 (B&O returns-and-allowances netting) — manual DOR adjustment until shipped. |
+| FUP-02 | n8n workflow tags (R008 ×11) — API-read-only; one-time UI pass. TT- prefix needs an audit-rule R001 taxonomy entry. |
+| FUP-03 | n8n `should-flush?` quiet-hours fallback inverted (digest never flushes if config absent) — pinned by test, fix via sync_back. |
+| FUP-04 | Wire `tests/fixtures/wealth-parity/networth_dedup_cases.json` SHA assertion into sparkry-crm vitest (cross-repo). |
+| FUP-05 | bank_csv legacy-hash bridge: >2dp legacy renderings documented-unsupported (cross-reference matcher mitigates). |
+| FUP-06 | AR single-use approval token stored plaintext in payload_json — neutralized by the endpoint's terminal-state check + sweep supersede; hashing is hardening, not a hole. |
+| FUP-07 | AR router auth via route dependency (structure parity with ingest); close-recon register_sum window label vs tie-out note; vision cost-cap boundary-equality tests; close snapshot-window skip-branch test. |
+| FUP-08 | OpenAI vision fallback is image-only (PDFs hard-error → gemini); PDF→image conversion if a real fallback is ever needed. |
+| FUP-09 | IRS 2026 tax-table verification (config/tax_tables/2026.yaml placeholders) — RELEASE-GATES enabling accounting-tax-forecast.timer --apply. |
+| FUP-10 | Ignore-or-track decision on the 3 unmapped Chase accounts (surfaced daily in the pulse); ea-alerts@sparkry.com mailbox existence confirmation. |
+
 ## REQ-BBT-* — Feature: Bold-bets tracker
 
 | REQ-ID | Requirement |

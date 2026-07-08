@@ -22,6 +22,7 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.alerts.models import AlertDispatch
 from src.alerts.sweep import sweep_failed_rows
 from src.alerts.webhook import WebhookResult
 from src.ar.templates import build_draft
@@ -82,6 +83,50 @@ def _sweep_post(payload: dict[str, object]) -> WebhookResult:
         key=str(payload.get("alert_key", "")),
         apply=True,
     )
+
+
+def _neutralize_stale_notify_rows(session: Session) -> int:
+    """Skip failed ar_reminder_notify ledger rows whose reminder is terminal.
+
+    P3-205: a failed draft-notification row is normally replayed by
+    ``sweep_failed_rows`` on the chaser's next run. But if the reminder it
+    describes has since reached a terminal state (sent/dismissed — see
+    ``ArReminder`` state machine docstring), nobody can act on that approval
+    card anymore; re-POSTing it to Telegram is stale noise, not a useful
+    retry. Alert keys follow ``notify._alert_key``'s ``ar:{invoice_id}:{rung}``
+    format.
+    """
+    neutralized = 0
+    rows = (
+        session.query(AlertDispatch)
+        .filter(
+            AlertDispatch.alert_type == "ar_reminder_notify",
+            AlertDispatch.status == "failed",
+        )
+        .all()
+    )
+    for row in rows:
+        parts = (row.alert_key or "").split(":")
+        if len(parts) != 3 or parts[0] != "ar":
+            continue
+        invoice_id, rung_str = parts[1], parts[2]
+        try:
+            rung = int(rung_str)
+        except ValueError:
+            continue
+        reminder = (
+            session.query(ArReminder)
+            .filter(ArReminder.invoice_id == invoice_id, ArReminder.rung == rung)
+            .one_or_none()
+        )
+        if reminder is None or reminder.status not in (AR_STATUS_SENT, AR_STATUS_DISMISSED):
+            continue
+        row.status = "skipped"
+        row.error_detail = "superseded: reminder terminal"
+        neutralized += 1
+    if neutralized:
+        session.commit()
+    return neutralized
 
 
 def record_status_audit(
@@ -222,6 +267,10 @@ def run(session: Session, *, today: date, apply: bool) -> RunSummary:
     summary = RunSummary()
 
     if apply:
+        # P3-205: neutralize failed notify rows for reminders that are
+        # already terminal BEFORE the replay sweep runs, so a stale approval
+        # card for a reminder nobody can act on is never re-POSTed.
+        _neutralize_stale_notify_rows(session)
         # P1-002 (WS6 review): failed draft-notification webhooks from prior
         # runs are replayed here (REQ-FIX-ALR-002 shared sweep) — the AR
         # chaser's own daily run is its retry path.

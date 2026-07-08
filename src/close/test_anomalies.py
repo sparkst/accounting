@@ -204,6 +204,18 @@ def test_cadence_edges(session: Session, gap: int, flagged: bool) -> None:
     assert present is flagged
 
 
+def test_missing_recurring_requires_three_distinct_dates(session: Session) -> None:
+    """P2-002: raw row count alone must not satisfy the cadence gate — a
+    same-day duplicate charge must not count as a second distinct occurrence.
+    Two real charges (Apr 6, May 6) plus a same-day dup of the first give 3
+    raw rows but only 2 distinct dates; must NOT be treated as recurring."""
+    _tx(session, description="Dup", date_="2026-04-06", amount="-30.00")
+    _tx(session, description="Dup", date_="2026-04-06", amount="-30.00")  # same-day dup
+    _tx(session, description="Dup", date_="2026-05-06", amount="-30.00")
+    report = scan_anomalies(session, "2026-06")
+    assert "dup" not in {m.vendor_key for m in report.missing_recurring}
+
+
 def test_config_ignore_suppresses(session: Session, tmp_path: Path) -> None:
     """REQ-MCA-001: config ignore: suppresses a history-flagged missing vendor."""
     _tx(session, description="Sub", date_="2026-04-06", amount="-30.00")

@@ -21,6 +21,7 @@ from src.models.ar_reminder import (
     AR_STATUS_DISMISSED,
     AR_STATUS_DRAFTED,
     AR_STATUS_PENDING_APPROVAL,
+    AR_STATUS_SENT,
     ArReminder,
 )
 from src.models.audit_event import AuditEvent
@@ -377,6 +378,101 @@ def test_run_apply_sweeps_failed_ar_reminder_notify_rows(
 
     assert len(calls) == 1
     assert calls[0]["alert_key"] == "ar:some-invoice:14"
+    session.refresh(failed_row)
+    assert failed_row.status == "sent"
+
+
+def test_run_apply_neutralizes_stale_notify_row_for_terminal_reminder(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-205: a failed ar_reminder_notify row for an already-terminal (sent)
+    reminder must be neutralized, not re-POSTed — nobody can act on a stale
+    approval card for a reminder that's already been sent."""
+    inv = _make_invoice(session, days_since_sent=20)
+    reminder = ArReminder(
+        invoice_id=inv.id,
+        rung=14,
+        status=AR_STATUS_SENT,
+        draft_subject="s",
+        draft_body="b",
+    )
+    session.add(reminder)
+    session.commit()
+
+    failed_row = AlertDispatch(
+        alert_key=f"ar:{inv.id}:14",
+        occurrence_date=TODAY.isoformat(),
+        alert_type="ar_reminder_notify",
+        entity="sparkry",
+        subject="AR reminder draft",
+        status="failed",
+        http_status=None,
+        error_detail="connection reset",
+        delivery_channel="n8n_webhook",
+        payload_json=f'{{"alert_key": "ar:{inv.id}:14", "type": "info"}}',
+    )
+    session.add(failed_row)
+    session.commit()
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_sweep_post(payload: dict[str, object]) -> WebhookResult:
+        calls.append(payload)
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(chaser, "_sweep_post", _fake_sweep_post)
+
+    run(session, today=TODAY, apply=True)
+
+    assert calls == []
+    session.refresh(failed_row)
+    assert failed_row.status == "skipped"
+    assert failed_row.error_detail == "superseded: reminder terminal"
+
+
+def test_run_apply_still_sweeps_stale_notify_row_for_pending_reminder(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P3-205: a failed ar_reminder_notify row for a still-actionable (pending)
+    reminder is unaffected by the neutralize pass and is still swept."""
+    inv = _make_invoice(session, days_since_sent=20)
+    reminder = ArReminder(
+        invoice_id=inv.id,
+        rung=14,
+        status=AR_STATUS_PENDING_APPROVAL,
+        draft_subject="s",
+        draft_body="b",
+    )
+    session.add(reminder)
+    session.commit()
+
+    failed_row = AlertDispatch(
+        alert_key=f"ar:{inv.id}:14",
+        occurrence_date=TODAY.isoformat(),
+        alert_type="ar_reminder_notify",
+        entity="sparkry",
+        subject="AR reminder draft",
+        status="failed",
+        http_status=None,
+        error_detail="connection reset",
+        delivery_channel="n8n_webhook",
+        payload_json=f'{{"alert_key": "ar:{inv.id}:14", "type": "info"}}',
+    )
+    session.add(failed_row)
+    session.commit()
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_sweep_post(payload: dict[str, object]) -> WebhookResult:
+        calls.append(payload)
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(chaser, "_sweep_post", _fake_sweep_post)
+
+    run(session, today=TODAY, apply=True)
+
+    assert len(calls) == 1
+    assert calls[0]["alert_key"] == f"ar:{inv.id}:14"
     session.refresh(failed_row)
     assert failed_row.status == "sent"
 

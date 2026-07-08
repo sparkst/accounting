@@ -32,7 +32,7 @@ from src.models.brokerage import (
     RealizedGainLoss,
 )
 from src.models.enums import BrokerageTxStatus, CanonicalAction
-from src.models.history import AccountBalanceSnapshot, HistoricalPrice
+from src.models.history import AccountBalanceSnapshot, HistoricalPrice, StockSplit
 
 # ── Constants ────────────────────────────────────────────────────────────
 
@@ -373,6 +373,9 @@ class _HistoryState(TypedDict):
     balance_snapshots_by_account: dict[str, list[tuple[date, AccountBalanceSnapshot]]]
     # ``[(trade_date, close)]`` per symbol, ascending by date.
     prices_by_symbol: dict[str, list[tuple[date, Decimal]]]
+    # ``[(ex_date, ratio)]`` per symbol, ascending by ex_date. ratio is post/pre
+    # (2:1 -> 2.0). REQ-FIX-WLT-002: split-safe re-pricing.
+    splits_by_symbol: dict[str, list[tuple[date, Decimal]]]
     # All Account rows by id — used for plan-wrapper / metadata lookups.
     accounts_by_id: dict[str, Account]
 
@@ -447,14 +450,42 @@ def _load_history_state(session: Session) -> _HistoryState:
             (hp.trade_date, Decimal(str(hp.close)))
         )
 
+    splits_by_symbol: dict[str, list[tuple[date, Decimal]]] = {}
+    for sp in (
+        session.query(StockSplit)
+        .order_by(StockSplit.symbol, StockSplit.ex_date)
+        .all()
+    ):
+        splits_by_symbol.setdefault(sp.symbol, []).append(
+            (sp.ex_date, Decimal(str(sp.ratio)))
+        )
+
     accounts_by_id = {a.id: a for a in session.query(Account).all()}
 
     return _HistoryState(
         position_snapshots_by_account=pos_by_account_sorted,
         balance_snapshots_by_account=bal_by_account,
         prices_by_symbol=prices_by_symbol,
+        splits_by_symbol=splits_by_symbol,
         accounts_by_id=accounts_by_id,
     )
+
+
+def _cumulative_split_ratio(
+    splits: list[tuple[date, Decimal]], after: date, through: date
+) -> Decimal:
+    """Product of split ratios with ``after < ex_date <= through``.
+
+    REQ-FIX-WLT-002: re-pricing a held position at ``through`` using the raw
+    close on that date requires scaling the snapshot's (pre-split) quantity by
+    every split whose ex-date fell strictly after the snapshot date and on or
+    before the target. Returns Decimal("1") when no split applies.
+    """
+    ratio = Decimal("1")
+    for ex_date, r in splits:
+        if after < ex_date <= through:
+            ratio *= r
+    return ratio
 
 
 def _latest_at_or_before(
@@ -529,6 +560,7 @@ def _per_account_value_at(
     pos_index = state["position_snapshots_by_account"]
     bal_index = state["balance_snapshots_by_account"]
     prices_index = state["prices_by_symbol"]
+    splits_index = state["splits_by_symbol"]
 
     # Union of every account that has any snapshot data at all.
     candidate_account_ids = set(pos_index.keys()) | set(bal_index.keys())
@@ -553,7 +585,13 @@ def _per_account_value_at(
                         prices_index.get(ps.symbol, []), target_date
                     )
                 if close is not None and ps.quantity is not None:
-                    total += Decimal(str(ps.quantity)) * close
+                    # REQ-FIX-WLT-002: scale the snapshot (pre-split) quantity by
+                    # the cumulative split ratio for ex-dates in (snapshot, target]
+                    # so a split between snapshot and target doesn't cliff.
+                    ratio = _cumulative_split_ratio(
+                        splits_index.get(ps.symbol, []), latest_pos_date, target_date
+                    )
+                    total += Decimal(str(ps.quantity)) * ratio * close
                 else:
                     total += Decimal(str(ps.market_value))
             # Only emit the account if at least one position contributed —

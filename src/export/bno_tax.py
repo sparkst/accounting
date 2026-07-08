@@ -20,7 +20,7 @@ import io
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from src.export.basis import pretax_abs_amount
+from src.export.basis import RETAIL_CATEGORIES, pretax_abs_amount, retail_facts
 from src.utils.constants import SPARKRY_CONTACT_EMAIL
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,14 @@ from src.utils.constants import SPARKRY_CONTACT_EMAIL
 # ---------------------------------------------------------------------------
 
 # Income categories → B&O classification
+#
+# KNOWN GAP (tracked follow-up, P3-302 of the 2026-07 program review): sales
+# refunds are booked as OTHER_EXPENSE and correctly reduce income-tax net
+# (Sch C L27a / 1065 other deductions), but they are NOT netted here against
+# Retailing gross receipts. WA B&O allows a returns-and-allowances deduction
+# for refunded retail sales already reported in the measure — until refund
+# netting ships, apply that deduction MANUALLY when filing with DOR or the
+# B&O measure overstates by the period's refund total.
 BO_CLASSIFICATION: dict[str, tuple[str, str]] = {
     "CONSULTING_INCOME": ("ServiceOther", "Service and Other Activities"),
     "SUBSCRIPTION_INCOME": ("ServiceOther", "Service and Other Activities"),
@@ -83,6 +91,14 @@ def _aggregate_income_by_month(
     REQ-FIX-TAX-002: uses ``pretax_abs_amount`` so SALES_INCOME rows report
     the pre-tax figure (collected WA sales tax excluded), matching the DOR
     upload basis instead of double-counting the tax as gross receipts.
+
+    REQ-FIX-TAX-002 / REQ-020: SALES_INCOME (Retailing) rows confirmed as
+    out-of-state (``retail_facts(tx).is_confirmed_oos``) are excluded from
+    the Retailing bucket entirely, mirroring ``compute_retail_detail``'s
+    ``wa_taxable = gross_retailing - interstate_deduction``. Without this,
+    the B&O CSV's Retailing basis (and its ``estimated_bo_tax``) would
+    diverge from the authoritative DOR upload whenever confirmed
+    out-of-state retail sales exist.
     """
     result: dict[int, dict[str, Decimal]] = {m: {} for m in range(1, 13)}
     for tx in transactions:
@@ -96,7 +112,13 @@ def _aggregate_income_by_month(
         if month is None:
             continue
         bo_code, _ = BO_CLASSIFICATION[cat]
-        amt = pretax_abs_amount(tx)
+        if cat in RETAIL_CATEGORIES:
+            facts = retail_facts(tx)
+            if facts.is_confirmed_oos:
+                continue
+            amt = facts.pretax
+        else:
+            amt = pretax_abs_amount(tx)
         result[month][bo_code] = result[month].get(bo_code, Decimal("0")) + amt
     return result
 

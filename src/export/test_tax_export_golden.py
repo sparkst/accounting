@@ -27,7 +27,7 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from src.export.bno_tax import generate_bno_export
+from src.export.bno_tax import generate_bno_export, generate_dor_upload
 from src.export.freetaxusa import build_1099b_csv
 from src.export.freetaxusa import build_form_1065_summary as freetaxusa_1065
 from src.export.retail_sales_tax import compute_retail_detail
@@ -79,14 +79,22 @@ class TestGoldenCrossSurfaceConsistency:
         detail = compute_retail_detail(active, year, quarter=quarter)
         assert detail.gross_retailing == Decimal("340.70")
 
-    def test_bno_csv_reports_same_pretax_gross_as_dor(self) -> None:
+    def test_bno_csv_reports_same_wa_taxable_retailing_as_dor(self) -> None:
+        """REQ-FIX-TAX-002 / REQ-020: the B&O CSV's Retailing basis excludes
+        confirmed out-of-state sales, matching the DOR upload's authoritative
+        ``wa_taxable`` line (not the pre-interstate-deduction gross). WA
+        order: $100 - $9.30 tax = $90.70. The $250 OOS order is excluded from
+        both surfaces."""
         active, year, quarter = _load_active_transactions()
         detail = compute_retail_detail(active, year, quarter=quarter)
 
         bno_content, _ = generate_bno_export(active, "blackline", year)
         bno_sales_total = _bno_csv_sales_total(bno_content)
 
-        assert bno_sales_total == detail.gross_retailing == Decimal("340.70")
+        assert bno_sales_total == detail.wa_taxable == Decimal("90.70")
+        # The full pretax gross (all destinations) remains distinct — the OOS
+        # sale is excluded from both the B&O CSV and the DOR wa_taxable line.
+        assert detail.gross_retailing == Decimal("340.70")
 
     def test_freetaxusa_1065_reports_same_pretax_gross(self) -> None:
         active, year, _ = _load_active_transactions()
@@ -121,3 +129,21 @@ class TestGoldenCrossSurfaceConsistency:
         rows = [r for r in csv.reader(io.StringIO(out)) if any(r)]
         assert len(rows) == 2  # header + the one INVESTMENT_INCOME row
         assert rows[1][5] == "Short"
+
+    def test_dor_upload_file_body_pinned(self) -> None:
+        """REQ-FIX-TAX-002: DOR upload generated file body is pinned
+        end-to-end to prevent undetected regressions in the wa_taxable basis
+        or estimated_bo_tax computation. The golden fixture includes a $100
+        WA order ($90.70 pre-tax) → TAX,2,0,90.70 (Retailing); plus state and
+        local sales-tax lines TAX,1,0,90.70 and TAX,45,1739,90.70."""
+        active, year, quarter = _load_active_transactions()
+        content, _ = generate_dor_upload(active, "blackline", year, quarter=quarter)
+        lines = content.strip().split("\n")
+        # ACCOUNT line should be present
+        assert any(line.startswith("ACCOUNT,") for line in lines)
+        # Retailing B&O line (code 2) at $90.70 pre-tax basis (not $100 tax-incl)
+        assert any(line == "TAX,2,0,90.70" for line in lines)
+        # State retail sales tax (code 1) at $90.70 basis
+        assert any(line == "TAX,1,0,90.70" for line in lines)
+        # Local sales tax (code 45) at Sammamish location (1739) at $90.70
+        assert any(line == "TAX,45,1739,90.70" for line in lines)

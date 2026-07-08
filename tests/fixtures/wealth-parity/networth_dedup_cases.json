@@ -1,0 +1,85 @@
+{
+  "_doc": "REQ-FIX-WLT-004 shared parity fixture. The contract between the local pytest (src/utils/test_networth_dedup.py) and the sparkry-crm vitest against unmatchedActiveAt. Each case: an unmatched legacy raw_account_name with a value series, per-name tier-1 (matched_first) and tier-2 (alias_cutoff) cutoff maps (keys LOWERCASED), a target date, and the expected contribution (latest value at-or-before target if still active, else 0.00). Both repos assert a checked-in SHA-256 of this file so silent drift fails CI in both.",
+  "cases": [
+    {
+      "name": "no_cutoff_full_history_included",
+      "matched_first": {},
+      "alias_cutoff": {},
+      "unmatched_series": {"Amy IRA": [["2021-01-01", "100.00"], ["2021-06-01", "150.00"]]},
+      "target_date": "2021-07-01",
+      "expected_contribution": "150.00"
+    },
+    {
+      "name": "tier1_only_suppresses_at_cutoff",
+      "matched_first": {"amy ira": "2022-01-01"},
+      "alias_cutoff": {},
+      "unmatched_series": {"Amy IRA": [["2021-01-01", "100.00"], ["2021-12-01", "120.00"]]},
+      "target_date": "2022-01-01",
+      "expected_contribution": "0.00"
+    },
+    {
+      "name": "tier1_only_included_strictly_before",
+      "matched_first": {"amy ira": "2022-01-01"},
+      "alias_cutoff": {},
+      "unmatched_series": {"Amy IRA": [["2021-01-01", "100.00"], ["2021-12-01", "120.00"]]},
+      "target_date": "2021-12-31",
+      "expected_contribution": "120.00"
+    },
+    {
+      "name": "tier2_only_alias_cutoff",
+      "matched_first": {},
+      "alias_cutoff": {"travis vanguard ira": "2023-03-15"},
+      "unmatched_series": {"Travis Vanguard IRA": [["2022-01-01", "500.00"], ["2023-01-01", "600.00"]]},
+      "target_date": "2023-04-01",
+      "expected_contribution": "0.00"
+    },
+    {
+      "name": "both_cutoffs_earlier_wins",
+      "matched_first": {"amy roth ira": "2024-01-01"},
+      "alias_cutoff": {"amy roth ira": "2022-06-01"},
+      "unmatched_series": {"Amy Roth IRA": [["2021-01-01", "10.00"], ["2022-05-01", "20.00"]]},
+      "target_date": "2022-06-01",
+      "expected_contribution": "0.00"
+    },
+    {
+      "name": "both_cutoffs_earlier_wins_included_before",
+      "matched_first": {"amy roth ira": "2024-01-01"},
+      "alias_cutoff": {"amy roth ira": "2022-06-01"},
+      "unmatched_series": {"Amy Roth IRA": [["2021-01-01", "10.00"], ["2022-05-01", "20.00"]]},
+      "target_date": "2022-05-31",
+      "expected_contribution": "20.00"
+    },
+    {
+      "name": "mixed_case_alias_vs_snapshot_casing",
+      "matched_first": {},
+      "alias_cutoff": {"travis roth ira": "2023-01-01"},
+      "unmatched_series": {"TRAVIS ROTH IRA": [["2022-01-01", "300.00"]]},
+      "target_date": "2023-06-01",
+      "expected_contribution": "0.00"
+    },
+    {
+      "name": "carry_forward_cut_at_cutoff",
+      "matched_first": {"travis vanguard ira": "2022-01-01"},
+      "alias_cutoff": {},
+      "unmatched_series": {"Travis Vanguard IRA": [["2020-01-01", "800.00"]]},
+      "target_date": "2025-01-01",
+      "expected_contribution": "0.00"
+    },
+    {
+      "name": "pre_2022_restore_scenario_included",
+      "matched_first": {"amy ira": "2023-06-01"},
+      "alias_cutoff": {"amy ira": "2023-06-01"},
+      "unmatched_series": {"Amy IRA": [["2019-01-01", "50.00"], ["2021-01-01", "75.00"]]},
+      "target_date": "2021-12-31",
+      "expected_contribution": "75.00"
+    },
+    {
+      "name": "no_series_row_before_target_contributes_zero",
+      "matched_first": {},
+      "alias_cutoff": {},
+      "unmatched_series": {"Amy IRA": [["2023-01-01", "100.00"]]},
+      "target_date": "2022-06-01",
+      "expected_contribution": "0.00"
+    }
+  ]
+}

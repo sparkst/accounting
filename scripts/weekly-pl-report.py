@@ -94,6 +94,7 @@ def generate_report() -> str:
                 func.count().label("txn_count"),
             ).filter(
                 Transaction.status != TransactionStatus.REJECTED.value,
+                Transaction.status != TransactionStatus.SPLIT_PARENT.value,
                 Transaction.direction == "expense",
                 Transaction.date >= three_months_ago,
                 ~Transaction.date.like(f"{current_month}%"),
@@ -108,6 +109,7 @@ def generate_report() -> str:
                 func.sum(func.abs(Transaction.amount)).label("total"),
             ).filter(
                 Transaction.status != TransactionStatus.REJECTED.value,
+                Transaction.status != TransactionStatus.SPLIT_PARENT.value,
                 Transaction.direction == "expense",
                 Transaction.date >= month_start,
             ).group_by(Transaction.description).all()

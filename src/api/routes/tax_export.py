@@ -22,7 +22,7 @@ from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
-from src.export.basis import pretax_abs_amount
+from src.export.basis import RETAIL_CATEGORIES, pretax_abs_amount, retail_facts
 from src.export.bno_tax import generate_bno_export, generate_dor_upload
 from src.export.freetaxusa import generate_freetaxusa_export
 from src.export.retail_sales_tax import compute_retail_detail
@@ -145,6 +145,30 @@ def _tx_to_dict(tx: Transaction) -> dict[str, Any]:
     }
 
 
+def _bno_pretax_amount(tx_dict: dict[str, Any]) -> Decimal | None:
+    """Return the B&O-basis pre-tax amount for an income tx dict.
+
+    REQ-FIX-TAX-002 / REQ-020: mirrors ``bno_tax._aggregate_income_by_month``
+    — SALES_INCOME rows confirmed as out-of-state
+    (``retail_facts(tx).is_confirmed_oos``) are excluded entirely (returns
+    ``None``) so every B&O-purposed surface (the B&O CSV, the DOR upload, the
+    dashboard B&O subtotals, and the B&O wizard's monthly readiness view)
+    reconciles on the same ``wa_taxable`` basis. Non-retail categories and
+    WA-confirmed retail rows fall through to the standard
+    ``pretax_abs_amount``. This intentionally differs from the income-tax
+    ``line_items``/``gross_income`` figures (Schedule C / 1065 gross receipts
+    include out-of-state sales) — those stay on the gross-incl-OOS basis via
+    ``pretax_abs_amount`` directly.
+    """
+    cat = tx_dict.get("tax_category")
+    if cat in RETAIL_CATEGORIES:
+        facts = retail_facts(tx_dict)
+        if facts.is_confirmed_oos:
+            return None
+        return facts.pretax
+    return pretax_abs_amount(tx_dict)
+
+
 def _readiness(transactions: list[Transaction]) -> dict[str, Any]:
     """Compute readiness stats: confirmed_count, total_count, pct, unconfirmed_ids."""
     total = len(transactions)
@@ -205,15 +229,22 @@ def _aggregate_for_yoy(
 
     Returns line_items, gross_income, total_expenses, net_profit,
     bno_monthly, bno_quarterly.
+
+    REQ-FIX-TAX-002: category_totals (and therefore line_items/gross_income)
+    route through ``pretax_abs_amount`` so SALES_INCOME is reported pre-tax
+    (collected WA sales tax excluded) — the same gross-incl-out-of-state
+    basis as ``/api/tax-summary``'s own line_items, so the YoY comparison's
+    absolute current/prior figures agree with the non-comparison response
+    for the same year. bno_monthly/bno_quarterly additionally exclude
+    confirmed out-of-state SALES_INCOME via ``_bno_pretax_amount``, matching
+    ``/api/tax-summary``'s bno_monthly (REQ-020).
     """
     category_totals: dict[str, Decimal] = {}
     for tx in transactions:
         cat = tx.tax_category
         if not cat or cat in ("PERSONAL_NON_DEDUCTIBLE", "CAPITAL_CONTRIBUTION"):
             continue
-        amt = Decimal(str(tx.amount)) if tx.amount is not None else Decimal("0")
-        pct = Decimal(str(tx.deductible_pct))
-        deductible = abs(amt) * pct
+        deductible = pretax_abs_amount(_tx_to_dict(tx))
         category_totals[cat] = category_totals.get(cat, Decimal("0")) + deductible
 
     line_items = []
@@ -256,7 +287,10 @@ def _aggregate_for_yoy(
             month_num = int(date_str[5:7])
         except (IndexError, ValueError):
             continue
-        monthly_income[month_num] += abs(float(tx.amount)) if tx.amount is not None else 0.0
+        bno_amt = _bno_pretax_amount(_tx_to_dict(tx))
+        if bno_amt is None:
+            continue
+        monthly_income[month_num] += float(bno_amt)
 
     bno_monthly = [
         {"month": f"{year}-{m:02d}", "income": round(monthly_income[m], 2)}
@@ -694,7 +728,14 @@ def get_monthly_breakdown(
 
     Only months with at least one transaction are included; the ``months``
     array is ordered Jan → Dec.  Per-category totals use the same
-    absolute-deductible-amount calculation as ``/api/tax-summary``.
+    absolute-deductible-amount calculation as ``/api/tax-summary``'s
+    ``line_items``, EXCEPT for ``SALES_INCOME``: this endpoint drives the
+    B&O wizard's monthly readiness view, so confirmed out-of-state retail
+    sales are excluded from the ``SALES_INCOME`` bucket (REQ-FIX-TAX-002 /
+    REQ-020) to reconcile with the B&O CSV/DOR upload's ``wa_taxable``
+    basis. ``/api/tax-summary``'s own ``line_items``/``gross_income``
+    remain on the gross-incl-out-of-state basis (correct for Schedule C /
+    1065 gross receipts).
     """
     entity = _validate_entity(entity)
     _validate_year(year)
@@ -720,9 +761,14 @@ def get_monthly_breakdown(
         if month_num < 1 or month_num > 12:
             continue
 
-        amt = Decimal(str(tx.amount)) if tx.amount is not None else Decimal("0")
-        pct = Decimal(str(tx.deductible_pct))
-        deductible = abs(amt) * pct
+        # REQ-FIX-TAX-002: monthly cells use the INCOME-TAX basis
+        # (pretax_abs_amount — pre-tax but INCLUDING out-of-state sales), the
+        # same basis as the annual line_items beside them on the Financials
+        # drill-down, so months always sum to the annual cell. The B&O wizard
+        # must NOT source its Retailing basis from this endpoint — it uses
+        # compute_retail_detail (wa_taxable), which correctly drops
+        # confirmed-OOS rows.
+        deductible = pretax_abs_amount(_tx_to_dict(tx))
 
         bucket = month_cat[month_num]
         bucket[cat] = bucket.get(cat, Decimal("0")) + deductible
@@ -905,8 +951,11 @@ def get_tax_summary(
         warnings.append(warn)
 
     # ── Per-month / per-quarter income breakdown for B&O table ────────────
-    # REQ-FIX-TAX-002: same pre-tax basis as above, not the tax-inclusive
-    # stored amount.
+    # REQ-FIX-TAX-002 / REQ-020: _bno_pretax_amount reports the pre-tax basis
+    # (not the tax-inclusive stored amount) AND drops confirmed out-of-state
+    # SALES_INCOME rows entirely, so this B&O table reconciles with the B&O
+    # CSV/DOR upload's wa_taxable basis instead of the gross-incl-OOS figure
+    # used by line_items/gross_income above.
     monthly_income: dict[int, float] = {m: 0.0 for m in range(1, 13)}
     for tx in transactions:
         cat = tx.tax_category
@@ -917,8 +966,10 @@ def get_tax_summary(
             month_num = int(date_str[5:7])
         except (IndexError, ValueError):
             continue
-        amt = float(pretax_abs_amount(_tx_to_dict(tx)))
-        monthly_income[month_num] += amt
+        bno_amt = _bno_pretax_amount(_tx_to_dict(tx))
+        if bno_amt is None:
+            continue
+        monthly_income[month_num] += float(bno_amt)
 
     bno_monthly = [
         {"month": f"{year}-{m:02d}", "income": round(monthly_income[m], 2)}

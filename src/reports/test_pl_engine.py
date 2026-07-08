@@ -155,6 +155,32 @@ class TestComputeEntityPL:
         assert pl.expenses == Decimal("0")
         assert pl.net == Decimal("0")
 
+    def test_linked_direction_expense_leg_nets_to_zero_both_sides(self, session: Session) -> None:
+        """REQ-FIX-API-003 / P2-r1a: link_reimbursement explicitly permits
+        the expense leg of a reimbursement pair to be direction=expense (not
+        just direction=reimbursable) and sets the link bidirectionally. Such
+        a pair must also net to exactly zero on both sides — not just the
+        canonical direction=reimbursable (Cardinal Health) case."""
+        income_tx = _make_tx(
+            session, amount="150.00", direction=Direction.INCOME.value,
+            description="Reimbursement",
+        )
+        expense_tx = _make_tx(
+            session, amount="-150.00", direction=Direction.EXPENSE.value,
+            description="Reimbursed expense (direction=expense)",
+            reimbursement_link=income_tx.id,
+        )
+        # Mirror link_reimbursement's bidirectional link (transactions.py
+        # 1323/1326): the income leg also points back at the expense leg.
+        income_tx.reimbursement_link = expense_tx.id
+        session.add(income_tx)
+        session.commit()
+
+        pl = compute_entity_pl(session, "2026-06-01", "2026-06-15")
+        assert pl.revenue == Decimal("0")
+        assert pl.expenses == Decimal("0")
+        assert pl.net == Decimal("0")
+
     def test_unlinked_reimbursable_invisible_to_both_sides(self, session: Session) -> None:
         """An unlinked reimbursable expense (not yet reimbursed) is not P&L
         on either side — correct, it's still pending."""

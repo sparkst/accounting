@@ -204,6 +204,78 @@ class TestBuildBlacklineBnoCsv:
 
 
 # ---------------------------------------------------------------------------
+# Tests: confirmed out-of-state retail sales excluded from Retailing basis
+# (REQ-FIX-TAX-002 / REQ-020) — parity with generate_dor_upload's wa_taxable.
+# ---------------------------------------------------------------------------
+
+
+class TestBlacklineRetailingExcludesConfirmedOutOfState:
+    def _wa_and_oos_tx(self) -> list[dict]:
+        wa_tx = {
+            "date": "2025-01-15",
+            "description": "WA retail order",
+            "amount": "109.30",
+            "tax_category": "SALES_INCOME",
+            "deductible_pct": "1.0",
+            "raw_data": {
+                "total_price": "109.30",
+                "total_tax": "9.30",
+                "tax_lines": [{"title": "WA State Tax"}],
+                "shipping_address": {"province_code": "WA"},
+            },
+        }
+        oos_tx = {
+            "date": "2025-01-20",
+            "description": "Out-of-state retail order",
+            "amount": "250.00",
+            "tax_category": "SALES_INCOME",
+            "deductible_pct": "1.0",
+            "raw_data": {
+                "total_price": "250.00",
+                "total_tax": "0.00",
+                "tax_lines": [],
+                "shipping_address": {"province_code": "OR"},
+            },
+        }
+        return [wa_tx, oos_tx]
+
+    def test_confirmed_oos_sale_excluded_from_retailing_gross(self):
+        rows = list(
+            csv.reader(io.StringIO(build_blackline_bno_csv(self._wa_and_oos_tx(), 2025)))
+        )
+        q1_rows = [r for r in rows if "Q1" in str(r) and "Retailing" in str(r)]
+        assert q1_rows, "Expected a Q1 Retailing row"
+        # Only the WA order's pre-tax amount (109.30 - 9.30 = 100.00) counts —
+        # the $250 confirmed-out-of-state order is excluded entirely,
+        # mirroring compute_retail_detail's wa_taxable deduction.
+        assert q1_rows[0][3] == "100.00"
+
+    def test_estimated_bo_tax_matches_dor_wa_taxable_basis(self):
+        from src.export.retail_sales_tax import compute_retail_detail
+
+        transactions = self._wa_and_oos_tx()
+        detail = compute_retail_detail(transactions, 2025, quarter=1)
+
+        rows = list(
+            csv.reader(io.StringIO(build_blackline_bno_csv(transactions, 2025)))
+        )
+        q1_rows = [r for r in rows if "Q1" in str(r) and "Retailing" in str(r)]
+        assert Decimal(q1_rows[0][3]) == detail.wa_taxable == Decimal("100.00")
+
+    def test_retailing_estimated_bo_tax_pinned(self):
+        """REQ-FIX-TAX-002 / REQ-FIX-TAX-006: Retailing tax-owed cell (col 5)
+        is pinned to prevent BO_RATE['Retailing'] drift from
+        RETAILING_BO_RATE undetected. $90.70 wa_taxable * 0.00471 = $0.43."""
+        rows = list(
+            csv.reader(io.StringIO(build_blackline_bno_csv(self._wa_and_oos_tx(), 2025)))
+        )
+        q1_rows = [r for r in rows if "Q1" in str(r) and "Retailing" in str(r)]
+        assert q1_rows, "Expected a Q1 Retailing row"
+        # $100.00 wa_taxable * 0.00471 = $0.471 → $0.47
+        assert q1_rows[0][5] == "0.47"
+
+
+# ---------------------------------------------------------------------------
 # Tests: generate_bno_export
 # ---------------------------------------------------------------------------
 

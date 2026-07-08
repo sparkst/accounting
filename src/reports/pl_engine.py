@@ -14,11 +14,18 @@ Semantics:
 - Excludes ``rejected`` and ``split_parent`` rows (REQ-FIX-API-001/002
   exclusion semantics) — a split parent's children carry the actual amounts.
 - Reimbursable netting (per CLAUDE.md — reimbursable pairs net to zero on
-  P&L): the expense side only ever sums ``direction=expense`` rows (never
-  ``direction=reimbursable``); the revenue side additionally excludes income
-  rows that are reimbursement receipts (any transaction whose id is targeted
-  by another row's ``reimbursement_link``). An unlinked reimbursable expense
-  stays invisible to both sides — correct, it is not yet P&L.
+  P&L): the expense side sums ``direction=expense`` rows but excludes any
+  such row that is itself the expense leg of a linked reimbursement pair
+  (``link_reimbursement`` permits the expense leg to be direction=expense,
+  not just direction=reimbursable, and sets the link bidirectionally); rows
+  with ``direction=reimbursable`` are never summed as expenses in the first
+  place. The revenue side additionally excludes income rows that are
+  reimbursement receipts. Both exclusions key off the same
+  ``reimbursement_target_ids`` set (any transaction id targeted by another
+  row's ``reimbursement_link``), so a linked pair — regardless of whether
+  the expense leg is direction=expense or direction=reimbursable — nets to
+  exactly zero on both sides. An unlinked reimbursable expense stays
+  invisible to both sides — correct, it is not yet P&L.
 - All amounts are ``abs()``'d by direction and computed in Decimal
   end-to-end (``Decimal(str(x))`` at the boundary, per CLAUDE.md) — never a
   SQL-side float aggregate.
@@ -118,6 +125,14 @@ def compute_entity_pl(
                 continue  # reimbursement receipt — already netted, not revenue
             revenue += amt
         elif tx.direction == Direction.EXPENSE.value:
+            # REQ-FIX-API-003: link_reimbursement permits the expense leg to
+            # be direction=expense (not just reimbursable) and sets the link
+            # bidirectionally, so reimbursement_target_ids also contains the
+            # expense-side id for such a pair. Skip it here too — it is
+            # already netted via the income-side exclusion above, so summing
+            # it as an expense would double-count the reimbursed amount.
+            if tx.id in reimbursement_target_ids:
+                continue
             expenses += amt
         # transfer / reimbursable-direction rows are never P&L on either side
 

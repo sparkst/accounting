@@ -601,6 +601,7 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-FIX-TAX-005 | 1099-B export handles `tax_subcategory=None` and matches term case-insensitively (no 500 on personal exports). |
 | REQ-FIX-TAX-006 | B&O CSV grand totals equal the sum of the displayed (per-row-rounded) values. |
 | REQ-FIX-TAX-007 | DOR upload hard-fails with an actionable error when any row carries the unmapped `____` location code. |
+| REQ-FIX-TAX-008 | **DEFERRED follow-up (P3-302, 2026-07 review):** net confirmed sales refunds (OTHER_EXPENSE) against Retailing B&O gross receipts as a returns-and-allowances deduction. Until shipped, `bno_tax.py` documents the gap and the filer applies the deduction manually at DOR. |
 
 ## REQ-FIX-INV-* — Invoicing integrity
 

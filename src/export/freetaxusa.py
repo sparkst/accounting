@@ -120,6 +120,10 @@ def build_1099b_csv(transactions: list[dict[str, Any]]) -> str:
         # absent) — ``tx.get("tax_subcategory", "")`` returns None in that
         # case, and ``"long" in None`` raised a TypeError (500 on personal
         # exports). Case-insensitive match so "LONG-TERM" also maps correctly.
+        # NOTE: Rows with missing or unrecognized tax_subcategory silently
+        # default to "Short" term (higher tax rate). If holding period is
+        # available in raw_data, consider deriving term from opened/closed
+        # dates for better accuracy.
         subcategory = (tx.get("tax_subcategory") or "").lower()
         term = "Long" if "long" in subcategory else "Short"
 

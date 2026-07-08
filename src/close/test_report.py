@@ -94,6 +94,6 @@ def test_build_close_report_kpis(session: Session) -> None:
 def test_data_hygiene_callouts_present(session: Session) -> None:
     """REQ-FIX-DAT-002: the two report-only data-hygiene lines are always included."""
     report = build_close_report(session, "2026-06", today=_TODAY)
-    assert "Unnamed Vanguard taxable account — name or archive" in report.data_hygiene
+    assert "Vanguard $0 stub (named 2026-07-08) — confirm archive" in report.data_hygiene
     assert "$50 Fidelity TOD — human closure decision" in report.data_hygiene
     assert report.data_hygiene == list(DATA_HYGIENE_CALLOUTS)

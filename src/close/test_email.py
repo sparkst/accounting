@@ -87,7 +87,7 @@ def test_render_html_contains_sections_and_links() -> None:
     assert "books.sparkry.ai/?status=needs_review&amp;entity=sparkry" in html
     assert "Auto-confirm summary" in html
     assert "12 transaction(s) auto-confirmed" in html
-    assert "Unnamed Vanguard taxable account — name or archive" in html
+    assert "Vanguard $0 stub (named 2026-07-08) — confirm archive" in html
     assert "$50 Fidelity TOD — human closure decision" in html
 
 

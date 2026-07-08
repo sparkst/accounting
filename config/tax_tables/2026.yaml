@@ -1,0 +1,58 @@
+# !!! VERIFY vs IRS Rev. Proc. before release !!!
+#
+# 2026 MFJ tax-table constants for the tax-posture forecaster (REQ-TXF-001..004,
+# design spec §4.2 step 6, §10 open item 2). These are release-blocking values —
+# do not enable accounting-tax-forecast.timer until every number below has been
+# checked against the actual 2026 IRS Revenue Procedure (brackets, standard
+# deduction, SS wage base, QBI thresholds, home-office constant). Values here
+# are conservative 2025-carried-forward placeholders, NOT verified 2026 figures.
+
+tax_year: 2026
+
+# Home-office deduction constant (Sparkry Schedule C safe-harbor, $5/sqft up
+# to 300 sqft simplified method) — placeholder, confirm against actual usage.
+home_office_deduction: 1500.00
+
+# BlackLine K-1 passthrough share (config, not code — Travis 100% vested,
+# Emerson 0% vested profits interest per CLAUDE.md Entities table).
+k1_share: 1.0
+
+# Self-employment tax (design spec §4.2 step 3).
+se_tax_rate: 0.9235          # net-earnings-from-SE multiplier
+ss_rate: 0.124                 # 12.4% Social Security portion
+medicare_rate: 0.029           # 2.9% Medicare portion (unlimited)
+addl_medicare_rate: 0.009      # 0.9% additional Medicare over threshold
+ss_wage_base: 176100.00        # 2025 figure carried forward — VERIFY for 2026
+addl_medicare_mfj_threshold: 250000.00
+
+# QBI (design spec §4.2 step 4). Sparkry consulting is SSTB.
+qbi_rate: 0.20
+qbi_mfj_threshold: 383900.00       # phase-out band start, MFJ — VERIFY for 2026
+qbi_mfj_phase_out_width: 100000.00  # band width (threshold -> threshold+width fully phased out)
+qbi_is_sstb: true
+
+# MFJ standard deduction — VERIFY for 2026.
+standard_deduction_mfj: 30000.00
+
+# MFJ federal bracket table (design spec §4.2 step 6). `up_to` is the
+# taxable-income ceiling of the bracket (last bracket uses a very large
+# number to represent "no ceiling"); `rate` applies to income above the
+# previous bracket's ceiling up to this one's. VERIFY every value for 2026.
+mfj_brackets:
+  - {up_to: 23850.00, rate: 0.10}
+  - {up_to: 96950.00, rate: 0.12}
+  - {up_to: 206700.00, rate: 0.22}
+  - {up_to: 394600.00, rate: 0.24}
+  - {up_to: 501050.00, rate: 0.32}
+  - {up_to: 751600.00, rate: 0.35}
+  - {up_to: 99999999.00, rate: 0.37}
+
+# Safe-harbor target (design spec §4.3).
+safe_harbor_pct: 1.10
+
+# Estimated-tax due dates for the current tax_year (design spec §4.3/§4.5).
+estimated_tax_due_dates:
+  - {quarter: 1, due_date: "2026-04-15"}
+  - {quarter: 2, due_date: "2026-06-15"}
+  - {quarter: 3, due_date: "2026-09-15"}
+  - {quarter: 4, due_date: "2027-01-15"}

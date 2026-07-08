@@ -1,0 +1,29 @@
+# Sellability metrics config (REQ-SEL-001..002, design spec §5.1).
+#
+# Every add-back is itemized in the rendered report — nothing implicit.
+# Edit the lists below to reflect actual add-back policy; ship with empty/
+# zero defaults so a fresh checkout never silently inflates SDE.
+
+# Sparkry tax_category values whose abs(amount) sums into SDE add-backs.
+addback_categories:
+  - HEALTH_INSURANCE
+  - PERSONAL_NON_DEDUCTIBLE
+
+# Owner-salary add-back — Sparkry is a single-member LLC, so draws aren't
+# expenses; kept explicit and zero unless that ever changes (e.g. S-corp
+# election with a reasonable-comp payroll expense to add back).
+owner_salary_monthly: 0.00
+
+# One-off, non-recurring items to add back (audit trail: date/description/
+# amount/note). Empty by default.
+one_time_items: []
+
+# Per-customer recurring-flag override — True forces recurring, False forces
+# project, absent falls back to the BillingModel-derived default.
+recurring_customers: {}
+
+# Stripe non-invoice income -> client-name mapping. Rules tried in order;
+# first match wins. Supported match kinds:
+#   "customer:<stripe_customer_id>"   — raw_data["customer"] equality
+#   "desc_contains:<substring>"       — case-insensitive substring of description
+stripe_client_map: []

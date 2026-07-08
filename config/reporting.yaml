@@ -1,0 +1,28 @@
+# WBR threshold config (REQ-WBR-001..003, design spec §3.3).
+#
+# Every key here has a coded default in src/reports/wbr.py
+# (WBR_DEFAULT_THRESHOLDS) — this file only needs to carry the keys an
+# operator wants to override. Delete this file entirely and the report runs
+# on coded defaults with a "(defaults)" footer marker.
+#
+# All dollar/percent values are coerced to Decimal at load time
+# (src/reports/report_config.py::to_decimal); day-count values stay int.
+
+thresholds:
+  net_drop_pct: 30       # entity net WoW drop, percent
+  net_min_abs: 500        # ... AND at least this many dollars
+  exp_rise_pct: 30        # entity expenses WoW rise, percent
+  exp_min_abs: 500        # ... AND at least this many dollars
+  ar_total_max: 30000     # AR aging total ceiling (matches weekly-P&L flag)
+  checking_floor: 2500    # per-account checking balance floor
+  credit_max: 8000        # any liability (credit) balance ceiling
+  review_max: 25          # review-queue depth ceiling
+  plaid_stale_days: 2     # Plaid item last-success age ceiling, days
+
+# Per-source freshness cadence (days) — older than this renders a stale
+# marker in the "Data as-of" footer.
+freshness:
+  plaid: 2
+  gmail: 3
+  stripe: 3
+  bank_csv: 35

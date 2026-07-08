@@ -847,3 +847,108 @@ class TestForwardedEmailIntegration:
         tx = session.query(Transaction).one()
         assert tx.amount is None
         assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+
+
+# ---------------------------------------------------------------------------
+# Tests — REQ-FIX-ING-002: Decimal-only exchange-rate math
+# ---------------------------------------------------------------------------
+
+USD_AND_FOREIGN_RECEIPT: dict[str, object] = {
+    "id": "aa11bb22cc33dd44",
+    "filename": "2025-05-01_Foreign_Vendor_aa11bb22cc33dd44",
+    "date": "2025-05-01T12:00:00.000Z",
+    "from": "Foreign Vendor <billing@foreignvendor.example>",
+    "subject": "Your receipt from Foreign Vendor",
+    "body_text": (
+        "Receipt from Foreign Vendor\n"
+        "Amount paid $10.00\n"
+        "Local charge: £8.00\n"
+    ),
+    "body_html": "<html></html>",
+}
+
+
+class TestForeignCurrencyDecimalMath:
+    """REQ-FIX-ING-002: a receipt carrying BOTH a USD amount and a detected
+    foreign amount must ingest without a float/Decimal TypeError, and the
+    stored exchange_rate must be a Decimal."""
+
+    def test_usd_and_foreign_amount_ingests_without_typeerror(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, USD_AND_FOREIGN_RECEIPT)
+        adapter = GmailN8nAdapter(source_dirs=[str(tmp_path)])
+        result = adapter.run(session)
+
+        assert result.records_created == 1
+        assert result.records_failed == 0
+
+        tx = session.query(Transaction).one()
+        assert tx.amount == decimal.Decimal("-10.00")
+        assert tx.currency_code == "GBP"
+        assert tx.amount_foreign == decimal.Decimal("8.00")
+        assert tx.exchange_rate is not None
+        assert isinstance(tx.exchange_rate, decimal.Decimal)
+        # 10.00 / 8.00 = 1.25, quantized to 8dp.
+        assert tx.exchange_rate == decimal.Decimal("1.25000000")
+        assert tx.exchange_rate_source == "email_extracted"
+
+
+# ---------------------------------------------------------------------------
+# Tests — REQ-FIX-ING-003: per-file rollback on failure
+# ---------------------------------------------------------------------------
+
+
+class TestPerFileRollback:
+    """REQ-FIX-ING-003: a mid-file exception rolls back only that file's
+    partial rows; the session remains usable for subsequent files."""
+
+    def test_middle_file_failure_does_not_poison_batch(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, ANTHROPIC_RECEIPT)
+        write_fixture(tmp_path, RUNPOD_RECEIPT)
+        write_fixture(tmp_path, TUNE_UP_RECEIPT)
+
+        import src.adapters.gmail_n8n as gmail_mod
+
+        orig_record = gmail_mod.GmailN8nAdapter._record_ingested_file
+        state = {"count": 0}
+
+        def flaky_record_ingested_file(
+            session: Session,
+            json_path: Path,
+            file_hash: str,
+            status: FileStatus,
+            transaction_ids: list[str],
+        ) -> None:
+            state["count"] += 1
+            if state["count"] == 2:
+                raise RuntimeError("forced failure on file 2")
+            orig_record(session, json_path, file_hash, status, transaction_ids)
+
+        monkey_target = gmail_mod.GmailN8nAdapter._record_ingested_file
+        gmail_mod.GmailN8nAdapter._record_ingested_file = staticmethod(  # type: ignore[method-assign]
+            flaky_record_ingested_file
+        )
+        try:
+            adapter = GmailN8nAdapter(source_dirs=[str(tmp_path)])
+            result = adapter.run(session)
+        finally:
+            gmail_mod.GmailN8nAdapter._record_ingested_file = monkey_target  # type: ignore[method-assign]
+
+        assert result.records_created == 2
+        assert result.records_failed == 1
+
+        # The session must still be usable: 2 committed transactions, and no
+        # partial/orphaned row from the failed file. Files are processed in
+        # sorted-glob order (2025-03-09 Anthropic, 2025-04-12 RunPod,
+        # 2025-06-18 Tune-Up) — the 2nd file (RunPod) is the forced failure.
+        transactions = session.query(Transaction).all()
+        assert len(transactions) == 2
+        descriptions = {tx.description for tx in transactions}
+        assert descriptions == {"Anthropic, PBC", "Travis Sparks"}
+
+        # No partial IngestedFile row for the failed file either.
+        ingested_files = session.query(IngestedFile).all()
+        assert len(ingested_files) == 2

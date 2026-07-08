@@ -56,11 +56,14 @@ Entities:
 
 Valid tax_category values (exact strings):
   Business: ADVERTISING, CAR_AND_TRUCK, CONTRACT_LABOR, INSURANCE,
-            LEGAL_AND_PROFESSIONAL, OFFICE_EXPENSE, SUPPLIES,
+            HEALTH_INSURANCE, LEGAL_AND_PROFESSIONAL, OFFICE_EXPENSE, SUPPLIES,
             TAXES_AND_LICENSES, TRAVEL, MEALS, COGS,
-            CONSULTING_INCOME, SUBSCRIPTION_INCOME, SALES_INCOME, REIMBURSABLE
+            CONSULTING_INCOME, SUBSCRIPTION_INCOME, SALES_INCOME,
+            WHOLESALE_INCOME, REIMBURSABLE
   Personal: CHARITABLE_CASH, CHARITABLE_STOCK, MEDICAL, STATE_LOCAL_TAX,
             MORTGAGE_INTEREST, INVESTMENT_INCOME, PERSONAL_NON_DEDUCTIBLE
+  Other:    OTHER_EXPENSE (catch-all expense; refunds/uncategorizable),
+            CAPITAL_CONTRIBUTION (owner money into an entity — not income)
 
 Valid direction values: income, expense, transfer, reimbursable
 
@@ -292,7 +295,7 @@ def _write_usage_log(
 
 
 def _parse_response(raw_text: str) -> ClassificationResult:
-    """Parse Claude's JSON response into a ClassificationResult.
+    """Parse Gemini's JSON response into a ClassificationResult.
 
     On any parse / validation error, returns a low-confidence fallback result
     rather than raising — the engine will route it to needs_review.

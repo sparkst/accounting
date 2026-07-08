@@ -111,12 +111,19 @@ def backfill(dry_run: bool = False) -> dict[str, int]:
                         )
                         stats["errors"] += 1
                 else:
-                    # USD amount exists — store foreign amount for reference
+                    # USD amount exists — store foreign amount for reference.
+                    # REQ-FIX-ING-002: exchange_rate is Numeric(18,8,
+                    # asdecimal=True) — Decimal-only arithmetic. tx.amount is
+                    # already Decimal (asdecimal=True); best.amount is Decimal
+                    # (CurrencyAmount.amount). A prior float(...) / Decimal here
+                    # raised TypeError on every tx reaching this branch.
                     if not dry_run:
                         tx.currency_code = best.currency_code
                         tx.amount_foreign = best.amount
                         if best.amount > 0:
-                            tx.exchange_rate = float(abs(tx.amount)) / best.amount
+                            tx.exchange_rate = (
+                                abs(Decimal(str(tx.amount))) / best.amount
+                            ).quantize(Decimal("1e-8"))
                             tx.exchange_rate_source = "email_extracted"
                     logger.info(
                         "%s tx %s: stored reference %s %.2f (USD amount=%.2f)",

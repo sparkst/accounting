@@ -162,7 +162,13 @@ def make_transaction(
     tx.direction = result.direction.value
     tx.deductible_pct = result.deductible_pct
     tx.confidence = result.confidence
-    tx.review_reason = result.review_reason
+    # REQ-FIX-ING-008: review_reason is set EXCLUSIVELY by the reasons block
+    # below (needs_review) or cleared (auto_classified) — no initial
+    # assignment here. Previously `tx.review_reason = result.review_reason`
+    # persisted the veto's mismatch text even when confidence ended up high
+    # enough to auto-classify, and result.status was never consulted at all:
+    # a sign-veto (_reconcile_sign -> NEEDS_REVIEW) with confidence >= 0.7
+    # landed as auto_classified.
     # Entity was set at construction (entity=entity above); classify() returns a
     # result object and never mutates tx.entity, so no re-assignment is needed.
     # A Plaid TRANSFER-category txn is NOT auto-set to direction=transfer: that
@@ -171,9 +177,15 @@ def make_transaction(
     # direction as a suggestion and force needs_review so a human confirms
     # transfer-vs-income. See _is_plaid_transfer_category for the rationale.
     is_transfer_category = _is_plaid_transfer_category(plaid_txn)
+    # REQ-FIX-ING-008: honor the engine's sign-reconciliation veto
+    # (_reconcile_sign -> NEEDS_REVIEW) regardless of confidence — a vetoed
+    # result must never auto-classify just because its confidence score
+    # happens to be >= threshold.
+    vetoed = result.status == TransactionStatus.NEEDS_REVIEW
     needs_review = (
         entity is None
         or is_transfer_category
+        or vetoed
         or result.confidence < _AUTO_THRESHOLD
     )
     tx.status = (
@@ -193,19 +205,83 @@ def make_transaction(
         reasons.append("account not mapped to an entity")
     if is_transfer_category:
         reasons.append("transfer-category — confirm transfer vs income")
-    if result.confidence < _AUTO_THRESHOLD and result.review_reason:
+    if vetoed and result.review_reason:
+        # Veto text survives regardless of confidence (REQ-FIX-ING-008) — a
+        # vetoed result's confidence score is irrelevant to whether the veto
+        # reasoning is shown to the reviewer.
+        reasons.append(result.review_reason)
+    elif result.confidence < _AUTO_THRESHOLD and result.review_reason:
         reasons.append(result.review_reason)
     if reasons:
         tx.review_reason = "plaid: " + "; ".join(reasons)
+    elif tx.status == TransactionStatus.AUTO_CLASSIFIED.value:
+        # No stale mismatch/low-confidence text survives on a clean row.
+        tx.review_reason = None
     return tx
 
 
 def _existing_by_source_id(session: Session, source_id: str) -> Transaction | None:
+    """Look up the register row for a Plaid source_id — PARENTS ONLY.
+
+    REQ-FIX-ING-007: split children copy their parent's source_id
+    (src/classification/splitter.py) so, without the parent_id IS NULL
+    filter, an upstream Plaid event (modified/removed/pending-posted) could
+    select and mutate a CHILD — breaking the split-sum invariant (children no
+    longer sum to parent). A child is never a valid target for any Plaid
+    sync mutation; only the parent (or an unsplit row) is.
+    """
     return (
         session.query(Transaction)
-        .filter(Transaction.source == SOURCE, Transaction.source_id == source_id)
+        .filter(
+            Transaction.source == SOURCE,
+            Transaction.source_id == source_id,
+            Transaction.parent_id.is_(None),
+        )
         .first()
     )
+
+
+def _flag_split_parent_for_review(
+    session: Session, parent: Transaction, reason: str
+) -> None:
+    """REQ-FIX-ING-007: an upstream Plaid event arrived for a transaction
+    that has since been split by a human. The parent's amount is structural
+    (children sum to it) and must never be mutated by automation — but the
+    human needs to know their split may now be stale. Sets
+    ``review_reason`` on the parent (status stays ``split_parent`` — flipping
+    it to ``needs_review`` would destroy the split) and flips every
+    non-rejected child to ``needs_review`` with the same reason. Every
+    mutation is audited; a human-rejected child is left alone (its rejection
+    sticks, mirroring the top-level `added` re-verify rule).
+    """
+    old_parent_reason = parent.review_reason
+    if old_parent_reason != reason:
+        parent.review_reason = reason
+        _audit_field_change(
+            session, parent, field="review_reason",
+            old_value=old_parent_reason, new_value=reason,
+        )
+
+    children: list[Transaction] = (
+        session.query(Transaction).filter(Transaction.parent_id == parent.id).all()
+    )
+    for child in children:
+        if child.status == TransactionStatus.REJECTED.value:
+            continue
+        old_status = child.status
+        old_reason = child.review_reason
+        child.status = TransactionStatus.NEEDS_REVIEW.value
+        child.review_reason = reason
+        if old_status != TransactionStatus.NEEDS_REVIEW.value:
+            _audit_status_change(
+                session, child, old_status, TransactionStatus.NEEDS_REVIEW.value
+            )
+        if old_reason != reason:
+            _audit_field_change(
+                session, child, field="review_reason",
+                old_value=old_reason, new_value=reason,
+            )
+    session.flush()
 
 
 def _apply_update(session: Session, tx: Transaction, ptxn: Any) -> bool:
@@ -248,9 +324,17 @@ def process_modified(session: Session, modified: list[Any]) -> int:
         row = _existing_by_source_id(session, ptxn.transaction_id)
         if row is None:
             continue
-        # split_parent is refused centrally inside _apply_update (updating a
-        # split parent's amount would break the split-sum invariant — children no
-        # longer sum to parent). A no-op return must NOT be counted as a modify.
+        # REQ-FIX-ING-007: split_parent gets no field mutation — instead flag
+        # it (+ non-rejected children) for human re-verification. Checked
+        # before _apply_update (which also refuses split_parent centrally as
+        # defense-in-depth) so this call site can flag rather than silently
+        # no-op. A flag is NOT counted as a "modify".
+        if row.status == TransactionStatus.SPLIT_PARENT.value:
+            _flag_split_parent_for_review(
+                session, row,
+                "plaid_modified: upstream txn changed after split — re-verify split",
+            )
+            continue
         if not _apply_update(session, row, ptxn):
             continue
         session.flush()
@@ -270,8 +354,12 @@ def process_removed(session: Session, removed: list[Any]) -> int:
         if row is None:
             continue
         if row.status == TransactionStatus.SPLIT_PARENT.value:
-            # Rejecting a split parent would orphan its children — skip + warn.
-            logger.warning("plaid removed skipped: split_parent row %s", row.id)
+            # REQ-FIX-ING-007: never reject a split parent (would orphan its
+            # children) — flag it (+ non-rejected children) for review instead.
+            _flag_split_parent_for_review(
+                session, row,
+                "plaid_removed: upstream txn removed after split — re-verify split",
+            )
             continue
         old_status = row.status
         row.status = TransactionStatus.REJECTED.value
@@ -329,8 +417,12 @@ def supersede_csv_rows(
     payment_method label are NOT collateral. Confirmed rows ARE superseded (that
     is the intended purpose: replacing confirmed CSV history with Plaid), but
     split_parent rows are excluded so rejecting a parent never orphans its split
-    children. Mutations are wrapped in a savepoint so a mid-supersede failure
-    doesn't leave a partial audit trail.
+    children. REQ-FIX-ING-007: split CHILDREN are excluded too
+    (``parent_id IS NULL``) — a child's status is never ``split_parent``, so
+    without this filter a child could be silently rejected, breaking the
+    split-sum invariant even though its parent was correctly skipped.
+    Mutations are wrapped in a savepoint so a mid-supersede failure doesn't
+    leave a partial audit trail.
     """
     if not payment_method:
         logger.warning("plaid supersede skipped: account has no payment_method label")
@@ -344,6 +436,7 @@ def supersede_csv_rows(
             Transaction.date <= covered_max,
             Transaction.status != TransactionStatus.REJECTED.value,
             Transaction.status != TransactionStatus.SPLIT_PARENT.value,
+            Transaction.parent_id.is_(None),
         )
         .all()
     )
@@ -429,13 +522,25 @@ def process_added(
         if pending_id:
             prior = _existing_by_source_id(session, pending_id)
             if prior is not None:
-                # _apply_update centrally refuses split_parent rows. If the prior
-                # pending row was split by a human, overwriting its amount would
-                # break the split-sum invariant — and promoting source_id while
-                # skipping the amount update would desync the id from the
-                # children. So if the update was a no-op (split_parent), leave the
-                # parent entirely untouched and skip this posted txn (the warning
-                # is already emitted inside _apply_update). A human reconciles.
+                # REQ-FIX-ING-007: if the prior pending row was split by a
+                # human, overwriting its amount would break the split-sum
+                # invariant — and promoting source_id while skipping the
+                # amount update would desync the id from the children. Leave
+                # the parent entirely untouched (structurally — no field
+                # mutation) but flag it (+ non-rejected children) for human
+                # re-verification; the posted txn itself is skipped.
+                if prior.status == TransactionStatus.SPLIT_PARENT.value:
+                    _flag_split_parent_for_review(
+                        session, prior,
+                        "plaid: posted txn arrived for split pending — re-verify split",
+                    )
+                    continue
+                # REQ-FIX-ING-007: a human-rejected prior sticks — promote the
+                # id/hash (so the posted txn is never re-inserted as a
+                # duplicate on a future sync) and refresh fields, but the
+                # status must NEVER flip back to needs_review. REJECTED is
+                # therefore in the transfer-recheck exempt set below alongside
+                # NEEDS_REVIEW/SPLIT_PARENT.
                 if not _apply_update(session, prior, ptxn):
                     continue
                 prior.source_id = ptxn.transaction_id
@@ -448,12 +553,16 @@ def process_added(
                 # already in needs_review, demote it so a human confirms
                 # transfer-vs-income (P3-001). split_parent rows are exempt: their
                 # status is structural, not a classification, and must not flip.
+                # REJECTED rows are exempt too (REQ-FIX-ING-007): a human veto
+                # sticks — Plaid re-categorizing a settled, human-rejected row
+                # as a transfer must not resurrect it into needs_review.
                 if (
                     _is_plaid_transfer_category(ptxn)
                     and prior.status
                     not in (
                         TransactionStatus.NEEDS_REVIEW.value,
                         TransactionStatus.SPLIT_PARENT.value,
+                        TransactionStatus.REJECTED.value,
                     )
                 ):
                     old_status = prior.status

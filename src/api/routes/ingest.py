@@ -194,7 +194,10 @@ def _run_ingest_locked(source: Source | None) -> IngestSummary:
     classified_count = 0
     classify_session = SessionLocal()
     try:
-        anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        # REQ-FIX-ING-010: Tier 3 is Gemini — read GEMINI_API_KEY, not
+        # ANTHROPIC_API_KEY (the old name injected a wrong-provider key into
+        # genai.Client(api_key=...), clobbering the correct env fallback).
+        llm_api_key = os.getenv("GEMINI_API_KEY")
 
         pending: list[Transaction] = (
             classify_session.query(Transaction)
@@ -207,7 +210,7 @@ def _run_ingest_locked(source: Source | None) -> IngestSummary:
                 classification = classify(
                     tx,
                     classify_session,
-                    anthropic_api_key=anthropic_api_key,
+                    llm_api_key=llm_api_key,
                 )
                 apply_result(tx, classification)
                 classify_session.commit()
@@ -413,9 +416,10 @@ def run_reclassify() -> ReclassifySummary:
     session = None
     try:
         session = SessionLocal()
+        # REQ-FIX-ING-010: Tier 3 is Gemini — read GEMINI_API_KEY.
         result = reclassify_all(
             session,
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            llm_api_key=os.getenv("GEMINI_API_KEY"),
             seed_rules=True,
         )
     except Exception:

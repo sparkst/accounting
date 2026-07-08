@@ -133,7 +133,7 @@ if the box is unreachable.
 **Data flow:** Sources → Adapters (Python) → Classification (3-tier) → SQLite Register → Dashboard (SvelteKit) / Tax Exports
 
 - **Adapters** (`src/adapters/`): One per data source. Each normalizes to a common Transaction schema. Per-record error isolation — one bad record never halts a batch.
-- **Classification** (`src/classification/`): Tier 1 vendor rules (instant) → Tier 2 pattern matching → Tier 3 Claude API. Items below 0.7 confidence route to `needs_review`.
+- **Classification** (`src/classification/`): Tier 1 vendor rules (instant) → Tier 2 pattern matching → Tier 3 Gemini API (`gemini-2.5-flash-lite`). Items below 0.7 confidence route to `needs_review`.
 - **Learning loop**: Every human interaction (confirm, edit, correct) creates/updates a VendorRule. The system suggests aggressively; humans confirm.
 - **Invoicing** (`src/invoicing/`): Invoice generation (calendar-based + flat-rate), PDF rendering (WeasyPrint), email delivery (Resend), Stripe payment link creation. Double-billing guards on both invoice types.
 - **Tax Documents** (`src/tax_docs/`): Tax document intake and processing.

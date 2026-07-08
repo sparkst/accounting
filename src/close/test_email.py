@@ -151,3 +151,15 @@ def test_module_constants() -> None:
     """REQ-MCA-001: ledger channel/type constants are stable."""
     assert email_mod.ALERT_TYPE == "monthly_close"
     assert email_mod.DELIVERY_CHANNEL == "resend_email"
+
+
+def test_render_html_embeds_sellability_section() -> None:
+    """REQ-SEL-001: the sellability section ships WITH the close email."""
+    report = _report()
+    report.sellability_text = "SDE (TTM): $123,456\n  add-back: owner salary $0"
+    html = email_mod.render_html(report)
+    assert "Sellability" in html
+    assert "SDE (TTM): $123,456" in html
+    # Absent text renders no empty section header.
+    report.sellability_text = None
+    assert "Sellability" not in email_mod.render_html(report)

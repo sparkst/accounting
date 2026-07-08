@@ -1,0 +1,13 @@
+{
+  "institution": "ft",
+  "statement_type": "balances",
+  "model": "gemini-2.5-flash",
+  "input_tokens": 4000,
+  "output_tokens": 800,
+  "fields": {
+    "institution": "Franklin Templeton",
+    "account_number_mask": "8291",
+    "as_of": "2026-03-31",
+    "balance": "12345.67"
+  }
+}

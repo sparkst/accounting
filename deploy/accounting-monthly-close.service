@@ -1,0 +1,42 @@
+[Unit]
+Description=Accounting monthly close agent — reconciliation + anomalies + auto-confirm summary email (REQ-MCA-001/004)
+After=network-online.target plaid-transactions-sync.service
+Wants=network-online.target
+OnFailure=accounting-alert@%p.service
+# Ordering only (no Wants=/Requires= on the Plaid syncs) — a Persistent=true boot
+# catch-up runs the daily syncs before this month-start job builds the report, and
+# a sync failure never blocks the close email.
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+# Doppler config is selected by the service token in /etc/accounting/doppler.env
+# (scoped to accounting/srv) — no --config flag needed. Requires RESEND_API_KEY +
+# ALERT_TO_EMAIL in accounting/srv. Set CLOSE_NARRATIVE_LLM=1 (+ GEMINI_API_KEY)
+# to add the optional narrative section (REQ-MCA-004); omitted → deterministic only.
+# GATED: install the timer, run one DRY-RUN by hand first
+#   doppler run -- env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python -m scripts.monthly_close
+# then flip to --apply below after one clean cycle.
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python -m scripts.monthly_close --apply
+TimeoutStartSec=180
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by accounting-monthly-close.timer — not enabled directly (no [Install]).

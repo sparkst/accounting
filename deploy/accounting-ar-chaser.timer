@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the accounting AR chaser daily at 14:15 UTC (~07:15 Pacific)
+
+[Timer]
+OnCalendar=*-*-* 14:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+# GATED: install but DO NOT `systemctl enable` until the AR chaser has been run
+# DRY-RUN by hand (python -m scripts.ar_chaser run) and the required webhook /
+# Resend env + `books-ar-approve` Cloudflare Access token are provisioned.

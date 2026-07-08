@@ -44,6 +44,10 @@ class ClassificationResult:
     review_reason: str | None = field(default=None)
     tax_subcategory: str | None = field(default=None)
     deductible_pct: float = field(default=1.0)
+    # REQ-MCA-002: id of the winning Tier-1 VendorRule (populated only by
+    # ``rules.lookup_vendor_rule``); None for Tier-2/3 results. The auto-confirm
+    # policy keys on this + the rule's confidence.
+    rule_id: str | None = field(default=None)
 
 
 # ---------------------------------------------------------------------------

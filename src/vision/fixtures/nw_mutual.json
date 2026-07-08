@@ -1,0 +1,13 @@
+{
+  "institution": "nw_mutual",
+  "statement_type": "balances",
+  "model": "gemini-2.5-flash",
+  "input_tokens": 4100,
+  "output_tokens": 850,
+  "fields": {
+    "institution": "Northwestern Mutual",
+    "account_number_mask": "****3456",
+    "as_of": "2026-05-01",
+    "balance": "250000.00"
+  }
+}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the accounting monthly close on the 1st at 15:00 UTC (~08:00 Pacific)
+
+[Timer]
+OnCalendar=*-*-01 15:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+# GATED: install but run one DRY-RUN by hand (drop --apply in the service) before
+# enabling. Flip the service ExecStart to --apply and `systemctl enable` after one
+# clean cycle. Requires RESEND_API_KEY + ALERT_TO_EMAIL in accounting/srv.

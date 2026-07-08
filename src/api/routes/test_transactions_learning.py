@@ -381,6 +381,70 @@ def test_divergent_confirm_under_broad_rule_updates_existing_precise_rule(
         assert count == 1
 
 
+def test_divergent_confirm_under_broad_regex_full_span_tie_flips_next_match(
+    client: TestClient,
+) -> None:
+    """P2-a1c-2 / REQ-FIX-ING-004 + REQ-FIX-ING-009: when the matched BROAD
+    rule is a REGEX whose matched span equals the ENTIRE description (e.g. a
+    seed rule like ``\\bshopify\\b`` against a description that cleans down
+    to the single token "Shopify"), the new precise literal rule ties the
+    broad rule on match-length. Before the is_regex tiebreak in _rank_best,
+    this tie fell through to `examples`, where a well-established broad seed
+    rule (examples=5) beat the brand-new precise rule (examples=1) and the
+    human's correction never took effect on the next lookup. This pins that
+    the precise literal rule now wins the tie outright."""
+    with _TestSession() as s:
+        broad_rule = _make_rule(
+            s,
+            pattern=r"\bshopify\b",
+            is_regex=True,
+            tax_category=TaxCategory.OFFICE_EXPENSE.value,
+            examples=5,
+            confidence=0.90,
+            source=VendorRuleSource.HUMAN.value,
+        )
+        broad_rule_id = broad_rule.id
+        tx = _make_tx(
+            s,
+            description="Shopify",
+            tax_category=TaxCategory.OFFICE_EXPENSE.value,  # inherited from the broad regex rule
+        )
+        tx_id = tx.id
+
+    resp = client.patch(
+        f"/api/transactions/{tx_id}",
+        json={"status": "confirmed", "tax_category": "SUPPLIES"},
+    )
+    assert resp.status_code == 200
+
+    with _TestSession() as s:
+        # Broad regex rule is untouched.
+        broad_rule = s.query(VendorRule).filter(VendorRule.id == broad_rule_id).one()
+        assert broad_rule.tax_category == TaxCategory.OFFICE_EXPENSE.value
+        assert broad_rule.examples == 5
+
+        # A precise exact-literal rule now exists, tied on match length with
+        # the broad regex rule (both match the full 7-char description).
+        precise = (
+            s.query(VendorRule)
+            .filter(
+                VendorRule.vendor_pattern == "Shopify",
+                VendorRule.entity == Entity.SPARKRY.value,
+                VendorRule.is_regex.is_(False),
+            )
+            .one()
+        )
+        assert precise.tax_category == TaxCategory.SUPPLIES.value
+        assert precise.examples == 1
+
+        # The flip test: despite the length tie and fewer examples, the
+        # precise literal rule outranks the broad regex rule on the next
+        # lookup.
+        result = lookup_vendor_rule("Shopify", s)
+        assert result is not None
+        assert result.tax_category == TaxCategory.SUPPLIES
+
+
 # ---------------------------------------------------------------------------
 # Entity change creates a parallel rule under the new entity
 # ---------------------------------------------------------------------------

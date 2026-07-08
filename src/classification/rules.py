@@ -53,12 +53,27 @@ def _match_candidates(
 
 def _rank_best(matches: list[tuple[VendorRule, re.Match[str]]]) -> VendorRule:
     """Rank match candidates: matched-text length desc (specificity), then
-    examples desc, then confidence desc, then id for deterministic
-    tie-breaking (REQ-FIX-ING-009)."""
+    exact-literal over regex desc, then examples desc, then confidence desc,
+    then id for deterministic tie-breaking (REQ-FIX-ING-009).
+
+    The exact-literal-over-regex tiebreak (P2-a1c-2 / REQ-FIX-ING-004,
+    REQ-FIX-ING-009) matters when a broad ``is_regex=True`` rule's matched
+    span happens to cover the ENTIRE description (e.g. a seed rule like
+    ``\\bshopify\\b`` against a description that cleans down to the single
+    token "Shopify") — ``len(match.group(0))`` then ties with a newly-created
+    precise literal rule for that same description, and without this
+    tiebreak the tie fell through to ``examples``, where a well-established
+    broad seed rule (multiple examples) would beat the brand-new precise
+    rule (examples=1) and the human's correction would never take effect on
+    the next lookup. An exact-literal rule for a description is always at
+    least as specific as any regex that merely happens to match the same
+    span, so literal wins ties outright.
+    """
     best_rule, _best_match = max(
         matches,
         key=lambda rm: (
             len(rm[1].group(0)),
+            0 if rm[0].is_regex else 1,
             rm[0].examples,
             rm[0].confidence,
             rm[0].id,

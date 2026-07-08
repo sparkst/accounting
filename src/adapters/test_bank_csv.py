@@ -930,8 +930,15 @@ class TestQuantizedDedupKey:
             .all()
         )
         assert len(rows) == 2
-        suffixes = {(tx.source_id or "").rsplit(":", 1)[-1] for tx in rows}
-        assert suffixes == {"0", "1"}
+        # P3-102: assert behavior, not the source_id encoding — the two rows
+        # must be DISTINCT register entries, and a full re-import of the same
+        # file must match both (0 new), proving the disambiguation is stable.
+        assert rows[0].source_hash != rows[1].source_hash
+        rerun = BankCsvAdapter(
+            csv_bytes, config, filename="dup.csv", dry_run=False
+        ).run(session)
+        assert rerun.records_created == 0
+        assert rerun.records_skipped == 2
 
     def test_full_reimport_is_idempotent_with_shuffled_order(self, session: Session):
         """Re-importing the exact same file content (rows shuffled) produces 0
@@ -1008,6 +1015,105 @@ class TestQuantizedDedupKey:
         )
         assert still_there is not None
         assert still_there.id == legacy_tx.id
+
+    def test_legacy_hash_bridge_matches_across_decimal_rendering(self, session: Session):
+        """P2-a1c / REQ-FIX-ING-006: a legacy row hashed from an UNQUANTIZED
+        1-decimal rendering ("-10.5") is still matched when the same
+        statement is re-imported with a 2-decimal rendering ("-10.50") — the
+        two strings are numerically identical but the OLD hash scheme was
+        never quantized, so a naive exact-string bridge would miss this and
+        silently duplicate the row."""
+        filename = "legacy_rendering.csv"
+        date = "2025-01-05"
+        # Legacy hash computed EXACTLY as the pre-ING-006 code did: raw,
+        # unquantized str(Decimal("-10.5")) == "-10.5" (1 decimal place).
+        legacy_amount = Decimal("-10.5")
+        desc = "legacy rendering vendor"
+        legacy_source_id = f"{filename}:{date}:{legacy_amount}:{desc}"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+
+        legacy_tx = Transaction(
+            source="bank_csv",
+            source_id=legacy_source_id,
+            source_hash=legacy_hash,
+            date=date,
+            description="Legacy Rendering Vendor",
+            amount=legacy_amount,
+            currency="USD",
+            status=TransactionStatus.NEEDS_REVIEW.value,
+            confidence=0.0,
+            raw_data={},
+        )
+        session.add(legacy_tx)
+        session.commit()
+
+        config = BankCsvConfig(
+            bank_name="test_legacy_rendering",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        # Re-imported statement renders the SAME amount with 2 decimal places.
+        csv_bytes = (
+            b"Date,Description,Amount\n01/05/2025,Legacy Rendering Vendor,-10.50\n"
+        )
+        result = BankCsvAdapter(
+            csv_bytes, config, filename=filename, dry_run=False
+        ).run(session)
+
+        assert result.records_created == 0
+        assert result.records_skipped == 1
+        # The legacy row itself is never rewritten.
+        still_there = (
+            session.query(Transaction).filter(Transaction.source_hash == legacy_hash).first()
+        )
+        assert still_there is not None
+        assert still_there.id == legacy_tx.id
+
+    def test_legacy_hash_bridge_matches_whole_dollar_rendering(self, session: Session):
+        """P3-101: the ZERO-decimal-place variant — a legacy row hashed from
+        str(Decimal("-10")) == "-10" (whole dollars) is matched, not
+        duplicated, when re-imported rendered as "-10.00"."""
+        filename = "legacy_whole_dollar.csv"
+        date = "2025-01-06"
+        legacy_amount = Decimal("-10")
+        desc = "legacy whole dollar vendor"
+        legacy_source_id = f"{filename}:{date}:{legacy_amount}:{desc}"
+        legacy_hash = compute_source_hash("bank_csv", legacy_source_id)
+
+        session.add(
+            Transaction(
+                source="bank_csv",
+                source_id=legacy_source_id,
+                source_hash=legacy_hash,
+                date=date,
+                description="Legacy Whole Dollar Vendor",
+                amount=legacy_amount,
+                currency="USD",
+                status=TransactionStatus.NEEDS_REVIEW.value,
+                confidence=0.0,
+                raw_data={},
+            )
+        )
+        session.commit()
+
+        config = BankCsvConfig(
+            bank_name="test_legacy_whole_dollar",
+            date_column="Date",
+            date_format="%m/%d/%Y",
+            description_column="Description",
+            amount_column="Amount",
+        )
+        csv_bytes = (
+            b"Date,Description,Amount\n01/06/2025,Legacy Whole Dollar Vendor,-10.00\n"
+        )
+        result = BankCsvAdapter(
+            csv_bytes, config, filename=filename, dry_run=False
+        ).run(session)
+
+        assert result.records_created == 0
+        assert result.records_skipped == 1
 
     def test_legacy_hash_bridge_only_covers_occurrence_zero(self, session: Session):
         """A second identical charge (occurrence 1) is NOT covered by the legacy

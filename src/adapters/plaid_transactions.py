@@ -344,7 +344,14 @@ def process_modified(session: Session, modified: list[Any]) -> int:
 
 def process_removed(session: Session, removed: list[Any]) -> int:
     """Plaid removed a txn (e.g. a settled pending). Mark rejected, never delete
-    (audit rule). No-op when already reconciled away or never seen."""
+    (audit rule). No-op when already reconciled away or never seen.
+
+    REQ-FIX-ING-007: `removed` on an already-rejected row is a no-op guard —
+    Plaid can redeliver a `removed` entry for a transaction already rejected
+    (e.g. re-synced after a prior `removed` was processed, or a row that was
+    independently rejected). Without this guard a redelivery would write a
+    duplicate no-op status="rejected"->"rejected" AuditEvent every time and
+    inflate the returned count for a row that saw no actual change."""
     count = 0
     for r in removed:
         # Plaid SDK removed-entries are typed objects; dict support is retained
@@ -360,6 +367,9 @@ def process_removed(session: Session, removed: list[Any]) -> int:
                 session, row,
                 "plaid_removed: upstream txn removed after split — re-verify split",
             )
+            continue
+        if row.status == TransactionStatus.REJECTED.value:
+            # Already rejected — skip re-audit (no-op guard, see docstring).
             continue
         old_status = row.status
         row.status = TransactionStatus.REJECTED.value

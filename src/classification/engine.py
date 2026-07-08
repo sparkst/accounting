@@ -97,8 +97,11 @@ def _reconcile_sign(
       wrong roughly half the time. This asymmetry (override vs. no-override)
       is intentional.
 
-    Both branches keep transfer/reimbursable transactions exempt implicitly
-    (they require ``direction == INCOME`` or ``EXPENSE`` respectively).
+    The outflow-on-income veto does NOT explicitly gate on direction, so it can
+    override a TRANSFER or REIMBURSABLE row if assigned an income tax_category
+    (theoretical — reimbursables/transfers never get income categories in practice).
+    The inflow-on-expense veto preserves direction/category without override (kept
+    for human review).
     Returns *result* unchanged when consistent with the authoritative sign.
     """
     if transaction.source not in _AUTHORITATIVE_SIGN_SOURCES:
@@ -110,7 +113,14 @@ def _reconcile_sign(
     except (InvalidOperation, ValueError):
         return result
 
-    is_income = (
+    # P3-b2e: transfer/reimbursable rows are EXPLICITLY exempt — the
+    # tax_category disjunct alone would otherwise let an income-category label
+    # on a transfer clobber its direction. The is_expense mirror branch below
+    # is direction-gated and needs no equivalent guard.
+    is_income = result.direction not in (
+        Direction.TRANSFER,
+        Direction.REIMBURSABLE,
+    ) and (
         result.direction == Direction.INCOME
         or result.tax_category in _INCOME_TAX_CATEGORIES
     )

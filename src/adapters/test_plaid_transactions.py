@@ -389,6 +389,29 @@ def test_modified_amount_change_writes_audit_event(db):
     assert events[0].entity_id is None and events[0].entity_type is None
 
 
+def test_modified_on_rejected_row_refreshes_fields_status_untouched(db):
+    """REQ-FIX-ING-007 decision table: `modified` on a rejected (non-split) row
+    still refreshes volatile fields (audited), but status must NOT change —
+    a human rejection is not a classification the sync should overwrite."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="mr1", amount=10.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="mr1").one()
+    row.status = TransactionStatus.REJECTED.value
+    row.review_reason = "human rejected this charge"
+    db.commit()
+    updated = process_modified(db, [_plaid_txn(transaction_id="mr1", amount=13.25)])
+    assert updated == 1
+    db.refresh(row)
+    assert row.amount == Decimal("-13.25")
+    assert row.status == TransactionStatus.REJECTED.value
+    assert row.review_reason == "human rejected this charge"
+    events = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                            field_changed="amount").all()
+    assert len(events) == 1
+
+
 def test_process_modified_unknown_id_is_noop(db):
     """P2-002-TEST: process_modified on a source_id not in DB returns 0, no-op.
     Mirrors test_removed_unknown_id_is_noop for the analogous removed path."""
@@ -445,6 +468,31 @@ def test_removed_writes_status_audit_event(db):
     assert events[0].entity_id is None and events[0].entity_type is None
 
 
+def test_removed_twice_on_already_rejected_is_noop(db):
+    """REQ-FIX-ING-007 decision table: `removed` on an already-rejected row is a
+    no-op guard (skip re-audit) — Plaid can redeliver a removed entry across
+    syncs. The second call must not write a duplicate status AuditEvent nor
+    count the row as newly-processed."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="rr2", amount=9.0)],
+                      account_index={"acc_1": acct})
+    first = process_removed(db, [{"transaction_id": "rr2"}])
+    assert first == 1
+    row = db.query(Transaction).filter_by(source_id="rr2").one()
+    assert row.status == "rejected"
+    events_before = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                                    field_changed="status").count()
+    second = process_removed(db, [{"transaction_id": "rr2"}])
+    assert second == 0  # no-op: not counted as newly-processed
+    db.refresh(row)
+    assert row.status == "rejected"
+    assert row.review_reason == "plaid_removed"
+    events_after = db.query(AuditEvent).filter_by(transaction_id=row.id,
+                                                   field_changed="status").count()
+    assert events_after == events_before  # no duplicate no-op audit event
+
+
 def test_pending_id_in_removed_is_noop_after_promotion(db):
     """REQ-PT-005: after pending→posted promotion the original pending id no
     longer exists, so it arriving in `removed` is a no-op (count 0) and the
@@ -483,6 +531,32 @@ def test_removed_then_readded_is_reactivated(db):
     events = db.query(AuditEvent).filter_by(transaction_id=row.id,
                                             field_changed="status").all()
     assert any(e.new_value == "needs_review" for e in events)
+
+
+def test_added_replay_against_human_rejected_row_is_noop(db):
+    """REQ-FIX-ING-007 decision table: `added` replayed against a row a human
+    rejected (any review_reason other than 'plaid_removed') must NOT be
+    reactivated — a human veto sticks. Only the plaid_removed reactivation
+    path (test_removed_then_readded_is_reactivated) resurrects a row."""
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(db, item, [_plaid_txn(transaction_id="hr1", amount=9.0)],
+                      account_index={"acc_1": acct})
+    row = db.query(Transaction).filter_by(source_id="hr1").one()
+    row.status = TransactionStatus.REJECTED.value
+    row.review_reason = "human rejected this charge"
+    db.commit()
+    events_before = db.query(AuditEvent).filter_by(transaction_id=row.id).count()
+    # Plaid re-delivers the same id in `added` (e.g. a resync).
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        counts = process_added(db, item, [_plaid_txn(transaction_id="hr1", amount=9.0)],
+                               account_index={"acc_1": acct})
+    db.refresh(row)
+    assert row.status == TransactionStatus.REJECTED.value
+    assert row.review_reason == "human rejected this charge"
+    assert counts.inserted == 0 and counts.reactivated == 0
+    events_after = db.query(AuditEvent).filter_by(transaction_id=row.id).count()
+    assert events_after == events_before  # no audit trail from a skipped no-op
 
 
 def test_process_added_reports_reactivated_count(db):

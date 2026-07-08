@@ -41,6 +41,43 @@ from src.utils.dedup import compute_source_hash
 logger = logging.getLogger(__name__)
 
 
+def _legacy_amount_variants(amt_q: Decimal) -> list[str]:
+    """Distinct decimal-place renderings of a cents-quantized amount that a
+    legacy (pre-ING-006) importer could plausibly have hashed.
+
+    REQ-FIX-ING-006 (P2-a1c): the permanent legacy-hash bridge originally
+    matched using ``str(amt_q)`` (the quantized 2-decimal string). That only
+    matches a pre-existing legacy row if today's CSV renders the amount with
+    the exact same number of decimal places the ORIGINAL import used. A
+    statement re-exported with different decimal rendering ("-10.5" vs
+    "-10.50") is numerically identical but hashes differently, so the legacy
+    row was silently duplicated instead of matched. This function expands
+    ``amt_q`` (always exactly 2 decimal places, quantized to cents) to every
+    shorter-decimal rendering that is numerically equal (e.g. "-10.50" ->
+    also try "-10.5", and for whole-dollar amounts also "-10"), so the bridge
+    is tried against each — still an exact hash-equality check per candidate,
+    just against more than one plausible historical string. The first variant
+    is str(amt_q), which equals prior behavior only for 2-decimal same-
+    rendering re-imports; >2-decimal legacy hashes (e.g. a CSV cell "10.500"
+    preserved verbatim by parse_amount pre-fix) are a RECORDED, intentional
+    limitation (P3-a2f/l7a): such a legacy row re-imports as a new row, but
+    find_cross_reference_matches (date+amount+payment_method, Decimal-equal)
+    flags it needs_review as a possible duplicate rather than silently
+    double-counting.
+    """
+    two_dp = str(amt_q)
+    variants = [two_dp]
+    if two_dp.endswith("0"):
+        one_dp = two_dp[:-1]
+        variants.append(one_dp)
+        if one_dp.endswith(".0"):
+            zero_dp = one_dp[:-2] or "0"
+            if zero_dp == "-":
+                zero_dp = "0"
+            variants.append(zero_dp)
+    return variants
+
+
 def _is_plaid_owned(session: Session, payment_method: str | None) -> bool:
     """True if a payment_method label belongs to a Plaid-linked account — bank CSV
     must not re-ingest it (Plaid is sole source). REQ-PT-012."""
@@ -572,16 +609,28 @@ class BankCsvAdapter(BaseAdapter):
             .first()
         )
         if existing is None and occurrence == 0:
-            legacy_normalized_amount = str(row.amount) if row.amount is not None else ""
-            legacy_source_id = (
-                f"{self._filename}:{row.date}:{legacy_normalized_amount}:{normalized_desc}"
+            # REQ-FIX-ING-006 (P2-a1c): try every plausible legacy decimal
+            # rendering of this amount (see _legacy_amount_variants), not just
+            # today's exact str(row.amount) — a legacy row's hash may have
+            # been computed from a differently-rendered but numerically equal
+            # amount string. First variant is always str(amt_q), preserving
+            # prior behavior for same-rendering re-imports.
+            amount_variants = (
+                _legacy_amount_variants(amt_q) if row.amount is not None else [""]
             )
-            legacy_hash = compute_source_hash(self.source, legacy_source_id)
-            existing = (
-                session.query(Transaction)
-                .filter(Transaction.source_hash == legacy_hash)
-                .first()
-            )
+            for legacy_normalized_amount in amount_variants:
+                legacy_source_id = (
+                    f"{self._filename}:{row.date}:{legacy_normalized_amount}:"
+                    f"{normalized_desc}"
+                )
+                legacy_hash = compute_source_hash(self.source, legacy_source_id)
+                existing = (
+                    session.query(Transaction)
+                    .filter(Transaction.source_hash == legacy_hash)
+                    .first()
+                )
+                if existing is not None:
+                    break
         if existing is not None:
             result.records_skipped += 1
             return

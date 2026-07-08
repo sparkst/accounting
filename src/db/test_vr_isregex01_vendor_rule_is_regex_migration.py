@@ -16,7 +16,7 @@ import pytest
 import sqlalchemy as sa
 
 _REVISION = "vr_isregex01_vendor_rule_is_regex"
-_PREV_REVISION = "alr01_alert_dispatch_payload"
+_PREV_REVISION = "wa2607c_vanguard_ira_types"
 
 
 def _run_alembic(*args: str) -> None:

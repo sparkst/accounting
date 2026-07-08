@@ -29,8 +29,11 @@ logger = logging.getLogger(__name__)
 
 # Every alert_type this dispatcher (+ the digest pulse, which shares the same
 # ledger and webhook) can emit — scopes the sweep to this dispatcher's own
-# n8n webhook target (N8N_SEVERITY_WEBHOOK_URL/SECRET).
-ALERT_TYPES = ("balance_milestone", "balance_drift", "balance_pulse")
+# n8n webhook target (N8N_SEVERITY_WEBHOOK_URL/SECRET). "policy_drift"
+# (scripts/policy_drift_dispatch.py, monthly) targets the SAME webhook; the
+# daily sweep here is its retry path (P1-001-2: a failed monthly drift alert
+# must not wait a month — or forever — for a re-send).
+ALERT_TYPES = ("balance_milestone", "balance_drift", "balance_pulse", "policy_drift")
 
 
 @dataclass

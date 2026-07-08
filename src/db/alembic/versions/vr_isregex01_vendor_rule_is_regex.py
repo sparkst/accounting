@@ -28,7 +28,9 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "vr_isregex01_vendor_rule_is_regex"
-down_revision: str | None = "alr01_alert_dispatch_payload"
+# Rebased at merge time per the program migration ledger: WS3 implemented in a
+# worktree whose head was alr01; the merged main-branch tip is WS4's wa2607c.
+down_revision: str | None = "wa2607c_vanguard_ira_types"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

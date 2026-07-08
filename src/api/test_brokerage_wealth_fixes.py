@@ -123,6 +123,155 @@ def test_per_name_cutoff_not_global(monkeypatch: pytest.MonkeyPatch) -> None:
     assert by_date[date(2025, 6, 1)] == Decimal("1500.00")
 
 
+def test_req_wd_009b_present_day_total_invariant_with_alias_seeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-WD-009(b) end-to-end invariant (P3-002): with the account_alias
+    seeded (the supported, documented configuration), the present-day total
+    is NOT inflated by a legacy raw-name row that rolled into a matched
+    account — the modern account's own value is the whole story at `today`.
+
+    This is the checked-in end-to-end guard the review flagged as missing
+    (previously only the isolated predicate/SHA fixture in
+    test_networth_dedup.py exercised this invariant, never the actual
+    networth_history endpoint).
+    """
+    import src.api.routes.brokerage as bmod
+
+    today = date(2025, 6, 1)
+    monkeypatch.setattr(bmod, "_today", lambda: today)
+    s = _session()
+
+    # Modern matched account, onboarded 2024-01-01, current value 1000.
+    a = _account(s, "MODERN1")
+    s.add(
+        PositionSnapshot(
+            account_id=a.id, as_of=datetime(2024, 1, 1), symbol="NOPX",
+            quantity=Decimal("1"), market_value=Decimal("1000.00"),
+            source_file="f", source_row_hash="modern1", raw_data={},
+        )
+    )
+    # The legacy raw name is aliased to the modern account (tier-2 coverage).
+    s.add(AccountAlias(raw_account_name="legacy rollup name", account_id=a.id))
+
+    # Legacy unmatched history under a DIFFERENT label, predating the modern
+    # account's onboarding — same real-world money, tracked pre-2024 as XLSX
+    # rollup rows with no Account FK.
+    s.add(
+        AccountBalanceSnapshot(
+            account_id=None, raw_account_name="Legacy Rollup Name",
+            as_of=date(2020, 1, 1), balance=Decimal("400.00"),
+            source="xlsx", source_row_hash="legacy1",
+        )
+    )
+    s.commit()
+
+    points = bmod.networth_history(
+        include_unmatched=True,
+        granularity="monthly",
+        tags_include=None,
+        tags_exclude=None,
+        account_ids=None,
+        session=s,
+    )
+    by_date = {p["as_of"]: p["balance_total"] for p in points}
+    # At `today`, the legacy row is excluded (cutoff 2024-01-01 <= today) —
+    # present-day total is exactly the modern account's value, not inflated
+    # by the legacy row it superseded.
+    assert by_date[today] == Decimal("1000.00")
+
+
+def test_no_alias_cross_label_rollover_double_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P3-002 (documented gap): a legacy raw name that rolled into a matched
+    account under a DIFFERENT label, with NO account_alias row recorded (an
+    incomplete alias seed), has no tier-1 or tier-2 cutoff and is included in
+    full at every date — double-counting present-day net worth. This locks in
+    the known regression risk the review flagged so a future alias-seed gap
+    is caught here first, not just noticed in production net worth.
+    """
+    import src.api.routes.brokerage as bmod
+
+    today = date(2025, 6, 1)
+    monkeypatch.setattr(bmod, "_today", lambda: today)
+    s = _session()
+
+    # Modern matched account, onboarded 2024-01-01, current value 1000 — the
+    # real successor to the legacy row below, but under a different label and
+    # with NO account_alias row (the incomplete-seed scenario).
+    a = _account(s, "MODERN2")
+    s.add(
+        PositionSnapshot(
+            account_id=a.id, as_of=datetime(2024, 1, 1), symbol="NOPX",
+            quantity=Decimal("1"), market_value=Decimal("1000.00"),
+            source_file="f", source_row_hash="modern2", raw_data={},
+        )
+    )
+    # No AccountAlias row for this raw name — the gap.
+    s.add(
+        AccountBalanceSnapshot(
+            account_id=None, raw_account_name="Old Unmapped Label",
+            as_of=date(2020, 1, 1), balance=Decimal("400.00"),
+            source="xlsx", source_row_hash="legacy2",
+        )
+    )
+    s.commit()
+
+    points = bmod.networth_history(
+        include_unmatched=True,
+        granularity="monthly",
+        tags_include=None,
+        tags_exclude=None,
+        account_ids=None,
+        session=s,
+    )
+    by_date = {p["as_of"]: p["balance_total"] for p in points}
+    # Documents the current (unfixed) double-count: 1000 (modern) + 400
+    # (legacy, forward-filled with no cutoff) = 1400, not the true 1000.
+    # If this ever starts asserting 1000.00, the defense-in-depth gap has
+    # been closed — update this test to assert the correct value then.
+    assert by_date[today] == Decimal("1400.00")
+
+
+def test_uncovered_raw_name_with_no_cutoff_logs_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P3-002: an unmatched raw name with neither a tier-1 nor tier-2 cutoff
+    logs a WARNING naming it, so an incomplete alias seed fails loud instead
+    of silently double-counting (the review's defense-in-depth ask)."""
+    import logging
+
+    import src.api.routes.brokerage as bmod
+
+    monkeypatch.setattr(bmod, "_today", lambda: date(2025, 6, 1))
+    s = _session()
+    s.add(
+        AccountBalanceSnapshot(
+            account_id=None, raw_account_name="Totally Unmapped Legacy",
+            as_of=date(2020, 1, 1), balance=Decimal("50.00"),
+            source="xlsx", source_row_hash="uncovered1",
+        )
+    )
+    s.commit()
+
+    with caplog.at_level(logging.WARNING, logger="src.api.routes.brokerage"):
+        bmod.networth_history(
+            include_unmatched=True,
+            granularity="monthly",
+            tags_include=None,
+            tags_exclude=None,
+            account_ids=None,
+            session=s,
+        )
+
+    assert any(
+        "no dedup cutoff" in rec.getMessage()
+        and "Totally Unmapped Legacy" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
 # ── REQ-FIX-WLT-005 ────────────────────────────────────────────────────
 
 

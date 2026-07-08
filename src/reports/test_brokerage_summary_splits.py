@@ -67,8 +67,10 @@ def test_split_between_snapshot_and_target_is_cliff_free() -> None:
             raw_data={},
         )
     )
-    # Prices: pre-split 100 on snapshot day, post-split 50 on target day.
-    s.add(HistoricalPrice(symbol="SPLT", trade_date=snap_date, close=Decimal("100")))
+    # Prices AS YFINANCE STORES THEM (P1-001): auto_adjust=False Close is
+    # split-adjusted to the PRESENT share scale — the snapshot-day row is 50
+    # (nominal 100 ÷ the later 2:1 split), the target-day row is 50 (nominal).
+    s.add(HistoricalPrice(symbol="SPLT", trade_date=snap_date, close=Decimal("50")))
     s.add(HistoricalPrice(symbol="SPLT", trade_date=target, close=Decimal("50")))
     # 2:1 forward split ex-date within the window.
     s.add(StockSplit(symbol="SPLT", ex_date=date(2026, 6, 4), ratio=Decimal("2.000000")))
@@ -76,7 +78,68 @@ def test_split_between_snapshot_and_target_is_cliff_free() -> None:
 
     state = _load_history_state(s)
     per_account = _per_account_value_at(s, target, history_state=state)
-    # 10 shares * 2 (split) * 50 (post-split close) = 1000 — no cliff.
+    # 10 shares * 2 (all splits after snapshot) * 50 = 1000 — no cliff.
+    assert per_account[a.id]["market_value"] == Decimal("1000")
+
+
+def test_pre_split_historical_target_reprices_to_nominal() -> None:
+    """P1-001 regression (the AMZN-20:1 shape): a target date BEFORE the split,
+    valued from a snapshot also before the split, must reprice to the true
+    nominal value. The stored close on that date is split-adjusted to present
+    (nominal ÷ ratio), so the quantity scale-up by ALL later splits must apply
+    even though the split ex-date is after the target."""
+    s = _session()
+    a = _add_account(s)
+    s.add(
+        PositionSnapshot(
+            account_id=a.id,
+            as_of=datetime(2026, 5, 1),
+            symbol="SPLT",
+            quantity=Decimal("10"),
+            price=Decimal("100"),
+            market_value=Decimal("1000.00"),
+            source_file="t.csv",
+            source_row_hash="h1b",
+            raw_data={},
+        )
+    )
+    target = date(2026, 5, 15)  # BEFORE the 2026-06-04 split
+    # Stored close on the pre-split target date: nominal $100 ÷ 2 = 50.
+    s.add(HistoricalPrice(symbol="SPLT", trade_date=target, close=Decimal("50")))
+    s.add(StockSplit(symbol="SPLT", ex_date=date(2026, 6, 4), ratio=Decimal("2.000000")))
+    s.commit()
+
+    state = _load_history_state(s)
+    per_account = _per_account_value_at(s, target, history_state=state)
+    # True nominal value on 2026-05-15: 10 shares × $100 = $1000.
+    # (The pre-fix bounded ratio gave 10 × 1 × 50 = $500 — a 2x cliff.)
+    assert per_account[a.id]["market_value"] == Decimal("1000")
+
+
+def test_split_symbol_casing_mismatch_still_matches() -> None:
+    """P3-411: split stored uppercase, snapshot symbol lowercase — must match."""
+    s = _session()
+    a = _add_account(s)
+    s.add(
+        PositionSnapshot(
+            account_id=a.id,
+            as_of=datetime(2026, 6, 1),
+            symbol="splt",
+            quantity=Decimal("10"),
+            price=Decimal("100"),
+            market_value=Decimal("1000.00"),
+            source_file="t.csv",
+            source_row_hash="h1c",
+            raw_data={},
+        )
+    )
+    target = date(2026, 6, 8)
+    s.add(HistoricalPrice(symbol="SPLT", trade_date=target, close=Decimal("50")))
+    s.add(StockSplit(symbol="SPLT", ex_date=date(2026, 6, 4), ratio=Decimal("2.000000")))
+    s.commit()
+
+    state = _load_history_state(s)
+    per_account = _per_account_value_at(s, target, history_state=state)
     assert per_account[a.id]["market_value"] == Decimal("1000")
 
 

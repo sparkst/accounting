@@ -238,7 +238,14 @@ def test_holding_endpoint_returns_series_and_summary(
     _price(session, symbol="SPY", trade_date=deposit_date, close=Decimal("500"))
     _price(session, symbol="SPY", trade_date=TODAY, close=Decimal("525"))
 
-    r = client.get("/api/brokerage/performance/holding/AAPL")
+    # Explicit start/end matching the seeded SPY price dates exactly — the
+    # default 365-day lookback window predates deposit_date (TODAY-60), so
+    # _benchmark_twr would find no SPY price at-or-before `start` and return
+    # (None, None), silently hiding the benchmark_basis assertion below.
+    r = client.get(
+        "/api/brokerage/performance/holding/AAPL"
+        f"?start_date={deposit_date.isoformat()}&end_date={TODAY.isoformat()}"
+    )
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["symbol"] == "AAPL"
@@ -251,11 +258,17 @@ def test_holding_endpoint_returns_series_and_summary(
         "twr_annualized",
         "xirr",
         "benchmark_twr",
+        "benchmark_basis",
         "current_value",
         "total_principal",
         "total_growth",
     ):
         assert k in summary
+    # P3-001: both SPY prices in this fixture are raw `close` (no adj_close
+    # seeded), so the benchmark falls back to price_return — the flag must
+    # say so rather than silently reading as total_return.
+    assert summary["benchmark_twr"] is not None
+    assert summary["benchmark_basis"] == "price_return"
 
 
 def test_holding_endpoint_404_unknown_symbol(client: TestClient) -> None:

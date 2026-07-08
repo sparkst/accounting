@@ -446,7 +446,7 @@ def _load_history_state(session: Session) -> _HistoryState:
         .order_by(HistoricalPrice.symbol, HistoricalPrice.trade_date)
         .all()
     ):
-        prices_by_symbol.setdefault(hp.symbol, []).append(
+        prices_by_symbol.setdefault(hp.symbol.upper(), []).append(
             (hp.trade_date, Decimal(str(hp.close)))
         )
 
@@ -456,7 +456,9 @@ def _load_history_state(session: Session) -> _HistoryState:
         .order_by(StockSplit.symbol, StockSplit.ex_date)
         .all()
     ):
-        splits_by_symbol.setdefault(sp.symbol, []).append(
+        # Keys uppercased to match position-snapshot lookups regardless of the
+        # casing an adapter stored (P3-411).
+        splits_by_symbol.setdefault(sp.symbol.upper(), []).append(
             (sp.ex_date, Decimal(str(sp.ratio)))
         )
 
@@ -472,18 +474,22 @@ def _load_history_state(session: Session) -> _HistoryState:
 
 
 def _cumulative_split_ratio(
-    splits: list[tuple[date, Decimal]], after: date, through: date
+    splits: list[tuple[date, Decimal]], after: date
 ) -> Decimal:
-    """Product of split ratios with ``after < ex_date <= through``.
+    """Product of split ratios with ``ex_date > after`` — NO upper bound.
 
-    REQ-FIX-WLT-002: re-pricing a held position at ``through`` using the raw
-    close on that date requires scaling the snapshot's (pre-split) quantity by
-    every split whose ex-date fell strictly after the snapshot date and on or
-    before the target. Returns Decimal("1") when no split applies.
+    REQ-FIX-WLT-002: yfinance ``auto_adjust=False`` "Close" is Yahoo's
+    split-adjusted-to-PRESENT series (only dividends excluded — "Adj Close"
+    additionally adjusts those). Every stored close therefore lives at the
+    present share scale, so a snapshot's (pre-split) quantity must be scaled
+    by every split after the snapshot date regardless of the target date.
+    Bounding the ratio at the target (the previous implementation) understated
+    any pre-split target date by the full split factor (e.g. 20x for
+    AMZN 2022-06-06). Returns Decimal("1") when no split applies.
     """
     ratio = Decimal("1")
     for ex_date, r in splits:
-        if after < ex_date <= through:
+        if ex_date > after:
             ratio *= r
     return ratio
 
@@ -582,14 +588,14 @@ def _per_account_value_at(
                 close: Decimal | None = None
                 if ps.symbol is not None and ps.quantity is not None:
                     close = _price_at_or_before(
-                        prices_index.get(ps.symbol, []), target_date
+                        prices_index.get(ps.symbol.upper(), []), target_date
                     )
-                if close is not None and ps.quantity is not None:
-                    # REQ-FIX-WLT-002: scale the snapshot (pre-split) quantity by
-                    # the cumulative split ratio for ex-dates in (snapshot, target]
-                    # so a split between snapshot and target doesn't cliff.
+                if close is not None and ps.quantity is not None and ps.symbol is not None:
+                    # REQ-FIX-WLT-002: closes are split-adjusted-to-present, so
+                    # scale the snapshot quantity by EVERY split after the
+                    # snapshot date (unbounded — see _cumulative_split_ratio).
                     ratio = _cumulative_split_ratio(
-                        splits_index.get(ps.symbol, []), latest_pos_date, target_date
+                        splits_index.get(ps.symbol.upper(), []), latest_pos_date
                     )
                     total += Decimal(str(ps.quantity)) * ratio * close
                 else:

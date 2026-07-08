@@ -28,8 +28,17 @@ def _parse_month(value: Any) -> date:
     """Parse ``YYYY-MM`` (or a full ``YYYY-MM-DD``) into the first-of-month date."""
     s = str(value)
     parts = s.split("-")
-    year = int(parts[0])
-    month = int(parts[1])
+    if len(parts) < 2:
+        raise ValueError(
+            f"Month value must be YYYY-MM or YYYY-MM-DD, got: {s}"
+        )
+    try:
+        year = int(parts[0])
+        month = int(parts[1])
+    except (ValueError, IndexError) as exc:
+        raise ValueError(
+            f"Invalid month format: {s} (expected YYYY-MM or YYYY-MM-DD)"
+        ) from exc
     return date(year, month, 1)
 
 
@@ -110,23 +119,46 @@ def glide_pct(concentration: ConcentrationPolicy, month: date) -> Decimal:
 def load_policy_config(path: str | Path | None = None) -> PolicyConfig:
     """Load and validate the investment-policy config, Decimal at the boundary."""
     p = Path(path) if path is not None else _DEFAULT_PATH
-    raw = yaml.safe_load(p.read_text())
 
+    try:
+        raw = yaml.safe_load(p.read_text()) or {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"Config must be a YAML dict, got {type(raw).__name__}")
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML in {p}: {exc}") from exc
+
+    if "concentration" not in raw:
+        raise ValueError(f"Missing required key 'concentration' in {p}")
     conc = raw["concentration"]
+    if not isinstance(conc, dict):
+        raise ValueError(f"'concentration' must be a dict in {p}, got {type(conc).__name__}")
+    # P3-412: nested required keys raise a clear ValueError naming the key and
+    # file, never a bare KeyError.
+    def _req(d: dict[str, Any], key: str, section: str) -> Any:
+        if key not in d:
+            raise ValueError(f"Missing required key '{section}.{key}' in {p}")
+        return d[key]
+
     concentration = ConcentrationPolicy(
-        symbols=[str(s).upper() for s in conc["symbols"]],
-        baseline_pct=_dec(conc["baseline_pct"]),
-        baseline_month=_parse_month(conc["baseline_month"]),
-        target_pct=_dec(conc["target_pct"]),
-        target_month=_parse_month(conc["target_month"]),
-        drift_alert_threshold_pts=_dec(conc["drift_alert_threshold_pts"]),
+        symbols=[str(s).upper() for s in _req(conc, "symbols", "concentration")],
+        baseline_pct=_dec(_req(conc, "baseline_pct", "concentration")),
+        baseline_month=_parse_month(_req(conc, "baseline_month", "concentration")),
+        target_pct=_dec(_req(conc, "target_pct", "concentration")),
+        target_month=_parse_month(_req(conc, "target_month", "concentration")),
+        drift_alert_threshold_pts=_dec(
+            _req(conc, "drift_alert_threshold_pts", "concentration")
+        ),
     )
 
     wa_excise: dict[int, WaExciseYear] = {}
     for year, thresholds in (raw.get("wa_excise") or {}).items():
+        if not isinstance(thresholds, dict):
+            raise ValueError(f"'wa_excise.{year}' must be a dict in {p}")
         wa_excise[int(year)] = WaExciseYear(
-            threshold=_dec(thresholds["threshold"]),
-            surcharge_threshold=_dec(thresholds["surcharge_threshold"]),
+            threshold=_dec(_req(thresholds, "threshold", f"wa_excise.{year}")),
+            surcharge_threshold=_dec(
+                _req(thresholds, "surcharge_threshold", f"wa_excise.{year}")
+            ),
         )
 
     bold = raw.get("bold_bets") or {}
@@ -141,6 +173,9 @@ def load_policy_config(path: str | Path | None = None) -> PolicyConfig:
             )
         )
     bold_bets = BoldBetsPolicy(cap=_dec(bold.get("cap", 20000)), positions=positions)
+
+    if "international_target_pct_of_equity" not in raw:
+        raise ValueError(f"Missing required key 'international_target_pct_of_equity' in {p}")
 
     return PolicyConfig(
         concentration=concentration,

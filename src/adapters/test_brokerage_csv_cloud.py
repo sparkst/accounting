@@ -9,13 +9,22 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.brokerage_csv import (
     _CLOUD_INGEST_SOURCE,
+    _CLOUD_LOG_SOURCE,
     ETRADE,
     SCHWAB,
     _default_target,
     import_csv_cloud,
+)
+from src.models.base import Base
+from src.models.enums import IngestionStatus
+from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
 
 # ── Sample CSV content ────────────────────────────────────────────────────────
@@ -192,7 +201,61 @@ def test_cloud_post_failure_yields_error_no_raise(etrade_csv_path, monkeypatch):
     assert result.imported == 0
 
 
+# ── REQ-FIX-WLT-007: cloud import writes a local IngestionLog row ─────────────
+
+
+@pytest.fixture()
+def log_session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def test_cloud_import_writes_ingestion_log_on_success(
+    etrade_csv_path, mock_post, log_session: Session
+) -> None:
+    result = import_csv_cloud(etrade_csv_path, brokerage=ETRADE, session=log_session)
+    assert result.errors == []
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_cloud_import_writes_ingestion_log_on_error(
+    etrade_csv_path, log_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.adapters._shared.wealth_client import WealthHTTPError
+
+    monkeypatch.setattr(
+        "src.adapters.brokerage_csv.post_to_wealth",
+        lambda payload, source, **kw: (_ for _ in ()).throw(WealthHTTPError(422, "bad")),
+    )
+    result = import_csv_cloud(etrade_csv_path, brokerage=ETRADE, session=log_session)
+    assert result.imported == 0
+    assert result.errors
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_cloud_import_without_session_skips_log(etrade_csv_path, mock_post) -> None:
+    """Backward-compat: no session → no IngestionLog attempted, still returns result."""
+    result = import_csv_cloud(etrade_csv_path, brokerage=ETRADE)
+    assert result.errors == []
+    assert result.imported == 2
+
+
 # ── CLI tests ─────────────────────────────────────────────────────────────────
+#
+# The apply+cloud CLI test stubs ``get_session`` — REQ-FIX-WLT-007's
+# IngestionLog write happens through the same real session the local-write
+# path uses, so an unmocked test here would silently write into
+# ``data/accounting.db``.
+
 
 def test_cli_dry_run_does_not_post(etrade_csv_path, mock_post):
     from src.adapters.brokerage_csv import main
@@ -203,14 +266,26 @@ def test_cli_dry_run_does_not_post(etrade_csv_path, mock_post):
 
 
 def test_cli_target_cloud_calls_cloud_function(etrade_csv_path, mock_post):
+    import unittest.mock as um
+    from contextlib import contextmanager
+
     from src.adapters.brokerage_csv import main
 
-    rc = main([
-        "import-csv", "--file", str(etrade_csv_path),
-        "--brokerage", ETRADE, "--apply", "--target", "cloud",
-    ])
+    mock_session = um.MagicMock()
+
+    @contextmanager
+    def _fake_get_session():
+        yield mock_session
+
+    with um.patch("src.db.connection.get_session", _fake_get_session):
+        rc = main([
+            "import-csv", "--file", str(etrade_csv_path),
+            "--brokerage", ETRADE, "--apply", "--target", "cloud",
+        ])
     assert rc == 0
     mock_post.assert_called_once()
+    assert mock_session.add.called
+    assert mock_session.commit.called
 
 
 def test_cli_target_local_dry_run_no_post(etrade_csv_path, mock_post):
@@ -227,12 +302,22 @@ def test_cli_target_local_dry_run_no_post(etrade_csv_path, mock_post):
 
 def test_cli_default_target_env(etrade_csv_path, mock_post, monkeypatch):
     """When WEALTH_TARGET_DEFAULT=cloud, --apply without --target uses cloud."""
+    import unittest.mock as um
+    from contextlib import contextmanager
+
     monkeypatch.setenv("WEALTH_TARGET_DEFAULT", "cloud")
     from src.adapters.brokerage_csv import main
 
-    rc = main([
-        "import-csv", "--file", str(etrade_csv_path),
-        "--brokerage", ETRADE, "--apply",
-    ])
+    mock_session = um.MagicMock()
+
+    @contextmanager
+    def _fake_get_session():
+        yield mock_session
+
+    with um.patch("src.db.connection.get_session", _fake_get_session):
+        rc = main([
+            "import-csv", "--file", str(etrade_csv_path),
+            "--brokerage", ETRADE, "--apply",
+        ])
     assert rc == 0
     mock_post.assert_called_once()

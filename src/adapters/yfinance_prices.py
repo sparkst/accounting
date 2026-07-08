@@ -8,12 +8,14 @@ Conventions
 -----------
 - Float→Decimal conversions go through ``Decimal(str(value))`` to avoid the
   precision loss that ``Decimal(float_value)`` introduces.
-- Both the raw ``Close`` and the ``Adj Close`` (total-return adjusted) columns
-  are captured: ``close`` holds the unadjusted market price, ``adj_close`` holds
-  Yahoo's dividend/split-adjusted close (``None`` when the column or value is
-  absent). ``auto_adjust=False`` is kept so the frame carries both series
-  (REQ-FIX-WLT-001). Downstream chooses raw close for live re-pricing and
-  adj_close for total-return benchmark math.
+- Both the ``Close`` and the ``Adj Close`` columns are captured. IMPORTANT
+  semantics (P1-001 of the 2026-07 review): with ``auto_adjust=False`` Yahoo's
+  ``Close`` is **split-adjusted to the present share scale** (only dividend
+  adjustment is excluded — that's what ``Adj Close`` adds). ``close`` is NOT
+  the historical nominal print. Downstream re-pricing therefore scales share
+  counts by ALL splits after the snapshot date
+  (``brokerage_summary._cumulative_split_ratio``), and ``adj_close`` serves
+  total-return benchmark math (REQ-FIX-WLT-001).
 - Rows whose Close is NaN (delisted dates, partial sessions) are skipped.
 - Open/High/Low NaN pass through as ``None`` rather than zero.
 - Yahoo occasionally returns tz-aware Timestamps; we normalise to UTC before

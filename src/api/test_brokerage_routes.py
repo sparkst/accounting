@@ -2649,3 +2649,148 @@ class TestNetworthHistoryForwardFill:
         )
         assert body[0]["as_of"] == "2024-07-03"
         assert body[0]["balance_total"] == pytest.approx(42000.0)
+
+
+# ── /api/brokerage/policy, /bold-bets, /networth-attribution (P1-b2c) ───
+#
+# REQ-IPD-001..004, REQ-BBT-001..002, REQ-NWA-001. These hit the routes
+# through TestClient end-to-end (not the underlying analytics functions
+# directly) so a field-name typo in the route handlers' manual dict mapping
+# (src/api/routes/brokerage.py ~1793-1961) would surface as a real 500/422,
+# and confirm the same `require_api_key` dependency chain used by the
+# sibling /api/brokerage routes applies here too.
+
+
+class TestPolicyRoute:
+    def test_empty_returns_200_with_expected_shape(
+        self, empty_client: TestClient
+    ) -> None:
+        r = empty_client.get("/api/brokerage/policy")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        for key in (
+            "as_of", "investable_base", "equity_base", "cash_value", "cash_pct",
+            "international_value", "international_pct_of_equity",
+            "international_target_pct", "combined_symbols", "combined_value",
+            "combined_pct", "current_pct", "glide_pct", "headroom_pts",
+            "drift_alert_threshold_pts", "concentration", "glide_series",
+            "wa_tax_year", "realized_lt_gains_ytd", "excise_threshold",
+            "excise_threshold_headroom", "excise_surcharge_threshold",
+            "excise_surcharge_headroom", "bold_bets_over_cap",
+            "bold_bets_sleeve_value", "bold_bets_cap", "warnings",
+        ):
+            assert key in body, f"missing key {key!r} in /brokerage/policy response"
+        assert body["investable_base"] == 0
+        assert body["concentration"] == []
+        assert isinstance(body["glide_series"], list) and body["glide_series"]
+
+    def test_seeded_returns_200(self, client: TestClient) -> None:
+        r = client.get("/api/brokerage/policy")
+        assert r.status_code == 200, r.text
+
+
+class TestBoldBetsRoute:
+    def test_empty_returns_200_with_expected_shape(
+        self, empty_client: TestClient
+    ) -> None:
+        r = empty_client.get("/api/brokerage/bold-bets")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        for key in (
+            "positions", "sleeve_value", "sleeve_cost_basis", "sleeve_unrealized",
+            "sleeve_realized", "cap", "over_cap", "pct_of_investable",
+            "investable_base",
+        ):
+            assert key in body, f"missing key {key!r} in /brokerage/bold-bets response"
+        assert body["positions"] == []
+        assert body["over_cap"] is False
+
+    def test_seeded_returns_200(self, client: TestClient) -> None:
+        r = client.get("/api/brokerage/bold-bets")
+        assert r.status_code == 200, r.text
+
+
+class TestNetworthAttributionRoute:
+    def test_empty_returns_200_with_expected_shape(
+        self, empty_client: TestClient
+    ) -> None:
+        r = empty_client.get(
+            "/api/brokerage/networth-attribution"
+            "?start=2026-01-01&end=2026-03-01"
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        for key in (
+            "start", "end", "nw_start", "nw_end", "delta_nw", "market_effect",
+            "net_flows", "coverage_change", "flow_tx_count", "new_account_count",
+            "dropped_account_count", "weekly_line",
+        ):
+            assert key in body, (
+                f"missing key {key!r} in /brokerage/networth-attribution response"
+            )
+        assert body["start"] == "2026-01-01"
+        assert body["end"] == "2026-03-01"
+        assert body["weekly_line"].startswith("NW Δ $")
+
+    def test_seeded_returns_200(self, client: TestClient) -> None:
+        r = client.get(
+            "/api/brokerage/networth-attribution"
+            "?start=2026-01-01&end=2026-06-01"
+        )
+        assert r.status_code == 200, r.text
+
+    def test_missing_query_params_is_422(self, empty_client: TestClient) -> None:
+        r = empty_client.get("/api/brokerage/networth-attribution")
+        assert r.status_code == 422
+
+    def test_end_before_start_is_422(self, empty_client: TestClient) -> None:
+        r = empty_client.get(
+            "/api/brokerage/networth-attribution"
+            "?start=2026-03-01&end=2026-01-01"
+        )
+        assert r.status_code == 422
+
+
+class TestNewWealthEndpointsAuthParity:
+    """P1-b2c: confirm /policy, /bold-bets, /networth-attribution enforce the
+    same `require_api_key` dependency chain as an existing sibling route
+    (/api/brokerage/networth) — set via `_auth` on the whole router in
+    src/api/main.py, so parity here is a proxy for "wired into the same
+    router include" rather than a route-specific auth bypass."""
+
+    _NEW_PATHS = (
+        "/api/brokerage/policy",
+        "/api/brokerage/bold-bets",
+        "/api/brokerage/networth-attribution?start=2026-01-01&end=2026-03-01",
+    )
+
+    def test_no_api_key_env_all_new_routes_pass(
+        self, empty_client: TestClient
+    ) -> None:
+        import os
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("API_KEY", None)
+            for path in self._NEW_PATHS:
+                r = empty_client.get(path)
+                assert r.status_code == 200, f"{path}: {r.text}"
+
+    def test_api_key_set_missing_key_gets_401_like_sibling_route(
+        self, empty_client: TestClient
+    ) -> None:
+        with patch.dict("os.environ", {"API_KEY": "secret-test-key"}):
+            # Sibling route for comparison.
+            sibling = empty_client.get("/api/brokerage/networth")
+            assert sibling.status_code == 401
+            for path in self._NEW_PATHS:
+                r = empty_client.get(path)
+                assert r.status_code == 401, f"{path}: expected 401, got {r.status_code}"
+
+    def test_api_key_set_correct_key_gets_200(
+        self, empty_client: TestClient
+    ) -> None:
+        with patch.dict("os.environ", {"API_KEY": "secret-test-key"}):
+            for path in self._NEW_PATHS:
+                r = empty_client.get(
+                    path, headers={"X-Api-Key": "secret-test-key"}
+                )
+                assert r.status_code == 200, f"{path}: {r.text}"

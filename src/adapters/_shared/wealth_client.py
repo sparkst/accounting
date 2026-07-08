@@ -134,6 +134,10 @@ def post_to_wealth(
         On HTTP 5xx.
     WealthHTTPError
         On any other non-2xx status.
+    WealthTransportError
+        On transport-layer failures (DNS, TLS, connect, timeout).
+    WealthProtocolError
+        On a 2xx response with a non-JSON body.
     """
     base_url = os.environ.get("WEALTH_API_BASE", "").rstrip("/")
     if not base_url:

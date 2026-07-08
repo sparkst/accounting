@@ -10,13 +10,22 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.gsk_pdf import (
     _CLOUD_INGEST_SOURCE,
+    _CLOUD_LOG_SOURCE,
     GSK_RAW_ACCOUNT_NAME,
     SOURCE_TAG,
     _default_target,
     import_pdf_cloud,
+)
+from src.models.base import Base
+from src.models.enums import IngestionStatus
+from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -173,7 +182,66 @@ def test_cloud_post_401_caught(tmp_path, mock_pdftotext, monkeypatch):
     assert result.imported == 0
 
 
+# ── REQ-FIX-WLT-007: cloud import writes a local IngestionLog row ─────────────
+
+
+@pytest.fixture()
+def log_session() -> Session:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def test_cloud_import_writes_ingestion_log_on_success(
+    tmp_path, mock_pdftotext, mock_post, log_session: Session
+) -> None:
+    pdf = _make_fake_pdf(tmp_path)
+    result = import_pdf_cloud(pdf, session=log_session)
+    assert result.errors == []
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.SUCCESS.value
+
+
+def test_cloud_import_writes_ingestion_log_on_error(
+    tmp_path, mock_pdftotext, log_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.adapters._shared.wealth_client import WealthHTTPError
+
+    monkeypatch.setattr(
+        "src.adapters.gsk_pdf.post_to_wealth",
+        lambda payload, source, **kw: (_ for _ in ()).throw(WealthHTTPError(422, "bad")),
+    )
+    pdf = _make_fake_pdf(tmp_path)
+    result = import_pdf_cloud(pdf, session=log_session)
+    assert result.imported == 0
+    assert result.errors
+
+    logs = log_session.scalars(select(IngestionLog)).all()
+    assert len(logs) == 1
+    assert logs[0].source == _CLOUD_LOG_SOURCE
+    assert logs[0].status == IngestionStatus.FAILURE.value
+
+
+def test_cloud_import_without_session_skips_log(
+    tmp_path, mock_pdftotext, mock_post
+) -> None:
+    """Backward-compat: no session → no IngestionLog attempted, still returns result."""
+    pdf = _make_fake_pdf(tmp_path)
+    result = import_pdf_cloud(pdf)
+    assert result.errors == []
+    assert result.imported == 1
+
+
 # ── CLI tests ─────────────────────────────────────────────────────────────────
+#
+# The apply+cloud CLI test stubs ``get_session`` — REQ-FIX-WLT-007's
+# IngestionLog write happens through the same real session the local-write
+# path uses, so an unmocked test here would silently write into
+# ``data/accounting.db``.
+
 
 def test_cli_dry_run_does_not_post(tmp_path, mock_pdftotext, mock_post):
     """Dry-run mode never calls post_to_wealth regardless of --target."""
@@ -187,12 +255,24 @@ def test_cli_dry_run_does_not_post(tmp_path, mock_pdftotext, mock_post):
 
 def test_cli_target_cloud_calls_cloud_function(tmp_path, mock_pdftotext, mock_post):
     """--apply --target cloud routes to import_pdf_cloud."""
+    import unittest.mock as um
+    from contextlib import contextmanager
+
     from src.adapters.gsk_pdf import main
 
+    mock_session = um.MagicMock()
+
+    @contextmanager
+    def _fake_get_session():
+        yield mock_session
+
     pdf = _make_fake_pdf(tmp_path)
-    rc = main(["import-pdf", "--file", str(pdf), "--apply", "--target", "cloud"])
+    with um.patch("src.db.connection.get_session", _fake_get_session):
+        rc = main(["import-pdf", "--file", str(pdf), "--apply", "--target", "cloud"])
     assert rc == 0
     mock_post.assert_called_once()
+    assert mock_session.add.called
+    assert mock_session.commit.called
 
 
 def test_cli_target_local_does_not_post(tmp_path, mock_pdftotext, mock_post):

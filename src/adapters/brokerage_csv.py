@@ -35,6 +35,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_cloud_ingestion_log
 from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.adapters.base import AdapterResult, BaseAdapter
 from src.models.enums import (
@@ -63,6 +64,9 @@ SUPPORTED_BROKERAGES = (ETRADE, SCHWAB, VANGUARD)
 # Cloud-mode constants
 _CLOUD_INGEST_SOURCE = "brokerage-csv"
 """Workers ingest slug for brokerage taxable-event rows."""
+
+_CLOUD_LOG_SOURCE = "wealth_cloud:brokerage_csv"
+"""``ingestion_log.source`` for the cloud-push path (REQ-FIX-WLT-007)."""
 
 _CLOUD_BATCH_SIZE = 100
 
@@ -681,15 +685,22 @@ def import_csv_cloud(
     path: Path,
     *,
     brokerage: str | None = None,
+    session: Session | None = None,
 ) -> CloudImportResult:
     """Parse a brokerage 1099-B CSV and POST rows to the Workers ingest endpoint.
 
     Per-record error isolation: WealthClientError per-batch is caught, recorded
     in ``result.errors``, and the batch continues.
 
+    When ``session`` is supplied, exactly one local IngestionLog row is
+    written per run (success and error paths alike) so cloud pushes surface
+    in delivery-health exactly like local imports (REQ-FIX-WLT-007).
+    Backward compatible: with no session the log write is skipped.
+
     Args:
         path:      Path to the CSV file.
         brokerage: One of 'etrade', 'schwab', 'vanguard'. When None, auto-detected.
+        session:   Optional local session, used only for the IngestionLog write.
 
     Returns:
         :class:`CloudImportResult` with counts and per-record errors.
@@ -703,12 +714,18 @@ def import_csv_cloud(
             f"{path.name}: could not detect brokerage format; "
             "pass --brokerage etrade|schwab|vanguard"
         )
+        write_cloud_ingestion_log(
+            session, source=_CLOUD_LOG_SOURCE, result=result
+        )
         return result
 
     try:
         rows = parse_brokerage_csv(content, broker, path.name)
     except ValueError as exc:
         result.errors.append(f"{path.name}: {exc}")
+        write_cloud_ingestion_log(
+            session, source=_CLOUD_LOG_SOURCE, result=result
+        )
         return result
 
     cloud_rows: list[dict[str, object]] = []
@@ -748,6 +765,9 @@ def import_csv_cloud(
                 )
             logger.warning("brokerage_csv: cloud POST failed for batch: %s", exc)
 
+    write_cloud_ingestion_log(
+        session, source=_CLOUD_LOG_SOURCE, result=result
+    )
     return result
 
 
@@ -834,7 +854,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if target == "cloud":
-        result = import_csv_cloud(csv_path, brokerage=args.brokerage)
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        try:
+            from src.db.connection import get_session  # late import keeps tests light
+        except ImportError:
+            result = import_csv_cloud(csv_path, brokerage=args.brokerage, session=None)
+        else:
+            with get_session() as session:
+                result = import_csv_cloud(
+                    csv_path, brokerage=args.brokerage, session=session
+                )
         _print_summary(result, dry_run=False)
         return 0
 

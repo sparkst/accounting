@@ -288,8 +288,13 @@ def compute_bold_bets(
 
     accounts_by_id = {a.id: a for a in session.query(Account).all()}
 
+    # Materialized once and reused below for both the sleeve positions loop
+    # and the investable_base computation — avoids a second DB round trip
+    # (P2-bb1).
+    snapshot_rows = list(_latest_snapshot_rows(session))
+
     positions: list[BoldBetPositionResult] = []
-    for ps in _latest_snapshot_rows(session):
+    for ps in snapshot_rows:
         if ps.market_value is None or ps.market_value <= 0:
             continue
         symbol = (ps.symbol or "").upper()
@@ -326,11 +331,15 @@ def compute_bold_bets(
     )
     sleeve_realized = sum((p.realized_gain for p in positions), Decimal("0"))
 
+    # Hoisted out of the comprehension: computing these per-row would re-run a
+    # full Account table scan (_investable_account_ids) and re-query snapshots
+    # (_latest_snapshot_rows) once per position row (P2-bb1).
+    investable_ids = _investable_account_ids(session)
     investable_base = sum(
         (
             Decimal(str(ps.market_value))
-            for ps in _latest_snapshot_rows(session)
-            if ps.account_id in _investable_account_ids(session)
+            for ps in snapshot_rows
+            if ps.account_id in investable_ids
             and ps.market_value is not None
             and ps.market_value > 0
         ),

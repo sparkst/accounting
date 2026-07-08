@@ -982,6 +982,35 @@ def networth_history(
                     matched_name_first_date[key] = as_of
         alias_cutoff_by_raw_name = _alias_cutoff_by_raw_name(session)
 
+        # Defense-in-depth (P3-002 / REQ-WD-009): a legacy raw name with
+        # NEITHER a tier-1 matched-name cutoff NOR a tier-2 account_alias
+        # cutoff has no coverage cutoff at all — its full history, including
+        # any post-cutover dates, is included forever. That is only correct
+        # if the name genuinely has no modern counterpart (e.g. a truly
+        # closed account); if it rolled into a matched account under a
+        # DIFFERENT label with no account_alias row recorded, this silently
+        # double-counts present-day net worth. We can't distinguish the two
+        # cases here, so fail loud instead of silent: log every uncovered
+        # name so an incomplete alias seed is operator-visible rather than a
+        # quiet valuation error.
+        uncovered_raw_names = sorted(
+            {
+                raw_name
+                for raw_name in unmatched_by_pseudo
+                if raw_name.lower() not in matched_name_first_date
+                and raw_name.lower() not in alias_cutoff_by_raw_name
+            }
+        )
+        if uncovered_raw_names:
+            logger.warning(
+                "networth_history: %d unmatched raw name(s) have no dedup "
+                "cutoff (no matched-name or account_alias coverage) and "
+                "will be included in full at every date — verify each has "
+                "no modern counterpart, or seed account_alias: %s",
+                len(uncovered_raw_names),
+                uncovered_raw_names[:20],
+            )
+
     def _unmatched_contribution(target: date) -> tuple[Decimal, int]:
         total = Decimal("0")
         count = 0
@@ -1638,6 +1667,13 @@ def holding_history(
     def _acct_slot_at(
         series: list[tuple[date, dict[str, Decimal]]], target: date
     ) -> dict[str, Decimal] | None:
+        """Carry each account's last-known position forward to later dates.
+
+        REQ-FIX-WLT-005: When a broker fully sells a position but does not
+        emit a zero-quantity snapshot, the last-known value forward-fills
+        indefinitely in this time series. To exclude a position, the source
+        must explicitly provide a zero-quantity row at the liquidation date.
+        """
         last: dict[str, Decimal] | None = None
         for d, slot in series:
             if d > target:
@@ -2015,6 +2051,13 @@ class PerformanceSummary(BaseModel):
     twr_annualized: Decimal | None
     xirr: Decimal | None
     benchmark_twr: Decimal | None
+    # REQ-FIX-WLT-001: "total_return" when the benchmark used adjusted closes
+    # at both endpoints, "price_return" when it fell back to raw close
+    # (adj_close unavailable at one/both endpoints), None when benchmark_twr
+    # itself is None (no price data). Mirrors BenchmarkComparisonResponse's
+    # flag on /networth-history-benchmark so a price_return fallback here
+    # isn't silently indistinguishable from total_return (P3-001).
+    benchmark_basis: str | None = None
     current_value: Decimal
     total_principal: Decimal
     total_growth: Decimal
@@ -2062,6 +2105,10 @@ class PeriodRow(BaseModel):
     mwr: Decimal | None
     spy: Decimal | None
     qqq: Decimal | None
+    # P3-002: "total_return" | "price_return" | None — basis each benchmark
+    # column was computed on (price_return = adj_close unavailable fallback).
+    spy_basis: str | None = None
+    qqq_basis: str | None = None
 
     @field_serializer("twr", "mwr", "spy", "qqq")
     def _ser(self, v: Decimal | None) -> str | None:
@@ -2264,12 +2311,15 @@ def _build_external_cash_flows(
 
 def _benchmark_twr(
     session: Session, symbol: str, start: date, end: date
-) -> Decimal | None:
-    """Return total return for ``symbol`` from start_close to end_close.
+) -> tuple[Decimal | None, str | None]:
+    """Return (total return, basis) for ``symbol`` from start_close to end_close.
 
     Uses the latest ``HistoricalPrice`` at or before each endpoint. Returns
-    ``None`` if either endpoint lacks a price. Annualizes for windows ≥ 30
-    days (same convention as ``time_weighted_return``).
+    ``(None, None)`` if either endpoint lacks a price. Annualizes for windows
+    ≥ 30 days (same convention as ``time_weighted_return``). ``basis`` is
+    ``"total_return"`` when adj_close was available at both endpoints,
+    ``"price_return"`` on the raw-close fallback (P3-001) — mirrors the flag
+    surfaced by ``_build_price_lookup`` / ``BenchmarkComparisonResponse``.
     """
     start_row = (
         session.query(HistoricalPrice)
@@ -2290,7 +2340,7 @@ def _benchmark_twr(
         .first()
     )
     if start_row is None or end_row is None:
-        return None
+        return None, None
     # REQ-FIX-WLT-001: total-return basis — use adj_close when BOTH endpoints
     # carry it (comparable to the portfolio TWR, which sees dividends as internal
     # cash); otherwise fall back to raw close for BOTH endpoints (same basis, no
@@ -2298,18 +2348,20 @@ def _benchmark_twr(
     if start_row.adj_close is not None and end_row.adj_close is not None:
         start_px = Decimal(str(start_row.adj_close))
         end_px = Decimal(str(end_row.adj_close))
+        basis = "total_return"
     else:
         start_px = Decimal(str(start_row.close))
         end_px = Decimal(str(end_row.close))
+        basis = "price_return"
     if start_px == Decimal("0"):
-        return None
+        return None, None
     raw = (end_px - start_px) / start_px
     window_days = (end - start).days
     if window_days >= 30 and window_days > 0:
         raw_f = float(raw)
         ann = Decimal(str((1.0 + raw_f) ** (365.0 / window_days) - 1.0))
-        return ann.quantize(Decimal("0.000001"))
-    return raw.quantize(Decimal("0.000001"))
+        return ann.quantize(Decimal("0.000001")), basis
+    return raw.quantize(Decimal("0.000001")), basis
 
 
 def _scope_summary(
@@ -2357,13 +2409,14 @@ def _scope_summary(
         money_weighted_return(xirr_flows, current_value, end) if xirr_flows else None
     )
 
-    benchmark = _benchmark_twr(session, "SPY", start, end)
+    benchmark, benchmark_basis = _benchmark_twr(session, "SPY", start, end)
 
     return {
         "twr": twr_raw,
         "twr_annualized": twr_ann,
         "xirr": mwr,
         "benchmark_twr": benchmark,
+        "benchmark_basis": benchmark_basis,
         "current_value": current_value,
         "total_principal": total_principal,
         "total_growth": total_growth,
@@ -2671,14 +2724,18 @@ def performance_periods(
             else None
         )
 
-        spy = _benchmark_twr(session, "SPY", p_start, end)
-        qqq = _benchmark_twr(session, "QQQ", p_start, end)
+        spy, spy_basis = _benchmark_twr(session, "SPY", p_start, end)
+        qqq, qqq_basis = _benchmark_twr(session, "QQQ", p_start, end)
 
         rows.append(
             {
                 "period": label,
                 "twr": twr,
                 "mwr": mwr,
+                # P3-002: disclose the basis so a price-return fallback (missing
+                # adj_close) is never silently compared against portfolio TWR.
+                "spy_basis": spy_basis,
+                "qqq_basis": qqq_basis,
                 "spy": spy,
                 "qqq": qqq,
             }

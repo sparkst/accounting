@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the tax-posture forecaster two weeks ahead of each estimated-tax due date
+
+[Timer]
+# Jan/Apr/Jun/Sep 1st, 07:00 America/Los_Angeles — 2 weeks ahead of the
+# Jan 15 / Apr 15 / Jun 15 / Sep 15 estimated-tax due dates (design spec §4.5).
+OnCalendar=*-01,04,06,09-01 07:00:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+# GATED: do not `systemctl enable` until (1) config/tax_tables/2026.yaml is
+# verified against IRS Rev. Proc. and (2) a manual --apply smoke run on the
+# box has been verified (design spec §7/§10).

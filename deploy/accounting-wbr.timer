@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Weekly Business Review scorecard Mon 06:00 America/Los_Angeles
+
+[Timer]
+# systemd resolves the TZ suffix per elapse, so DST is automatic — 13:00 UTC
+# during PDT, 14:00 UTC during PST — no hand-rolled UTC math (design spec §3.4).
+OnCalendar=Mon *-*-* 06:00:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+# Rollout: install but DO NOT `systemctl enable` until a manual --apply smoke
+# run on the box has been verified (design spec §7).

@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.api.auth import require_api_key
+from src.api.routes.ar import router as ar_router
 from src.api.routes.attachments import router as attachments_router
 from src.api.routes.brokerage import router as brokerage_router
 from src.api.routes.csv_import import router as csv_import_router
@@ -170,6 +171,9 @@ app.include_router(brokerage_router, prefix="/api", dependencies=_auth)
 app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
 app.include_router(transactions_router, prefix="/api", dependencies=_auth)
 app.include_router(ingest_router, prefix="/api")
+# AR approve/dismiss self-authenticate (webhook secret + single-use token),
+# so — like ingest_router — they are registered WITHOUT dependencies=_auth.
+app.include_router(ar_router, prefix="/api")
 app.include_router(invoices_router, prefix="/api", dependencies=_auth)
 app.include_router(planning_router, prefix="/api", dependencies=_auth)
 app.include_router(plaid_router, prefix="/api", dependencies=_auth)

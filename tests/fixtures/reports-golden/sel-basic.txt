@@ -1,0 +1,34 @@
+SELLABILITY — 2026-06 close (Sparkry)
+
+SDE — 2026-06
+  Sparkry net income: $3,650
+  + HEALTH_INSURANCE: $150
+  = SDE: $3,800
+
+SDE — TTM
+  Sparkry net income: $23,700
+  + HEALTH_INSURANCE: $900
+  = SDE: $24,600
+
+CLIENT REVENUE (TTM)
+  Acme Corp                      $24,000     93.0%   recurring
+  Bolt LLC                       $1,000       3.9%   project
+  Substack                       $500         1.9%   project
+  UNATTRIBUTED                   $300         1.2%   project
+  concentration: top-1 93.0% · top-3 98.8% (top-1 93.0% > 50%)
+
+RECURRING vs PROJECT (TTM)
+  recurring: $24,000   project: $1,800
+
+6-MONTH TREND (revenue / SDE / top-1 concentration)
+  2026-01   revenue $4,000     SDE $3,800     top-1 100.0%
+  2026-02   revenue $4,500     SDE $4,300     top-1 88.9%
+  2026-03   revenue $5,000     SDE $4,800     top-1 80.0%
+  2026-04   revenue $4,300     SDE $4,100     top-1 93.0%
+  2026-05   revenue $4,000     SDE $3,800     top-1 100.0%
+  2026-06   revenue $4,000     SDE $3,800     top-1 100.0%
+
+BLACKLINE (investment-mode — not sellability-framed)
+  net this month: ($1,300)   TTM cumulative: ($1,300)
+
+⚠️ Unnamed $50 Fidelity TOD account — name it or archive it (REQ-FIX-DAT-002, human decision).

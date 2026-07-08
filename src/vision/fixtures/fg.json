@@ -1,0 +1,13 @@
+{
+  "institution": "fg",
+  "statement_type": "balances",
+  "model": "gemini-2.5-flash",
+  "input_tokens": 4200,
+  "output_tokens": 900,
+  "fields": {
+    "institution": "F&G",
+    "account_number_mask": "****2585",
+    "as_of": "2026-05-07",
+    "balance": "660218.55"
+  }
+}

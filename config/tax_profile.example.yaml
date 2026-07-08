@@ -1,0 +1,33 @@
+# Household MFJ tax-profile inputs for the tax-posture forecaster
+# (REQ-TXF-003, design spec §4.4). Copy this file to config/tax_profile.yaml
+# (gitignored — never commit real household figures) and fill in real
+# numbers. Until that file exists (or prior_year_total_tax <= 0), the report
+# runs in BUSINESS-ONLY mode: Schedule C / K-1 / B&O / SE projections render
+# fully, and the MFJ bracket-position + safe-harbor sections print
+# "UNAVAILABLE — fill config/tax_profile.yaml".
+
+tax_year: 2026
+filing_status: mfj
+
+w2:
+  - employer: ""
+    ytd_wages: 0.00
+    ytd_federal_withholding: 0.00
+    ytd_ss_wages: 0.00
+    # Box 5 Medicare wages (uncapped — unlike ytd_ss_wages, which is capped
+    # at the SS wage base). Feeds the Additional Medicare (0.9%) threshold
+    # test on SE income. Optional: if omitted, falls back to ytd_wages.
+    ytd_medicare_wages: 0.00
+
+expected_investment_income:
+  interest: 0.00
+  dividends_qualified: 0.00
+  capital_gains_lt: 0.00
+
+# Prior full-year total tax liability (Form 1040 line 22, prior tax year) —
+# the 110% safe-harbor target base. <= 0 keeps the report in business-only
+# mode even if the rest of this file is filled in.
+prior_year_total_tax: 0.00
+
+estimated_payments:
+  - {date: "2026-04-15", amount: 0.00}

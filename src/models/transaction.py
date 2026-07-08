@@ -255,10 +255,10 @@ class Transaction(Base):
         onupdate=_now,
     )
     confirmed_by: Mapped[str] = mapped_column(
-        String(8),
+        String(64),
         nullable=False,
         default=ConfirmedBy.AUTO.value,
-        comment="auto | human",
+        comment="auto | human | auto:rule:<id>",
     )
     notes: Mapped[str | None] = mapped_column(
         Text,

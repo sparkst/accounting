@@ -36,6 +36,7 @@ from src.adapters.brokerage_csv import (
 )
 from src.api.auth import require_api_key, require_api_or_ingest_key
 from src.classification.engine import apply_result, classify
+from src.close.autoconfirm import auto_confirm_if_eligible
 from src.db.connection import SessionLocal
 from src.models.enums import Source, TransactionStatus
 from src.models.ingestion_log import IngestionLog
@@ -213,6 +214,9 @@ def _run_ingest_locked(source: Source | None) -> IngestSummary:
                     llm_api_key=llm_api_key,
                 )
                 apply_result(tx, classification)
+                # REQ-MCA-002: Tier-1 high-confidence rows auto-confirm here,
+                # right after the result lands on the row and before commit.
+                auto_confirm_if_eligible(classify_session, tx, classification)
                 classify_session.commit()
                 classified_count += 1
             except Exception:

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the sellability metrics report monthly on the 1st, prior-month scope
+
+[Timer]
+OnCalendar=*-*-01 06:30:00 America/Los_Angeles
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+# Rollout: install but DO NOT `systemctl enable` until a manual --apply smoke
+# run on the box has been verified (design spec §7).

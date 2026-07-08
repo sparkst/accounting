@@ -7,6 +7,7 @@ REQ-FIX-DAT-002 data-hygiene callouts. Pure read; email.py renders it.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -21,11 +22,15 @@ from src.close.reconcile import ReconcileSummary, prior_month, reconcile
 from src.models.enums import TransactionStatus
 from src.models.transaction import Transaction
 
+logger = logging.getLogger(__name__)
+
 DASHBOARD_BASE = "https://books.sparkry.ai"
 
 # REQ-FIX-DAT-002: report-only data-hygiene callouts (never auto-actioned).
+# The formerly-unnamed Vanguard $0 stub was NAMED 2026-07-08 (audited PATCH);
+# what remains is the human archive decision.
 DATA_HYGIENE_CALLOUTS: tuple[str, ...] = (
-    "Unnamed Vanguard taxable account — name or archive",
+    "Vanguard $0 stub (named 2026-07-08) — confirm archive",
     "$50 Fidelity TOD — human closure decision",
 )
 
@@ -80,6 +85,8 @@ class CloseReport:
     anomalies: AnomalyReport
     autoconfirm: AutoConfirmSummary
     data_hygiene: list[str] = field(default_factory=lambda: list(DATA_HYGIENE_CALLOUTS))
+    # REQ-SEL-001: the sellability section ships WITH the close email.
+    sellability_text: str | None = None
 
 
 def _month_bounds(month: str) -> tuple[str, str]:
@@ -151,6 +158,19 @@ def build_close_report(
     month = month or prior_month(today)
     first, last = _month_bounds(month)
 
+    # REQ-SEL-001: embed the sellability section. Lazy import (reports→close
+    # would otherwise risk a cycle); a sellability failure degrades to a note,
+    # never kills the close report.
+    try:
+        from src.reports.sellability import compute_sellability, render_sellability_section
+
+        sellability_text: str | None = render_sellability_section(
+            compute_sellability(session, today=today)
+        )
+    except Exception:  # noqa: BLE001 — close must ship even if SEL breaks
+        logger.exception("sellability section failed; close report degrades")
+        sellability_text = "Sellability section unavailable (compute error — check logs)"
+
     return CloseReport(
         month=month,
         generated_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
@@ -159,4 +179,5 @@ def build_close_report(
         reconcile=reconcile(session, month, today=today),
         anomalies=scan_anomalies(session, month),
         autoconfirm=_autoconfirm_summary(session, first, last),
+        sellability_text=sellability_text,
     )

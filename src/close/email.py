@@ -148,6 +148,15 @@ def render_html(report: CloseReport, *, narrative: str | None = None) -> str:
     for callout in report.data_hygiene:
         parts.append(_line(_esc(callout)))
 
+    # Sellability (REQ-SEL-001: ships WITH the close email)
+    if report.sellability_text:
+        parts.append(_section("Sellability"))
+        parts.append(
+            f'<tr><td colspan="2" style="padding:4px 12px;font-family:ui-monospace,'
+            f'SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;">'
+            f"{_esc(report.sellability_text)}</td></tr>"
+        )
+
     body = "".join(parts)
     return (
         '<body style="margin:0;padding:0;background-color:#f5f5f7;">'

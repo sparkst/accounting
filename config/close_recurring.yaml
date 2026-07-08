@@ -1,0 +1,18 @@
+# Monthly-close expected-recurring overrides (REQ-MCA-001, spec §1.3).
+#
+# History is the source of truth: a vendor is "expected recurring" when it has
+# >= 3 charges in the prior 6 months whose median interval is 25-35 days. This
+# file only OVERRIDES that derivation — it adds no new table.
+#
+#   ignore:  vendor keys (normalized, lower-case) to suppress from the
+#            missing-recurring anomaly even if history would flag them.
+#   require: vendors to force-track as recurring even if history is thin, each
+#            with an expected_day (1-28) and an amount_hint (informational).
+
+ignore: []
+  # - "annual dues acme"        # example: a yearly charge that trips the monthly heuristic
+
+require: []
+  # - vendor: "some monthly saas"
+  #   expected_day: 15
+  #   amount_hint: "49.00"

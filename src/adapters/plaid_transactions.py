@@ -26,6 +26,7 @@ from src.adapters.plaid_client import (
     call_with_retry,
 )
 from src.classification.engine import classify
+from src.close.autoconfirm import auto_confirm_if_eligible
 from src.models.audit_event import AuditEvent
 from src.models.brokerage import Account
 from src.models.enums import (
@@ -217,6 +218,11 @@ def make_transaction(
     elif tx.status == TransactionStatus.AUTO_CLASSIFIED.value:
         # No stale mismatch/low-confidence text survives on a clean row.
         tx.review_reason = None
+    # REQ-MCA-002: a Tier-1 match on a >=0.90 vendor rule is auto-confirmed at
+    # ingest. Uses the engine's ClassificationResult (tier_used/rule_id/status)
+    # — never re-derives eligibility. Transfer-category / vetoed rows already
+    # sit at needs_review above, so the helper's tx.status guard excludes them.
+    auto_confirm_if_eligible(session, tx, result)
     return tx
 
 

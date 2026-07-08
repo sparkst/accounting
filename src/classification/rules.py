@@ -193,4 +193,5 @@ def lookup_vendor_rule(
         reasoning=f"Matched vendor rule: pattern={best_rule.vendor_pattern!r}",
         tax_subcategory=best_rule.tax_subcategory,
         deductible_pct=best_rule.deductible_pct,
+        rule_id=best_rule.id,  # REQ-MCA-002: auto-confirm keys on the winning rule
     )

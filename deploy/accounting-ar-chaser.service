@@ -1,0 +1,41 @@
+[Unit]
+Description=Accounting AR chaser — draft-for-approval reminder ladder (REQ-ARC-001..003)
+After=network-online.target
+Wants=network-online.target
+OnFailure=accounting-alert@%p.service
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+# Doppler config is selected by the service token in /etc/accounting/doppler.env
+# (scoped to accounting/srv) — no --config flag needed. Required env:
+#   N8N_SEVERITY_WEBHOOK_URL / N8N_SEVERITY_WEBHOOK_SECRET  (draft notification POST)
+#   N8N_ALERTS_WEBHOOK_SECRET                               (approve/dismiss callback auth)
+#   RESEND_API_KEY, ALERT_FROM/TO config                   (reminder-email send)
+# Also requires the deploy-time `books-ar-approve` Cloudflare Access service
+# token scoped to /api/ar/* (same pattern as books-ingest).
+# GATED: drop --apply and run DRY-RUN by hand first to validate the ladder,
+# then flip --apply after one clean cycle.
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python -m scripts.ar_chaser run --apply
+TimeoutStartSec=120
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by accounting-ar-chaser.timer — not enabled directly (no [Install]).

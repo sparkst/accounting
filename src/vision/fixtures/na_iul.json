@@ -1,0 +1,15 @@
+{
+  "institution": "na_iul",
+  "statement_type": "policy_values",
+  "model": "gemini-2.5-flash",
+  "input_tokens": 4300,
+  "output_tokens": 950,
+  "fields": {
+    "policy_number": "IUL0099",
+    "as_of": "2026-06-01",
+    "cash_value": "52000.00",
+    "surrender_value": "45000.00",
+    "death_benefit": "500000.00",
+    "premium_paid": "60000.00"
+  }
+}

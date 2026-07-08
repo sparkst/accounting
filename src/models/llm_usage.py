@@ -18,6 +18,8 @@ from src.models.base import Base
 _PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash-lite": (0.10, 0.40),
     "gemini-2.5-flash": (0.30, 2.50),
+    # OpenAI vision fallback (REQ-VIS-001): gpt-4o-mini $0.15/1M in, $0.60/1M out.
+    "gpt-4o-mini": (0.15, 0.60),
     "claude-3-5-haiku": (0.25, 1.25),
     "claude-3-haiku": (0.25, 1.25),
     "claude-3-5-sonnet": (3.0, 15.0),

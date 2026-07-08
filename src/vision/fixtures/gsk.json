@@ -1,0 +1,13 @@
+{
+  "institution": "gsk",
+  "statement_type": "balances",
+  "model": "gemini-2.5-flash",
+  "input_tokens": 3800,
+  "output_tokens": 700,
+  "fields": {
+    "institution": "GSK",
+    "account_number_mask": "GSK_PENSION",
+    "as_of": "2026-05-07",
+    "balance": "123456.78"
+  }
+}

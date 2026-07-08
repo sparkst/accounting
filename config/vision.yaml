@@ -1,0 +1,27 @@
+# Vision shadow-ingestion cost model + defaults (REQ-VIS-004, spec §4.2/§4.4).
+#
+# Rates are USD per 1M tokens, mirroring src/models/llm_usage.py _PRICING. The
+# harness uses est_tokens_per_file to project a pre-run cost and abort if the
+# projection exceeds the per-run cap; mid-run it tracks actual provider usage.
+
+# Per-run guardrails (env VISION_RUN_COST_CAP_USD overrides run_cost_cap_usd).
+run_cost_cap_usd: 2.00
+max_files: 10
+
+# Rough token budget per statement file for the pre-run projection.
+est_tokens_per_file:
+  input: 4000
+  output: 1500
+
+# Per-provider pricing (USD per 1M tokens). Used for the projection only; the
+# actual cost logged to llm_usage_log comes from provider usage metadata via
+# estimate_cost_for_model.
+providers:
+  gemini:
+    model: "gemini-2.5-flash"
+    input_per_m: 0.30
+    output_per_m: 2.50
+  openai:
+    model: "gpt-4o-mini"
+    input_per_m: 0.15
+    output_per_m: 0.60

@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from src.api.routes.tax_export import INCOME_CATEGORIES, _fetch_transactions
 from src.export.bno_tax import BO_CLASSIFICATION, BO_RATE
 from src.models.enums import Entity
+from src.models.transaction import Transaction
 from src.reports.report_config import CONFIG_DIR, load_config, load_yaml, to_decimal
 from src.reports.report_email import dispatch_report
 
@@ -130,6 +131,19 @@ class BracketWalkRow(TypedDict):
     tax_in_bracket: Decimal
 
 
+class _OrdinaryBracketWalk(TypedDict):
+    """Internal result of walking the *ordinary*-rate brackets only — used
+    as a building block for the combined :class:`BracketData` below."""
+
+    available: bool
+    taxable_income: Decimal
+    total_tax: Decimal
+    marginal_rate: Decimal
+    effective_rate: Decimal | None
+    distance_to_next_edge: Decimal | None
+    rows: list[BracketWalkRow]
+
+
 class BracketData(TypedDict):
     available: bool
     taxable_income: Decimal
@@ -138,6 +152,12 @@ class BracketData(TypedDict):
     effective_rate: Decimal | None
     distance_to_next_edge: Decimal | None
     rows: list[BracketWalkRow]
+    # P2-c3e: net LTCG/qualified-div is taxed at preferential rates, stacked
+    # on top of ordinary taxable income, not folded into the ordinary walk.
+    ordinary_taxable_income: Decimal
+    ordinary_tax: Decimal
+    ltcg_taxable: Decimal
+    ltcg_tax: Decimal
 
 
 class SafeHarborLine(TypedDict):
@@ -171,6 +191,8 @@ class TXFData(TypedDict):
     seasonality_guard: bool
     seasonality_reason: str | None
     sparkry: EntityProjection
+    home_office_deduction: Decimal
+    sparkry_net_after_home_office: Decimal
     blackline: EntityProjection
     se_tax: SETaxData
     qbi: QBIData
@@ -212,6 +234,14 @@ _TAX_TABLE_DEFAULTS: dict[str, Any] = {
         {"up_to": "751600.00", "rate": "0.35"},
         {"up_to": "99999999.00", "rate": "0.37"},
     ],
+    # Preferential-rate brackets for net long-term capital gains / qualified
+    # dividends (MFJ, stacked on top of ordinary taxable income) — same
+    # release-blocking-placeholder status as mfj_brackets above (P2-c3e).
+    "ltcg_mfj_brackets": [
+        {"up_to": "96700.00", "rate": "0.00"},
+        {"up_to": "600050.00", "rate": "0.15"},
+        {"up_to": "99999999.00", "rate": "0.20"},
+    ],
     "safe_harbor_pct": "1.10",
     "estimated_tax_due_dates": [
         {"quarter": 1, "due_date": "2026-04-15"},
@@ -223,6 +253,28 @@ _TAX_TABLE_DEFAULTS: dict[str, Any] = {
 
 
 # ── Category math (reuses /tax-summary's exact predicate — REQ-TXF-001) ──
+
+
+def _exclude_reimbursement_pairs(session: Session, transactions: list[Transaction]) -> list[Transaction]:
+    """Drop both legs of any linked reimbursement pair, mirroring
+    ``pl_engine.compute_entity_pl``'s netting exactly (P1-txfr3imb): a
+    reimbursement receipt classified into an INCOME_CATEGORIES tax_category
+    (plausible if the classifier tags a Stripe/bank deposit as
+    CONSULTING_INCOME before it is manually linked) must not inflate
+    Schedule-C gross receipts, and the linked reimbursable/expense leg must
+    not double as a deductible expense. ``reimbursement_link`` is set
+    bidirectionally by ``link_reimbursement`` (transactions.py), so any row
+    whose id is targeted by another row's ``reimbursement_link`` — on
+    EITHER side of the pair — is excluded here."""
+    reimbursement_target_ids = {
+        row[0]
+        for row in session.query(Transaction.reimbursement_link)
+        .filter(Transaction.reimbursement_link.is_not(None))
+        .all()
+    }
+    if not reimbursement_target_ids:
+        return transactions
+    return [tx for tx in transactions if tx.id not in reimbursement_target_ids]
 
 
 def _month_totals(transactions: list[Any], categories: set[str], *, income: bool) -> dict[int, Decimal]:
@@ -294,7 +346,7 @@ def _trailing_3mo_alt(ytd_gross: Decimal, month_totals: dict[int, Decimal], toda
 def _project_entity(
     session: Session, entity: str, year: int, today: date, days_in_year: int, days_elapsed: int
 ) -> tuple[EntityProjection, bool, str | None]:
-    transactions = _fetch_transactions(session, entity, year)
+    transactions = _exclude_reimbursement_pairs(session, _fetch_transactions(session, entity, year))
     income_totals = _category_totals(transactions, INCOME_CATEGORIES)
     gross_ytd = sum(income_totals.values(), Decimal("0"))
     expense_categories = {
@@ -328,13 +380,20 @@ def _project_entity(
 # ── SE tax / QBI / brackets / safe harbor ────────────────────────────────
 
 
-def _compute_se_tax(business_net: Decimal, w2_wages: Decimal, cfg: dict[str, Decimal]) -> SETaxData:
+def _compute_se_tax(
+    business_net: Decimal, w2_ss_wages: Decimal, w2_medicare_wages: Decimal, cfg: dict[str, Decimal]
+) -> SETaxData:
+    """``w2_ss_wages`` (Social Security wages, capped at ``ss_wage_base``)
+    feeds only the SS-wage-base room calculation. ``w2_medicare_wages``
+    (uncapped Medicare wages) feeds the Additional Medicare threshold test —
+    they diverge for households above the SS wage base, where SS wages
+    understate actual Medicare wages (P3-d4f)."""
     se_base = max(Decimal("0"), business_net) * cfg["se_tax_rate"]
-    ss_room = max(Decimal("0"), cfg["ss_wage_base"] - w2_wages)
+    ss_room = max(Decimal("0"), cfg["ss_wage_base"] - w2_ss_wages)
     ss_taxable = min(se_base, ss_room)
     ss_tax = ss_taxable * cfg["ss_rate"]
     medicare_tax = se_base * cfg["medicare_rate"]
-    combined = w2_wages + se_base
+    combined = w2_medicare_wages + se_base
     over_threshold = max(Decimal("0"), combined - cfg["addl_medicare_mfj_threshold"])
     addl_medicare_taxable = min(se_base, over_threshold)
     addl_medicare_tax = addl_medicare_taxable * cfg["addl_medicare_rate"]
@@ -375,7 +434,7 @@ def _compute_qbi(
     }
 
 
-def _walk_brackets(taxable_income: Decimal, brackets: list[dict[str, Decimal]]) -> BracketData:
+def _walk_brackets(taxable_income: Decimal, brackets: list[dict[str, Decimal]]) -> _OrdinaryBracketWalk:
     if taxable_income <= 0:
         return {
             "available": True,
@@ -418,6 +477,61 @@ def _walk_brackets(taxable_income: Decimal, brackets: list[dict[str, Decimal]]) 
     }
 
 
+def _tax_ltcg_stacked(ordinary_taxable_income: Decimal, ltcg_amount: Decimal, ltcg_brackets: list[dict[str, Decimal]]) -> Decimal:
+    """Preferential-rate tax on net LTCG/qualified dividends, "stacked" on
+    top of ordinary taxable income per the Qualified Dividends and Capital
+    Gains Tax Worksheet: the LTCG dollars occupy
+    ``[ordinary_taxable_income, ordinary_taxable_income + ltcg_amount]`` on
+    the *combined* income scale, and each dollar in that range is taxed at
+    the preferential-bracket rate for that position on the scale (P2-c3e)."""
+    if ltcg_amount <= 0:
+        return Decimal("0")
+    stack_bottom = ordinary_taxable_income
+    stack_top = ordinary_taxable_income + ltcg_amount
+    total_tax = Decimal("0")
+    prev_ceiling = Decimal("0")
+    for b in ltcg_brackets:
+        ceiling = b["up_to"]
+        rate = b["rate"]
+        band_lo = max(prev_ceiling, stack_bottom)
+        band_hi = min(ceiling, stack_top)
+        band_amount = max(Decimal("0"), band_hi - band_lo)
+        total_tax += band_amount * rate
+        prev_ceiling = ceiling
+        if stack_top <= ceiling:
+            break
+    return total_tax
+
+
+def _combine_bracket_with_ltcg(
+    ordinary: _OrdinaryBracketWalk,
+    total_taxable_income: Decimal,
+    ordinary_taxable_income: Decimal,
+    ltcg_taxable: Decimal,
+    ltcg_tax: Decimal,
+) -> BracketData:
+    """Assemble the public :class:`BracketData` from the ordinary-bracket
+    walk plus the separately-computed preferential-rate LTCG tax. Marginal
+    rate / distance-to-next-edge / rows describe the ordinary brackets (the
+    rate on the next ordinary dollar earned); ``total_tax``/``effective_rate``
+    reflect the full combined liability (P2-c3e)."""
+    total_tax = ordinary["total_tax"] + ltcg_tax
+    effective_rate = (total_tax / total_taxable_income) if total_taxable_income > 0 else None
+    return {
+        "available": True,
+        "taxable_income": _q2(total_taxable_income),
+        "total_tax": _q2(total_tax),
+        "marginal_rate": ordinary["marginal_rate"],
+        "effective_rate": effective_rate.quantize(Decimal("0.0001")) if effective_rate is not None else None,
+        "distance_to_next_edge": ordinary["distance_to_next_edge"],
+        "rows": ordinary["rows"],
+        "ordinary_taxable_income": _q2(ordinary_taxable_income),
+        "ordinary_tax": _q2(ordinary["total_tax"]),
+        "ltcg_taxable": _q2(ltcg_taxable),
+        "ltcg_tax": _q2(ltcg_tax),
+    }
+
+
 def _compute_safe_harbor(
     prior_year_total_tax: Decimal,
     w2_withholding: Decimal,
@@ -426,21 +540,39 @@ def _compute_safe_harbor(
     safe_harbor_pct: Decimal,
     today: date,
 ) -> SafeHarborData:
+    """Each returned line's ``set_aside`` is the standalone *incremental*
+    amount to set aside by that due date, on top of everything already
+    reserved for prior due dates in this cycle (P2-b2d) — NOT a cumulative
+    running total. The first remaining due date's increment is measured
+    against ``paid_to_date``; each subsequent due date's increment is
+    measured against the *previous remaining* due date's cumulative target,
+    so summing every printed line yields exactly the remaining shortfall to
+    reach ``target``."""
     target = prior_year_total_tax * safe_harbor_pct
     paid_to_date = w2_withholding + sum(
         (to_decimal(p["amount"]) for p in estimated_payments if date.fromisoformat(str(p["date"])) <= today),
         Decimal("0"),
     )
     lines: list[SafeHarborLine] = []
+    # P1-shr1: carry-the-remainder rounding — round the CUMULATIVE requirement
+    # at each due date and print the difference of rounded cumulatives, so the
+    # printed lines always sum to exactly the (rounded) remaining shortfall.
+    # Rounding each increment independently compounded upward (e.g. 4 lines of
+    # $2.50 each printing as 4×$3 = $12 against a $10 shortfall).
+    prev_rounded_cum = _q0(paid_to_date)
+    floor = prev_rounded_cum
     for entry in due_dates:
         due = date.fromisoformat(str(entry["due_date"]))
         if due <= today:
             continue
         quarter = int(entry["quarter"])
         cumulative_fraction = Decimal(quarter) / Decimal(4)
-        required_by_then = target * cumulative_fraction
-        set_aside = max(Decimal("0"), required_by_then - paid_to_date)
-        lines.append({"due_date": due.isoformat(), "set_aside": _q0(set_aside)})
+        required_by_then = max(target * cumulative_fraction, floor)
+        rounded_cum = max(_q0(required_by_then), prev_rounded_cum)
+        set_aside = rounded_cum - prev_rounded_cum
+        lines.append({"due_date": due.isoformat(), "set_aside": set_aside})
+        prev_rounded_cum = rounded_cum
+        floor = required_by_then
     return {
         "available": True,
         "target": _q2(target),
@@ -457,6 +589,10 @@ _UNAVAILABLE_BRACKET: BracketData = {
     "effective_rate": None,
     "distance_to_next_edge": None,
     "rows": [],
+    "ordinary_taxable_income": Decimal("0"),
+    "ordinary_tax": Decimal("0"),
+    "ltcg_taxable": Decimal("0"),
+    "ltcg_tax": Decimal("0"),
 }
 _UNAVAILABLE_SAFE_HARBOR: SafeHarborData = {
     "available": False,
@@ -472,7 +608,7 @@ _UNAVAILABLE_SAFE_HARBOR: SafeHarborData = {
 def _project_bno(
     session: Session, entity: str, year: int, today: date, days_in_year: int, days_elapsed: int, cadence: str, periods_per_year: int
 ) -> list[BnoRow]:
-    transactions = _fetch_transactions(session, entity, year)
+    transactions = _exclude_reimbursement_pairs(session, _fetch_transactions(session, entity, year))
     income_totals = _category_totals(transactions, INCOME_CATEGORIES)
     rows: list[BnoRow] = []
     for category, ytd in sorted(income_totals.items()):
@@ -506,6 +642,10 @@ def compute_txf(session: Session, today: date | None = None, *, config_dir: Path
     year = int(tables_cfg.get("tax_year", today.year))
 
     brackets = [{"up_to": to_decimal(b["up_to"]), "rate": to_decimal(b["rate"])} for b in tables_cfg["mfj_brackets"]]
+    ltcg_brackets = [
+        {"up_to": to_decimal(b["up_to"]), "rate": to_decimal(b["rate"])}
+        for b in tables_cfg.get("ltcg_mfj_brackets", _TAX_TABLE_DEFAULTS["ltcg_mfj_brackets"])
+    ]
     cfg: dict[str, Decimal] = {
         "k1_share": to_decimal(tables_cfg["k1_share"]),
         "se_tax_rate": to_decimal(tables_cfg["se_tax_rate"]),
@@ -539,11 +679,23 @@ def compute_txf(session: Session, today: date | None = None, *, config_dir: Path
     bno_rows += _project_bno(session, Entity.BLACKLINE.value, year, today, days_in_year, days_elapsed, "quarterly", 4)
 
     tax_profile_path = cfg_dir / "tax_profile.yaml"
-    profile = load_yaml(tax_profile_path)
+    profile_parse_error: str | None = None
+    try:
+        profile = load_yaml(tax_profile_path)
+    except ValueError as exc:
+        # REQ-TXF-003 (P1-cfg9a): an unparseable hand-edited profile degrades
+        # to business-only mode with a banner — it must never kill the whole
+        # quarterly report (business projections don't need the profile).
+        profile = {}
+        profile_parse_error = str(exc)
     prior_year_total_tax = to_decimal(profile.get("prior_year_total_tax", 0)) if profile else Decimal("0")
     business_only = not profile or prior_year_total_tax <= 0
     business_only_reason = None
-    if not profile:
+    if profile_parse_error is not None:
+        business_only_reason = (
+            f"config/tax_profile.yaml is not valid YAML: {profile_parse_error}"
+        )
+    elif not profile:
         business_only_reason = "config/tax_profile.yaml not found"
     elif prior_year_total_tax <= 0:
         business_only_reason = "prior_year_total_tax not set (<= 0) in config/tax_profile.yaml"
@@ -551,12 +703,20 @@ def compute_txf(session: Session, today: date | None = None, *, config_dir: Path
     w2_rows = profile.get("w2", []) if profile else []
     w2_wages = sum((to_decimal(w.get("ytd_wages", 0)) for w in w2_rows), Decimal("0"))
     w2_ss_wages = sum((to_decimal(w.get("ytd_ss_wages", 0)) for w in w2_rows), Decimal("0"))
+    # P3-d4f: Medicare wages are uncapped (unlike SS wages, capped at
+    # ss_wage_base) — fall back to gross ytd_wages (also uncapped) when a
+    # W-2 row doesn't specify ytd_medicare_wages, rather than the capped SS
+    # figure, so the Additional Medicare threshold test isn't understated
+    # for households above the SS wage base.
+    w2_medicare_wages = sum(
+        (to_decimal(w.get("ytd_medicare_wages", w.get("ytd_wages", 0))) for w in w2_rows), Decimal("0")
+    )
     w2_withholding = sum((to_decimal(w.get("ytd_federal_withholding", 0)) for w in w2_rows), Decimal("0"))
     investment = profile.get("expected_investment_income", {}) if profile else {}
     investment_income = sum((to_decimal(v) for v in investment.values()), Decimal("0")) if investment else Decimal("0")
     capital_gains_lt = to_decimal(investment.get("capital_gains_lt", 0)) if investment else Decimal("0")
 
-    se_tax = _compute_se_tax(business_net_total, w2_ss_wages, cfg)
+    se_tax = _compute_se_tax(business_net_total, w2_ss_wages, w2_medicare_wages, cfg)
 
     taxable_income_before_qbi = max(
         Decimal("0"),
@@ -569,7 +729,14 @@ def compute_txf(session: Session, today: date | None = None, *, config_dir: Path
         safe_harbor = _UNAVAILABLE_SAFE_HARBOR
     else:
         taxable_income = max(Decimal("0"), taxable_income_before_qbi - qbi["final"])
-        bracket = _walk_brackets(taxable_income, brackets)
+        # P2-c3e: net LTCG is taxed at preferential rates, not the ordinary
+        # MFJ brackets — pull it out of the ordinary-bracket base and tax it
+        # separately, stacked on top of ordinary income.
+        ltcg_taxable = max(Decimal("0"), min(capital_gains_lt, taxable_income))
+        ordinary_taxable_income = max(Decimal("0"), taxable_income - ltcg_taxable)
+        ordinary_walk = _walk_brackets(ordinary_taxable_income, brackets)
+        ltcg_tax = _tax_ltcg_stacked(ordinary_taxable_income, ltcg_taxable, ltcg_brackets)
+        bracket = _combine_bracket_with_ltcg(ordinary_walk, taxable_income, ordinary_taxable_income, ltcg_taxable, ltcg_tax)
         estimated_payments = profile.get("estimated_payments", []) if profile else []
         due_dates = tables_cfg["estimated_tax_due_dates"]
         safe_harbor = _compute_safe_harbor(
@@ -593,6 +760,8 @@ def compute_txf(session: Session, today: date | None = None, *, config_dir: Path
         "seasonality_guard": guard,
         "seasonality_reason": reason,
         "sparkry": sparkry,
+        "home_office_deduction": _q2(cfg["home_office_deduction"]),
+        "sparkry_net_after_home_office": _q2(sparkry_net),
         "blackline": blackline,
         "se_tax": se_tax,
         "qbi": qbi,
@@ -645,7 +814,9 @@ def render_report(data: TXFData) -> str:
     alt = f"  (alt trailing-3mo: {_fmt0(sp['gross_receipts_projected_alt'])})" if sp["gross_receipts_projected_alt"] is not None else ""
     out.append(f"  gross receipts   ytd {_fmt0(sp['gross_receipts_ytd'])}   projected {_fmt0(sp['gross_receipts_projected'])}{alt}")
     out.append(f"  expenses         ytd {_fmt0(sp['expenses_ytd'])}   projected {_fmt0(sp['expenses_projected'])}")
-    out.append(f"  net profit (projected, after home-office): {_fmt0_signed(sp['net_projected'])}")
+    out.append(f"  net profit (projected, before home-office): {_fmt0_signed(sp['net_projected'])}")
+    out.append(f"  less home-office deduction: {_fmt0_signed(-data['home_office_deduction'])}")
+    out.append(f"  net profit (projected, after home-office): {_fmt0_signed(data['sparkry_net_after_home_office'])}")
 
     out.append("")
     out.append("1065 / K-1 (BlackLine)")
@@ -669,9 +840,10 @@ def render_report(data: TXFData) -> str:
     out.append("")
     out.append("WA B&O ACCRUAL")
     for row in data["bno_rows"]:
+        rate_pct = (row['rate'] * 100).quantize(Decimal('0.001'), rounding=ROUND_HALF_UP)
         out.append(
             f"  {row['entity']:<10} {row['label']:<28} projected gross {_fmt0(row['projected_gross']):<10} "
-            f"rate {row['rate'] * 100}%   {row['cadence']} accrual {_fmt0(row['per_period_tax'])}"
+            f"rate {rate_pct}%   {row['cadence']} accrual {_fmt0(row['per_period_tax'])}"
         )
 
     out.append("")
@@ -681,8 +853,14 @@ def render_report(data: TXFData) -> str:
         out.append("  UNAVAILABLE — fill config/tax_profile.yaml")
     else:
         out.append(f"  taxable income: {_fmt0(br['taxable_income'])}   total tax: {_fmt0(br['total_tax'])}")
+        if br["ltcg_tax"] > 0:
+            out.append(
+                f"    (ordinary: {_fmt0(br['ordinary_tax'])} on {_fmt0(br['ordinary_taxable_income'])}"
+                f"  +  LTCG/qual-div preferential-rate tax: {_fmt0(br['ltcg_tax'])} on {_fmt0(br['ltcg_taxable'])})"
+            )
         eff = f"{(br['effective_rate'] * 100).quantize(Decimal('0.1'))}%" if br["effective_rate"] is not None else "n/a"
         out.append(f"  marginal rate: {(br['marginal_rate'] * 100).quantize(Decimal('0.1'))}%   effective rate: {eff}")
+        out.append("  marginal rate is the ordinary-bracket rate on the next ordinary dollar; net LTCG is taxed separately above at preferential rates. Qualified dividends, if any, are still folded into ordinary income here.")
         if br["distance_to_next_edge"] is not None:
             out.append(f"  distance to next bracket edge: {_fmt0(br['distance_to_next_edge'])}")
 
@@ -695,6 +873,8 @@ def render_report(data: TXFData) -> str:
         out.append(f"  target: {_fmt0(sh['target'])}   paid to date: {_fmt0(sh['paid_to_date'])}")
         if not sh["lines"]:
             out.append("  no remaining estimated-tax due dates this cycle.")
+        else:
+            out.append("  each line below is incremental — additional to what's already set aside for prior due dates, not a running cumulative total:")
         for line in sh["lines"]:
             out.append(f"  Set aside {_fmt0(line['set_aside'])} by {line['due_date']}")
 

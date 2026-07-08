@@ -587,7 +587,9 @@ def _compute_ops(
     }, warnings
 
 
-def _compute_freshness(session: Session, freshness_cfg: dict[str, int]) -> list[FreshnessRow]:
+def _compute_freshness(
+    session: Session, freshness_cfg: dict[str, int], today: date
+) -> list[FreshnessRow]:
     rows: list[FreshnessRow] = []
     for source, label in _FRESHNESS_SOURCE_LABEL.items():
         max_date = session.query(Transaction.date).filter(Transaction.source == source).order_by(
@@ -595,7 +597,7 @@ def _compute_freshness(session: Session, freshness_cfg: dict[str, int]) -> list[
         ).limit(1).scalar()
         stale = False
         if max_date:
-            days_old = (date.today() - date.fromisoformat(max_date)).days
+            days_old = (today - date.fromisoformat(max_date)).days
             cadence = freshness_cfg.get(label.replace("-txn", "").replace("-", "_"), freshness_cfg.get(source, 9999))
             stale = days_old > cadence
         rows.append({"label": label, "as_of": max_date, "stale": stale})
@@ -605,7 +607,9 @@ def _compute_freshness(session: Session, freshness_cfg: dict[str, int]) -> list[
 # ── Top-level compute + render ───────────────────────────────────────────
 
 
-def compute_wbr(session: Session, today: date | None = None) -> WBRData:
+def compute_wbr(
+    session: Session, today: date | None = None, *, config_dir: Path | None = None
+) -> WBRData:
     today = today or _today()
     week_start, this_monday = week_window(today)
     last_window = week_window(date.fromisoformat(week_start))
@@ -614,6 +618,7 @@ def compute_wbr(session: Session, today: date | None = None) -> WBRData:
     cfg = load_config(
         "reporting.yaml",
         {"thresholds": WBR_DEFAULT_THRESHOLDS, "freshness": WBR_DEFAULT_FRESHNESS},
+        config_dir=config_dir,
     )
     thresholds = {k: to_decimal(v) for k, v in cfg["thresholds"].items()}
     freshness_cfg = {k: int(v) for k, v in cfg.get("freshness", WBR_DEFAULT_FRESHNESS).items()}
@@ -654,7 +659,7 @@ def compute_wbr(session: Session, today: date | None = None) -> WBRData:
     ops, ops_warns = _compute_ops(session, week_start, this_monday, thresholds)
     all_warnings.extend(ops_warns)
 
-    freshness = _compute_freshness(session, freshness_cfg)
+    freshness = _compute_freshness(session, freshness_cfg, today)
     for fresh_row in freshness:
         if fresh_row["stale"]:
             all_warnings.append(f"{fresh_row['label']} data stale (as of {fresh_row['as_of']})")

@@ -66,6 +66,7 @@ def _tx(
     status: str = TransactionStatus.CONFIRMED.value,
     source: str = Source.GMAIL_N8N.value,
     raw_data: dict[str, Any] | None = None,
+    reimbursement_link: str | None = None,
 ) -> Transaction:
     key = "|".join((entity, direction, date, tax_category, description, amount, source))
     tx = Transaction(
@@ -84,6 +85,7 @@ def _tx(
         confidence=0.9,
         raw_data=raw_data or {},
         confirmed_by=ConfirmedBy.AUTO.value,
+        reimbursement_link=reimbursement_link,
     )
     session.add(tx)
     session.commit()
@@ -190,6 +192,27 @@ def config_dir(tmp_path: Path) -> Path:
     return d
 
 
+@pytest.fixture()
+def config_dir_recurring_override(tmp_path: Path) -> Path:
+    """P2-selrec2 fixture: overrides ``recurring_customers`` to force Bolt
+    LLC (hourly billing, no calendar_patterns -> not recurring by default)
+    into the recurring bucket, and adds a ``stripe_client_map`` desc_contains
+    rule that attributes the previously-UNATTRIBUTED "misc income" Stripe
+    row to a named client."""
+    d = tmp_path / "config_override"
+    d.mkdir()
+    (d / "sellability.yaml").write_text(
+        "addback_categories: [HEALTH_INSURANCE]\n"
+        "owner_salary_monthly: 0.00\n"
+        "one_time_items: []\n"
+        'recurring_customers: {"Bolt LLC": true}\n'
+        "stripe_client_map:\n"
+        '  - {match: "desc_contains:substack", client: "Substack"}\n'
+        '  - {match: "desc_contains:misc", client: "Foo Corp"}\n'
+    )
+    return d
+
+
 class TestScopeMonth:
     def test_july_1st_scopes_to_june(self) -> None:
         start, end = sel.scope_month(date(2026, 7, 1))
@@ -252,6 +275,42 @@ class TestComputeSellability:
         assert any(line["label"] == "HEALTH_INSURANCE" and line["amount"] == Decimal("150.00") for line in june_sde["addback_lines"])
         assert june_sde["sde"] == Decimal("3800.00")
 
+    def test_linked_reimbursable_pair_excluded_from_sde_and_client_revenue(
+        self, session: Session, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1-r1emb regression: a linked reimbursable expense/income pair
+        (the Cardinal-Health-style case) must contribute ZERO to both the
+        month SDE net_income (routed via ``compute_entity_pl``) and to
+        client-revenue totals (routed via the module's own
+        ``reimbursement_target_ids`` exclusion) — guarding the
+        explicitly-flagged pl_engine merge risk."""
+        import src.reports.report_config as rc
+
+        monkeypatch.setattr(rc, "CONFIG_DIR", config_dir)
+        _full_fixture(session)
+        baseline = sel.compute_sellability(session, TODAY)
+        baseline_net_income = baseline["month_sde"]["net_income"]
+        baseline_sde = baseline["month_sde"]["sde"]
+        baseline_client_total = sum((r["amount"] for r in baseline["client_rows_ttm"]), Decimal("0"))
+
+        income_tx = _tx(
+            session, amount="750.00", direction=Direction.INCOME.value, entity=Entity.SPARKRY.value,
+            date="2026-06-18", tax_category=TaxCategory.CONSULTING_INCOME.value,
+            description="Cardinal Health reimbursement receipt",
+        )
+        _tx(
+            session, amount="-750.00", direction=Direction.REIMBURSABLE.value, entity=Entity.SPARKRY.value,
+            date="2026-06-17", tax_category=TaxCategory.SUPPLIES.value,
+            description="Cardinal Health reimbursable expense",
+            reimbursement_link=income_tx.id,
+        )
+
+        data = sel.compute_sellability(session, TODAY)
+        assert data["month_sde"]["net_income"] == baseline_net_income
+        assert data["month_sde"]["sde"] == baseline_sde
+        client_total = sum((r["amount"] for r in data["client_rows_ttm"]), Decimal("0"))
+        assert client_total == baseline_client_total
+
     def test_rejected_txn_excluded(self, session: Session, config_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         import src.reports.report_config as rc
 
@@ -293,6 +352,48 @@ class TestComputeSellability:
         assert len(data["mom_trend"]) == 6
         assert data["mom_trend"][-1]["month"] == "2026-06"
         assert data["mom_trend"][0]["month"] == "2026-01"
+
+    def test_config_driven_recurring_override_and_stripe_match_rule_move_attribution(
+        self,
+        session: Session,
+        config_dir: Path,
+        config_dir_recurring_override: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """REQ-SEL-001..002 / P2-selrec2 regression: ``recurring_customers``
+        overrides and ``stripe_client_map`` match rules are config-driven
+        (config/sellability.yaml), not hardcoded — changing either in
+        config_dir must move the recurring/project revenue split and client
+        attribution, not just exercise the config-load smoke path."""
+        import src.reports.report_config as rc
+
+        _full_fixture(session)
+
+        monkeypatch.setattr(rc, "CONFIG_DIR", config_dir)
+        baseline = sel.compute_sellability(session, TODAY)
+        baseline_clients = {r["client"]: r for r in baseline["client_rows_ttm"]}
+        assert baseline_clients["Bolt LLC"]["recurring"] is False
+        assert baseline_clients[sel.UNATTRIBUTED]["amount"] == Decimal("300.00")
+        assert baseline["recurring_revenue_ttm"] == Decimal("24000.00")
+        assert baseline["project_revenue_ttm"] == Decimal("1800.00")
+
+        monkeypatch.setattr(rc, "CONFIG_DIR", config_dir_recurring_override)
+        data = sel.compute_sellability(session, TODAY)
+        clients = {r["client"]: r for r in data["client_rows_ttm"]}
+
+        # Bolt LLC flips to recurring via the recurring_customers override.
+        assert clients["Bolt LLC"]["recurring"] is True
+        # The "misc income" row is now attributed to "Foo Corp" via the new
+        # stripe_client_map rule, so UNATTRIBUTED no longer appears at all.
+        assert sel.UNATTRIBUTED not in clients
+        assert clients["Foo Corp"]["amount"] == Decimal("300.00")
+        assert clients["Foo Corp"]["unattributed"] is False
+
+        # recurring/project split moves accordingly: Bolt's 1000 shifts from
+        # project -> recurring (Acme 24000 + Bolt 1000 = 25000 recurring);
+        # project is left with Substack 500 + Foo Corp 300 = 800.
+        assert data["recurring_revenue_ttm"] == Decimal("25000.00")
+        assert data["project_revenue_ttm"] == Decimal("800.00")
 
 
 class TestDeterminism:
@@ -389,3 +490,8 @@ class TestCLI:
         assert rc == 0
         captured = capsys.readouterr()
         assert "SELLABILITY" in captured.out
+
+        # No SEL ledger row written in dry-run
+        s2 = SessionLocal()
+        assert s2.query(AlertDispatch).filter(AlertDispatch.alert_key.like("sel:%")).count() == 0
+        s2.close()

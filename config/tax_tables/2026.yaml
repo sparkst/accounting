@@ -47,6 +47,15 @@ mfj_brackets:
   - {up_to: 751600.00, rate: 0.35}
   - {up_to: 99999999.00, rate: 0.37}
 
+# Preferential-rate brackets for net long-term capital gains / qualified
+# dividends, MFJ, stacked on top of ordinary taxable income (P2-c3e — the
+# bracket walk previously taxed LTCG at ordinary rates). Same "VERIFY for
+# 2026" status as mfj_brackets above.
+ltcg_mfj_brackets:
+  - {up_to: 96700.00, rate: 0.00}
+  - {up_to: 600050.00, rate: 0.15}
+  - {up_to: 99999999.00, rate: 0.20}
+
 # Safe-harbor target (design spec §4.3).
 safe_harbor_pct: 1.10
 

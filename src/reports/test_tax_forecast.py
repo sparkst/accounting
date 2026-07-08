@@ -109,6 +109,7 @@ def _tx(
     tax_category: str,
     description: str = "Test",
     status: str = TransactionStatus.CONFIRMED.value,
+    reimbursement_link: str | None = None,
 ) -> Transaction:
     key = "|".join((entity, direction, date, tax_category, description, amount))
     tx = Transaction(
@@ -127,6 +128,7 @@ def _tx(
         confidence=0.9,
         raw_data={},
         confirmed_by=ConfirmedBy.AUTO.value,
+        reimbursement_link=reimbursement_link,
     )
     session.add(tx)
     session.commit()
@@ -216,7 +218,7 @@ class TestSETax:
             "ss_wage_base": Decimal("176100.00"),
             "addl_medicare_mfj_threshold": Decimal("250000.00"),
         }
-        result = txf._compute_se_tax(Decimal("100000"), Decimal("0"), cfg)
+        result = txf._compute_se_tax(Decimal("100000"), Decimal("0"), Decimal("0"), cfg)
         assert result["se_base"] == Decimal("92350.00")
         assert result["ss_tax"] == Decimal("11451.40")
         assert result["medicare_tax"] == Decimal("2678.15")
@@ -233,9 +235,29 @@ class TestSETax:
             "ss_wage_base": Decimal("0"),
             "addl_medicare_mfj_threshold": Decimal("250000.00"),
         }
-        result = txf._compute_se_tax(Decimal("300000"), Decimal("0"), cfg)
+        result = txf._compute_se_tax(Decimal("300000"), Decimal("0"), Decimal("0"), cfg)
         # se_base=300000; combined=300000; over=50000; addl=50000*0.009=450
         assert result["addl_medicare_tax"] == Decimal("450.00")
+
+    def test_addl_medicare_uses_uncapped_medicare_wages_not_capped_ss_wages(self) -> None:
+        """P3-d4f regression: W-2 SS wages capped at ss_wage_base understate
+        combined income for the Additional Medicare threshold test when the
+        household has W-2 wages above the SS cap; Medicare wages are
+        uncapped and must be used for that test instead."""
+        cfg = {
+            "se_tax_rate": Decimal("1"),
+            "ss_rate": Decimal("0"),
+            "medicare_rate": Decimal("0"),
+            "addl_medicare_rate": Decimal("0.009"),
+            "ss_wage_base": Decimal("176100.00"),
+            "addl_medicare_mfj_threshold": Decimal("250000.00"),
+        }
+        # W-2 SS wages capped at 176100; uncapped Medicare wages are 260000.
+        # se_base=40000. Using capped SS wages: combined=216100, under
+        # threshold, addl=0. Using uncapped Medicare wages: combined=300000,
+        # over=50000, addl=40000*0.009=360 (capped at se_base=40000).
+        result = txf._compute_se_tax(Decimal("40000"), Decimal("176100.00"), Decimal("260000.00"), cfg)
+        assert result["addl_medicare_tax"] == Decimal("360.00")
 
 
 class TestQBI:
@@ -285,8 +307,50 @@ class TestBracketWalk:
         assert result["effective_rate"] is None
 
 
+class TestLTCGStacked:
+    """P2-c3e: net LTCG/qualified dividends must be taxed at preferential
+    rates stacked on top of ordinary income, not folded into the ordinary
+    MFJ brackets."""
+
+    LTCG_BRACKETS = [
+        {"up_to": Decimal("96700.00"), "rate": Decimal("0.00")},
+        {"up_to": Decimal("600050.00"), "rate": Decimal("0.15")},
+        {"up_to": Decimal("99999999.00"), "rate": Decimal("0.20")},
+    ]
+
+    def test_ltcg_entirely_in_zero_pct_band(self) -> None:
+        # Ordinary income 50000, LTCG 20000 -> stack occupies [50000,70000],
+        # entirely under the 96700 0%-rate ceiling.
+        tax = txf._tax_ltcg_stacked(Decimal("50000"), Decimal("20000"), self.LTCG_BRACKETS)
+        assert tax == Decimal("0")
+
+    def test_ltcg_straddles_zero_and_15_pct_bands(self) -> None:
+        # Ordinary income 90000, LTCG 20000 -> stack occupies [90000,110000].
+        # 6700 in the 0% band (90000..96700) + 13300 in the 15% band
+        # (96700..110000) = 13300 * 0.15 = 1995.00.
+        tax = txf._tax_ltcg_stacked(Decimal("90000"), Decimal("20000"), self.LTCG_BRACKETS)
+        assert tax == Decimal("1995.00")
+
+    def test_zero_ltcg_returns_zero(self) -> None:
+        assert txf._tax_ltcg_stacked(Decimal("50000"), Decimal("0"), self.LTCG_BRACKETS) == Decimal("0")
+
+    def test_combine_bracket_with_ltcg_totals_correctly(self) -> None:
+        ordinary = txf._walk_brackets(Decimal("90000"), TestBracketWalk.BRACKETS)
+        ltcg_tax = txf._tax_ltcg_stacked(Decimal("90000"), Decimal("20000"), self.LTCG_BRACKETS)
+        combined = txf._combine_bracket_with_ltcg(ordinary, Decimal("110000"), Decimal("90000"), Decimal("20000"), ltcg_tax)
+        assert combined["taxable_income"] == Decimal("110000.00")
+        assert combined["ordinary_tax"] == ordinary["total_tax"]
+        assert combined["ltcg_tax"] == Decimal("1995.00")
+        assert combined["total_tax"] == ordinary["total_tax"] + Decimal("1995.00")
+        assert combined["marginal_rate"] == ordinary["marginal_rate"]
+
+
 class TestSafeHarbor:
     def test_hand_verified_remaining_quarters(self) -> None:
+        """P2-b2d: each line is the standalone INCREMENTAL amount for that
+        due date (not a cumulative running total) — summing all lines must
+        equal target - paid_to_date exactly, so an owner acting on each
+        line as an independent action reaches (not overshoots) the target."""
         due_dates = [
             {"quarter": 1, "due_date": "2026-04-15"},
             {"quarter": 2, "due_date": "2026-06-15"},
@@ -300,10 +364,41 @@ class TestSafeHarbor:
         )
         assert result["target"] == Decimal("22000.00")
         assert result["paid_to_date"] == Decimal("12000.00")
+        # Q3 cumulative target = 22000*3/4=16500; increment over paid_to_date
+        # (12000) = 4500. Q4 cumulative target = 22000; increment over Q3's
+        # cumulative target (16500) = 5500. 4500 + 5500 = 10000 = the total
+        # remaining shortfall (22000 - 12000) — standalone-additive.
         assert result["lines"] == [
             {"due_date": "2026-09-15", "set_aside": Decimal("4500")},
-            {"due_date": "2027-01-15", "set_aside": Decimal("10000")},
+            {"due_date": "2027-01-15", "set_aside": Decimal("5500")},
         ]
+        assert sum((line["set_aside"] for line in result["lines"]), Decimal("0")) == result["target"] - result["paid_to_date"]
+
+    def test_rounding_boundary_lines_sum_to_rounded_shortfall(self) -> None:
+        """P1-shr1: increments landing exactly on $.50 must NOT compound
+        upward (independent ROUND_HALF_UP per line gave 4×$3 = $12 against a
+        $10 shortfall). Carry-the-remainder rounding: printed lines sum to
+        the rounded remaining shortfall."""
+        due_dates = [
+            {"quarter": 1, "due_date": "2026-04-15"},
+            {"quarter": 2, "due_date": "2026-06-15"},
+            {"quarter": 3, "due_date": "2026-09-15"},
+            {"quarter": 4, "due_date": "2027-01-15"},
+        ]
+        # target = 10.00 → per-quarter cumulative 2.50/5.00/7.50/10.00; every
+        # increment is exactly $2.50 — the worst case for per-line HALF_UP.
+        result = txf._compute_safe_harbor(
+            Decimal("10.00") / Decimal("1.10"), Decimal("0.00"), [],
+            due_dates, Decimal("1.10"), date(2026, 1, 1),
+        )
+        lines = result["lines"]
+        assert len(lines) == 4
+        total = sum((line["set_aside"] for line in lines), Decimal("0"))
+        # Rounded shortfall is $10 — not $12.
+        assert total == Decimal("10")
+        # Cumulative never regresses and each line is a whole-dollar amount.
+        assert all(line["set_aside"] == line["set_aside"].to_integral_value() for line in lines)
+        assert all(line["set_aside"] >= 0 for line in lines)
 
 
 class TestComputeTXF:
@@ -324,6 +419,22 @@ class TestComputeTXF:
         assert data["business_only"] is True
         assert "prior_year_total_tax" in (data["business_only_reason"] or "")
 
+    def test_business_only_when_profile_unparseable(
+        self, session: Session, config_dir: Path
+    ) -> None:
+        """P1-cfg9a / REQ-TXF-003: a YAML typo in the hand-edited profile
+        degrades to business-only mode with a banner — never crashes the
+        whole quarterly report."""
+        (config_dir / "tax_profile.yaml").write_text(
+            "prior_year_total_tax: 20000.00\n  bad_indent: : nope\n"
+        )
+        _seed_year(session)
+        data = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        assert data["business_only"] is True
+        assert "not valid YAML" in (data["business_only_reason"] or "")
+        # Business projections still render fully.
+        assert data["sparkry"]["gross_receipts_ytd"] == Decimal("30000.00")
+
     def test_full_household_mode_with_profile(self, session: Session, config_dir_with_profile: Path) -> None:
         _seed_year(session)
         data = txf.compute_txf(session, TODAY, config_dir=config_dir_with_profile)
@@ -343,6 +454,42 @@ class TestComputeTXF:
         data = txf.compute_txf(session, TODAY, config_dir=config_dir)
         assert data["sparkry"]["expenses_ytd"] == Decimal("6000.00")  # not 6500
 
+    def test_linked_reimbursement_receipt_excluded_from_gross_receipts(
+        self, session: Session, config_dir: Path
+    ) -> None:
+        """P1-txfr3imb regression: a reimbursement receipt classified into
+        an INCOME_CATEGORIES tax_category (plausible if the classifier tags
+        a Stripe/bank deposit as CONSULTING_INCOME before it is manually
+        linked via link_reimbursement) must NOT inflate gross_receipts_ytd —
+        matching compute_entity_pl's explicit exclusion of
+        reimbursement_target_ids from revenue. The linked reimbursable leg
+        must likewise not double as a deductible expense."""
+        _seed_year(session)
+        baseline = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        baseline_gross = baseline["sparkry"]["gross_receipts_ytd"]
+        baseline_expenses = baseline["sparkry"]["expenses_ytd"]
+
+        income_tx = _tx(
+            session, amount="1200.00", direction=Direction.INCOME.value, entity=Entity.SPARKRY.value,
+            date="2026-06-20", tax_category=TaxCategory.CONSULTING_INCOME.value,
+            description="Cardinal Health reimbursement receipt",
+        )
+        expense_tx = _tx(
+            session, amount="-1200.00", direction=Direction.REIMBURSABLE.value, entity=Entity.SPARKRY.value,
+            date="2026-06-19", tax_category=TaxCategory.SUPPLIES.value,
+            description="Cardinal Health reimbursable expense",
+            reimbursement_link=income_tx.id,
+        )
+        # Mirror link_reimbursement's bidirectional link (transactions.py):
+        # the income leg also points back at the expense leg.
+        income_tx.reimbursement_link = expense_tx.id
+        session.add(income_tx)
+        session.commit()
+
+        data = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        assert data["sparkry"]["gross_receipts_ytd"] == baseline_gross
+        assert data["sparkry"]["expenses_ytd"] == baseline_expenses
+
     def test_bno_rows_use_bno_tax_rates(self, session: Session, config_dir: Path) -> None:
         from src.export.bno_tax import BO_RATE
 
@@ -354,6 +501,106 @@ class TestComputeTXF:
         blackline_row = next(r for r in data["bno_rows"] if r["entity"] == Entity.BLACKLINE.value)
         assert blackline_row["rate"] == BO_RATE["Retailing"]
         assert blackline_row["cadence"] == "quarterly"
+
+    def test_bno_accrual_excludes_reimbursement_pair(self, session: Session, config_dir: Path) -> None:
+        """REQ-TXF-001 / P2-bno2 regression: the WA B&O accrual
+        (``_project_bno``) must exclude both legs of a linked reimbursement
+        pair from projected gross receipts, exactly like the Schedule C
+        gross-receipts figure already does (P1-txfr3imb) — otherwise a
+        Cardinal-Health-style reimbursement receipt classified into an
+        INCOME_CATEGORIES tax_category would correctly stay out of Schedule
+        C but still silently inflate the B&O accrual base."""
+        _seed_year(session)
+        baseline = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        baseline_bno = next(r for r in baseline["bno_rows"] if r["entity"] == Entity.SPARKRY.value)
+
+        income_tx = _tx(
+            session, amount="1200.00", direction=Direction.INCOME.value, entity=Entity.SPARKRY.value,
+            date="2026-06-20", tax_category=TaxCategory.CONSULTING_INCOME.value,
+            description="Cardinal Health reimbursement receipt",
+        )
+        expense_tx = _tx(
+            session, amount="-1200.00", direction=Direction.REIMBURSABLE.value, entity=Entity.SPARKRY.value,
+            date="2026-06-19", tax_category=TaxCategory.SUPPLIES.value,
+            description="Cardinal Health reimbursable expense",
+            reimbursement_link=income_tx.id,
+        )
+        # Mirror link_reimbursement's bidirectional link (transactions.py).
+        income_tx.reimbursement_link = expense_tx.id
+        session.add(income_tx)
+        session.commit()
+
+        data = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        sparkry_bno = next(r for r in data["bno_rows"] if r["entity"] == Entity.SPARKRY.value)
+        assert sparkry_bno["projected_gross"] == baseline_bno["projected_gross"]
+        assert sparkry_bno["annual_tax"] == baseline_bno["annual_tax"]
+        assert sparkry_bno["per_period_tax"] == baseline_bno["per_period_tax"]
+
+
+class TestBusinessOnlyRenderedOutput:
+    """REQ-TXF-003 / P2-buo2 regression: exercise the actual renderer
+    (``render_report``), not just ``compute_txf``'s ``business_only`` flag —
+    the business-only banner must appear and the household bracket/safe-harbor
+    sections must be absent from the RENDERED text when tax_profile.yaml is
+    missing."""
+
+    def test_business_only_banner_present_and_household_sections_absent(
+        self, session: Session, config_dir: Path
+    ) -> None:
+        _seed_year(session)
+        data = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        assert data["business_only"] is True
+        rendered = txf.render_report(data)
+
+        assert "⚠️ BUSINESS-ONLY MODE" in rendered
+        assert "tax_profile.yaml not found" in rendered
+
+        # Both household-dependent sections must print the UNAVAILABLE
+        # placeholder, not a computed bracket/safe-harbor breakdown.
+        assert rendered.count("UNAVAILABLE — fill config/tax_profile.yaml") == 2
+        assert "marginal rate:" not in rendered
+        assert "distance to next bracket edge:" not in rendered
+        assert "target:" not in rendered
+        assert "Set aside $" not in rendered
+
+        # Business-only projections still render fully.
+        assert "SCHEDULE C (Sparkry)" in rendered
+        assert "WA B&O ACCRUAL" in rendered
+
+
+class TestSeasonalityGuardRenderedEndToEnd:
+    """REQ-TXF-001 / P2-seas2 regression: end-to-end seasonality-guard —
+    seed a year where one month holds >40% of YTD gross receipts, run
+    ``compute_txf`` + ``render_report`` (not the guard helper in isolation),
+    and assert the trailing-3-month alternative line and the ASSUMPTIONS
+    block's HIGH VARIANCE banner both make it into the actual rendered
+    text."""
+
+    def test_concentrated_month_trips_guard_and_renders_alt_and_assumptions(
+        self, session: Session, config_dir: Path
+    ) -> None:
+        # 5 months at $1,000 + June at $20,000 -> June holds 20000/25000 =
+        # 80% of YTD gross receipts, well over the 40% trip threshold.
+        for month in range(1, 6):
+            d = f"2026-{month:02d}-10"
+            _tx(
+                session, amount="1000.00", direction=Direction.INCOME.value, entity=Entity.SPARKRY.value,
+                date=d, tax_category=TaxCategory.CONSULTING_INCOME.value,
+            )
+        _tx(
+            session, amount="20000.00", direction=Direction.INCOME.value, entity=Entity.SPARKRY.value,
+            date="2026-06-10", tax_category=TaxCategory.CONSULTING_INCOME.value,
+        )
+
+        data = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        assert data["seasonality_guard"] is True
+        assert data["sparkry"]["gross_receipts_projected_alt"] is not None
+
+        rendered = txf.render_report(data)
+        assert "ASSUMPTIONS" in rendered
+        assert "⚠️ HIGH VARIANCE" in rendered
+        assert "trailing-3-month alternative shown alongside gross receipts" in rendered
+        assert "alt trailing-3mo:" in rendered
 
 
 class TestDeterminism:
@@ -450,3 +697,8 @@ class TestCLI:
         assert rc == 0
         captured = capsys.readouterr()
         assert "TAX FORECAST" in captured.out
+
+        # No TXF ledger row written in dry-run
+        s2 = SessionLocal()
+        assert s2.query(AlertDispatch).filter(AlertDispatch.alert_key.like("txf:%")).count() == 0
+        s2.close()

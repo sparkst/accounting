@@ -14,6 +14,10 @@ w2:
     ytd_wages: 0.00
     ytd_federal_withholding: 0.00
     ytd_ss_wages: 0.00
+    # Box 5 Medicare wages (uncapped — unlike ytd_ss_wages, which is capped
+    # at the SS wage base). Feeds the Additional Medicare (0.9%) threshold
+    # test on SE income. Optional: if omitted, falls back to ytd_wages.
+    ytd_medicare_wages: 0.00
 
 expected_investment_income:
   interest: 0.00

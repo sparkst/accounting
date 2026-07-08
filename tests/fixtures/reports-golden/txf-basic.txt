@@ -11,7 +11,9 @@ ASSUMPTIONS
 SCHEDULE C (Sparkry)
   gross receipts   ytd $30,000   projected $58,245
   expenses         ytd $6,000   projected $11,649
-  net profit (projected, after home-office): $46,596
+  net profit (projected, before home-office): $46,596
+  less home-office deduction: ($100)
+  net profit (projected, after home-office): $46,496
 
 1065 / K-1 (BlackLine)
   entity net projected: $17,473   K-1 share applied downstream
@@ -27,14 +29,16 @@ QBI
 
 WA B&O ACCRUAL
   sparkry    Service and Other Activities projected gross $58,245    rate 1.500%   monthly accrual $73
-  blackline  Retailing                    projected gross $23,298    rate 0.47100%   quarterly accrual $27
+  blackline  Retailing                    projected gross $23,298    rate 0.471%   quarterly accrual $27
 
 MFJ FEDERAL BRACKET POSITION
-  taxable income: $77,656   total tax: $8,842
-  marginal rate: 12.0%   effective rate: 11.4%
-  distance to next bracket edge: $19,294
+  taxable income: $77,656   total tax: $8,806
+  marginal rate: 12.0%   effective rate: 11.3%
+  marginal rate is the ordinary-bracket rate on the next ordinary dollar; net LTCG is taxed separately above at preferential rates. Qualified dividends, if any, are still folded into ordinary income here.
+  distance to next bracket edge: $19,594
 
 SAFE HARBOR (110% of prior-year total tax)
   target: $22,000   paid to date: $12,000
+  each line below is incremental — additional to what's already set aside for prior due dates, not a running cumulative total:
   Set aside $4,500 by 2026-09-15
-  Set aside $10,000 by 2027-01-15
+  Set aside $5,500 by 2027-01-15

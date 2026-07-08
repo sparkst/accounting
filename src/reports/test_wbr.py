@@ -69,6 +69,7 @@ def _tx(
     description: str = "Test",
     status: str = TransactionStatus.CONFIRMED.value,
     source: str = Source.GMAIL_N8N.value,
+    reimbursement_link: str | None = None,
 ) -> Transaction:
     key = "|".join((source, entity, direction, date, description, amount, status))
     tx = Transaction(
@@ -87,6 +88,7 @@ def _tx(
         confidence=0.9,
         raw_data={},
         confirmed_by=ConfirmedBy.AUTO.value,
+        reimbursement_link=reimbursement_link,
     )
     session.add(tx)
     session.commit()
@@ -332,10 +334,95 @@ class TestComputeWBR:
         assert sparkry["expenses_this"] < Decimal("9999.00")
 
 
-class TestTieOut:
-    """REQ-WBR-002: every WBR number ties out to compute_entity_pl directly."""
+class TestFreshnessDeterminism:
+    """P1-fr3sh regression: freshness must key off the injected ``today``
+    parameter, not real wall-clock ``date.today()``. Pin ``today`` far in the
+    past and far in the future (both nowhere near the real test-run date) and
+    assert the ``stale`` flag flips purely as a function of the injected date
+    — proving the computation cannot be silently reading wall-clock time."""
 
-    def test_entity_rows_equal_compute_entity_pl(self, session: Session) -> None:
+    def test_freshness_stale_flag_follows_injected_today_not_wall_clock(self, session: Session) -> None:
+        # A single gmail_n8n txn dated 2026-01-01; gmail cadence is 3 days.
+        _tx(
+            session,
+            amount="1.00",
+            direction=Direction.INCOME.value,
+            entity=Entity.SPARKRY.value,
+            date="2026-01-01",
+            source=Source.GMAIL_N8N.value,
+        )
+
+        # today = 2026-01-02 (1 day old) → within 3-day cadence → not stale.
+        fresh_data = wbr.compute_wbr(session, date(2026, 1, 2))
+        gmail_row = next(r for r in fresh_data["freshness"] if r["label"] == "gmail")
+        assert gmail_row["stale"] is False
+
+        # today = 2030-01-01 (far future, nowhere near real wall-clock time)
+        # → thousands of days old → stale. If the implementation regressed to
+        # date.today(), this assertion would be indifferent to the injected
+        # ``today`` and could pass or fail depending on when the suite runs.
+        stale_data = wbr.compute_wbr(session, date(2030, 1, 1))
+        gmail_row_stale = next(r for r in stale_data["freshness"] if r["label"] == "gmail")
+        assert gmail_row_stale["stale"] is True
+
+
+class TestReimbursableNetting:
+    """P1-r1emb regression: a linked reimbursable expense/income pair (the
+    Cardinal-Health-style case) must net to zero and leave WBR's rendered
+    entity numbers unchanged — guarding the explicitly-flagged pl_engine
+    merge risk (WS5 was built against an older pl_engine copy)."""
+
+    def test_linked_reimbursable_pair_does_not_move_entity_net_this(self, session: Session) -> None:
+        _full_fixture(session)
+        baseline = wbr.compute_wbr(session, TODAY)
+        baseline_sparkry = next(r for r in baseline["entities"] if r["entity"] == Entity.SPARKRY.value)
+        baseline_household_net = baseline["household"]["net_this"]
+
+        # A reimbursement pair landing inside this week's window
+        # [2026-07-06, 2026-07-13): a reimbursable expense linked to its
+        # matching income row. Both legs must be invisible to P&L.
+        income_tx = _tx(
+            session,
+            amount="500.00",
+            direction=Direction.INCOME.value,
+            entity=Entity.SPARKRY.value,
+            date="2026-07-08",
+            description="Cardinal Health reimbursement receipt",
+        )
+        _tx(
+            session,
+            amount="-500.00",
+            direction=Direction.REIMBURSABLE.value,
+            entity=Entity.SPARKRY.value,
+            date="2026-07-07",
+            description="Cardinal Health reimbursable expense",
+            reimbursement_link=income_tx.id,
+        )
+
+        data = wbr.compute_wbr(session, TODAY)
+        sparkry = next(r for r in data["entities"] if r["entity"] == Entity.SPARKRY.value)
+
+        assert sparkry["revenue_this"] == baseline_sparkry["revenue_this"]
+        assert sparkry["expenses_this"] == baseline_sparkry["expenses_this"]
+        assert sparkry["net_this"] == baseline_sparkry["net_this"]
+        assert data["household"]["net_this"] == baseline_household_net
+
+
+class TestNoReDerivation:
+    """P1-t1eout: these tests assert WBR does not RE-DERIVE its own P&L
+    arithmetic — every entity/household row is produced by literally calling
+    ``compute_entity_pl`` rather than reimplementing the revenue/expense/net
+    math inline. That is a real and valuable guarantee (it is what makes
+    ``TestHandComputedTieOut`` below sufficient — WBR has no second code path
+    to independently get wrong), but it is NOT a tie-out to pl_engine's
+    correctness: both sides of every assertion here call the exact same
+    ``compute_entity_pl`` function, so they move together under ANY change
+    to its math, including a reimbursable-netting regression. A genuine
+    pl_engine regression will NOT be caught by this class — see
+    ``TestHandComputedTieOut`` for hand-computed, pl_engine-independent
+    expected values that would catch such a regression."""
+
+    def test_entity_rows_call_the_same_compute_entity_pl(self, session: Session) -> None:
         from src.reports.pl_engine import compute_entity_pl
 
         _full_fixture(session)
@@ -347,13 +434,45 @@ class TestTieOut:
             assert row["expenses_this"] == pl.expenses
             assert row["net_this"] == pl.net
 
-    def test_household_equals_compute_entity_pl_with_entity_none(self, session: Session) -> None:
+    def test_household_calls_the_same_compute_entity_pl_with_entity_none(self, session: Session) -> None:
         from src.reports.pl_engine import compute_entity_pl
 
         _full_fixture(session)
         data = wbr.compute_wbr(session, TODAY)
         pl = compute_entity_pl(session, data["week_start"], data["week_end"], entity=None)
         assert data["household"]["net_this"] == pl.net
+
+
+class TestHandComputedTieOut:
+    """REQ-WBR-002 real tie-out: expected revenue/expenses/net below are
+    computed BY HAND from ``_full_fixture``'s seeded rows — NOT by calling
+    ``compute_entity_pl`` — so a genuine regression in pl_engine's math
+    (e.g. a reimbursable-netting bug, or NEEDS_REVIEW rows being wrongly
+    excluded) trips this test even though ``TestNoReDerivation`` above would
+    stay green (both sides of that class's assertions move together).
+
+    Hand computation for Sparkry, this week [2026-07-06, 2026-07-13):
+      revenue = 8250.00 (main week revenue tx)
+              +    1.00 (freshness gmail_n8n sentinel, 2026-07-12, income)
+              = 8251.00
+      expenses =  550.00 (main week expense tx)
+               +  900.00 (AWS annual renewal, 2026-07-09)
+               +  140.00 (14 * $10.00 NEEDS_REVIEW rows, 2026-07-07 —
+                          NEEDS_REVIEW is not an excluded status, so these
+                          DO count as expenses per pl_engine's semantics)
+               = 1590.00
+      net = 8251.00 - 1590.00 = 6661.00
+    (These figures also match the pinned golden fixture's rendered
+    "$8,251 / ($1,590) / $6,661" row — cross-checked two independent ways.)
+    """
+
+    def test_sparkry_this_week_matches_hand_computed_figures(self, session: Session) -> None:
+        _full_fixture(session)
+        data = wbr.compute_wbr(session, TODAY)
+        sparkry = next(r for r in data["entities"] if r["entity"] == Entity.SPARKRY.value)
+        assert sparkry["revenue_this"] == Decimal("8251.00")
+        assert sparkry["expenses_this"] == Decimal("1590.00")
+        assert sparkry["net_this"] == Decimal("6661.00")
 
 
 class TestFormatting:
@@ -489,6 +608,61 @@ class TestDispatchLedger:
         )
         assert result.status == "dry_run"
         assert session.query(AlertDispatch).filter_by(alert_key="wbr:2026-W28").count() == 0
+
+
+class TestConfigDirOverride:
+    """REQ-WBR-001..003 / P2-wbrcfg2 regression: ``compute_wbr`` previously
+    had no ``config_dir`` override (unlike ``compute_txf``/
+    ``compute_sellability``). This class covers the newly added parameter:
+    a config-driven threshold change flips a row's warning marker, and an
+    absent ``reporting.yaml`` surfaces the ``used_config_defaults`` marker
+    in the rendered footer."""
+
+    @pytest.fixture()
+    def config_dir_low_net_threshold(self, tmp_path: Path) -> Path:
+        d = tmp_path / "config"
+        d.mkdir()
+        (d / "reporting.yaml").write_text(
+            "thresholds:\n"
+            "  net_drop_pct: 5\n"
+            "  net_min_abs: 100\n"
+        )
+        return d
+
+    def test_custom_low_net_drop_threshold_flips_row_from_ok_to_warn(
+        self, session: Session, config_dir_low_net_threshold: Path
+    ) -> None:
+        _full_fixture(session)
+        baseline = wbr.compute_wbr(session, TODAY)
+        baseline_sparkry = next(r for r in baseline["entities"] if r["entity"] == Entity.SPARKRY.value)
+        assert baseline_sparkry["net_warn"] is None  # ✅ under the default 30% threshold
+
+        data = wbr.compute_wbr(session, TODAY, config_dir=config_dir_low_net_threshold)
+        sparkry = next(r for r in data["entities"] if r["entity"] == Entity.SPARKRY.value)
+        assert sparkry["net_warn"] is not None  # ⚠️ under the custom 5% threshold
+
+        rendered = wbr.render_report(data)
+        assert wbr._row_mark(sparkry["net_warn"]) in rendered
+
+    def test_missing_reporting_yaml_in_config_dir_surfaces_defaults_marker(
+        self, session: Session, tmp_path: Path
+    ) -> None:
+        empty_config_dir = tmp_path / "empty_config"
+        empty_config_dir.mkdir()
+        _full_fixture(session)
+        data = wbr.compute_wbr(session, TODAY, config_dir=empty_config_dir)
+        assert data["used_config_defaults"] is True
+        rendered = wbr.render_report(data)
+        assert "thresholds: defaults" in rendered
+
+    def test_present_reporting_yaml_does_not_mark_used_config_defaults(
+        self, session: Session, config_dir_low_net_threshold: Path
+    ) -> None:
+        _full_fixture(session)
+        data = wbr.compute_wbr(session, TODAY, config_dir=config_dir_low_net_threshold)
+        assert data["used_config_defaults"] is False
+        rendered = wbr.render_report(data)
+        assert "thresholds: config v1" in rendered
 
 
 class TestCLI:

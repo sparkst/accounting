@@ -18,6 +18,7 @@ no network and no real SDK import occur.
 
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import logging
@@ -40,6 +41,16 @@ logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-2.5-flash"
 OPENAI_MODEL = "gpt-4o-mini"
+
+# P2-001: chat.completions vision input only accepts these raster image mimes
+# as an `image_url` data-URL part. Anything else (notably `application/pdf` —
+# the only mime the shadow pipeline currently produces, see shadow.py) cannot
+# be attached to a chat.completions request at all; OpenAIVisionProvider.extract
+# refuses those explicitly rather than silently completing on the prompt text
+# alone (which fabricates an "extraction" with no document behind it).
+_OPENAI_SUPPORTED_IMAGE_MIMES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
 
 # Circuit breaker settings (mirrors llm_classifier).
 _CB_FAILURE_THRESHOLD = 3
@@ -299,7 +310,21 @@ class OpenAIVisionProvider:
         if not self._circuit.allow_attempt():
             raise VisionCircuitOpen("openai circuit breaker open")
 
+        # The document must actually reach the model — a prompt-only completion
+        # is hallucinated, not extracted. Only raster images are attachable to
+        # a chat.completions request; anything else (e.g. application/pdf) is
+        # refused up front rather than silently faked. Not a circuit-breaker
+        # failure — this is a permanent input-shape problem, not a transient
+        # provider fault.
+        if mime not in _OPENAI_SUPPORTED_IMAGE_MIMES:
+            raise VisionError(
+                f"openai fallback cannot accept mime type {mime!r}: only "
+                f"{sorted(_OPENAI_SUPPORTED_IMAGE_MIMES)} can be attached to a "
+                "chat.completions vision request"
+            )
+
         client = self._make_client()
+        data_url = f"data:{mime};base64,{base64.b64encode(file_bytes).decode('ascii')}"
         try:
             t0 = time.monotonic()
             response = client.chat.completions.create(
@@ -313,7 +338,13 @@ class OpenAIVisionProvider:
                         "fields as strict JSON. Return money as strings with two "
                         "decimals.",
                     },
-                    {"role": "user", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                        ],
+                    },
                 ],
             )
             duration_ms = int((time.monotonic() - t0) * 1000)

@@ -171,6 +171,34 @@ def test_balance_discrepancy_flagged(session: Session) -> None:
     assert summary.has_discrepancy is True
 
 
+def test_balance_tie_out_tolerates_snapshot_date_skew(session: Session) -> None:
+    """P2-c3f: skewed snapshot dates (not on month boundaries) don't false-flag.
+
+    Baseline lands several days before the month, and the in-month snapshot
+    isn't the last day — a transaction dated outside the exact snapshot
+    window must not be counted against the tie-out, or a correct ledger
+    would be flagged as a discrepancy.
+    """
+    item = _item(session)
+    acct = _account(session, item, payment_method="Chase ****6")
+    _snap(session, acct, date(2026, 5, 27), "1000.00")  # baseline, 5 days before June
+    _snap(session, acct, date(2026, 6, 20), "1050.00")  # latest, 10 days before month end
+    # Inside the exact snapshot window (5/28..6/20): counts toward Σ.
+    _tx(session, payment_method="Chase ****6", date_="2026-06-10", amount="50.00")
+    # Outside the snapshot window (after 6/20, still within the calendar
+    # month) — must NOT be counted, or Δ(100) vs naive-month-Σ(70) would
+    # falsely flag a $30 discrepancy.
+    _tx(session, payment_method="Chase ****6", date_="2026-06-25", amount="20.00")
+    summary = reconcile(session, "2026-06", today=_TODAY)
+    acc = summary.items[0].accounts[0]
+    assert acc.balance_delta == Decimal("50.00")
+    assert acc.tie_out_gap == Decimal("0.00")
+    assert acc.tie_out_ok is True
+    # Full calendar-month register aggregate is still reported for display.
+    assert acc.register_sum == Decimal("70.00")
+    assert acc.register_count == 2
+
+
 def test_credit_card_reports_flows_no_tie_out(session: Session) -> None:
     """REQ-MCA-001: credit-card accounts report flows only — no balance tie-out."""
     item = _item(session, name="Amex")

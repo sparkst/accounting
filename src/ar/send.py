@@ -6,9 +6,15 @@ Nothing sends to a customer without an explicit approval. The
 Telegram double-tap (or a re-used single-use token) cannot double-send: the
 second attempt claims zero rows and returns a no-op.
 
+The invoice's paid/void status is re-checked here — not just in the daily
+chaser sweep — because the invoice can close (``PATCH /invoices/{id}``,
+``match_payment``) at any moment between drafting a reminder and Travis
+tapping Approve. If the invoice has closed by approval time, the reminder is
+dismissed instead of sent (``ApproveResult.status == "invoice_closed"``), so a
+paid/void invoice is never dunned regardless of when the human approves.
+
 On a successful send the reminder records ``resend_message_id``/``sent_at`` and
-moves to ``sent``; a Resend failure moves it to ``failed`` (retryable back to
-``pending_approval``). Every transition writes an entity-mode AuditEvent, and
+moves to ``sent``; a Resend failure moves it to ``failed``. Every transition writes an entity-mode AuditEvent, and
 the send is logged to ``alert_dispatch`` on the ``resend_email`` channel
 (``payload_json=NULL``) so it is excluded from the webhook replay sweep.
 """
@@ -26,7 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.alerts.models import AlertDispatch
-from src.ar.chaser import _load_context, record_status_audit
+from src.ar.chaser import _load_context, dismiss_reminder, is_invoice_closed, record_status_audit
 from src.invoicing.email_sender import FROM_ADDRESS, _validate_email
 from src.models.ar_reminder import (
     AR_STATUS_APPROVED,
@@ -48,7 +54,7 @@ class ApproveResult:
     """Outcome of an approve-and-send attempt."""
 
     sent: bool
-    status: str  # sent | failed | not_pending
+    status: str  # sent | failed | not_pending | invoice_closed
     message_id: str | None = None
     error: str | None = None
 
@@ -171,6 +177,18 @@ def approve_and_send(
     invoice = session.get(Invoice, reminder.invoice_id)
     if invoice is None:  # pragma: no cover - FK integrity guarantees this
         return ApproveResult(sent=False, status="failed", error="invoice missing")
+
+    # P1-001: the invoice can transition to paid/void (PATCH /invoices/{id},
+    # match_payment) at any point between drafting and this approve — the
+    # daily chaser's paid/void auto-dismiss only runs on its own pass, so it
+    # never sees an approval that happens in between. Re-check here so
+    # approving never dispatches a dunning email to an already-paid customer.
+    if is_invoice_closed(invoice):
+        dismiss_reminder(
+            session, reminder, changed_by="auto", approved_via=approved_via
+        )
+        return ApproveResult(sent=False, status="invoice_closed")
+
     customer, _line_items = _load_context(session, invoice)
     to_email = _recipient_email(customer)
 

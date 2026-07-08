@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from src.alerts.models import AlertDispatch
 from src.ar.send import approve_and_send
 from src.models.ar_reminder import (
+    AR_STATUS_DISMISSED,
     AR_STATUS_FAILED,
     AR_STATUS_PENDING_APPROVAL,
     AR_STATUS_SENT,
@@ -56,7 +57,11 @@ def session() -> Generator[Session, None, None]:
 
 
 def _seed(
-    session: Session, *, contact_email: str | None = "jane@example.com"
+    session: Session,
+    *,
+    contact_email: str | None = "jane@example.com",
+    invoice_status: str = "overdue",
+    paid_date: str | None = None,
 ) -> ArReminder:
     customer = Customer(
         name="Acme", contact_email=contact_email, billing_model="hourly"
@@ -67,7 +72,8 @@ def _seed(
         invoice_number="INV-S1",
         customer_id=customer.id,
         entity="sparkry",
-        status="overdue",
+        status=invoice_status,
+        paid_date=paid_date,
         subtotal=Decimal("750.00"),
         total=Decimal("750.00"),
     )
@@ -197,3 +203,55 @@ def test_missing_recipient_email_fails(
     assert result.sent is False
     assert result.status == "failed"
     assert len(calls) == 0
+
+
+def test_approve_paid_invoice_does_not_send(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-001: an invoice paid between draft and approval is never dunned.
+
+    The invoice can transition to PAID independently of the daily chaser
+    sweep (PATCH /invoices/{id}, match_payment) at any point between a
+    reminder being drafted and Travis tapping Approve. Approving must
+    re-check and dismiss instead of sending.
+    """
+    calls = _mock_send(monkeypatch)
+    reminder = _seed(session, invoice_status="paid", paid_date="2026-07-01")
+
+    result = approve_and_send(session, reminder, approved_via="telegram", today=TODAY)
+
+    assert result.sent is False
+    assert result.status == "invoice_closed"
+    assert len(calls) == 0  # never calls Resend
+
+    session.refresh(reminder)
+    assert reminder.status == AR_STATUS_DISMISSED
+
+    audits = (
+        session.query(AuditEvent)
+        .filter(
+            AuditEvent.entity_type == "ar_reminder",
+            AuditEvent.entity_id == reminder.id,
+            AuditEvent.field_changed == "status",
+        )
+        .all()
+    )
+    transitions = {(a.old_value, a.new_value) for a in audits}
+    assert ("pending_approval", "approved") in transitions
+    assert ("approved", "dismissed") in transitions
+
+
+def test_approve_void_invoice_does_not_send(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-001: a voided invoice is never dunned even if already approved-claimed."""
+    calls = _mock_send(monkeypatch)
+    reminder = _seed(session, invoice_status="void")
+
+    result = approve_and_send(session, reminder, approved_via="cli", today=TODAY)
+
+    assert result.sent is False
+    assert result.status == "invoice_closed"
+    assert len(calls) == 0
+    session.refresh(reminder)
+    assert reminder.status == AR_STATUS_DISMISSED

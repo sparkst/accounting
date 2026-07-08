@@ -139,6 +139,8 @@ def find_exact_literal_rule(
 def lookup_vendor_rule(
     description: str,
     session: Session,
+    *,
+    touch_last_matched: bool = True,
 ) -> ClassificationResult | None:
     """Return a :class:`ClassificationResult` from the best matching VendorRule.
 
@@ -166,6 +168,13 @@ def lookup_vendor_rule(
     Args:
         description: Raw description / vendor string from the transaction.
         session: Open SQLAlchemy session.
+        touch_last_matched: When True (default, used by the classification
+            engine), stamps ``last_matched`` on the winning rule — not
+            committed here, the engine/caller owns that. Callers that must
+            remain pure reads (e.g. the REQ-MCA-002 auto-confirm backlog
+            sweep, which is contractually forbidden from mutating
+            ``vendor_rules``) pass ``False`` so no attribute is dirtied and
+            nothing is written even in ``--apply`` mode.
 
     Returns:
         A pre-populated :class:`ClassificationResult` with ``tier_used=1``, or
@@ -181,8 +190,9 @@ def lookup_vendor_rule(
 
     best_rule = _rank_best(matches)
 
-    # Update last_matched timestamp (not committed here — engine or caller does that).
-    best_rule.last_matched = datetime.now(UTC).replace(tzinfo=None)
+    if touch_last_matched:
+        # Update last_matched timestamp (not committed here — engine or caller does that).
+        best_rule.last_matched = datetime.now(UTC).replace(tzinfo=None)
 
     return ClassificationResult(
         entity=Entity(best_rule.entity),

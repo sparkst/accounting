@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Generator
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -119,6 +120,56 @@ def test_sweep_skips_low_confidence_rule(session: Session) -> None:
     assert session.get(Transaction, tx_id).status == TransactionStatus.AUTO_CLASSIFIED.value
 
 
+def test_sweep_apply_never_touches_vendor_rules(session: Session) -> None:
+    """P1-a1c: --apply sweep must never mutate vendor_rules, incl. last_matched.
+
+    src/close/autoconfirm.py's module docstring asserts auto-confirm "never
+    touches vendor_rules ... no path mutates vendor_rules from auto-confirm".
+    lookup_vendor_rule's default touch_last_matched=True previously dirtied
+    that column even for a plain read, and the outer sweep commit persisted
+    it. The sweep must call the read-only variant.
+    """
+    rule = _rule(session, confidence=0.95)
+    _tx(session)
+    session.commit()
+    rule_id = rule.id
+    assert rule.last_matched is None
+
+    result = cli.sweep(session, apply=True)
+    assert result.confirmed == 1
+
+    session.expire_all()
+    persisted_rule = session.get(VendorRule, rule_id)
+    assert persisted_rule.last_matched is None
+
+
+def test_sweep_skips_row_whose_stored_classification_diverges_from_rule(
+    session: Session,
+) -> None:
+    """P2-b2e: confirmed_by=auto:rule:<id> must be faithful to what it confirms.
+
+    If the transaction's stored (already-classified) entity/tax_category/
+    direction no longer match the current best Tier-1 rule for its
+    description — e.g. it was originally Tier-2/3 classified, or the rule
+    was edited since — the sweep must skip it rather than confirm the OLD
+    classification while attributing it to a rule whose classification
+    doesn't match.
+    """
+    rule = _rule(session, confidence=0.95)  # office_expense / expense
+    tx = _tx(session, tax_category=TaxCategory.SUPPLIES.value)  # diverges from rule
+    session.commit()
+    tx_id = tx.id
+
+    result = cli.sweep(session, apply=True)
+
+    assert result.confirmed == 0
+    session.expire_all()
+    persisted = session.get(Transaction, tx_id)
+    assert persisted.status == TransactionStatus.AUTO_CLASSIFIED.value
+    assert persisted.confirmed_by == "auto"
+    assert rule.last_matched is None
+
+
 # ── digest ────────────────────────────────────────────────────────────────
 
 
@@ -155,6 +206,74 @@ def test_digest_apply_records_ledger(session: Session, monkeypatch: pytest.Monke
     assert row.delivery_channel == "resend_email"
     assert row.payload_json is None
     assert session.query(AlertDispatch).count() == 1
+
+
+def test_digest_apply_ledger_row_durable_across_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P0-001 regression: the ledger row must be committed, not just flushed.
+
+    A same-session query can't distinguish a flush from a commit — both are
+    visible within the same in-flight transaction. Close the writer session
+    and reopen a fresh one bound to the same engine to prove the row
+    actually reached disk (durability), not just the session identity map.
+    """
+    monkeypatch.setenv("ALERT_TO_EMAIL", "travis@sparkry.ai")
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    writer = _Session()
+    try:
+        row = cli.send_digest(writer, apply=True)
+        assert row is not None
+    finally:
+        writer.close()
+
+    reader = _Session()
+    try:
+        assert reader.query(AlertDispatch).count() == 1
+    finally:
+        for model in (AuditEvent, AlertDispatch, Transaction, VendorRule, TaxYearLock):
+            reader.query(model).delete()
+        reader.commit()
+        reader.close()
+
+
+def test_digest_same_day_rerun_sends_exactly_once(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-201 regression: a same-day re-run (systemd retry, operator re-run)
+    must NOT send a second real email — the pre-send ledger check
+    short-circuits before resend.Emails.send, not merely before the ledger
+    insert."""
+    import resend
+
+    monkeypatch.setenv("ALERT_TO_EMAIL", "travis@sparkry.ai")
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    calls = {"n": 0}
+
+    def _fake_send(params: dict) -> dict:  # type: ignore[type-arg]
+        calls["n"] += 1
+        return {"id": "fake"}
+
+    monkeypatch.setattr(resend.Emails, "send", staticmethod(_fake_send))
+
+    now = datetime(2026, 7, 6, 14, 10)
+    first = cli.send_digest(session, apply=True, now=now)
+    assert first is not None and first.status == "sent"
+    second = cli.send_digest(session, apply=True, now=now)
+    assert second is not None and second.id == first.id  # same ledger row
+    assert calls["n"] == 1  # exactly one real send
+    assert session.query(AlertDispatch).count() == 1
+
+    # A prior FAILED day retries (and flips in place) rather than skipping.
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    other_day = datetime(2026, 7, 13, 14, 10)
+    failed = cli.send_digest(session, apply=True, now=other_day)
+    assert failed is not None and failed.status == "failed"
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    retried = cli.send_digest(session, apply=True, now=other_day)
+    assert retried is not None and retried.id == failed.id
+    assert retried.status == "sent"
+    assert calls["n"] == 2
 
 
 # ── undo ──────────────────────────────────────────────────────────────────

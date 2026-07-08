@@ -131,11 +131,56 @@ def _make_openai_client(fields: dict[str, Any] | None = None) -> MagicMock:
 def test_openai_provider_extract_with_injected_client(session: Session) -> None:
     """REQ-VIS-001: OpenAI fallback parses fields + logs usage (no network, no import)."""
     provider = OpenAIVisionProvider(_client=_make_openai_client())
-    result = provider.extract(b"x", "application/pdf", {}, "p", session=session)
+    result = provider.extract(b"x", "image/png", {}, "p", session=session)
     assert result.fields == _FIELDS
     assert result.model == "gpt-4o-mini"
     assert result.cost_estimate > 0
     assert session.query(LLMUsageLog).count() == 1
+
+
+def test_openai_provider_sends_document_bytes(session: Session) -> None:
+    """P2-001: the document must actually be attached to the outbound request.
+
+    Regression for the hallucination bug — extract() previously sent only the
+    static prompt text with no image/document content part, so gpt-4o-mini's
+    "extraction" had no document behind it.
+    """
+    import base64
+
+    fake_client = _make_openai_client()
+    provider = OpenAIVisionProvider(_client=fake_client)
+    file_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    provider.extract(file_bytes, "image/png", {}, "extract the fields", session=session)
+
+    _, kwargs = fake_client.chat.completions.create.call_args
+    user_message = kwargs["messages"][1]
+    assert user_message["role"] == "user"
+    content_parts = user_message["content"]
+    assert isinstance(content_parts, list)
+    image_parts = [p for p in content_parts if p.get("type") == "image_url"]
+    assert len(image_parts) == 1
+    data_url = image_parts[0]["image_url"]["url"]
+    assert data_url.startswith("data:image/png;base64,")
+    encoded = data_url.removeprefix("data:image/png;base64,")
+    assert base64.b64decode(encoded) == file_bytes
+    text_parts = [p for p in content_parts if p.get("type") == "text"]
+    assert text_parts and text_parts[0]["text"] == "extract the fields"
+
+
+def test_openai_provider_rejects_unsupported_mime(session: Session) -> None:
+    """P2-001: a mime chat.completions can't attach (e.g. PDF) is refused, not faked.
+
+    The shadow pipeline's only current mime is `application/pdf`
+    (src/vision/shadow.py) — the OpenAI fallback cannot attach it to a
+    chat.completions vision request, so it must raise rather than silently
+    complete on the prompt text alone.
+    """
+    fake_client = _make_openai_client()
+    provider = OpenAIVisionProvider(_client=fake_client)
+    with pytest.raises(VisionError, match="cannot accept mime type"):
+        provider.extract(b"%PDF-1.4", "application/pdf", {}, "p", session=session)
+    # No hallucinated completion was ever requested.
+    fake_client.chat.completions.create.assert_not_called()
 
 
 def test_select_provider_default_and_named() -> None:

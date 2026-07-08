@@ -86,6 +86,10 @@ def approve(
         result = approve_and_send(session, reminder, approved_via="telegram")
         if result.status == "not_pending":
             raise HTTPException(status_code=409, detail="reminder is not pending approval")
+        if result.status == "invoice_closed":
+            raise HTTPException(
+                status_code=409, detail="invoice is already paid or void"
+            )
         if not result.sent:
             raise HTTPException(status_code=502, detail="reminder send failed")
         return ReminderActionResult(
@@ -109,9 +113,18 @@ def dismiss(
     session = SessionLocal()
     try:
         reminder = _load_pending(session, reminder_id, body.token)
-        dismiss_reminder(
+        changed = dismiss_reminder(
             session, reminder, changed_by="telegram", approved_via="telegram"
         )
+        if not changed:
+            # P3-001-2: the guarded transition lost a race — most likely a
+            # concurrent approve already claimed and sent this reminder.
+            # Report the row's actual terminal status rather than the stale
+            # in-memory "pending_approval" read at _load_pending time.
+            session.refresh(reminder)
+            raise HTTPException(
+                status_code=409, detail="reminder is not pending approval"
+            )
         return ReminderActionResult(reminder_id=reminder_id, status=reminder.status)
     finally:
         session.close()

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import src.ar.chaser as chaser
 import src.ar.notify as notify_mod
+from src.alerts.models import AlertDispatch
 from src.alerts.webhook import WebhookResult
 from src.ar.chaser import aging_buckets, run
 from src.models.ar_reminder import (
@@ -37,6 +38,7 @@ _TABLES: list[Any] = [
     InvoiceLineItem.__table__,
     ArReminder.__table__,
     AuditEvent.__table__,
+    AlertDispatch.__table__,
 ]
 Base.metadata.create_all(_ENGINE, tables=_TABLES)
 _Session = sessionmaker(bind=_ENGINE)
@@ -48,7 +50,7 @@ TODAY = date(2026, 7, 1)
 def session() -> Generator[Session, None, None]:
     s = _Session()
     yield s
-    for model in (AuditEvent, ArReminder, InvoiceLineItem, Invoice, Customer):
+    for model in (AuditEvent, ArReminder, InvoiceLineItem, Invoice, Customer, AlertDispatch):
         s.query(model).delete()
     s.commit()
     s.close()
@@ -246,6 +248,55 @@ def test_invoice_without_sent_at_skipped(session: Session) -> None:
     assert _rungs(session, inv.id) == []
 
 
+def test_dismiss_reminder_cannot_clobber_a_concurrently_sent_row(
+    session: Session,
+) -> None:
+    """P3-001-2: a racing dismiss must not overwrite an already-sent status.
+
+    Simulates the race: the caller holds a stale in-memory ``reminder``
+    (status='pending_approval') while a concurrent ``approve_and_send`` — in
+    its own session — has already claimed and sent it, flipping the DB row to
+    'sent'. The guarded UPDATE...WHERE in dismiss_reminder must see the
+    current DB state, find no matching row, and refuse the transition rather
+    than blindly writing 'dismissed' over 'sent'.
+    """
+    inv = _make_invoice(session, days_since_sent=20)
+    reminder = ArReminder(
+        invoice_id=inv.id,
+        rung=14,
+        status=AR_STATUS_PENDING_APPROVAL,
+        draft_subject="s",
+        draft_body="b",
+    )
+    session.add(reminder)
+    session.commit()
+
+    # Load the object's attributes in THIS session post-commit so the identity
+    # map holds them, then flip the DB row through an INDEPENDENT session
+    # (P1-202): a same-session .update() (even with synchronize_session=False,
+    # because commit() expires the identity map) would refresh `reminder`
+    # in-memory and the trivial early-return would satisfy this test without
+    # ever exercising the guarded UPDATE...WHERE claim.
+    assert reminder.status == AR_STATUS_PENDING_APPROVAL  # loads post-commit
+    other = _Session()
+    try:
+        other.query(ArReminder).filter_by(id=reminder.id).update(
+            {"status": "sent"}, synchronize_session=False
+        )
+        other.commit()
+    finally:
+        other.close()
+    # The caller's in-memory view is genuinely stale now.
+    assert reminder.status == AR_STATUS_PENDING_APPROVAL
+
+    changed = chaser.dismiss_reminder(session, reminder, changed_by="cli")
+
+    assert changed is False
+    persisted = session.get(ArReminder, reminder.id)
+    assert persisted is not None
+    assert persisted.status == "sent"  # never clobbered to 'dismissed'
+
+
 def test_unique_rung_violation_skips_not_crashes(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -286,6 +337,48 @@ def test_model_enforces_unique_invoice_rung(session: Session) -> None:
     with pytest.raises(IntegrityError):
         session.commit()
     session.rollback()
+
+
+def test_run_apply_sweeps_failed_ar_reminder_notify_rows(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1-002: a failed ar_reminder_notify row is replayed on the next --apply run.
+
+    Reproduces the orphan: a prior invocation's n8n POST failed (row persisted
+    with status='failed', delivery_channel='n8n_webhook', payload_json set).
+    The next daily ``run --apply`` must retry it via the shared REQ-FIX-ALR-002
+    sweep, not leave it stuck forever with no automated retry.
+    """
+    failed_row = AlertDispatch(
+        alert_key="ar:some-invoice:14",
+        occurrence_date=TODAY.isoformat(),
+        alert_type="ar_reminder_notify",
+        entity="sparkry",
+        subject="AR reminder draft",
+        status="failed",
+        http_status=None,
+        error_detail="connection reset",
+        delivery_channel="n8n_webhook",
+        payload_json='{"alert_key": "ar:some-invoice:14", "type": "info"}',
+    )
+    session.add(failed_row)
+    session.commit()
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_sweep_post(payload: dict[str, object]) -> WebhookResult:
+        calls.append(payload)
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(chaser, "_sweep_post", _fake_sweep_post)
+
+    # No due invoices this run — isolates the assertion to the sweep step.
+    run(session, today=TODAY, apply=True)
+
+    assert len(calls) == 1
+    assert calls[0]["alert_key"] == "ar:some-invoice:14"
+    session.refresh(failed_row)
+    assert failed_row.status == "sent"
 
 
 def test_aging_buckets_math(session: Session) -> None:

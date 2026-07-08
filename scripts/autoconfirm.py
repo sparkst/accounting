@@ -34,6 +34,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from src.alerts.models import AlertDispatch  # noqa: E402
@@ -97,8 +98,25 @@ def sweep(session: Session, *, apply: bool = False, limit: int | None = None) ->
     result = SweepResult(applied=apply)
     for tx in rows:
         result.scanned += 1
-        cls = lookup_vendor_rule(tx.description, session)
+        # touch_last_matched=False: the sweep is a read for eligibility only —
+        # REQ-MCA-002 forbids auto-confirm from mutating vendor_rules, so the
+        # matcher used here must never dirty last_matched (P1-a1c).
+        cls = lookup_vendor_rule(tx.description, session, touch_last_matched=False)
         if cls is None:
+            continue
+        # P2-b2e: confirmed_by=auto:rule:<id> must stay faithful to what got
+        # confirmed. auto_confirm_if_eligible only confirms the row's
+        # EXISTING stored classification, not cls's — if the current
+        # best-matching rule has since diverged from that stored
+        # entity/tax_category/direction (edited rule, or the row was
+        # originally Tier-2/3), skip rather than attribute the confirm to a
+        # rule whose classification doesn't match the recorded row. Leaves
+        # the row for the next sweep / human review.
+        if (
+            cls.entity.value != tx.entity
+            or cls.tax_category.value != tx.tax_category
+            or cls.direction.value != tx.direction
+        ):
             continue
         savepoint = session.begin_nested()
         confirmed = auto_confirm_if_eligible(session, tx, cls)
@@ -125,7 +143,9 @@ def sweep(session: Session, *, apply: bool = False, limit: int | None = None) ->
     if apply:
         session.commit()
     else:
-        # Discard last_matched touches from every lookup so DRY-RUN writes nothing.
+        # DRY-RUN: roll back any confirm mutations staged by
+        # auto_confirm_if_eligible (lookup_vendor_rule itself no longer
+        # touches vendor_rules — touch_last_matched=False above).
         session.rollback()
     return result
 
@@ -241,6 +261,21 @@ def send_digest(
     if not apply:
         return None
 
+    # P1-201: pre-send dedup mirroring src/alerts/dispatcher._already_sent —
+    # the UNIQUE constraint only prevents a duplicate ledger ROW; without this
+    # check a same-day re-run (systemd retry, operator re-run) would SEND a
+    # second real email before colliding on the constraint.
+    existing = (
+        session.query(AlertDispatch)
+        .filter_by(
+            alert_key=f"autoconfirm_digest:{now.date().isoformat()}",
+            occurrence_date=now.date().isoformat(),
+        )
+        .one_or_none()
+    )
+    if existing is not None and existing.status == "sent":
+        return existing
+
     subject = f"Auto-confirm digest — week of {now.date().isoformat()}"
     html_body = render_digest_html(vendors)
     recipient = to_email or os.environ["ALERT_TO_EMAIL"]
@@ -267,6 +302,16 @@ def send_digest(
         status = "failed"
         error_detail = f"{type(exc).__name__}: {exc}"
 
+    # A prior FAILED row for today flips in place on retry (mirrors _record);
+    # only a fresh day inserts a new row.
+    if existing is not None:
+        existing.status = status
+        existing.http_status = http_status
+        existing.error_detail = error_detail
+        existing.subject = subject
+        session.commit()
+        return existing
+
     row = AlertDispatch(
         alert_key=f"autoconfirm_digest:{now.date().isoformat()}",
         occurrence_date=now.date().isoformat(),
@@ -279,8 +324,15 @@ def send_digest(
         payload_json=None,
         delivery_channel=DELIVERY_CHANNEL,
     )
-    session.add(row)
-    session.flush()
+    # Mirrors src/alerts/dispatcher.py:_record — savepoint + commit so the
+    # ledger row is durable on its own; a concurrent same-day insert collides
+    # on UNIQUE(alert_key, occurrence_date) and is treated as already recorded.
+    try:
+        with session.begin_nested():
+            session.add(row)
+        session.commit()
+    except IntegrityError:
+        session.rollback()
     return row
 
 

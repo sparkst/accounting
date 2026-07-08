@@ -23,7 +23,16 @@ from src.models import brokerage as _brokerage  # noqa: F401 — register tables
 from src.models import history as _history  # noqa: F401 — register tables
 from src.models import transaction as _transaction  # noqa: F401 — register tables
 from src.models.base import Base
-from src.models.history import AccountBalanceSnapshot
+from src.models.brokerage import Account, BrokerageTransaction, PositionSnapshot, RealizedGainLoss
+from src.models.history import (
+    AccountAlias,
+    AccountBalanceSnapshot,
+    AccountTag,
+    CostBasisLot,
+    ExpectedAccount,
+    HistoricalPrice,
+    StockSplit,
+)
 from src.models.ingestion_log import IngestionLog
 from src.models.transaction import Transaction
 from src.vision import extract as extract_mod
@@ -175,10 +184,28 @@ def test_mismatch_run_is_dirty(session: Session, tmp_path: Path) -> None:
 # ── Never writes register / brokerage / history (REQ-VIS-002) ────────────────
 
 
+# Every register/brokerage/history table shadow.py claims (in its module
+# docstring) to leave untouched — P1-101: the row-count invariant must be
+# proven for all of them, not just Transaction and AccountBalanceSnapshot.
+_PROTECTED_MODELS = (
+    Transaction,
+    AccountBalanceSnapshot,
+    Account,
+    BrokerageTransaction,
+    PositionSnapshot,
+    RealizedGainLoss,
+    HistoricalPrice,
+    ExpectedAccount,
+    AccountTag,
+    CostBasisLot,
+    StockSplit,
+    AccountAlias,
+)
+
+
 def test_shadow_never_writes_register(session: Session, tmp_path: Path) -> None:
     """REQ-VIS-002: register/brokerage/history row counts are unchanged by a shadow run."""
-    before_tx = session.query(Transaction).count()
-    before_snap = session.query(AccountBalanceSnapshot).count()
+    before_counts = {model: session.query(model).count() for model in _PROTECTED_MODELS}
 
     provider = FakeVisionProvider(_fixture("fg")["fields"])
     run_shadow_batch(
@@ -186,8 +213,10 @@ def test_shadow_never_writes_register(session: Session, tmp_path: Path) -> None:
         config=_cfg(), report_dir=tmp_path,
     )
 
-    assert session.query(Transaction).count() == before_tx
-    assert session.query(AccountBalanceSnapshot).count() == before_snap
+    for model, before in before_counts.items():
+        assert session.query(model).count() == before, (
+            f"{model.__name__} row count changed by shadow run"
+        )
 
 
 # ── Cost ceiling (REQ-VIS-004) ───────────────────────────────────────────────

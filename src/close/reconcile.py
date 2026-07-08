@@ -232,14 +232,32 @@ def _account_recon(
         recon.note = "insufficient snapshots for tie-out"
         return recon
 
+    # P2-c3f: baseline is the latest snapshot strictly BEFORE the month (which
+    # can be several days earlier than the 1st) and latest is the latest
+    # snapshot WITHIN the month (not necessarily the last day). Comparing that
+    # delta against a register sum aggregated over the fixed calendar-month
+    # window [first, last] manufactures false discrepancies whenever the
+    # snapshot dates don't land exactly on the boundaries. Anchor the register
+    # sum to the exact snapshot window instead, so delta and Σ always cover
+    # the identical span.
+    window_start = baseline.snapshot_date + timedelta(days=1)
+    window_end = latest.snapshot_date
+    if window_start > window_end:
+        recon.note = "snapshot window inverted; skipping tie-out"
+        return recon
+    _, window_sum = _register_aggregate(
+        session, acct.payment_method, window_start, window_end
+    )
+
     delta = (_dec(latest.current_balance) - _dec(baseline.current_balance)).quantize(_CENTS)
-    gap = (delta - reg_sum).copy_abs().quantize(_CENTS)
+    gap = (delta - window_sum).copy_abs().quantize(_CENTS)
     recon.balance_delta = delta
     recon.tie_out_gap = gap
     recon.tie_out_ok = gap <= _TIE_OUT_TOLERANCE
     if not recon.tie_out_ok:
         recon.note = (
-            f"balance Δ {delta} vs register Σ {reg_sum} differ by {gap}"
+            f"balance Δ {delta} ({window_start}..{window_end}) vs register Σ "
+            f"{window_sum} differ by {gap}"
         )
     return recon
 

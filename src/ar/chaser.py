@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from src.alerts.sweep import sweep_failed_rows
+from src.alerts.webhook import WebhookResult
 from src.ar.templates import build_draft
 from src.models.ar_reminder import (
     AR_RUNGS,
@@ -64,6 +67,23 @@ class RunSummary:
     drafted_ids: list[str] = field(default_factory=list)
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _sweep_post(payload: dict[str, object]) -> WebhookResult:
+    """Re-POST a swept ar_reminder_notify payload via the shared severity webhook."""
+    from typing import cast
+
+    from src.balance_alerts.webhook import post_payload
+
+    return post_payload(
+        cast("dict[str, str | None]", payload),
+        key=str(payload.get("alert_key", "")),
+        apply=True,
+    )
+
+
 def record_status_audit(
     session: Session,
     reminder: ArReminder,
@@ -96,17 +116,43 @@ def dismiss_reminder(
 
     Returns True when a transition was applied. Shared by the paid-invoice
     sweep, the CLI ``dismiss`` command, and the API dismiss endpoint.
+
+    P3-001-2: the transition is a guarded, rowcount-checked UPDATE (mirroring
+    ``approve_and_send``'s claim), not a plain in-memory attribute write. If a
+    concurrent ``approve_and_send`` has already flipped this row to ``sent``
+    (a racing Telegram approve + CLI dismiss on the same reminder), the WHERE
+    clause excludes it and this call is a no-op — it can never clobber an
+    already-sent reminder's terminal status back to ``dismissed``.
     """
     if reminder.status in (AR_STATUS_SENT, AR_STATUS_DISMISSED):
         return False
     if not apply:
         return True
     old = reminder.status
-    reminder.status = AR_STATUS_DISMISSED
+    # dict[Any, Any]: Query.update's key type is a wide union and dict keys
+    # are invariant — a plain dict[str, ...] annotation fails to unify.
+    values: dict[Any, Any] = {
+        "status": AR_STATUS_DISMISSED,
+        "updated_at": _utcnow(),
+    }
     if approved_via is not None:
-        reminder.approved_via = approved_via
+        values["approved_via"] = approved_via
+    rowcount = (
+        session.query(ArReminder)
+        .filter(
+            ArReminder.id == reminder.id,
+            ArReminder.status.notin_((AR_STATUS_SENT, AR_STATUS_DISMISSED)),
+        )
+        .update(values, synchronize_session=False)
+    )
+    if rowcount == 0:
+        # A concurrent transition won the race — surface the real DB state.
+        session.commit()
+        session.refresh(reminder)
+        return False
     record_status_audit(session, reminder, old, AR_STATUS_DISMISSED, changed_by)
     session.commit()
+    session.refresh(reminder)
     return True
 
 
@@ -137,15 +183,21 @@ def _dismiss_closed_invoice_drafts(
         invoice = session.get(Invoice, reminder.invoice_id)
         if invoice is None:
             continue
-        closed = (
-            invoice.status in _CLOSED_INVOICE_STATUSES
-            or invoice.paid_date is not None
-        )
-        if not closed:
+        if not is_invoice_closed(invoice):
             continue
         if dismiss_reminder(session, reminder, changed_by="auto", apply=apply):
             dismissed += 1
     return dismissed
+
+
+def is_invoice_closed(invoice: Invoice) -> bool:
+    """True when the invoice is paid/void (or carries a paid_date) — the
+    shared guard used by both the paid-invoice sweep and the send path (an
+    approve arriving after payment must not email a paid client)."""
+    return (
+        invoice.status in _CLOSED_INVOICE_STATUSES
+        or invoice.paid_date is not None
+    )
 
 
 def _highest_unsent_rung(
@@ -168,6 +220,18 @@ def run(session: Session, *, today: date, apply: bool) -> RunSummary:
     from src.ar.notify import notify_draft
 
     summary = RunSummary()
+
+    if apply:
+        # P1-002 (WS6 review): failed draft-notification webhooks from prior
+        # runs are replayed here (REQ-FIX-ALR-002 shared sweep) — the AR
+        # chaser's own daily run is its retry path.
+        sweep_failed_rows(
+            session,
+            today,
+            post=_sweep_post,
+            apply=True,
+            alert_types=("ar_reminder_notify",),
+        )
 
     summary.dismissed = _dismiss_closed_invoice_drafts(session, apply=apply)
 

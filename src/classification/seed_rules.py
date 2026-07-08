@@ -31,6 +31,12 @@ class _RuleDef:
     deductible_pct: float = 1.0
     confidence: float = 0.95
     examples: int = 5
+    # REQ-FIX-ING-005: rules.py now matches vendor_pattern as a literal
+    # substring unless is_regex=True. Most seed patterns are plain vendor
+    # words (identical behavior either way), but a handful deliberately use
+    # regex syntax (alternation, wildcards, \b/\s) — those are explicitly
+    # flagged True below so their matching semantics are unchanged.
+    is_regex: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +76,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"eleven.*labs|elevenlabs",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -90,6 +97,7 @@ _SEED_RULES: list[_RuleDef] = [
     # SaaS / dev tools
     _RuleDef(
         vendor_pattern=r"amazon.*aws|aws\.amazon",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -99,6 +107,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\brender\b",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -108,6 +117,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\bvercel\b",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -117,6 +127,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"google.*workspace|google.*payments",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -135,6 +146,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\bspoton\b",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -166,6 +178,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Infrastructure / hosting
     _RuleDef(
         vendor_pattern=r"\bcloudflare\b",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -175,6 +188,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\bdreamhost\b",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -184,6 +198,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\bgodaddy\b",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -195,6 +210,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Travel
     _RuleDef(
         vendor_pattern=r"wi-?fi.*onboard|wifionboard",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.TRAVEL,
         direction=Direction.EXPENSE,
@@ -217,6 +233,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Income
     _RuleDef(
         vendor_pattern=r"stripe.*substack|substack.*stripe",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.SUBSCRIPTION_INCOME,
         direction=Direction.INCOME,
@@ -226,6 +243,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"cardinal.*health|fascinate.*os",
+        is_regex=True,
         entity=Entity.SPARKRY,
         tax_category=TaxCategory.CONSULTING_INCOME,
         direction=Direction.INCOME,
@@ -237,6 +255,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Personal
     _RuleDef(
         vendor_pattern=r"apple.*receipt|apple\.com|\bapple\b",
+        is_regex=True,
         entity=Entity.PERSONAL,
         tax_category=TaxCategory.PERSONAL_NON_DEDUCTIBLE,
         direction=Direction.EXPENSE,
@@ -248,6 +267,7 @@ _SEED_RULES: list[_RuleDef] = [
 
     _RuleDef(
         vendor_pattern=r"northwest.*registered|northwest\s+registered\s+agent",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.LEGAL_AND_PROFESSIONAL,
         direction=Direction.EXPENSE,
@@ -256,6 +276,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\bshopify\b",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SALES_INCOME,
         direction=Direction.INCOME,
@@ -270,6 +291,7 @@ _SEED_RULES: list[_RuleDef] = [
     # rule (examples=40) when both match the "SHOPIFY*" charge string.
     _RuleDef(
         vendor_pattern=r"shopify\s*\*",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -291,6 +313,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Print & packaging
     _RuleDef(
         vendor_pattern=r"minuteman.*press",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -302,6 +325,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Manufacturing & sourcing
     _RuleDef(
         vendor_pattern=r"brist.*mfg",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.COGS,
         direction=Direction.EXPENSE,
@@ -331,6 +355,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Shipping & logistics
     _RuleDef(
         vendor_pattern=r"\bdhl\b",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -340,6 +365,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\bfedex\b",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -349,6 +375,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"\busps\b|stamps\.com",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -369,6 +396,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"stickermule|sticker\s+mule",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -380,6 +408,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Events & races
     _RuleDef(
         vendor_pattern=r"tune.?up.*event|nwtuneup",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.MEALS,
         direction=Direction.EXPENSE,
@@ -390,6 +419,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"usa\s*cycling|usac",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.ADVERTISING,
         direction=Direction.EXPENSE,
@@ -399,6 +429,7 @@ _SEED_RULES: list[_RuleDef] = [
     ),
     _RuleDef(
         vendor_pattern=r"bikereg|bike\s*reg",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.ADVERTISING,
         direction=Direction.EXPENSE,
@@ -410,6 +441,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Photography
     _RuleDef(
         vendor_pattern=r"gaby.*photo",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.CONTRACT_LABOR,
         direction=Direction.EXPENSE,
@@ -421,6 +453,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Stripe fees (BlackLine payment processing)
     _RuleDef(
         vendor_pattern=r"stripe.*fee|stripe.*inc",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SUPPLIES,
         direction=Direction.EXPENSE,
@@ -432,6 +465,7 @@ _SEED_RULES: list[_RuleDef] = [
     # BlackLine income
     _RuleDef(
         vendor_pattern=r"black.*line.*mtb|blacklinemtb",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.SALES_INCOME,
         direction=Direction.INCOME,
@@ -464,6 +498,7 @@ _SEED_RULES: list[_RuleDef] = [
     # Alaska Airlines (travel for races/events)
     _RuleDef(
         vendor_pattern=r"alaska.*air",
+        is_regex=True,
         entity=Entity.BLACKLINE,
         tax_category=TaxCategory.TRAVEL,
         direction=Direction.EXPENSE,
@@ -513,6 +548,7 @@ def seed_vendor_rules(session: Session, *, force: bool = False) -> int:
 
         rule = VendorRule(
             vendor_pattern=defn.vendor_pattern,
+            is_regex=defn.is_regex,
             entity=defn.entity.value,
             tax_category=defn.tax_category.value,
             tax_subcategory=defn.tax_subcategory.value if defn.tax_subcategory else None,

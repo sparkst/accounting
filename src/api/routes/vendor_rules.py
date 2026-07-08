@@ -10,6 +10,7 @@ DELETE /api/vendor-rules/{id}      — Delete rule.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
@@ -55,6 +56,7 @@ class VendorRuleOut(BaseModel):
 
     id: str
     vendor_pattern: str
+    is_regex: bool
     entity: str
     tax_category: str
     tax_subcategory: str | None
@@ -83,10 +85,27 @@ class VendorRuleListResponse(BaseModel):
     offset: int
 
 
+def _validate_pattern(pattern: str, is_regex: bool) -> None:
+    """REQ-FIX-ING-005: is_regex=true patterns must compile at write time.
+
+    Raises:
+        ValueError: When ``is_regex`` is True and ``pattern`` is not a valid
+            regex. Literal (``is_regex=False``) patterns never fail here —
+            any string is a valid literal.
+    """
+    if not is_regex:
+        return
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"Invalid regex vendor_pattern {pattern!r}: {exc}") from exc
+
+
 class VendorRuleCreate(BaseModel):
     """Fields required to create a new vendor rule."""
 
     vendor_pattern: str
+    is_regex: bool = False
     entity: str
     tax_category: str
     tax_subcategory: str | None = None
@@ -102,12 +121,14 @@ class VendorRuleCreate(BaseModel):
             TaxSubcategory(self.tax_subcategory)
         Direction(self.direction)
         VendorRuleSource(self.source)
+        _validate_pattern(self.vendor_pattern, self.is_regex)
 
 
 class VendorRulePatch(BaseModel):
     """Fields allowed in a PATCH request. All optional."""
 
     vendor_pattern: str | None = None
+    is_regex: bool | None = None
     entity: str | None = None
     tax_category: str | None = None
     tax_subcategory: str | None = None
@@ -132,6 +153,7 @@ class VendorRulePatch(BaseModel):
 
 _PATCHABLE = (
     "vendor_pattern",
+    "is_regex",
     "entity",
     "tax_category",
     "tax_subcategory",
@@ -268,6 +290,7 @@ def create_vendor_rule(
 
         rule = VendorRule(
             vendor_pattern=body.vendor_pattern,
+            is_regex=body.is_regex,
             entity=body.entity,
             tax_category=body.tax_category,
             tax_subcategory=body.tax_subcategory,
@@ -313,6 +336,18 @@ def patch_vendor_rule(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         patch_data = body.model_dump(exclude_none=True)
+
+        # REQ-FIX-ING-005: validate the PATCH's resulting (pattern, is_regex)
+        # combination — a PATCH may set is_regex=true without touching
+        # vendor_pattern (validate the existing pattern), or set a new pattern
+        # on a rule that is already is_regex=true (validate the new pattern).
+        final_pattern = patch_data.get("vendor_pattern", rule.vendor_pattern)
+        final_is_regex = patch_data.get("is_regex", rule.is_regex)
+        try:
+            _validate_pattern(final_pattern, final_is_regex)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
         for field in _PATCHABLE:
             if field in patch_data:
                 setattr(rule, field, patch_data[field])

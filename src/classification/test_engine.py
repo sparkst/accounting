@@ -652,6 +652,61 @@ class TestClassificationEngine:
         assert result.status == TransactionStatus.NEEDS_REVIEW
         assert "outflow" in (result.review_reason or "").lower()
 
+    def test_plaid_inflow_classified_expense_routes_to_needs_review(
+        self, seeded_session: Session
+    ) -> None:
+        """REQ-FIX-ING-008: mirror veto — an authoritative-signed INFLOW
+        (Plaid, amount > 0) that a tier labels as expense routes to
+        needs_review, but — unlike the income-on-outflow veto — direction and
+        tax_category are NOT overridden (a positive-amount "expense" is
+        usually a refund; the human decides refund-income vs category
+        reversal)."""
+        txn = _make_transaction(
+            description="Mystery Refund QQQ no-rule-match",
+            source=Source.PLAID.value,
+            amount=Decimal("220.60"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.OFFICE_EXPENSE,
+                direction=Direction.EXPENSE,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword matched an expense category",
+            )
+            result = classify(txn, seeded_session)
+
+        # Category/direction preserved — NOT overridden.
+        assert result.direction == Direction.EXPENSE
+        assert result.tax_category == TaxCategory.OFFICE_EXPENSE
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+        assert "inflow" in (result.review_reason or "").lower()
+
+    def test_plaid_inflow_transfer_direction_not_vetoed(
+        self, seeded_session: Session
+    ) -> None:
+        """transfer/reimbursable directions are exempt from the mirror veto —
+        the condition requires direction == EXPENSE."""
+        txn = _make_transaction(
+            description="Internal transfer QQQ no-rule-match",
+            source=Source.PLAID.value,
+            amount=Decimal("500.00"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.OFFICE_EXPENSE,
+                direction=Direction.TRANSFER,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="looks like a transfer",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.direction == Direction.TRANSFER
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+
     def test_gmail_negative_income_not_overridden(self, seeded_session: Session) -> None:
         """The guard must NOT touch Gmail: that adapter stores income as
         -abs(amount) *before* classification sets direction=income, so a

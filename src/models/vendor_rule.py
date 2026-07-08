@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import Base
@@ -43,6 +43,19 @@ class VendorRule(Base):
         Text,
         nullable=False,
         comment="Regex or exact string matched against sender/description",
+    )
+    is_regex: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+        comment=(
+            "REQ-FIX-ING-005: when False (default), vendor_pattern is matched "
+            "as a literal case-insensitive substring (escaped at match time). "
+            "When True, vendor_pattern is compiled as a regex; invalid regex "
+            "patterns are skipped loudly rather than silently falling back to "
+            "substring matching."
+        ),
     )
     entity: Mapped[str] = mapped_column(
         String(16),

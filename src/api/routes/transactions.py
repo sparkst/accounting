@@ -231,18 +231,67 @@ def _create_audit_events(
         session.add(event)
 
 
+def _rule_fields(rule: VendorRule) -> tuple[str, str | None, str, float]:
+    return (rule.tax_category, rule.tax_subcategory, rule.direction, rule.deductible_pct)
+
+
+def _tx_fields(tx: Transaction) -> tuple[str, str | None, str, float]:
+    # Callers only reach here after _upsert_vendor_rule's guard clause
+    # confirms tx.tax_category / tx.direction are set — asserted for mypy
+    # narrowing (Transaction's columns are nullable; VendorRule's are not).
+    assert tx.tax_category is not None
+    assert tx.direction is not None
+    return (tx.tax_category, tx.tax_subcategory, tx.direction, tx.deductible_pct)
+
+
+def _overwrite_rule_from_tx(rule: VendorRule, tx: Transaction, now: datetime) -> None:
+    """REQ-FIX-ING-004: overwrite an exact-literal rule's classification
+    fields from a human correction. The rule must re-earn trust — examples
+    resets to 1. Learned rules also reset confidence to base (0.80); a
+    human-seed rule (source=human) keeps its 0.95 — a human correcting a
+    human-authored rule is still fully trusted.
+    """
+    assert tx.tax_category is not None
+    assert tx.direction is not None
+    rule.tax_category = tx.tax_category
+    rule.tax_subcategory = tx.tax_subcategory
+    rule.direction = tx.direction
+    rule.deductible_pct = tx.deductible_pct
+    rule.examples = 1
+    rule.last_matched = now
+    if rule.source == VendorRuleSource.LEARNED.value:
+        rule.confidence = 0.80
+
+
 def _upsert_vendor_rule(
     session: Session,
     tx: Transaction,
 ) -> None:
     """Create or update a VendorRule based on the confirmed transaction.
 
-    Learning-loop logic:
-    - If a rule already exists for (vendor_pattern == description, entity),
-      increment ``examples`` and update ``last_matched``.
-    - Otherwise create a new rule with source="learned" and confidence=0.8
-      (below the human seed rules of 0.95 but above the auto-classify
-      threshold of 0.7, so it will be used immediately).
+    REQ-FIX-ING-004: learning-loop logic, redesigned around agreement vs
+    divergence between the confirmed transaction and the rule that ACTUALLY
+    matches it (Tier-1 semantics, specificity-ranked — not a raw
+    ``vendor_pattern == description`` equality lookup, which can miss the
+    broad rule that misclassified the row in the first place):
+
+    - No matching rule for (description, entity): create a new literal
+      learned rule from the transaction (unchanged from before).
+    - Matching rule AGREES with the transaction's fields: bump
+      examples/confidence/last_matched (unchanged from before).
+    - Matching rule DIVERGES and IS the exact-literal rule for this
+      description: overwrite its fields in place and reset examples/
+      confidence — a correction must flip the classification of the next
+      matching transaction.
+    - Matching rule DIVERGES and is BROADER (substring/regex) than the
+      description: never mutate the broad rule (it may still be correct for
+      other descriptions) — instead create or update the exact-literal rule
+      for this description, which outranks the broad rule via specificity
+      ranking (REQ-FIX-ING-009) on the next classification.
+
+    Rules are (pattern, entity)-scoped, so a human-edited entity naturally
+    creates/updates a rule under the NEW entity — the old-entity rule (if
+    any) is left untouched (a vendor may legitimately serve two entities).
 
     This is only called when the transaction has both ``entity`` and
     ``tax_category`` set (required to build a useful rule).
@@ -254,39 +303,19 @@ def _upsert_vendor_rule(
         )
         return
 
-    # Use the description as a literal vendor_pattern (escaped for regex safety).
-    # Descriptions from real receipts are vendor names like "Anthropic, PBC"
-    # or "AWS" — a literal match is the most precise starting point; the human
-    # can widen it later via the dashboard.
-    vendor_pattern = tx.description
-
-    existing: VendorRule | None = (
-        session.query(VendorRule)
-        .filter(
-            VendorRule.vendor_pattern == vendor_pattern,
-            VendorRule.entity == tx.entity,
-        )
-        .first()
-    )
+    from src.classification.rules import find_best_matching_rule, find_exact_literal_rule
 
     now = datetime.now(UTC).replace(tzinfo=None)
+    matched_rule = find_best_matching_rule(session, tx.description, tx.entity)
 
-    if existing is not None:
-        existing.examples += 1
-        existing.last_matched = now
-        # Gradually increase confidence as more examples confirm the rule,
-        # capped at 0.95 (reserved for human-authored seed rules).
-        if existing.source == VendorRuleSource.LEARNED.value:
-            existing.confidence = min(0.95, 0.80 + existing.examples * 0.01)
-        logger.debug(
-            "Updated vendor rule %r for entity=%s — examples=%d",
-            vendor_pattern,
-            tx.entity,
-            existing.examples,
-        )
-    else:
+    if matched_rule is None:
+        # No matching rule — create a new literal learned rule. Descriptions
+        # from real receipts are vendor names like "Anthropic, PBC" or "AWS"
+        # — a literal match is the most precise starting point; the human
+        # can widen it later via the dashboard.
         rule = VendorRule(
-            vendor_pattern=vendor_pattern,
+            vendor_pattern=tx.description,
+            is_regex=False,
             entity=tx.entity,
             tax_category=tx.tax_category,
             tax_subcategory=tx.tax_subcategory,
@@ -300,10 +329,88 @@ def _upsert_vendor_rule(
         session.add(rule)
         logger.info(
             "Created learned vendor rule %r for entity=%s category=%s",
-            vendor_pattern,
+            tx.description,
             tx.entity,
             tx.tax_category,
         )
+        return
+
+    if _rule_fields(matched_rule) == _tx_fields(tx):
+        # Agreeing confirm — reinforce the matched rule.
+        matched_rule.examples += 1
+        matched_rule.last_matched = now
+        # Gradually increase confidence as more examples confirm the rule,
+        # capped at 0.95 (reserved for human-authored seed rules).
+        if matched_rule.source == VendorRuleSource.LEARNED.value:
+            matched_rule.confidence = min(0.95, 0.80 + matched_rule.examples * 0.01)
+        logger.debug(
+            "Vendor rule %r agreed with tx %s (entity=%s) — examples=%d",
+            matched_rule.vendor_pattern,
+            tx.id,
+            tx.entity,
+            matched_rule.examples,
+        )
+        return
+
+    # Divergent confirm — the matched rule's fields disagree with the human
+    # correction. Only the exact-literal rule for this description may be
+    # mutated in place; a broader rule is left untouched.
+    is_exact_literal = (
+        not matched_rule.is_regex
+        and matched_rule.vendor_pattern.strip().lower() == (tx.description or "").strip().lower()
+    )
+    if is_exact_literal:
+        old_fields = _rule_fields(matched_rule)
+        _overwrite_rule_from_tx(matched_rule, tx, now)
+        logger.info(
+            "Divergent confirm overwrote exact-literal vendor rule %r (entity=%s): %r -> %r",
+            matched_rule.vendor_pattern,
+            tx.entity,
+            old_fields,
+            _rule_fields(matched_rule),
+        )
+        return
+
+    # matched_rule is broader than this description — never mutate it.
+    # Create (or update) the exact-literal rule instead; specificity ranking
+    # guarantees it outranks the broad rule for identical descriptions.
+    literal_rule = find_exact_literal_rule(session, tx.description, tx.entity)
+    if literal_rule is not None:
+        old_fields = _rule_fields(literal_rule)
+        _overwrite_rule_from_tx(literal_rule, tx, now)
+        logger.info(
+            "Divergent confirm (broad rule %r left untouched) overwrote exact-literal "
+            "vendor rule %r (entity=%s): %r -> %r",
+            matched_rule.vendor_pattern,
+            literal_rule.vendor_pattern,
+            tx.entity,
+            old_fields,
+            _rule_fields(literal_rule),
+        )
+        return
+
+    new_rule = VendorRule(
+        vendor_pattern=tx.description,
+        is_regex=False,
+        entity=tx.entity,
+        tax_category=tx.tax_category,
+        tax_subcategory=tx.tax_subcategory,
+        direction=tx.direction,
+        deductible_pct=tx.deductible_pct,
+        confidence=0.80,
+        source=VendorRuleSource.LEARNED.value,
+        examples=1,
+        last_matched=now,
+    )
+    session.add(new_rule)
+    logger.info(
+        "Divergent confirm (broad rule %r left untouched) created exact-literal "
+        "vendor rule %r for entity=%s category=%s",
+        matched_rule.vendor_pattern,
+        tx.description,
+        tx.entity,
+        tx.tax_category,
+    )
 
 
 def _flag_reimbursement_partner_if_needed(

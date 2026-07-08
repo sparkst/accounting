@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -482,6 +483,14 @@ class BankCsvAdapter(BaseAdapter):
         In dry_run mode every row is parsed and cross-referenced, but nothing
         is written to the database.  Returns the normal AdapterResult; callers
         can inspect ``result.errors`` for per-record failures.
+
+        REQ-FIX-ING-001: each row is inserted inside its own
+        ``session.begin_nested()`` savepoint so a poisoned row rolls back only
+        itself — never the rows already flushed earlier in the batch.
+        ``records_created`` is incremented strictly after a savepoint
+        succeeds, so the count is always exact. A single unconditional
+        ``session.commit()`` happens once at the end of the run (a no-op when
+        nothing was written, e.g. all-dry-run or all-skipped/all-error).
         """
         result = AdapterResult(source=self.source)
         parse_result = parse_csv_bytes(self._csv_bytes, self._config)
@@ -497,18 +506,22 @@ class BankCsvAdapter(BaseAdapter):
         # Plaid-linked account. If so, skip all rows — Plaid is sole source.
         plaid_owned = _is_plaid_owned(session, self._config.payment_method)
 
+        # REQ-FIX-ING-006: per-file occurrence counter for the (date, amount,
+        # description) dedup tuple. Scoped to this run() call (one file), so
+        # identical rows within the same file get distinct suffixes :0, :1, ...
+        occurrence_counter: Counter[tuple[str, str, str]] = Counter()
+
         for row in parse_result.rows:
             result.records_processed += 1
             if plaid_owned:
                 result.records_skipped += 1
                 continue
             try:
-                self._process_row(row, session, result)
+                self._process_row(row, session, result, occurrence_counter)
             except Exception as exc:
                 result.record_error(f"{self._filename}:row{row.row_number}", exc)
 
-        # Commit any remaining records from the batch
-        if result.records_created > 0:
+        if not self._dry_run:
             session.commit()
 
         return result
@@ -518,23 +531,57 @@ class BankCsvAdapter(BaseAdapter):
         row: ParsedRow,
         session: Session,
         result: AdapterResult,
+        occurrence_counter: Counter[tuple[str, str, str]],
     ) -> None:
         """Insert a single row as a Transaction (skipped in dry_run mode)."""
         # Build a stable source_id from filename + transaction content (date,
         # amount, description) rather than row position so that re-exporting
         # the same bank statement with a different sort order produces identical
         # hashes and is correctly deduplicated.  S1-008.
+        #
+        # REQ-FIX-ING-006: the amount is quantized to cents before stringifying
+        # (Critical Patterns: hash-payload quantization) so a re-export that
+        # renders "10.5" as "10.50" hashes identically, and an occurrence
+        # counter is appended so two legitimate identical same-day charges in
+        # one file both import instead of the second silently colliding with
+        # the first's hash.
         normalized_desc = (row.description or "").strip().lower()
-        normalized_amount = str(row.amount) if row.amount is not None else ""
-        source_id = f"{self._filename}:{row.date}:{normalized_amount}:{normalized_desc}"
+        amt_q = (
+            Decimal(str(row.amount)).quantize(Decimal("0.01"))
+            if row.amount is not None
+            else Decimal("0")
+        )
+        tuple_key = (str(row.date), str(amt_q), normalized_desc)
+        occurrence = occurrence_counter[tuple_key]
+        occurrence_counter[tuple_key] += 1
+
+        source_id = f"{self._filename}:{row.date}:{amt_q}:{normalized_desc}:{occurrence}"
         source_hash = compute_source_hash(self.source, source_id)
 
-        # Check for existing transaction with same source_hash.
+        # Check for existing transaction with same (new-format) source_hash OR
+        # — permanent legacy-hash read bridge — occurrence 0 pre-existing under
+        # the old pre-ING-006 hash format (unquantized amount, no occurrence
+        # suffix). The old scheme collapsed duplicates onto a single hash, so
+        # only occurrence 0 can collide with a legacy row; occurrence >= 1 is
+        # by definition new content the legacy scheme silently dropped.
+        # Existing rows are NEVER rewritten to the new format (dedup keys of
+        # history are load-bearing) — see REQ-FIX-ING-006 / CLAUDE.md.
         existing = (
             session.query(Transaction)
             .filter(Transaction.source_hash == source_hash)
             .first()
         )
+        if existing is None and occurrence == 0:
+            legacy_normalized_amount = str(row.amount) if row.amount is not None else ""
+            legacy_source_id = (
+                f"{self._filename}:{row.date}:{legacy_normalized_amount}:{normalized_desc}"
+            )
+            legacy_hash = compute_source_hash(self.source, legacy_source_id)
+            existing = (
+                session.query(Transaction)
+                .filter(Transaction.source_hash == legacy_hash)
+                .first()
+            )
         if existing is not None:
             result.records_skipped += 1
             return
@@ -570,17 +617,14 @@ class BankCsvAdapter(BaseAdapter):
         )
 
         if not self._dry_run:
-            try:
-                session.begin_nested()  # savepoint for per-record isolation
+            # REQ-FIX-ING-001: savepoint context manager — rolls back ONLY this
+            # row's INSERT on failure (e.g. IntegrityError), never the outer
+            # transaction holding previously-flushed rows. records_created is
+            # incremented only after the savepoint releases successfully.
+            with session.begin_nested():
                 session.add(tx)
                 session.flush()
-                result.records_created += 1
-                # Batch commit every 100 records (final commit in run() after loop)
-                if result.records_created % 100 == 0:
-                    session.commit()
-            except Exception:
-                session.rollback()
-                raise
+            result.records_created += 1
             logger.info(
                 "BankCsvAdapter ingested row %d: %s %s %s",
                 row.row_number,

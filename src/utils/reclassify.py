@@ -82,7 +82,7 @@ def _update_forwarded_vendor(tx: Transaction) -> bool:
 def reclassify_all(
     session: Session,
     *,
-    anthropic_api_key: str | None = None,
+    llm_api_key: str | None = None,
     seed_rules: bool = True,
 ) -> ReclassifyResult:
     """Re-extract vendors and re-run classification on all needs_review transactions.
@@ -96,7 +96,10 @@ def reclassify_all(
 
     Args:
         session: Open SQLAlchemy session.
-        anthropic_api_key: API key for Tier 3 LLM classifier (optional).
+        llm_api_key: API key for Tier 3 (Gemini) classifier (optional).
+            REQ-FIX-ING-010: renamed from ``anthropic_api_key`` — passing an
+            Anthropic key here clobbered the correct ``GEMINI_API_KEY`` env
+            fallback inside ``genai.Client(api_key=...)``.
         seed_rules: When True, run seed_vendor_rules() to ensure the DB has
             the latest rules before classifying.
 
@@ -145,7 +148,7 @@ def reclassify_all(
             classification = classify(
                 tx,
                 session,
-                anthropic_api_key=anthropic_api_key,
+                llm_api_key=llm_api_key,
             )
             apply_result(tx, classification)
             result.classified += 1
@@ -186,10 +189,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    # REQ-FIX-ING-010: Tier 3 is Gemini — read GEMINI_API_KEY, not
+    # ANTHROPIC_API_KEY (the old code injected a wrong-provider key into
+    # genai.Client(api_key=...), clobbering the correct env fallback).
+    api_key = os.getenv("GEMINI_API_KEY")
     session = SessionLocal()
     try:
-        result = reclassify_all(session, anthropic_api_key=api_key)
+        result = reclassify_all(session, llm_api_key=api_key)
     finally:
         session.close()
 

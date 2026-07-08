@@ -428,3 +428,44 @@ class TestCircuitBreaker:
         llm_classify(txn, _client=good_client)
         assert _circuit.consecutive_failures == 0
         assert not _circuit.is_open
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-ING-010: Gemini docs/params/prompt correctness
+# ---------------------------------------------------------------------------
+
+
+class TestGeminiPromptAndDocsCorrectness:
+    def test_every_tax_category_appears_in_system_prompt(self) -> None:
+        """The prompt's category list must include every valid TaxCategory
+        enum value — Gemini can never return a category absent from the
+        prompt, so a missing value is a silent classification gap."""
+        from src.classification.llm_classifier import _SYSTEM_PROMPT
+        from src.models.enums import TaxCategory
+
+        missing = [c.value for c in TaxCategory if c.value not in _SYSTEM_PROMPT]
+        assert missing == [], f"TaxCategory values missing from _SYSTEM_PROMPT: {missing}"
+
+    def test_classify_signature_uses_llm_api_key(self) -> None:
+        """REQ-FIX-ING-010: classify()'s Tier-3 key param is llm_api_key, not
+        the wrong-provider anthropic_api_key."""
+        import inspect
+
+        from src.classification.engine import classify
+
+        params = inspect.signature(classify).parameters
+        assert "llm_api_key" in params
+        assert "anthropic_api_key" not in params
+
+    def test_engine_module_docstring_says_gemini(self) -> None:
+        import src.classification.engine as engine_mod
+
+        assert "Gemini" in (engine_mod.__doc__ or "")
+        assert "Claude API" not in (engine_mod.__doc__ or "")
+
+    def test_llm_classifier_parse_response_docstring_says_gemini(self) -> None:
+        from src.classification.llm_classifier import _parse_response
+
+        doc = _parse_response.__doc__ or ""
+        assert "Gemini" in doc
+        assert "Claude" not in doc

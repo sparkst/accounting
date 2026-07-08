@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 
 from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters._shared.money import parse_currency, quantize_balance
+from src.adapters._shared.notes_merge import machine_block, merge_machine_block
 from src.adapters._shared.result import BaseImportResult
 from src.adapters._shared.wealth_client import WealthClientError, post_to_wealth
 from src.models.brokerage import Account
@@ -48,6 +49,13 @@ SOURCE_TAG = "north_american_iul"
 
 NA_BROKER = Broker.NORTH_AMERICAN.value
 _DEFAULT_ACCOUNT_NAME = "North American Builder Plus IUL"
+
+# REQ-FIX-WLT-009: the importer owns exactly one delimited machine block in
+# Account.notes; human-curated text above the marker is never clobbered.
+_NOTES_MARKER = "na_iul auto"
+
+# REQ-FIX-WLT-007/009: cloud pushes surface in delivery-health under this source.
+_CLOUD_LOG_SOURCE = "wealth_cloud:north_american_iul"
 
 # Cloud target — reuses the AccountBalanceSnapshot ingest path on the wealth
 # Worker (same source the NW Mutual / F&G carriers post under), so the D1
@@ -102,9 +110,16 @@ def _upsert_account(
     policy_number: str,
     account_name: str | None,
     beneficiary: str | None,
-    notes: str | None,
+    notes_block: str | None,
 ) -> Account:
-    """Find-or-create the IUL Account row; refresh mutable metadata if present."""
+    """Find-or-create the IUL Account row; refresh mutable metadata if present.
+
+    ``notes_block`` is the importer-owned machine block (or ``None`` when there
+    is nothing to record). On a NEW account it is set directly; on an EXISTING
+    account it is merged in place via :func:`merge_machine_block` so any
+    human-curated text above the ``na_iul auto`` marker survives
+    (REQ-FIX-WLT-009).
+    """
     account = (
         session.query(Account)
         .filter(
@@ -122,7 +137,7 @@ def _upsert_account(
             entity=Entity.PERSONAL.value,
             tax_sheltered=True,  # IUL cash value grows tax-deferred.
             beneficiary=beneficiary,
-            notes=notes,
+            notes=notes_block,
         )
         session.add(account)
         session.flush()  # assign account.id for the snapshot FK.
@@ -133,8 +148,11 @@ def _upsert_account(
         account.account_name = account_name
     if beneficiary is not None:
         account.beneficiary = beneficiary
-    if notes is not None:
-        account.notes = notes
+    # Merge (not clobber) the machine block so operator free text is preserved.
+    if notes_block is not None:
+        account.notes = merge_machine_block(
+            account.notes, _NOTES_MARKER, notes_block
+        )
     return account
 
 
@@ -184,7 +202,9 @@ def import_policy(
     if result.errors or booked is None:
         return result
 
-    # Build a notes line capturing the context figures (audit, not P&L).
+    # Build the importer-owned machine block capturing the context figures
+    # (audit, not P&L). Wrapped in the delimited ``na_iul auto`` block so a
+    # re-import replaces only the machine line, never human-curated notes.
     note_bits: list[str] = []
     if accumulation_value is not None:
         note_bits.append(f"accumulation={parse_currency(accumulation_value)}")
@@ -192,7 +212,11 @@ def import_policy(
         note_bits.append(f"premium_paid={parse_currency(premium_paid)}")
     if cost_basis is not None:
         note_bits.append(f"cost_basis={parse_currency(cost_basis)}")
-    notes = "; ".join(note_bits) or None
+    notes_block = (
+        machine_block(_NOTES_MARKER, as_of.isoformat(), "; ".join(note_bits))
+        if note_bits
+        else None
+    )
 
     row_hash = _row_hash(policy_number, as_of, booked)
     record_label = f"policy {policy_number}@{as_of.isoformat()}"
@@ -216,7 +240,7 @@ def import_policy(
                     policy_number=policy_number,
                     account_name=account_name,
                     beneficiary=beneficiary,
-                    notes=notes,
+                    notes_block=notes_block,
                 )
                 session.add(
                     AccountBalanceSnapshot(
@@ -256,6 +280,31 @@ def import_policy(
 # ── Cloud-mode ───────────────────────────────────────────────────────────────
 
 
+def _log_cloud_run(session: Session | None, result: ImportResult) -> None:
+    """Write ONE local IngestionLog row summarizing a cloud push (REQ-FIX-WLT-007).
+
+    No-op when ``session`` is None (keeps the function importable without a DB).
+    status ∈ {success, partial, error}: error when nothing imported but there
+    were failures, partial when some imported alongside errors, else success.
+    """
+    if session is None:
+        return
+    if result.errors and result.imported == 0:
+        status = IngestionStatus.FAILURE
+    elif result.errors:
+        status = IngestionStatus.PARTIAL_FAILURE
+    else:
+        status = IngestionStatus.SUCCESS
+    write_ingestion_log(
+        session,
+        source=_CLOUD_LOG_SOURCE,
+        records_processed=result.imported,
+        records_failed=len(result.errors),
+        status=status,
+        error_detail="\n".join(result.errors) or None,
+    )
+
+
 def import_policy_cloud(
     *,
     policy_number: str,
@@ -263,6 +312,7 @@ def import_policy_cloud(
     surrender_value: object | None = None,
     accumulation_value: object | None = None,
     account_name: str | None = None,
+    session: Session | None = None,
 ) -> ImportResult:
     """POST one IUL balance snapshot to the wealth Worker (D1 net worth).
 
@@ -270,6 +320,11 @@ def import_policy_cloud(
     posts an ``AccountBalanceSnapshot`` row under the shared ``xlsx-snapshot``
     ingest source so the D1 net-worth aggregation resolves it by
     ``raw_account_name``. Sign convention: balance is a positive asset value.
+
+    When ``session`` is supplied, exactly one local ``IngestionLog`` row is
+    written per run (success and error paths alike) so cloud pushes surface in
+    delivery-health exactly like local imports (REQ-FIX-WLT-007). Backward
+    compatible: with no session the log write is skipped.
     """
     result = ImportResult()
     result.distinct_accounts = [policy_number]
@@ -278,6 +333,7 @@ def import_policy_cloud(
         surrender_value, accumulation_value, policy_number, result
     )
     if result.errors or booked is None:
+        _log_cloud_run(session, result)
         return result
 
     raw_account_name = account_name or _DEFAULT_ACCOUNT_NAME
@@ -296,6 +352,8 @@ def import_policy_cloud(
         result.errors.append(f"{label}: cloud POST error — {exc}")
         logger.error("north_american_iul cloud POST error: %s — %s",
                      label, type(exc).__name__)
+
+    _log_cloud_run(session, result)
     return result
 
 
@@ -357,22 +415,26 @@ def main(argv: list[str] | None = None) -> int:
         _print_summary(result, dry_run=True)
         return 0
 
-    if args.target == "cloud":
-        result = import_policy_cloud(
-            policy_number=args.policy,
-            as_of=as_of,
-            surrender_value=args.surrender,
-            accumulation_value=args.accumulation,
-            account_name=args.account_name,
-        )
-        _print_summary(result, dry_run=False)
-        return 1 if result.errors else 0
-
     try:
         from src.db.connection import get_session  # late import keeps tests light
     except ImportError as exc:  # pragma: no cover — environmental
         print(f"cannot import DB session factory: {exc}", file=sys.stderr)
         return 1
+
+    if args.target == "cloud":
+        # Cloud pushes still write a LOCAL IngestionLog row so delivery-health
+        # surfaces the push (REQ-FIX-WLT-007); open a local session for it.
+        with get_session() as session:
+            result = import_policy_cloud(
+                policy_number=args.policy,
+                as_of=as_of,
+                surrender_value=args.surrender,
+                accumulation_value=args.accumulation,
+                account_name=args.account_name,
+                session=session,
+            )
+        _print_summary(result, dry_run=False)
+        return 1 if result.errors else 0
 
     with get_session() as session:
         result = import_policy(**common, dry_run=False, session=session)

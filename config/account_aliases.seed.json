@@ -1,0 +1,4 @@
+{
+  "_doc": "REQ-FIX-WLT-004 local account_alias seed. Export of the sparkry-crm D1 account_alias table, applied to the local DB by scripts/seed_local_account_aliases.py (DRY-RUN default). Each entry maps a legacy XLSX raw_account_name (stored lowercased) to a live account, resolved by explicit account_id OR by (broker, account_name). Fill this from `wrangler d1 execute sparkry-crm-prod --remote --command 'SELECT raw_account_name, account_id FROM account_alias'`.",
+  "aliases": []
+}

@@ -66,6 +66,35 @@ class WealthServerError(WealthHTTPError):
     """5xx response from the Workers endpoint."""
 
 
+class WealthTransportError(WealthClientError):
+    """A transport-layer failure reaching the Workers endpoint.
+
+    Wraps :class:`httpx.HTTPError` (DNS resolution, TLS handshake, connect,
+    read/write timeout) so importer callers that ``except WealthClientError``
+    don't crash mid-batch on a network blip (REQ-FIX-WLT-007).
+    """
+
+
+class WealthProtocolError(WealthClientError):
+    """A 2xx response whose body was not valid JSON.
+
+    Attributes
+    ----------
+    status_code : int
+        The (successful) HTTP status code returned by the server.
+    body : str
+        The response body (truncated to 500 chars).
+    """
+
+    def __init__(self, status_code: int, body: str) -> None:
+        self.status_code = status_code
+        self.body = body
+        super().__init__(
+            f"Workers ingest returned HTTP {status_code} with a non-JSON body: "
+            f"{body[:400]}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public interface
 # ---------------------------------------------------------------------------
@@ -130,10 +159,28 @@ def post_to_wealth(
         "Content-Type": "application/json",
     }
 
-    response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    try:
+        response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+    except httpx.HTTPError as exc:
+        # DNS / TLS / connect / timeout — keep it inside the WealthClientError
+        # hierarchy so batch callers don't crash on a transient network fault.
+        logger.error(
+            "wealth_client: transport error POSTing %s (source=%s): %s",
+            url,
+            source,
+            type(exc).__name__,
+        )
+        raise WealthTransportError(str(exc)) from exc
 
     if response.is_success:
-        return response.json()  # type: ignore[no-any-return]
+        try:
+            return response.json()  # type: ignore[no-any-return]
+        except ValueError as exc:
+            # 2xx with a non-JSON body (e.g. an HTML error page served with a
+            # 200 by an intermediary) — surface as a typed protocol error.
+            raise WealthProtocolError(
+                response.status_code, response.text[:500]
+            ) from exc
 
     status = response.status_code
     body = response.text
@@ -160,8 +207,10 @@ __all__ = [
     "WealthClientError",
     "WealthConfigError",
     "WealthHTTPError",
+    "WealthProtocolError",
     "WealthRateLimitError",
     "WealthServerError",
+    "WealthTransportError",
     "WealthUnauthorizedError",
     "post_to_wealth",
 ]

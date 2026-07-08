@@ -13,14 +13,17 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from src.adapters._shared.wealth_client import (
     WealthClientError,
     WealthConfigError,
     WealthHTTPError,
+    WealthProtocolError,
     WealthRateLimitError,
     WealthServerError,
+    WealthTransportError,
     WealthUnauthorizedError,
     post_to_wealth,
 )
@@ -286,6 +289,68 @@ def test_413_raises_wealth_http_error(
 
 
 # ---------------------------------------------------------------------------
+# REQ-FIX-WLT-007: transport errors → WealthTransportError
+# ---------------------------------------------------------------------------
+
+
+def test_connect_error_raises_wealth_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx.ConnectError (DNS/TLS/connect) → WealthTransportError, not a crash."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    with patch("src.adapters._shared.wealth_client.httpx.post") as mock_post:
+        mock_post.side_effect = httpx.ConnectError("name resolution failed")
+        with pytest.raises(WealthTransportError) as exc_info:
+            post_to_wealth({"rows": []}, "brokerage-csv")
+
+    # Stays inside the hierarchy so batch callers catch it.
+    assert isinstance(exc_info.value, WealthClientError)
+
+
+def test_timeout_raises_wealth_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx.ReadTimeout is a subclass of httpx.HTTPError → WealthTransportError."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    with patch("src.adapters._shared.wealth_client.httpx.post") as mock_post:
+        mock_post.side_effect = httpx.ReadTimeout("timed out")
+        with pytest.raises(WealthTransportError):
+            post_to_wealth({"rows": []}, "brokerage-csv")
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-WLT-007: non-JSON 2xx body → WealthProtocolError
+# ---------------------------------------------------------------------------
+
+
+def test_non_json_2xx_body_raises_wealth_protocol_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A text/plain 200 whose body is not JSON → WealthProtocolError."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.is_success = True
+    resp.text = "<html>not json</html>"
+    resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+
+    with patch("src.adapters._shared.wealth_client.httpx.post") as mock_post:
+        mock_post.return_value = resp
+        with pytest.raises(WealthProtocolError) as exc_info:
+            post_to_wealth({"rows": []}, "brokerage-csv")
+
+    assert isinstance(exc_info.value, WealthClientError)
+    assert exc_info.value.status_code == 200
+    assert "not json" in exc_info.value.body
+
+
+# ---------------------------------------------------------------------------
 # All errors are WealthClientError (parent class)
 # ---------------------------------------------------------------------------
 
@@ -299,6 +364,8 @@ def test_all_errors_are_subclass_of_wealth_client_error(
     assert issubclass(WealthUnauthorizedError, WealthClientError)
     assert issubclass(WealthRateLimitError, WealthClientError)
     assert issubclass(WealthServerError, WealthClientError)
+    assert issubclass(WealthTransportError, WealthClientError)
+    assert issubclass(WealthProtocolError, WealthClientError)
 
 
 # ---------------------------------------------------------------------------

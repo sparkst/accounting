@@ -43,6 +43,7 @@ from src.models.brokerage import (
 )
 from src.models.enums import BrokerageTxStatus, CanonicalAction, CashFlowType, GainLossTerm
 from src.models.history import (
+    AccountAlias,
     AccountBalanceSnapshot,
     AccountTag,
     CostBasisLot,
@@ -50,11 +51,13 @@ from src.models.history import (
     HistoricalPrice,
 )
 from src.models.ingestion_log import IngestionLog
+from src.models.plaid import PlaidAccountBalanceSnapshot
 from src.reports.brokerage_summary import (
     _latest_at_or_before,
     _load_history_state,
     _mask_account_number,
     _per_account_value_at,
+    _price_at_or_before,
     compute_data_integrity,
     compute_net_worth,
     get_account_summary,
@@ -62,6 +65,7 @@ from src.reports.brokerage_summary import (
     get_recent_transactions,
     get_top_holdings,
 )
+from src.utils.networth_dedup import unmatched_active_at
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -958,35 +962,34 @@ def networth_history(
 
     accounts_by_id = state["accounts_by_id"]
 
-    # ── Suppression index for unmatched (legacy XLSX) rows ──────────────
-    # Two-tier rule (either fires):
-    #   (1) Per-name: a *matched* ABS exists with the same raw_account_name
-    #       at-or-before target (lists are sorted asc, so the first element
-    #       being <= target proves the suppression for every later target).
-    #   (2) Global cutoff: target is at-or-after the earliest matched
-    #       PositionSnapshot — live broker data has taken over even when the
-    #       XLSX label ("Amy IRA") doesn't string-match the live rollup label
-    #       ("Vanguard Amy 65344815"), preventing double-count.
+    # ── Per-name effective-cutoff suppression (REQ-FIX-WLT-004) ─────────
+    # Ports the sparkry-crm D1 per-name algorithm (REQ-WD-009) exactly via
+    # `unmatched_active_at`. For each legacy raw_account_name the effective
+    # cutoff is the EARLIER of:
+    #   (1) tier 1 — first date a matched ABS carries the same raw name; and
+    #   (2) tier 2 — earliest PositionSnapshot.as_of of the account that raw
+    #       name is explicitly aliased to (replaces the old single GLOBAL
+    #       cutoff, which wrongly zeroed a late-onboarding twin at the first
+    #       account's cutover). Absent map entry ⇒ +∞ for that tier.
     matched_name_first_date: dict[str, date] = {}
-    global_position_cutoff: date | None = None
+    alias_cutoff_by_raw_name: dict[str, date] = {}
     if include_unmatched and unmatched_by_pseudo:
-        # Derive from already-loaded state instead of re-querying.
+        # Derive tier 1 from already-loaded state instead of re-querying.
         for series in state["balance_snapshots_by_account"].values():
             for as_of, abs_row in series:
                 key = abs_row.raw_account_name.lower()
                 if key not in matched_name_first_date or as_of < matched_name_first_date[key]:
                     matched_name_first_date[key] = as_of
-        global_position_cutoff = _earliest_matched_position_date(session)
+        alias_cutoff_by_raw_name = _alias_cutoff_by_raw_name(session)
 
     def _unmatched_contribution(target: date) -> tuple[Decimal, int]:
         total = Decimal("0")
         count = 0
         for raw_name, series in unmatched_by_pseudo.items():
-            first_matched = matched_name_first_date.get(raw_name.lower())
-            if first_matched is not None and first_matched <= target:
-                continue  # tier 1
-            if global_position_cutoff is not None and target >= global_position_cutoff:
-                continue  # tier 2
+            if not unmatched_active_at(
+                raw_name, target, matched_name_first_date, alias_cutoff_by_raw_name
+            ):
+                continue  # at/after the per-name effective cutoff — contributes $0
             latest_bal = _latest_at_or_before(series, target)
             if latest_bal is not None:
                 total += latest_bal
@@ -1041,6 +1044,9 @@ class MissingAccountRow(BaseModel):
     source: str
     resolved_account_id: str | None = None
     last_seen_days_ago: int | None = None
+    # REQ-FIX-WLT-008: which snapshot table produced the freshest as_of
+    # (positions | balances | plaid), or None when the account has no snapshots.
+    freshness_source: str | None = None
 
 
 @router.get(
@@ -1075,8 +1081,9 @@ def missing_accounts(
     # source, accounts that are reporting freshly via brokerage CSV but
     # haven't been XLSX-matched would falsely appear as "never seen."
     latest_by_account: dict[str, date] = {}
+    freshness_source_by_account: dict[str, str] = {}
 
-    def _record(account_id: str | None, latest_as_of: object) -> None:
+    def _record(account_id: str | None, latest_as_of: object, source: str) -> None:
         if account_id is None or latest_as_of is None:
             return
         if isinstance(latest_as_of, datetime):
@@ -1086,6 +1093,7 @@ def missing_accounts(
         prev = latest_by_account.get(account_id)
         if prev is None or latest_as_of > prev:
             latest_by_account[account_id] = latest_as_of
+            freshness_source_by_account[account_id] = source
 
     bal_rows = (
         session.query(
@@ -1097,7 +1105,7 @@ def missing_accounts(
         .all()
     )
     for account_id, latest_as_of in bal_rows:
-        _record(account_id, latest_as_of)
+        _record(account_id, latest_as_of, "balances")
 
     pos_rows = (
         session.query(
@@ -1108,7 +1116,20 @@ def missing_accounts(
         .all()
     )
     for account_id, latest_as_of in pos_rows:
-        _record(account_id, latest_as_of)
+        _record(account_id, latest_as_of, "positions")
+
+    # REQ-FIX-WLT-008: Plaid-fed accounts get daily plaid_account_balance_snapshot
+    # rows but no ABS/PS rows — without this they'd read stale/missing forever.
+    plaid_rows = (
+        session.query(
+            PlaidAccountBalanceSnapshot.account_id,
+            func.max(PlaidAccountBalanceSnapshot.snapshot_date).label("latest_as_of"),
+        )
+        .group_by(PlaidAccountBalanceSnapshot.account_id)
+        .all()
+    )
+    for account_id, latest_as_of in plaid_rows:
+        _record(account_id, latest_as_of, "plaid")
 
     out: list[dict[str, Any]] = []
     expected_rows = (
@@ -1145,6 +1166,7 @@ def missing_accounts(
                     "source": exp.source,
                     "resolved_account_id": exp.resolved_account_id,
                     "last_seen_days_ago": None,
+                    "freshness_source": None,
                 }
             )
             continue
@@ -1160,6 +1182,9 @@ def missing_accounts(
                     "source": exp.source,
                     "resolved_account_id": exp.resolved_account_id,
                     "last_seen_days_ago": (today - latest).days,
+                    "freshness_source": freshness_source_by_account.get(
+                        exp.resolved_account_id
+                    ),
                 }
             )
         # else: fresh snapshot — exclude.
@@ -1205,23 +1230,41 @@ class BenchmarkComparisonResponse(BaseModel):
     series: list[BenchmarkPoint]
     portfolio_pct: float | None
     benchmark_pct: float | None
+    # REQ-FIX-WLT-006: first target date with both a portfolio value and a
+    # non-stale benchmark price; portfolio_pct/benchmark_pct measure from here.
+    anchor_date: date | None = None
+    # REQ-FIX-WLT-001: "total_return" when the benchmark uses adjusted closes,
+    # "price_return" when it fell back to raw close (adj_close unavailable).
+    benchmark_basis: str = "total_return"
 
 
 def _build_price_lookup(
     session: Session, symbol: str
-) -> list[tuple[date, Decimal]]:
-    """Single-query fetch of (trade_date, close) for ``symbol`` ascending.
+) -> tuple[list[tuple[date, Decimal]], str]:
+    """Single-query fetch of (trade_date, price) for ``symbol`` ascending.
 
-    Caller uses the returned list with ``_latest_at_or_before`` for O(N) total
-    work across many target dates instead of N database round-trips.
+    REQ-FIX-WLT-001: benchmark math is total-return. When every row for the
+    symbol carries an ``adj_close`` we use it (basis ``total_return``); if ANY
+    row is missing it we fall back to raw ``close`` for the whole series (basis
+    ``price_return``) — no silent mixing of adjusted and unadjusted within one
+    series. Returns ``(series, basis)``.
     """
     rows = (
-        session.query(HistoricalPrice.trade_date, HistoricalPrice.close)
+        session.query(
+            HistoricalPrice.trade_date,
+            HistoricalPrice.close,
+            HistoricalPrice.adj_close,
+        )
         .filter(HistoricalPrice.symbol == symbol)
         .order_by(HistoricalPrice.trade_date.asc())
         .all()
     )
-    return [(r[0], Decimal(str(r[1]))) for r in rows]
+    if not rows:
+        return [], "total_return"
+    all_adjusted = all(r[2] is not None for r in rows)
+    if all_adjusted:
+        return [(r[0], Decimal(str(r[2]))) for r in rows], "total_return"
+    return [(r[0], Decimal(str(r[1]))) for r in rows], "price_return"
 
 
 def _to_date(v: object) -> date | None:
@@ -1258,6 +1301,32 @@ def _earliest_matched_position_date(session: Session) -> date | None:
         .filter(PositionSnapshot.account_id.isnot(None))
         .scalar()
     )
+
+
+def _alias_cutoff_by_raw_name(session: Session) -> dict[str, date]:
+    """Per-raw-name tier-2 cutoff = earliest PositionSnapshot.as_of of the
+    aliased account (REQ-FIX-WLT-004).
+
+    Keys are lowercased, matching ``account_alias.raw_account_name`` PK storage
+    and the REQ-WD-009 key-casing contract. Only aliases whose target account
+    actually has PositionSnapshot rows contribute a cutoff; an alias to a
+    balance-only account yields no cutoff (its own ABS rows drive tier 1).
+    """
+    out: dict[str, date] = {}
+    rows = (
+        session.query(
+            AccountAlias.raw_account_name,
+            func.min(PositionSnapshot.as_of),
+        )
+        .join(PositionSnapshot, PositionSnapshot.account_id == AccountAlias.account_id)
+        .group_by(AccountAlias.raw_account_name)
+        .all()
+    )
+    for raw_name, min_as_of in rows:
+        d = _to_date(min_as_of)
+        if d is not None:
+            out[raw_name.lower()] = d
+    return out
 
 
 def _sum_per_account_filtered(
@@ -1381,9 +1450,9 @@ def networth_history_benchmark(
     if not target_dates or target_dates[-1] != today:
         target_dates.append(today)
 
-    # Single-query fetch of the benchmark's full price history; subsequent
-    # per-date lookups walk the in-memory list. Avoids N+1.
-    bench_prices = _build_price_lookup(session, bench_symbol)
+    # Single-query fetch of the benchmark's full adjusted price history;
+    # subsequent per-date lookups walk the in-memory list. Avoids N+1.
+    bench_prices, benchmark_basis = _build_price_lookup(session, bench_symbol)
 
     def _portfolio_at(target: date) -> Decimal:
         per_account = _per_account_value_at(session, target, history_state=state)
@@ -1395,20 +1464,23 @@ def networth_history_benchmark(
         )
         return total
 
-    # Anchor the benchmark simulation on the first target date's portfolio
-    # value, computed inline as part of the main loop to avoid a duplicate call.
+    # REQ-FIX-WLT-006: anchor the buy-and-hold sim on the FIRST target date that
+    # has BOTH a positive portfolio value AND a non-stale benchmark price. Dates
+    # before the anchor emit benchmark_value=None (rather than silently leaving
+    # shares None forever). Per-date bench lookups are 7-day-staleness-bounded
+    # (via _price_at_or_before) so a delisted/stale symbol gaps, not flatlines.
     initial_portfolio: Decimal | None = None
     shares: Decimal | None = None
+    anchor_date: date | None = None
     series: list[dict[str, Any]] = []
     benchmark_final: Decimal | None = None
     for d in target_dates:
         port_v = _portfolio_at(d)
-        if initial_portfolio is None:
+        bench_price = _price_at_or_before(bench_prices, d)
+        if shares is None and port_v > 0 and bench_price is not None and bench_price > 0:
             initial_portfolio = port_v
-            anchor_price = _latest_at_or_before(bench_prices, d)
-            if anchor_price is not None and anchor_price > 0:
-                shares = initial_portfolio / anchor_price
-        bench_price = _latest_at_or_before(bench_prices, d)
+            shares = port_v / bench_price
+            anchor_date = d
         if shares is not None and bench_price is not None:
             bench_v: Decimal | None = (shares * bench_price).quantize(Decimal("0.01"))
         else:
@@ -1429,25 +1501,27 @@ def networth_history_benchmark(
             "series": [],
             "portfolio_pct": None,
             "benchmark_pct": None,
+            "anchor_date": None,
+            "benchmark_basis": benchmark_basis,
         }
 
     portfolio_final = series[-1]["portfolio_value"]
-    portfolio_pct: float | None = (
-        float((portfolio_final - initial_portfolio) / initial_portfolio)
-        if initial_portfolio > 0
-        else None
-    )
-    benchmark_pct: float | None = (
-        float((benchmark_final - initial_portfolio) / initial_portfolio)
-        if benchmark_final is not None and initial_portfolio > 0
-        else None
-    )
+    portfolio_pct: float | None = None
+    benchmark_pct: float | None = None
+    if anchor_date is not None and initial_portfolio is not None and initial_portfolio > 0:
+        portfolio_pct = float((portfolio_final - initial_portfolio) / initial_portfolio)
+        if benchmark_final is not None:
+            benchmark_pct = float(
+                (benchmark_final - initial_portfolio) / initial_portfolio
+            )
 
     return {
         "benchmark_symbol": bench_symbol,
         "series": series,
         "portfolio_pct": portfolio_pct,
         "benchmark_pct": benchmark_pct,
+        "anchor_date": anchor_date,
+        "benchmark_basis": benchmark_basis,
     }
 
 
@@ -1493,6 +1567,9 @@ class HoldingHistoryResponse(BaseModel):
     unrealized_pct: float
     value_series: list[HoldingValuePoint]
     lots: list[HoldingLotRow]
+    # REQ-FIX-WLT-005: per-account latest snapshot date, for transparency into
+    # the forward-fill (brokers snapshot on different days).
+    per_account_as_of: dict[str, date] = {}
 
     @field_serializer("current_value", "current_quantity", "cost_basis", "unrealized_gain")
     def _ser(self, v: Decimal) -> float:
@@ -1515,49 +1592,81 @@ def holding_history(
     """
     sym = symbol.upper()
 
-    # Aggregate snapshots across accounts per as_of date.
+    # REQ-FIX-WLT-005: brokers snapshot on different days, so grouping by exact
+    # cross-account date produced a sawtooth (each bucket held only the accounts
+    # that reported that day) and current_* reflected a single most-recent date.
+    # Fix: build each account's ascending series, then over the sorted union of
+    # all dates carry each account's last-known {mv, qty, cost_basis} forward and
+    # sum per date. current_* = Σ over accounts of that account's LATEST snapshot.
     rows = (
         session.query(PositionSnapshot)
         .filter(func.upper(PositionSnapshot.symbol) == sym)
         .order_by(PositionSnapshot.as_of.asc())
         .all()
     )
-    by_date: dict[date, dict[str, Decimal]] = {}
+    # Per account: {date: aggregated slot at that snapshot date}.
+    per_account_dated: dict[str, dict[date, dict[str, Decimal]]] = {}
     security_name: str | None = None
     for snap in rows:
         as_of_d = snap.as_of.date() if isinstance(snap.as_of, datetime) else snap.as_of
-        slot = by_date.setdefault(
+        slot = per_account_dated.setdefault(snap.account_id, {}).setdefault(
             as_of_d,
             {"market_value": Decimal("0"), "quantity": Decimal("0"), "cost_basis": Decimal("0")},
         )
         if snap.market_value is not None:
-            slot["market_value"] += snap.market_value
+            slot["market_value"] += Decimal(str(snap.market_value))
         if snap.quantity is not None:
-            slot["quantity"] += snap.quantity
+            slot["quantity"] += Decimal(str(snap.quantity))
         if snap.cost_basis is not None:
-            slot["cost_basis"] += snap.cost_basis
+            slot["cost_basis"] += Decimal(str(snap.cost_basis))
         if security_name is None and snap.description:
             security_name = snap.description
 
-    sorted_dates = sorted(by_date.keys())
-    value_series = [
-        {
-            "as_of": d,
-            "market_value": by_date[d]["market_value"],
-            "quantity": by_date[d]["quantity"],
-        }
-        for d in sorted_dates
-    ]
+    # Ascending per-account series + each account's latest snapshot date.
+    per_account_series: dict[str, list[tuple[date, dict[str, Decimal]]]] = {
+        acct_id: sorted(by_date.items(), key=lambda kv: kv[0])
+        for acct_id, by_date in per_account_dated.items()
+    }
+    per_account_latest_date: dict[str, date] = {
+        acct_id: series[-1][0]
+        for acct_id, series in per_account_series.items()
+        if series
+    }
 
-    if sorted_dates:
-        latest = by_date[sorted_dates[-1]]
-        current_value = latest["market_value"]
-        current_quantity = latest["quantity"]
-        cost_basis = latest["cost_basis"]
-    else:
-        current_value = Decimal("0")
-        current_quantity = Decimal("0")
-        cost_basis = Decimal("0")
+    all_dates = sorted({d for series in per_account_series.values() for d, _ in series})
+
+    def _acct_slot_at(
+        series: list[tuple[date, dict[str, Decimal]]], target: date
+    ) -> dict[str, Decimal] | None:
+        last: dict[str, Decimal] | None = None
+        for d, slot in series:
+            if d > target:
+                break
+            last = slot
+        return last
+
+    value_series: list[dict[str, Any]] = []
+    for d in all_dates:
+        mv = Decimal("0")
+        qty = Decimal("0")
+        for series in per_account_series.values():
+            acct_slot = _acct_slot_at(series, d)
+            if acct_slot is not None:
+                mv += acct_slot["market_value"]
+                qty += acct_slot["quantity"]
+        value_series.append({"as_of": d, "market_value": mv, "quantity": qty})
+
+    # current_* = Σ over accounts of that account's LATEST snapshot values.
+    current_value = Decimal("0")
+    current_quantity = Decimal("0")
+    cost_basis = Decimal("0")
+    for series in per_account_series.values():
+        if not series:
+            continue
+        latest_slot = series[-1][1]
+        current_value += latest_slot["market_value"]
+        current_quantity += latest_slot["quantity"]
+        cost_basis += latest_slot["cost_basis"]
 
     unrealized_gain = current_value - cost_basis
     unrealized_pct = float(unrealized_gain / cost_basis) if cost_basis > 0 else 0.0
@@ -1591,6 +1700,288 @@ def holding_history(
         "unrealized_pct": unrealized_pct,
         "value_series": value_series,
         "lots": lots,
+        "per_account_as_of": per_account_latest_date,
+    }
+
+
+# ── REQ-IPD: Investment policy panel ───────────────────────────────────
+
+
+class ConcentrationRow(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    symbol: str
+    market_value: Decimal
+    pct: Decimal
+    cost_basis: Decimal
+    basis_missing: bool
+    embedded_gain: Decimal | None
+
+    @field_serializer("market_value", "pct", "cost_basis", "embedded_gain")
+    def _ser(self, v: Decimal | None) -> float | None:
+        return float(v) if v is not None else None
+
+
+class GlidePoint(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    month: date
+    glide_pct: Decimal
+
+    @field_serializer("glide_pct")
+    def _ser(self, v: Decimal) -> float:
+        return float(v)
+
+
+class PolicyResponse(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    as_of: date
+    investable_base: Decimal
+    equity_base: Decimal
+    cash_value: Decimal
+    cash_pct: Decimal
+    international_value: Decimal
+    international_pct_of_equity: Decimal
+    international_target_pct: Decimal
+    combined_symbols: list[str]
+    combined_value: Decimal
+    combined_pct: Decimal
+    current_pct: Decimal
+    glide_pct: Decimal
+    headroom_pts: Decimal
+    drift_alert_threshold_pts: Decimal
+    concentration: list[ConcentrationRow]
+    glide_series: list[GlidePoint]
+    wa_tax_year: int
+    realized_lt_gains_ytd: Decimal
+    excise_threshold: Decimal | None
+    excise_threshold_headroom: Decimal | None
+    excise_surcharge_threshold: Decimal | None
+    excise_surcharge_headroom: Decimal | None
+    bold_bets_over_cap: bool
+    bold_bets_sleeve_value: Decimal
+    bold_bets_cap: Decimal
+    warnings: list[str]
+
+    @field_serializer(
+        "investable_base",
+        "equity_base",
+        "cash_value",
+        "cash_pct",
+        "international_value",
+        "international_pct_of_equity",
+        "international_target_pct",
+        "combined_value",
+        "combined_pct",
+        "current_pct",
+        "glide_pct",
+        "headroom_pts",
+        "drift_alert_threshold_pts",
+        "realized_lt_gains_ytd",
+        "excise_threshold",
+        "excise_threshold_headroom",
+        "excise_surcharge_threshold",
+        "excise_surcharge_headroom",
+        "bold_bets_sleeve_value",
+        "bold_bets_cap",
+    )
+    def _ser(self, v: Decimal | None) -> float | None:
+        return float(v) if v is not None else None
+
+
+@router.get("/brokerage/policy", response_model=PolicyResponse)
+def policy(session: Session = Depends(get_db)) -> dict[str, Any]:  # noqa: B008
+    """REQ-IPD-001..003: concentration vs glide, intl/cash %, WA excise headroom."""
+    from src.analytics.policy import compute_bold_bets, compute_policy
+    from src.analytics.policy_config import load_policy_config
+
+    cfg = load_policy_config()
+    today = _today()
+    result = compute_policy(session, cfg, today)
+    bets = compute_bold_bets(session, cfg, today)
+    return {
+        "as_of": result.as_of,
+        "investable_base": result.investable_base,
+        "equity_base": result.equity_base,
+        "cash_value": result.cash_value,
+        "cash_pct": result.cash_pct,
+        "international_value": result.international_value,
+        "international_pct_of_equity": result.international_pct_of_equity,
+        "international_target_pct": result.international_target_pct,
+        "combined_symbols": result.combined_symbols,
+        "combined_value": result.combined_value,
+        "combined_pct": result.combined_pct,
+        "current_pct": result.current_pct,
+        "glide_pct": result.glide_pct,
+        "headroom_pts": result.headroom_pts,
+        "drift_alert_threshold_pts": result.drift_alert_threshold_pts,
+        "concentration": [
+            {
+                "symbol": c.symbol,
+                "market_value": c.market_value,
+                "pct": c.pct,
+                "cost_basis": c.cost_basis,
+                "basis_missing": c.basis_missing,
+                "embedded_gain": c.embedded_gain,
+            }
+            for c in result.concentration
+        ],
+        "glide_series": [
+            {"month": m, "glide_pct": p} for m, p in result.glide_series
+        ],
+        "wa_tax_year": result.wa_tax_year,
+        "realized_lt_gains_ytd": result.realized_lt_gains_ytd,
+        "excise_threshold": result.excise_threshold,
+        "excise_threshold_headroom": result.excise_threshold_headroom,
+        "excise_surcharge_threshold": result.excise_surcharge_threshold,
+        "excise_surcharge_headroom": result.excise_surcharge_headroom,
+        "bold_bets_over_cap": bets.over_cap,
+        "bold_bets_sleeve_value": bets.sleeve_value,
+        "bold_bets_cap": bets.cap,
+        "warnings": result.warnings,
+    }
+
+
+# ── REQ-BBT: Bold-bets sleeve ──────────────────────────────────────────
+
+
+class BoldBetRow(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    symbol: str
+    account_id: str
+    account_name: str | None = None
+    market_value: Decimal
+    cost_basis: Decimal | None
+    unrealized_gain: Decimal | None
+    realized_gain: Decimal
+    thesis: str | None = None
+    exit: str | None = None
+
+    @field_serializer("market_value", "cost_basis", "unrealized_gain", "realized_gain")
+    def _ser(self, v: Decimal | None) -> float | None:
+        return float(v) if v is not None else None
+
+
+class BoldBetsResponse(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    positions: list[BoldBetRow]
+    sleeve_value: Decimal
+    sleeve_cost_basis: Decimal
+    sleeve_unrealized: Decimal
+    sleeve_realized: Decimal
+    cap: Decimal
+    over_cap: bool
+    pct_of_investable: Decimal
+    investable_base: Decimal
+
+    @field_serializer(
+        "sleeve_value",
+        "sleeve_cost_basis",
+        "sleeve_unrealized",
+        "sleeve_realized",
+        "cap",
+        "pct_of_investable",
+        "investable_base",
+    )
+    def _ser(self, v: Decimal) -> float:
+        return float(v)
+
+
+@router.get("/brokerage/bold-bets", response_model=BoldBetsResponse)
+def bold_bets(session: Session = Depends(get_db)) -> dict[str, Any]:  # noqa: B008
+    """REQ-BBT-001..002: speculative sleeve (tag ∪ watchlist) + cap status."""
+    from src.analytics.policy import compute_bold_bets
+    from src.analytics.policy_config import load_policy_config
+
+    cfg = load_policy_config()
+    result = compute_bold_bets(session, cfg, _today())
+    return {
+        "positions": [
+            {
+                "symbol": p.symbol,
+                "account_id": p.account_id,
+                "account_name": p.account_name,
+                "market_value": p.market_value,
+                "cost_basis": p.cost_basis,
+                "unrealized_gain": p.unrealized_gain,
+                "realized_gain": p.realized_gain,
+                "thesis": p.thesis,
+                "exit": p.exit,
+            }
+            for p in result.positions
+        ],
+        "sleeve_value": result.sleeve_value,
+        "sleeve_cost_basis": result.sleeve_cost_basis,
+        "sleeve_unrealized": result.sleeve_unrealized,
+        "sleeve_realized": result.sleeve_realized,
+        "cap": result.cap,
+        "over_cap": result.over_cap,
+        "pct_of_investable": result.pct_of_investable,
+        "investable_base": result.investable_base,
+    }
+
+
+# ── REQ-NWA-001: Net-worth attribution ─────────────────────────────────
+
+
+class NetWorthAttributionResponse(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    start: date
+    end: date
+    nw_start: Decimal
+    nw_end: Decimal
+    delta_nw: Decimal
+    market_effect: Decimal
+    net_flows: Decimal
+    coverage_change: Decimal
+    flow_tx_count: int
+    new_account_count: int
+    dropped_account_count: int
+    weekly_line: str
+
+    @field_serializer(
+        "nw_start",
+        "nw_end",
+        "delta_nw",
+        "market_effect",
+        "net_flows",
+        "coverage_change",
+    )
+    def _ser(self, v: Decimal) -> float:
+        return float(v)
+
+
+@router.get(
+    "/brokerage/networth-attribution", response_model=NetWorthAttributionResponse
+)
+def networth_attribution(
+    start: date = Query(...),  # noqa: B008
+    end: date = Query(...),  # noqa: B008
+    session: Session = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """REQ-NWA-001: decompose ΔNW over (start, end] into market/flows/coverage."""
+    from src.analytics.attribution import compute_networth_attribution
+
+    if end < start:
+        raise HTTPException(status_code=422, detail="end must be >= start")
+    r = compute_networth_attribution(session, start, end)
+    return {
+        "start": r.start,
+        "end": r.end,
+        "nw_start": r.nw_start,
+        "nw_end": r.nw_end,
+        "delta_nw": r.delta_nw,
+        "market_effect": r.market_effect,
+        "net_flows": r.net_flows,
+        "coverage_change": r.coverage_change,
+        "flow_tx_count": r.flow_tx_count,
+        "new_account_count": r.new_account_count,
+        "dropped_account_count": r.dropped_account_count,
+        "weekly_line": r.format_weekly_line(),
     }
 
 
@@ -1900,11 +2291,19 @@ def _benchmark_twr(
     )
     if start_row is None or end_row is None:
         return None
-    if Decimal(str(start_row.close)) == Decimal("0"):
+    # REQ-FIX-WLT-001: total-return basis — use adj_close when BOTH endpoints
+    # carry it (comparable to the portfolio TWR, which sees dividends as internal
+    # cash); otherwise fall back to raw close for BOTH endpoints (same basis, no
+    # silent mixing). raw close is NOT NULL so the fallback always resolves.
+    if start_row.adj_close is not None and end_row.adj_close is not None:
+        start_px = Decimal(str(start_row.adj_close))
+        end_px = Decimal(str(end_row.adj_close))
+    else:
+        start_px = Decimal(str(start_row.close))
+        end_px = Decimal(str(end_row.close))
+    if start_px == Decimal("0"):
         return None
-    raw = (Decimal(str(end_row.close)) - Decimal(str(start_row.close))) / Decimal(
-        str(start_row.close)
-    )
+    raw = (end_px - start_px) / start_px
     window_days = (end - start).days
     if window_days >= 30 and window_days > 0:
         raw_f = float(raw)

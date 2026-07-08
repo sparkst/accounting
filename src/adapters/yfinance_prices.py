@@ -8,8 +8,12 @@ Conventions
 -----------
 - Float→Decimal conversions go through ``Decimal(str(value))`` to avoid the
   precision loss that ``Decimal(float_value)`` introduces.
-- ``Adj Close`` is dropped; we persist the raw close so downstream total-return
-  math can apply its own adjustment policy.
+- Both the raw ``Close`` and the ``Adj Close`` (total-return adjusted) columns
+  are captured: ``close`` holds the unadjusted market price, ``adj_close`` holds
+  Yahoo's dividend/split-adjusted close (``None`` when the column or value is
+  absent). ``auto_adjust=False`` is kept so the frame carries both series
+  (REQ-FIX-WLT-001). Downstream chooses raw close for live re-pricing and
+  adj_close for total-return benchmark math.
 - Rows whose Close is NaN (delisted dates, partial sessions) are skipped.
 - Open/High/Low NaN pass through as ``None`` rather than zero.
 - Yahoo occasionally returns tz-aware Timestamps; we normalise to UTC before
@@ -40,6 +44,7 @@ class HistoricalPriceRow(TypedDict):
     symbol: str
     trade_date: date
     close: Decimal
+    adj_close: Decimal | None
     open: Decimal | None
     high: Decimal | None
     low: Decimal | None
@@ -95,12 +100,17 @@ def _row_for_symbol(
     symbol: str,
     trade_date: date,
     close_raw: Any,
+    adj_close_raw: Any,
     open_raw: Any,
     high_raw: Any,
     low_raw: Any,
     volume_raw: Any,
 ) -> HistoricalPriceRow | None:
-    """Build a HistoricalPriceRow from raw scalars; return None if Close is NaN."""
+    """Build a HistoricalPriceRow from raw scalars; return None if Close is NaN.
+
+    ``adj_close`` goes through the same ``_to_decimal`` path as ``close`` and is
+    ``None`` when the ``Adj Close`` column is absent or NaN (REQ-FIX-WLT-001).
+    """
     close = _to_decimal(close_raw)
     if close is None:
         return None
@@ -108,6 +118,7 @@ def _row_for_symbol(
         symbol=symbol,
         trade_date=trade_date,
         close=close,
+        adj_close=_to_decimal(adj_close_raw),
         open=_to_decimal(open_raw),
         high=_to_decimal(high_raw),
         low=_to_decimal(low_raw),
@@ -207,6 +218,7 @@ def fetch_eod(
                 symbol=symbol,
                 trade_date=trade_date,
                 close_raw=sub_row.get("Close"),
+                adj_close_raw=sub_row.get("Adj Close"),
                 open_raw=sub_row.get("Open"),
                 high_raw=sub_row.get("High"),
                 low_raw=sub_row.get("Low"),

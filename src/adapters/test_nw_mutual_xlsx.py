@@ -34,6 +34,9 @@ from src.models.base import Base
 from src.models.brokerage import Account
 from src.models.history import AccountBalanceSnapshot
 from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
+)
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -272,6 +275,28 @@ def test_default_as_of_uses_file_mtime(session: Session, fixture_xlsx: Path) -> 
     snaps = session.query(AccountBalanceSnapshot).all()
     for s in snaps:
         assert s.as_of == expected
+
+
+def test_as_of_override_wins_over_mtime(
+    session: Session, fixture_xlsx: Path
+) -> None:
+    """REQ-FIX-WLT-009: an explicit --as-of override beats the file mtime."""
+    import os
+    import time
+
+    _seed_accounts(session, ALL_POLICIES)
+    mtime_epoch = time.mktime(date(2026, 4, 30).timetuple())
+    os.utime(fixture_xlsx, (mtime_epoch, mtime_epoch))
+
+    override = date(2026, 1, 15)
+    result = import_balances(
+        fixture_xlsx, dry_run=False, session=session, as_of=override
+    )
+    assert result.imported == 3
+    snaps = session.query(AccountBalanceSnapshot).all()
+    assert snaps
+    for s in snaps:
+        assert s.as_of == override  # override, not the 2026-04-30 mtime
 
 
 def test_na_skip_goes_to_warnings_not_errors(

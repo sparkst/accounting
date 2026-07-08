@@ -46,6 +46,9 @@ from src.models.base import Base
 from src.models.brokerage import Account, PositionSnapshot
 from src.models.enums import AccountType, Broker, Entity
 from src.models.ingestion_log import IngestionLog
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
+)
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -394,6 +397,30 @@ def test_as_of_defaults_to_file_mtime(
     snap = session.execute(select(PositionSnapshot)).scalars().first()
     assert snap is not None
     assert snap.as_of.date() == target
+
+
+def test_as_of_override_wins_over_mtime(
+    session: Session, tmp_path: Path
+) -> None:
+    """REQ-FIX-WLT-009: an explicit as_of override beats the file mtime."""
+    _seed_account(session, "65344815")
+    _seed_account(session, "70862729")
+    csv = _write(tmp_path, "OfxDownload.csv", INLINE_BROKERAGE)
+
+    import os
+    import time
+    mtime_date = date(2026, 4, 30)
+    epoch = time.mktime(mtime_date.timetuple())
+    os.utime(csv, (epoch, epoch))
+
+    override = date(2026, 1, 15)
+    result = import_positions(
+        csv, dry_run=False, session=session, as_of=override
+    )
+    assert result.imported == 3
+    snap = session.execute(select(PositionSnapshot)).scalars().first()
+    assert snap is not None
+    assert snap.as_of.date() == override  # override, not mtime
 
 
 # ── Real-fixture smoke tests (skip if files absent) ──────────────────────────

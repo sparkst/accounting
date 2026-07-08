@@ -100,9 +100,11 @@ def test_single_symbol_returns_normalized_rows() -> None:
     # Assert exact Decimal values, never floats
     assert isinstance(first["close"], Decimal)
     assert isinstance(first["open"], Decimal)
-    # Adj Close must NOT appear anywhere in row
-    assert "adj_close" not in first
-    assert "Adj Close" not in first  # type: ignore[operator]
+    # REQ-FIX-WLT-001: Adj Close is now captured as adj_close (total-return series)
+    assert first["adj_close"] == Decimal("101.5")
+    assert isinstance(first["adj_close"], Decimal)
+    # The raw-frame column name must never leak into the row dict
+    assert "Adj Close" not in first
 
 
 def test_multi_symbol_returns_rows_for_each_symbol() -> None:
@@ -324,6 +326,65 @@ def test_multi_symbol_missing_symbol_in_response_is_skipped() -> None:
 
     symbols = {r["symbol"] for r in rows}
     assert symbols == {"AAPL"}  # BADSYM silently absent, no exception
+
+
+def test_adj_close_captured_when_present_multi_symbol() -> None:
+    """REQ-FIX-WLT-001: adj_close is populated from the Adj Close column for
+    every symbol in a multi-symbol frame."""
+    fixture = _multi_symbol_df()
+    with patch("src.adapters.yfinance_prices.yf.download", return_value=fixture):
+        rows = fetch_eod(["AAPL", "MSFT"], date(2025, 1, 2), date(2025, 1, 4))
+
+    aapl = [r for r in rows if r["symbol"] == "AAPL"]
+    msft = [r for r in rows if r["symbol"] == "MSFT"]
+    assert aapl[0]["adj_close"] == Decimal("101.5")
+    assert aapl[0]["close"] == Decimal("101.75")  # raw close distinct from adj
+    assert msft[1]["adj_close"] == Decimal("404.75")
+
+
+def test_adj_close_is_none_when_column_absent() -> None:
+    """REQ-FIX-WLT-001: a frame with no Adj Close column yields adj_close=None,
+    never a crash and never a fabricated value."""
+    idx = pd.DatetimeIndex([pd.Timestamp("2025-01-02")], name="Date")
+    fixture = pd.DataFrame(
+        {
+            "Open": [100.0],
+            "High": [101.0],
+            "Low": [99.0],
+            "Close": [100.5],
+            # No "Adj Close" column at all
+            "Volume": [1_000_000],
+        },
+        index=idx,
+    )
+    with patch("src.adapters.yfinance_prices.yf.download", return_value=fixture):
+        rows = fetch_eod(["AAPL"], date(2025, 1, 2), date(2025, 1, 3))
+
+    assert len(rows) == 1
+    assert rows[0]["close"] == Decimal("100.5")
+    assert rows[0]["adj_close"] is None
+
+
+def test_adj_close_is_none_when_value_nan() -> None:
+    """REQ-FIX-WLT-001: NaN Adj Close (kept row because Close is present) → None."""
+    idx = pd.DatetimeIndex([pd.Timestamp("2025-01-02")], name="Date")
+    fixture = pd.DataFrame(
+        {
+            "Open": [100.0],
+            "High": [101.0],
+            "Low": [99.0],
+            "Close": [100.5],
+            "Adj Close": [np.nan],
+            "Volume": [1_000_000],
+        },
+        index=idx,
+    )
+    with patch("src.adapters.yfinance_prices.yf.download", return_value=fixture):
+        rows = fetch_eod(["AAPL"], date(2025, 1, 2), date(2025, 1, 3))
+
+    assert len(rows) == 1
+    assert rows[0]["close"] == Decimal("100.5")
+    assert rows[0]["adj_close"] is None
 
 
 def test_to_decimal_logs_and_returns_none_on_invalid_string(

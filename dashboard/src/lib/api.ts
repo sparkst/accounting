@@ -1098,6 +1098,84 @@ export async function fetchBrokerageMissingAccounts(): Promise<BrokerageMissingA
 	return request<BrokerageMissingAccount[]>('/brokerage/missing-accounts');
 }
 
+// ─── Investment policy panel (REQ-IPD) + bold bets (REQ-BBT) ─────────────────
+
+export interface PolicyConcentrationRow {
+	symbol: string;
+	market_value: number;
+	pct: number;
+	cost_basis: number;
+	basis_missing: boolean;
+	embedded_gain: number | null;
+}
+
+export interface PolicyGlidePoint {
+	month: string;
+	glide_pct: number;
+}
+
+export interface BrokeragePolicy {
+	as_of: string;
+	investable_base: number;
+	equity_base: number;
+	cash_value: number;
+	cash_pct: number;
+	international_value: number;
+	international_pct_of_equity: number;
+	international_target_pct: number;
+	combined_symbols: string[];
+	combined_value: number;
+	combined_pct: number;
+	current_pct: number;
+	glide_pct: number;
+	headroom_pts: number;
+	drift_alert_threshold_pts: number;
+	concentration: PolicyConcentrationRow[];
+	glide_series: PolicyGlidePoint[];
+	wa_tax_year: number;
+	realized_lt_gains_ytd: number;
+	excise_threshold: number | null;
+	excise_threshold_headroom: number | null;
+	excise_surcharge_threshold: number | null;
+	excise_surcharge_headroom: number | null;
+	bold_bets_over_cap: boolean;
+	bold_bets_sleeve_value: number;
+	bold_bets_cap: number;
+	warnings: string[];
+}
+
+export async function fetchBrokeragePolicy(): Promise<BrokeragePolicy> {
+	return request<BrokeragePolicy>('/brokerage/policy');
+}
+
+export interface BoldBetRow {
+	symbol: string;
+	account_id: string;
+	account_name: string | null;
+	market_value: number;
+	cost_basis: number | null;
+	unrealized_gain: number | null;
+	realized_gain: number;
+	thesis: string | null;
+	exit: string | null;
+}
+
+export interface BrokerageBoldBets {
+	positions: BoldBetRow[];
+	sleeve_value: number;
+	sleeve_cost_basis: number;
+	sleeve_unrealized: number;
+	sleeve_realized: number;
+	cap: number;
+	over_cap: boolean;
+	pct_of_investable: number;
+	investable_base: number;
+}
+
+export async function fetchBrokerageBoldBets(): Promise<BrokerageBoldBets> {
+	return request<BrokerageBoldBets>('/brokerage/bold-bets');
+}
+
 // ─── Brokerage account PATCH + detail ────────────────────────────────────────
 
 /**

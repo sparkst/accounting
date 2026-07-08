@@ -13,8 +13,11 @@ REQ-005g: Inherits BaseAdapter; writes IngestionLog.
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Generator
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -25,6 +28,7 @@ from src.adapters.etrade_csv import (
     EtradeCsvAdapter,
     map_action,
     parse_account_line,
+    parse_generated_at_date,
 )
 from src.models.base import Base
 from src.models.brokerage import (
@@ -38,6 +42,9 @@ from src.models.enums import (
     CanonicalAction,
     Entity,
     Source,
+)
+from src.models.plaid import (
+    PlaidItem,  # noqa: F401 — Account FKs plaid_item; register for create_all
 )
 
 # ---------------------------------------------------------------------------
@@ -575,3 +582,143 @@ class TestPositionIngest:
         # Only AAPL should land — the "Generated at" row must be filtered.
         assert len(positions) == 1
         assert positions[0].symbol == "AAPL"
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-WLT-003: as_of derivation / date-in-hash / cost_basis
+# ---------------------------------------------------------------------------
+
+# Positions CSV including the "Generated at ..." footer row (embedded date).
+ETRADE_POSITIONS_WITH_FOOTER = (
+    b"Account Summary\n"
+    b"Account,Net Account Value,Total Gain $,Total Gain %,Day's Gain Unrealized $,Day's Gain Unrealized %,Available For Withdrawal,Cash Purchasing Power\n"
+    b'"Cap 1(-6084) -6354",100.00,0.00,0.00,0.00,0.00,1.00,1.00\n'
+    b"\n\n"
+    b"View Summary - All Positions\n"
+    b"Filters applied:\n"
+    b"Symbol,Security type(s),Sort by,Sort order,\n"
+    b",All,Symbol,Asc,\n"
+    b"\n"
+    b"Symbol,Last Price $,Change $,Change %,Quantity,Price Paid $,Day's Gain $,Total Gain $,Total Gain %,Value $\n"
+    b"AAPL,150.00,1.50,1.00,100.0000,140.0000,150.0000,1000.0000,7.1428,15000.0000\n"
+    b"Generated at May 4 2026 02:47 PM ET,,,,,,,,,\n"
+)
+
+
+def _set_mtime(path: Path, d: date) -> None:
+    epoch = time.mktime(d.timetuple())
+    os.utime(path, (epoch, epoch))
+
+
+class TestParseGeneratedAt:
+    """REQ-FIX-WLT-003: footer-date parser (dateutil-free)."""
+
+    def test_parses_real_footer(self):
+        rows = [["Generated at May 4 2026 02:47 PM ET", "", ""]]
+        assert parse_generated_at_date(rows) == date(2026, 5, 4)
+
+    def test_parses_abbreviated_month_with_comma(self):
+        rows = [["Generated at Dec 15, 2025 09:00 AM ET"]]
+        assert parse_generated_at_date(rows) == date(2025, 12, 15)
+
+    def test_no_footer_returns_none(self):
+        rows = [["AAPL", "150.00"], ["MSFT", "413.85"]]
+        assert parse_generated_at_date(rows) is None
+
+    def test_unknown_month_returns_none(self):
+        rows = [["Generated at Smarch 4 2026 02:47 PM ET"]]
+        assert parse_generated_at_date(rows) is None
+
+
+class TestPositionAsOfDerivation:
+    """REQ-FIX-WLT-003: as_of priority ladder + provenance."""
+
+    def test_mtime_fallback_when_no_footer(self, session: Session, tmp_path: Path):
+        """No footer → as_of derived from file mtime, source='mtime'."""
+        folder = _make_folder(tmp_path)  # ETRADE_POSITIONS_CSV has no footer
+        _set_mtime(folder / "PortfolioDownload.csv", date(2026, 4, 30))
+        EtradeCsvAdapter(folder).run(session)
+
+        pos = session.query(PositionSnapshot).first()
+        assert pos is not None
+        assert pos.as_of.date() == date(2026, 4, 30)
+        assert pos.raw_data["as_of_source"] == "mtime"
+
+    def test_embedded_footer_date_used(self, session: Session, tmp_path: Path):
+        """Footer 'Generated at May 4 2026' beats mtime, source='embedded'."""
+        folder = _make_folder(tmp_path, pos_csv=ETRADE_POSITIONS_WITH_FOOTER)
+        _set_mtime(folder / "PortfolioDownload.csv", date(2020, 1, 1))
+        EtradeCsvAdapter(folder).run(session)
+
+        pos = session.query(PositionSnapshot).filter_by(symbol="AAPL").one()
+        assert pos.as_of.date() == date(2026, 5, 4)
+        assert pos.raw_data["as_of_source"] == "embedded"
+
+    def test_cli_override_wins(self, session: Session, tmp_path: Path):
+        """--as-of override beats an embedded footer, source='cli'."""
+        folder = _make_folder(tmp_path, pos_csv=ETRADE_POSITIONS_WITH_FOOTER)
+        EtradeCsvAdapter(folder, as_of_override=date(2019, 7, 4)).run(session)
+
+        pos = session.query(PositionSnapshot).filter_by(symbol="AAPL").one()
+        assert pos.as_of.date() == date(2019, 7, 4)
+        assert pos.raw_data["as_of_source"] == "cli"
+
+
+class TestPositionHashIncludesDate:
+    """REQ-FIX-WLT-003: date-quantized hash — intra-day idempotent, next-day fresh."""
+
+    def test_same_file_reimport_skips(self, session: Session, tmp_path: Path):
+        """Re-import of the same export (stable mtime) writes no new rows."""
+        folder = _make_folder(tmp_path)
+        _set_mtime(folder / "PortfolioDownload.csv", date(2026, 5, 1))
+        EtradeCsvAdapter(folder).run(session)
+        first = session.query(PositionSnapshot).count()
+
+        result2 = EtradeCsvAdapter(folder).run(session)
+        assert session.query(PositionSnapshot).count() == first
+        # No position rows created on the second run.
+        aapl = session.query(PositionSnapshot).filter_by(symbol="AAPL").count()
+        assert aapl == 1
+        assert result2 is not None
+
+    def test_next_day_export_inserts_new_rows(
+        self, session: Session, tmp_path: Path
+    ):
+        """A fresh export on a new date (new mtime) inserts a fresh snapshot."""
+        folder = _make_folder(tmp_path)
+        pos_path = folder / "PortfolioDownload.csv"
+
+        _set_mtime(pos_path, date(2026, 5, 1))
+        EtradeCsvAdapter(folder).run(session)
+        assert session.query(PositionSnapshot).filter_by(symbol="AAPL").count() == 1
+
+        # Same file content, next day → new as_of date → new hash → new row.
+        _set_mtime(pos_path, date(2026, 5, 2))
+        EtradeCsvAdapter(folder).run(session)
+
+        aapl_snaps = session.query(PositionSnapshot).filter_by(symbol="AAPL").all()
+        assert len(aapl_snaps) == 2
+        assert {s.as_of.date() for s in aapl_snaps} == {
+            date(2026, 5, 1),
+            date(2026, 5, 2),
+        }
+
+
+class TestPositionCostBasis:
+    """REQ-FIX-WLT-003: cost_basis = avg_cost × quantity, quantized to cents."""
+
+    def test_cost_basis_persisted(self, session: Session, tmp_path: Path):
+        folder = _make_folder(tmp_path)
+        EtradeCsvAdapter(folder).run(session)
+
+        aapl = session.query(PositionSnapshot).filter_by(symbol="AAPL").one()
+        # qty 100.0000 × avg 140.0000 = 14000.00
+        assert aapl.cost_basis == Decimal("14000.00")
+        assert aapl.avg_cost_basis == Decimal("140.0000")
+
+        msft = session.query(PositionSnapshot).filter_by(symbol="MSFT").one()
+        # qty 2630.5850 × avg 333.9237 = 878472.7369... → quantized to cents.
+        expected = (Decimal("2630.5850") * Decimal("333.9237")).quantize(
+            Decimal("0.01")
+        )
+        assert msft.cost_basis == expected

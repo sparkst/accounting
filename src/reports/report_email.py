@@ -32,6 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.alerts.models import AlertDispatch
+from src.utils.constants import SPARKRY_CONTACT_EMAIL
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +49,10 @@ __all__ = [
 ]
 
 # REQ-FIX-API-004 pattern: a single FROM_ADDRESS constant, not repeated literals.
+# Default recipient uses the CONTROLLED sparkry.ai domain (the .com is not ours
+# — the grep-gate test bans it); production overrides via REPORT_TO_EMAIL.
 FROM_ADDRESS = "Travis Sparks <travis@sparkry.ai>"
-DEFAULT_TO_EMAIL = "Travis@sparkry.com"
+DEFAULT_TO_EMAIL = SPARKRY_CONTACT_EMAIL
 
 _EMAIL_RE = re.compile(
     r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+"

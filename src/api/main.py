@@ -36,6 +36,7 @@ from src.api.routes.tax_export import router as tax_export_router
 from src.api.routes.tax_year_locks import router as tax_year_locks_router
 from src.api.routes.transactions import router as transactions_router
 from src.api.routes.vendor_rules import router as vendor_rules_router
+from src.api.routes.wbr_ledger import router as wbr_ledger_router
 from src.classification.seed_rules import seed_vendor_rules
 from src.db.connection import SessionLocal, init_db
 from src.invoicing.seed_customers import seed_customers
@@ -171,6 +172,10 @@ app.include_router(brokerage_router, prefix="/api", dependencies=_auth)
 app.include_router(csv_import_router, prefix="/api", dependencies=_auth)
 app.include_router(transactions_router, prefix="/api", dependencies=_auth)
 app.include_router(ingest_router, prefix="/api")
+# WBR ledger-summary self-authenticates route-level with
+# require_api_or_ingest_key (browser API_KEY or n8n INGEST_API_KEY), so —
+# like ingest_router — it is registered WITHOUT dependencies=_auth.
+app.include_router(wbr_ledger_router, prefix="/api")
 # AR approve/dismiss self-authenticate (webhook secret + single-use token),
 # so — like ingest_router — they are registered WITHOUT dependencies=_auth.
 app.include_router(ar_router, prefix="/api")

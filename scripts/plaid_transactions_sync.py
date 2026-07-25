@@ -106,12 +106,20 @@ def main(argv: list[str] | None = None) -> int:
             r.error_code or "-",
         )
         # REQ-WBR-LED-014: per-account_id breakdown so ops can tell a known
-        # duplicate-Item mirror from a new account that still needs mapping.
+        # duplicate-Item mirror (safe, expected) from a new account that
+        # still needs mapping (a held cursor — P1-002/P1-c4f).
         if r.skipped_unknown_account:
             logger.warning(
                 "    %s skipped_unknown_account=%s",
                 r.institution_name,
                 dict(sorted(r.skipped_unknown_account.items())),
+            )
+        if r.unrecognized_account_ids:
+            logger.error(
+                "    %s unrecognized_account_ids=%s (cursor held; map to an "
+                "Account to clear)",
+                r.institution_name,
+                dict(sorted(r.unrecognized_account_ids.items())),
             )
     # Exit non-zero so launchd surfaces a failed/held-cursor sync to ops.
     # Any per-row failure (cursor held) OR any item not in a clean state

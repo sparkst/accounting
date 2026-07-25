@@ -48,6 +48,44 @@ logger = logging.getLogger(__name__)
 SOURCE = "plaid"
 _AUTO_THRESHOLD = 0.7
 
+# ── REQ-WBR-LED-014: duplicate-Item account allowlist ─────────────────────────
+#: account_ids Plaid returns under a DUPLICATE Item that mirrors a sibling
+#: Item's own accounts (the 2026-07-24 incident — see
+#: scripts/remediate_plaid_mirrors.py, which imports this SAME tuple so the
+#: ingest allowlist and the one-time remediation can never drift apart,
+#: P2-006). Transactions on these account_ids are skipped SILENTLY-BUT-COUNTED
+#: at ingest — this is the known-harmless case. ANY OTHER unrecognized
+#: account_id is treated as a genuinely NEW, not-yet-mapped account and raises
+#: instead (see process_added / UnrecognizedPlaidAccountError) — Plaid's
+#: /transactions/sync never re-delivers a passed cursor, so silently skipping
+#: an unrecognized-but-not-a-known-mirror account_id would be PERMANENT data
+#: loss for a newly-added card on an existing login.
+KNOWN_MIRROR_ACCOUNT_IDS = frozenset(
+    {
+        "rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB",
+        "Z0p7Yzg0MqI1x0rBjgnjs8zZnk6ek8F88QaKg",
+        "8wBN3pLwXKUVx51oRzERUnR9J0b40nFYY54X4",
+    }
+)
+
+
+class UnrecognizedPlaidAccountError(RuntimeError):
+    """A transaction's ``account_id`` is neither mapped to an Account for this
+    Item NOR a KNOWN_MIRROR_ACCOUNT_IDS entry (REQ-WBR-LED-014 case B: a
+    genuinely new account, not a known-harmless duplicate-Item mirror).
+
+    Raised (rather than skip-and-continue) so the caller's per-row savepoint
+    in ``sync_one_item`` counts this as a failure: the cursor is held (this
+    row is re-delivered next run once the account is mapped) and the daily
+    sync's OnFailure alert fires, instead of the transaction being silently
+    and permanently dropped.
+    """
+
+    def __init__(self, account_id: str) -> None:
+        self.account_id = account_id
+        super().__init__(f"unrecognized plaid account_id: {account_id!r}")
+
+
 # ── Credit-card payment legs (REQ-WBR-LED-015) ────────────────────────────────
 # Paying a card off produces TWO register rows: the credit landing on the card
 # account and the matching ACH debit leaving checking. Neither is P&L — they are
@@ -59,6 +97,31 @@ _AUTO_THRESHOLD = 0.7
 # Card side is deterministic from Plaid's own metadata.
 _CARD_PAYMENT_TXN_CODE = "payment"
 _CARD_PAYMENT_PFC_DETAILED = "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
+#: P1-d7e: Plaid's bare `transaction_code == "payment"` is a generic
+#: bank-channel taxonomy (any bill payment, not specifically a card payoff) —
+#: unscoped, it would reintroduce exactly the harm the bare-"AUTOPAY" name
+#: exclusion below guards against (a genuine deductible bill payment silently
+#: dropped from P&L/B&O). It is only trusted alongside one of these two extra
+#: signals: the Account is itself a credit-card account, OR Plaid's own PFC
+#: primary agrees this is a loan/card payment.
+_CREDIT_ACCOUNT_TYPE = "credit_card"
+_LOAN_PAYMENTS_PFC_PRIMARY = "LOAN_PAYMENTS"
+
+#: The exact field set a card-payment leg gets, whether newly ingested
+#: (`_make_card_payment_transaction`) or corrected by the one-time
+#: remediation (`scripts/remediate_plaid_mirrors.reclassify_card_payments`,
+#: which imports this same dict) — P2-007. These must never diverge, or a
+#: remediated row and a freshly-ingested one end up with two different shapes
+#: for the same logical condition: `deductible_pct` in particular is read
+#: directly (no direction filter) by src/reports/tax_forecast.py and
+#: src/export/basis.py. `confidence`/`status`/`review_reason` are
+#: INSERT-time-only (a remediated row keeps its existing confidence/status),
+#: so they live outside this shared dict.
+CARD_PAYMENT_DIRECTION_TAX_FIELDS: dict[str, Any] = {
+    "direction": Direction.TRANSFER.value,
+    "tax_category": None,
+    "deductible_pct": 0.0,
+}
 
 # Checking side carries none of that metadata (Plaid categorises the outbound
 # ACH inconsistently), so it is matched on the bank descriptor: a
@@ -66,6 +129,19 @@ _CARD_PAYMENT_PFC_DETAILED = "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
 # Every pattern names a card issuer explicitly. A bare "AUTOPAY" is deliberately
 # NOT a pattern — "VERIZON AUTOPAY" is a genuine deductible expense, and
 # matching it would silently drop it from P&L and B&O gross.
+#
+# P2-004: sparkry-crm-wbr2's `CARD_PAYMENT_NAME_RE`
+# (src/lib/server/wealth/wbr/constants.ts) independently matches
+# AUTOPAY/PAYMENT-THANK-YOU/ONLINE-PAYMENT name patterns as a DISPLAY-ONLY
+# fallback for weeks this adapter hasn't remediated yet — see that file's
+# comment for why it deliberately DOES match a bare "AUTOPAY" (a display-only
+# regression there is far less costly than a P&L exclusion here, since
+# `category === 'Transfer'` from THIS adapter is what actually excludes a row
+# from money-in/out; the CRM's regex only relabels a still-visible row). If
+# you add an issuer descriptor pattern here, consider whether the CRM's regex
+# needs a matching update — the two are intentionally NOT required to be
+# identical, but a card-payment shape that only ONE side recognizes is a
+# footnote/label inconsistency the reader could notice.
 CARD_PAYMENT_DESCRIPTOR_PATTERNS = (
     "ORIG CO NAME:AMERICAN EXPRESS",  # Amex pulling an ACH card payment
     "CREDIT CRD AUTOPAY",  # Chase "CHASE CREDIT CRD AUTOPAY PMT"
@@ -176,8 +252,10 @@ def _is_plaid_transfer_category(plaid_txn: Any) -> bool:
 def card_payment_signal(
     *,
     transaction_code: Any = None,
+    pfc_primary: Any = None,
     pfc_detailed: Any = None,
     descriptor_parts: Iterable[Any] = (),
+    account_type: Any = None,
 ) -> str | None:
     """Return the signal identifying a credit-card payment leg, else None.
 
@@ -186,10 +264,30 @@ def card_payment_signal(
     remediation script's dry-run table. Takes plain values (not a Plaid object)
     so the live adapter and the one-time remediation over stored ``raw_data``
     share one implementation.
+
+    P1-d7e: the bare ``transaction_code == "payment"`` signal is scoped — it
+    only counts alongside the Account itself being a credit-card account, OR
+    Plaid's own PFC primary agreeing this is a loan/card payment. Unscoped, it
+    is a generic bank-channel taxonomy (ANY bill payment, e.g. a utility
+    bill-pay from checking), not specific to a card payoff, and would
+    reintroduce the exact harm the bare-"AUTOPAY" descriptor exclusion below
+    already guards against: a genuine deductible expense silently dropped from
+    P&L / B&O gross. ``pfc_detailed`` and the issuer descriptors need no such
+    scoping — they are already specific enough on their own.
     """
     if (
         isinstance(transaction_code, str)
         and transaction_code.lower() == _CARD_PAYMENT_TXN_CODE
+        and (
+            (
+                isinstance(account_type, str)
+                and account_type.lower() == _CREDIT_ACCOUNT_TYPE
+            )
+            or (
+                isinstance(pfc_primary, str)
+                and pfc_primary.upper() == _LOAN_PAYMENTS_PFC_PRIMARY
+            )
+        )
     ):
         return f"transaction_code={_CARD_PAYMENT_TXN_CODE}"
     if (
@@ -220,33 +318,53 @@ def _pfc_detailed(pfc: Any) -> Any:
     return detailed
 
 
-def card_payment_signal_for_txn(plaid_txn: Any) -> str | None:
-    """``card_payment_signal`` applied to a Plaid SDK transaction object."""
+def _pfc_primary(pfc: Any) -> Any:
+    """Read ``personal_finance_category.primary`` from an object or a dict."""
+    if pfc is None:
+        return None
+    primary = getattr(pfc, "primary", None)
+    if primary is None and isinstance(pfc, dict):
+        primary = pfc.get("primary")
+    return primary
+
+
+def card_payment_signal_for_txn(plaid_txn: Any, *, account_type: Any = None) -> str | None:
+    """``card_payment_signal`` applied to a Plaid SDK transaction object.
+
+    ``account_type`` is the RESOLVED Account's ``account_type`` (e.g.
+    ``"credit_card"``) — callers pass it through from the Account they already
+    looked up (REQ-WBR-LED-014's ``account_index``), so this scoping never
+    requires an extra query.
+    """
+    pfc = getattr(plaid_txn, "personal_finance_category", None)
     return card_payment_signal(
         transaction_code=getattr(plaid_txn, "transaction_code", None),
-        pfc_detailed=_pfc_detailed(
-            getattr(plaid_txn, "personal_finance_category", None)
-        ),
+        pfc_primary=_pfc_primary(pfc),
+        pfc_detailed=_pfc_detailed(pfc),
         descriptor_parts=(
             getattr(plaid_txn, "name", None),
             getattr(plaid_txn, "original_description", None),
         ),
+        account_type=account_type,
     )
 
 
-def card_payment_signal_for_raw(raw: Any) -> str | None:
+def card_payment_signal_for_raw(raw: Any, *, account_type: Any = None) -> str | None:
     """``card_payment_signal`` applied to a stored ``Transaction.raw_data`` dict."""
     if not isinstance(raw, dict):
         return None
+    pfc = raw.get("personal_finance_category")
     return card_payment_signal(
         transaction_code=raw.get("transaction_code"),
-        pfc_detailed=_pfc_detailed(raw.get("personal_finance_category")),
+        pfc_primary=_pfc_primary(pfc),
+        pfc_detailed=_pfc_detailed(pfc),
         descriptor_parts=(raw.get("name"), raw.get("original_description")),
+        account_type=account_type,
     )
 
 
 def _make_card_payment_transaction(
-    fields: dict[str, Any], *, entity: str | None, payment_method: str | None
+    fields: dict[str, Any], *, entity: str | None, payment_method: str | None, signal: str
 ) -> Transaction:
     """Build a ``direction=transfer`` row for a credit-card payment leg.
 
@@ -259,15 +377,23 @@ def _make_card_payment_transaction(
     not P&L; that mirrors how scripts/remediate_misclassified_income.py records
     processor payouts. An unmapped entity still forces needs_review, matching
     the classified path.
+
+    P2-005: this short-circuits ``classify()`` — and therefore the Tier-1
+    VendorRule learning loop — entirely, so a human's corrective VendorRule
+    for this vendor can never override it. The matched ``signal`` is recorded
+    on ``raw_data._card_payment_signal`` (minimum fix per the review) so an
+    operator debugging "why didn't my rule apply" sees the row never reached
+    the classifier, rather than assuming their rule silently failed.
     """
     unmapped = entity is None
+    raw_data = fields.get("raw_data")
+    if isinstance(raw_data, dict):
+        fields = {**fields, "raw_data": {**raw_data, "_card_payment_signal": signal}}
     return Transaction(
         **fields,
         entity=entity,
         payment_method=payment_method,
-        direction=Direction.TRANSFER.value,
-        tax_category=None,
-        deductible_pct=0.0,
+        **CARD_PAYMENT_DIRECTION_TAX_FIELDS,
         confidence=1.0,
         status=(
             TransactionStatus.NEEDS_REVIEW.value if unmapped
@@ -280,19 +406,27 @@ def _make_card_payment_transaction(
 
 
 def make_transaction(
-    plaid_txn: Any, *, session: Session, entity: str | None, payment_method: str | None
+    plaid_txn: Any,
+    *,
+    session: Session,
+    entity: str | None,
+    payment_method: str | None,
+    account_type: Any = None,
 ) -> Transaction:
     """Build a classified Transaction. Entity is authoritative from the mapped
     account (overrides the classifier). Unmapped (entity None) -> needs_review.
 
     A credit-card payment leg short-circuits to a transfer row before the
     classifier runs (REQ-WBR-LED-015) — the specific rule wins over the generic
-    ``_is_plaid_transfer_category`` needs_review routing below.
+    ``_is_plaid_transfer_category`` needs_review routing below. ``account_type``
+    is the resolved Account's type (e.g. ``"credit_card"``), used to scope the
+    bare ``transaction_code == "payment"`` signal (P1-d7e).
     """
     fields = build_tx_fields(plaid_txn)
-    if card_payment_signal_for_txn(plaid_txn) is not None:
+    signal = card_payment_signal_for_txn(plaid_txn, account_type=account_type)
+    if signal is not None:
         return _make_card_payment_transaction(
-            fields, entity=entity, payment_method=payment_method
+            fields, entity=entity, payment_method=payment_method, signal=signal
         )
     tx = Transaction(
         **fields, entity=entity, payment_method=payment_method, confidence=0.0,
@@ -462,10 +596,67 @@ def _apply_update(session: Session, tx: Transaction, ptxn: Any) -> bool:
     return True
 
 
-def process_modified(session: Session, modified: list[Any]) -> int:
+def _apply_card_payment_reclassification(
+    session: Session, tx: Transaction, ptxn: Any, *, account_type: Any = None
+) -> bool:
+    """Reclassify ``tx`` direction=transfer if ``ptxn``'s metadata NOW signals a
+    card-payment leg (REQ-WBR-LED-015), auditing each field change.
+
+    P1-b2d: ``make_transaction`` only ever runs on the INSERT path, so a card
+    payment that first arrives PENDING (a generic "PAYMENT" descriptor, no
+    ``transaction_code``/PFC yet) is classified normally by the 3-tier engine
+    and keeps its income/expense direction and tax_category even after the
+    POSTED payload — carrying the card-payment signal — later reconciles onto
+    that same row. Plaid can also add/enrich this metadata on a plain
+    ``modified`` payload for an already-posted row. Factored out of
+    ``make_transaction`` so every mutation site (pending→posted promotion,
+    ``process_modified``, the ``plaid_readded`` reactivation branch) applies
+    the identical check and field set (``CARD_PAYMENT_DIRECTION_TAX_FIELDS`` —
+    P2-007) rather than each re-implementing it.
+
+    No-ops (returns False) for split_parent/rejected rows — those statuses are
+    structural/human-vetoed and must never be silently reclassified — and when
+    the row is already ``direction=transfer`` with a NULL ``tax_category``
+    (avoids a duplicate no-op AuditEvent on every subsequent sync).
+    """
+    if tx.status in (
+        TransactionStatus.SPLIT_PARENT.value,
+        TransactionStatus.REJECTED.value,
+    ):
+        return False
+    if (
+        tx.direction == Direction.TRANSFER.value
+        and tx.tax_category is None
+        and tx.deductible_pct == 0.0
+    ):
+        return False  # already reclassified — nothing to do
+    signal = card_payment_signal_for_txn(ptxn, account_type=account_type)
+    if signal is None:
+        return False
+    for field_name, new_value in CARD_PAYMENT_DIRECTION_TAX_FIELDS.items():
+        old_value = getattr(tx, field_name)
+        if old_value != new_value:
+            _audit_field_change(
+                session, tx, field=field_name, old_value=old_value, new_value=new_value
+            )
+            setattr(tx, field_name, new_value)
+    return True
+
+
+def process_modified(
+    session: Session, modified: list[Any], *, account_index: dict[str, Account] | None = None
+) -> int:
     """Refresh volatile fields on existing rows (amount/date/description/raw_data).
     Human classification on the row is preserved — _apply_update never touches
-    entity/tax_category/direction/status."""
+    entity/tax_category/direction/status.
+
+    P1-b2d: after refreshing, re-check the card-payment signal (Plaid can
+    enrich a row's metadata after posting) via ``account_index`` — the same
+    Item-scoped map ``process_added``/``sync_one_item`` already build — so a
+    card payment that only becomes recognizable on a `modified` payload is
+    still reclassified rather than permanently keeping its original
+    income/expense direction.
+    """
     updated = 0
     for ptxn in modified:
         row = _existing_by_source_id(session, ptxn.transaction_id)
@@ -484,6 +675,10 @@ def process_modified(session: Session, modified: list[Any]) -> int:
             continue
         if not _apply_update(session, row, ptxn):
             continue
+        acct = (account_index or {}).get(ptxn.account_id)
+        _apply_card_payment_reclassification(
+            session, row, ptxn, account_type=acct.account_type if acct else None
+        )
         session.flush()
         updated += 1
     return updated
@@ -613,8 +808,11 @@ class AddedCounts:
     reactivated (plaid_readded). Operators need the reactivated count separately
     so a reinstated row isn't invisible in the added metric.
 
-    ``skipped_unknown_account`` maps an unrecognised ``account_id`` to how many
-    of its transactions were skipped (REQ-WBR-LED-014)."""
+    ``skipped_unknown_account`` maps a KNOWN-MIRROR ``account_id`` (see
+    KNOWN_MIRROR_ACCOUNT_IDS) to how many of its transactions were skipped
+    silently-but-counted (REQ-WBR-LED-014 case A). Any OTHER unrecognized
+    account_id raises ``UnrecognizedPlaidAccountError`` instead (case B) —
+    see ``sync_one_item`` for how that's counted."""
 
     inserted: int = 0
     reactivated: int = 0
@@ -643,17 +841,27 @@ def process_added(
         # second Item mirrors accounts it does not own — under item-scoped
         # account_ids that miss this index. Ingesting them created a phantom
         # duplicate of every transaction (entity None, so the classifier
-        # guessed). Skip anything outside this Item's own accounts and count it
-        # per account_id so a genuinely NEW account shows up in the log line
-        # rather than being silently ingested. Checked before ANY other branch:
-        # a mirror must not promote a pending, reactivate a removed row, or
-        # insert.
+        # guessed). Checked before ANY other branch: a mirror must not promote
+        # a pending, reactivate a removed row, or insert.
+        #
+        # Two distinct cases, deliberately NOT treated the same (P1-002/
+        # P1-c4f): a KNOWN mirror (this Item's duplicate-login sibling) is
+        # skipped SILENTLY-BUT-COUNTED — safe, harmless, expected. Any OTHER
+        # unrecognized account_id is a genuinely NEW account Plaid returned
+        # under this Item that has no Account row yet — silently skipping that
+        # would be PERMANENT data loss (/transactions/sync never re-delivers a
+        # passed cursor), so it RAISES instead: the per-row savepoint in
+        # sync_one_item counts it as a failure, holding the cursor (this row
+        # is re-delivered once the account is mapped) and tripping the daily
+        # sync's OnFailure alert.
         acct = account_index.get(ptxn.account_id)
         if acct is None:
-            counts.skipped_unknown_account[ptxn.account_id] = (
-                counts.skipped_unknown_account.get(ptxn.account_id, 0) + 1
-            )
-            continue
+            if ptxn.account_id in KNOWN_MIRROR_ACCOUNT_IDS:
+                counts.skipped_unknown_account[ptxn.account_id] = (
+                    counts.skipped_unknown_account.get(ptxn.account_id, 0) + 1
+                )
+                continue
+            raise UnrecognizedPlaidAccountError(ptxn.account_id)
         existing = _existing_by_source_id(session, ptxn.transaction_id)
         if existing is not None:
             # Per-site split_parent guard, kept because it changes control flow:
@@ -692,6 +900,13 @@ def process_added(
                 _audit_status_change(
                     session, existing, old_status, TransactionStatus.NEEDS_REVIEW.value
                 )
+                # P1-b2d: the re-added payload may now carry the card-payment
+                # signal even if the original pre-removal row didn't (or
+                # predates the fix) — reclassify it the same as every other
+                # mutation site rather than leaving it income/expense.
+                _apply_card_payment_reclassification(
+                    session, existing, ptxn, account_type=acct.account_type
+                )
                 session.flush()
                 counts.reactivated += 1
             continue
@@ -722,6 +937,17 @@ def process_added(
                     continue
                 prior.source_id = ptxn.transaction_id
                 prior.source_hash = compute_source_hash(SOURCE, ptxn.transaction_id)
+                # P1-b2d: re-check the card-payment signal on the POSTED txn.
+                # A card payment routinely arrives PENDING first with only a
+                # generic "PAYMENT" descriptor (no transaction_code/PFC yet),
+                # so `make_transaction` classified it normally on insert; the
+                # signal only becomes visible once the posted payload lands
+                # here. Checked BEFORE the generic transfer-category recheck
+                # below (mirrors make_transaction's ordering: the specific
+                # card-payment rule wins over the generic one).
+                _apply_card_payment_reclassification(
+                    session, prior, ptxn, account_type=acct.account_type
+                )
                 # Re-evaluate transfer-category on the POSTED txn. A pending that
                 # carried a non-transfer PFC but posts as TRANSFER_IN/OUT would
                 # otherwise keep its prior status and slip through as
@@ -758,6 +984,7 @@ def process_added(
             session=session,
             entity=acct.entity,
             payment_method=acct.payment_method,
+            account_type=acct.account_type,
         )
         session.add(tx)
         session.flush()
@@ -777,10 +1004,16 @@ class TxItemResult:
     failed: int = 0
     superseded: int = 0
     error_code: str | None = None
-    #: REQ-WBR-LED-014 — account_id -> count of transactions skipped because the
-    #: account is not one this Item owns (mirror account, or a NEW account that
-    #: still needs mapping).
+    #: REQ-WBR-LED-014 case A — account_id -> count of transactions skipped
+    #: silently-but-counted because the account_id is a KNOWN mirror (a
+    #: duplicate Item's own login sibling; see KNOWN_MIRROR_ACCOUNT_IDS).
     skipped_unknown_account: dict[str, int] = field(default_factory=dict)
+    #: REQ-WBR-LED-014 case B (P1-002/P1-c4f) — account_id -> count of
+    #: transactions that failed because the account_id is NEITHER mapped to
+    #: an Account for this Item NOR a known mirror: a genuinely new,
+    #: not-yet-mapped account. Each occurrence is also counted in `failed`
+    #: (the cursor is held so these rows are re-delivered once mapped).
+    unrecognized_account_ids: dict[str, int] = field(default_factory=dict)
 
     @property
     def skipped_unknown_total(self) -> int:
@@ -825,6 +1058,22 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
                         result.skipped_unknown_account[acct_id] = (
                             result.skipped_unknown_account.get(acct_id, 0) + n
                         )
+            except UnrecognizedPlaidAccountError as exc:
+                # P1-002/P1-c4f: a genuinely new, unmapped account_id — count
+                # as a failure (holds the cursor so this row is re-delivered
+                # once the account is mapped) rather than the silent,
+                # unrecoverable drop the bare allowlist skip used to be.
+                result.failed += 1
+                result.unrecognized_account_ids[exc.account_id] = (
+                    result.unrecognized_account_ids.get(exc.account_id, 0) + 1
+                )
+                logger.error(
+                    "plaid tx add failed: unrecognized account_id %s (not a "
+                    "known mirror) — cursor held; map it to an Account to "
+                    "clear this",
+                    exc.account_id,
+                    extra={"plaid_item_id": item.id},
+                )
             except Exception:
                 result.failed += 1
                 logger.exception("plaid tx added failure",
@@ -833,7 +1082,9 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
         for ptxn in modified:
             try:
                 with session.begin_nested():
-                    result.modified += process_modified(session, [ptxn])
+                    result.modified += process_modified(
+                        session, [ptxn], account_index=account_index
+                    )
             except Exception:
                 result.failed += 1
         # Per-row savepoint isolation for removals (mirrors added/modified) so one
@@ -915,6 +1166,24 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
         log_row.records_failed = result.failed
         log_row.status = (IngestionStatus.PARTIAL_FAILURE.value if result.failed
                           else IngestionStatus.SUCCESS.value)
+        # P1-002/P1-c4f: persist the skip/unrecognized-account counts on the
+        # durable audit trail, not just a journald WARNING/ERROR log line that
+        # rotates out — `records_processed`/`records_failed` don't carry
+        # per-account_id detail, so without this the only trace of WHICH
+        # account_ids were involved is whatever's left in the log files.
+        detail_parts: list[str] = []
+        if result.skipped_unknown_account:
+            detail_parts.append(
+                "skipped_known_mirror_account="
+                f"{dict(sorted(result.skipped_unknown_account.items()))}"
+            )
+        if result.unrecognized_account_ids:
+            detail_parts.append(
+                "unrecognized_account_ids="
+                f"{dict(sorted(result.unrecognized_account_ids.items()))}"
+            )
+        if detail_parts:
+            log_row.error_detail = "; ".join(detail_parts)
 
     except RetryablePlaidError as exc:
         item.last_sync_status = ("institution_down"

@@ -31,6 +31,7 @@ from scripts.remediate_plaid_mirrors import (
     find_mirror_rows,
     remediate,
 )
+from src.api.routes.wbr_ledger import ledger_window_rows
 from src.models.audit_event import ENTITY_TYPE_ACCOUNT, AuditEvent
 from src.models.base import Base
 from src.models.brokerage import Account
@@ -70,6 +71,7 @@ def _tx(
     status: str = TransactionStatus.AUTO_CLASSIFIED.value,
     parent_id: str | None = None,
     source: str = Source.PLAID.value,
+    payment_method: str | None = None,
 ) -> Transaction:
     tx = Transaction(
         id=str(uuid.uuid4()),
@@ -86,6 +88,7 @@ def _tx(
         status=status,
         confidence=0.9,
         raw_data=raw_data,
+        payment_method=payment_method,
         parent_id=parent_id,
     )
     db.add(tx)
@@ -132,6 +135,39 @@ def test_all_three_mirror_account_ids_match(db: Session) -> None:
     assert len(remediate(db, apply=True).mirrors) == 3
 
 
+def test_unrecognized_mirror_candidate_is_reported_not_touched(db: Session) -> None:
+    """P2-006: an account_id that LOOKS mirror-shaped (a non-rejected plaid
+    row whose account_id matches no known Account) but is NOT in
+    MIRROR_ACCOUNT_IDS is drift since the point-in-time production audit —
+    reported so an operator can add it by hand, never silently rejected."""
+    drifted = _tx(
+        db, raw_data={"account_id": "acc_new_mirror_candidate", "name": "AMAZON MKTPL"}
+    )
+
+    result = remediate(db, apply=True)
+
+    assert result.mirrors == []
+    assert result.unrecognized_mirror_candidates == {"acc_new_mirror_candidate": 1}
+    db.refresh(drifted)
+    assert drifted.status == TransactionStatus.AUTO_CLASSIFIED.value  # untouched
+
+
+def test_row_matching_a_known_account_is_not_an_unrecognized_candidate(db: Session) -> None:
+    """A plaid row whose account_id IS a real, mapped Account is not mirror
+    activity at all — it must not show up as drift."""
+    db.add(Account(
+        broker="chase", account_number="****1234", account_name="Checking",
+        account_type=AccountType.CHECKING.value, entity=Entity.PERSONAL.value,
+        plaid_account_id="acc_real_mapped",
+    ))
+    db.commit()
+    _tx(db, raw_data={"account_id": "acc_real_mapped", "name": "STARBUCKS"})
+
+    result = remediate(db, apply=True)
+
+    assert result.unrecognized_mirror_candidates == {}
+
+
 def test_already_rejected_mirror_is_left_alone(db: Session) -> None:
     _tx(db, raw_data=_mirror_raw(), status=TransactionStatus.REJECTED.value)
     assert find_mirror_rows(db) == []
@@ -157,8 +193,24 @@ def test_split_mirror_rows_are_skipped_and_reported(db: Session) -> None:
 # ── REQ-WBR-LED-017: card-payment reclassification ───────────────────────────
 
 
+def _credit_card_account(db: Session, payment_method: str) -> Account:
+    """P1-d7e: `find_card_payment_rows` scopes the bare
+    `transaction_code == "payment"` signal to credit_card accounts (resolved
+    via the payment_method join, since a stored row has no account FK) — seed
+    one so the tests below model a REAL card-side payment leg."""
+    account = Account(
+        broker="amex", account_number="****9999", account_name="Amex",
+        account_type=AccountType.CREDIT_CARD.value, entity=Entity.PERSONAL.value,
+        payment_method=payment_method,
+    )
+    db.add(account)
+    db.commit()
+    return account
+
+
 def test_card_side_payment_credit_reclassified_to_transfer(db: Session) -> None:
     """The +1637.65 Amex credit that showed up as income in the WBR ledger."""
+    _credit_card_account(db, "amex_31004")
     card_leg = _tx(
         db,
         raw_data={"account_id": "acc_amex_31004", "name": "ONLINE PAYMENT - THANK YOU",
@@ -167,6 +219,7 @@ def test_card_side_payment_credit_reclassified_to_transfer(db: Session) -> None:
         date="2026-07-19",
         direction=Direction.INCOME.value,
         tax_category=TaxCategory.CONSULTING_INCOME.value,
+        payment_method="amex_31004",
     )
 
     result = remediate(db, apply=True)
@@ -175,6 +228,7 @@ def test_card_side_payment_credit_reclassified_to_transfer(db: Session) -> None:
     db.refresh(card_leg)
     assert card_leg.direction == Direction.TRANSFER.value
     assert card_leg.tax_category is None
+    assert card_leg.deductible_pct == 0.0
     # The amount is evidence from the source and is never rewritten.
     assert card_leg.amount == Decimal("1637.65")
 
@@ -299,6 +353,7 @@ def test_ambiguous_chase_6380_match_is_skipped_not_guessed(db: Session) -> None:
 
 
 def test_dry_run_writes_nothing(db: Session) -> None:
+    _credit_card_account(db, "amex")
     mirror = _tx(db, raw_data=_mirror_raw())
     card_leg = _tx(
         db,
@@ -306,6 +361,7 @@ def test_dry_run_writes_nothing(db: Session) -> None:
                   "transaction_code": "payment"},
         amount=Decimal("1637.65"),
         direction=Direction.INCOME.value,
+        payment_method="amex",
     )
 
     result = remediate(db, apply=False)
@@ -323,6 +379,7 @@ def test_dry_run_writes_nothing(db: Session) -> None:
 
 
 def test_every_field_change_writes_an_audit_event(db: Session) -> None:
+    _credit_card_account(db, "amex")
     mirror = _tx(db, raw_data=_mirror_raw())
     card_leg = _tx(
         db,
@@ -331,6 +388,7 @@ def test_every_field_change_writes_an_audit_event(db: Session) -> None:
         amount=Decimal("1637.65"),
         direction=Direction.INCOME.value,
         tax_category=TaxCategory.CONSULTING_INCOME.value,
+        payment_method="amex",
     )
 
     remediate(db, apply=True)
@@ -341,11 +399,18 @@ def test_every_field_change_writes_an_audit_event(db: Session) -> None:
     )
     assert mirror_fields == ["review_reason", "status"]
     card_events = db.query(AuditEvent).filter_by(transaction_id=card_leg.id).all()
-    assert sorted(e.field_changed for e in card_events) == ["direction", "tax_category"]
+    # P2-007: deductible_pct is now part of the shared field set the
+    # remediation and the live adapter both apply — this row's default
+    # (1.0, Transaction's model default) differs from the target 0.0, so it
+    # gets its own audited change alongside direction/tax_category.
+    assert sorted(e.field_changed for e in card_events) == [
+        "deductible_pct", "direction", "tax_category"
+    ]
     assert all(e.changed_by.startswith("remediation:") for e in card_events)
 
 
 def test_second_run_is_a_no_op(db: Session) -> None:
+    _credit_card_account(db, "amex")
     _tx(db, raw_data=_mirror_raw())
     _tx(
         db,
@@ -353,6 +418,7 @@ def test_second_run_is_a_no_op(db: Session) -> None:
                   "transaction_code": "payment"},
         amount=Decimal("1637.65"),
         direction=Direction.INCOME.value,
+        payment_method="amex",
     )
     db.add(Account(
         broker="chase", account_number="****6380", account_name="Chase Personal",
@@ -404,24 +470,23 @@ def test_one_bad_row_does_not_halt_the_batch(db: Session) -> None:
 def test_rejected_rows_drop_out_of_the_wbr_ledger(db: Session) -> None:
     """REQ-WBR-LED-005/016: the whole point of the remediation — a rejected
     mirror no longer reaches the ledger feed, so it can't double-count in the
-    week's money-in/money-out."""
+    week's money-in/money-out.
+
+    P2-h8d: calls the REAL query builder (``ledger_window_rows``, shared with
+    the accounting endpoint) rather than a hand-copied re-implementation of
+    its filter — a copy cannot catch drift between the two."""
+    from datetime import date as _date
+
     mirror = _tx(db, raw_data=_mirror_raw(), amount=Decimal("-238.03"),
                  date="2026-07-22")
     _tx(db, raw_data=_mapped_raw(), amount=Decimal("-238.03"), date="2026-07-22")
 
     def _ledger_rows() -> list[Transaction]:
-        """The endpoint's row filter (src/api/routes/wbr_ledger.py)."""
-        return (
-            db.query(Transaction)
-            .filter(
-                Transaction.date >= "2026-07-20",
-                Transaction.date <= "2026-07-26",
-                Transaction.status != TransactionStatus.REJECTED.value,
-                Transaction.entity == Entity.PERSONAL.value,
-                Transaction.amount.isnot(None),
-                Transaction.parent_id.is_(None),
-            )
-            .all()
+        return ledger_window_rows(
+            db,
+            start=_date(2026, 7, 20),
+            end=_date(2026, 7, 26),
+            entity=Entity.PERSONAL.value,
         )
 
     assert len(_ledger_rows()) == 2  # the duplicate is visible before remediation

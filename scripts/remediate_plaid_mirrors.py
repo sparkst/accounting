@@ -42,11 +42,16 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from src.adapters.plaid_transactions import card_payment_signal_for_raw
+from src.adapters.plaid_transactions import (
+    CARD_PAYMENT_DIRECTION_TAX_FIELDS,
+    KNOWN_MIRROR_ACCOUNT_IDS,
+    card_payment_signal_for_raw,
+)
 from src.db.connection import get_session
 from src.models.audit_event import ENTITY_TYPE_ACCOUNT, AuditEvent
 from src.models.brokerage import Account
@@ -59,11 +64,15 @@ logger = logging.getLogger("remediate_plaid_mirrors")
 #: accounts it does not own. Verified read-only against production on
 #: 2026-07-24: 17 / 19 / 14 rows respectively, every one a duplicate of a row
 #: already ingested under the correctly-mapped account.
-MIRROR_ACCOUNT_IDS = (
-    "rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB",
-    "Z0p7Yzg0MqI1x0rBjgnjs8zZnk6ek8F88QaKg",
-    "8wBN3pLwXKUVx51oRzERUnR9J0b40nFYY54X4",
-)
+#:
+#: P2-006: imported from ``plaid_transactions.KNOWN_MIRROR_ACCOUNT_IDS`` — the
+#: SAME tuple the ingest-side allowlist uses — rather than a second, hardcoded
+#: copy. Before this fix the two definitions could drift (a fourth mirror
+#: account_id added between the production audit and this run would be
+#: invisible to the script); ``find_mirror_rows`` below additionally reports
+#: any STRUCTURALLY-mirror-shaped account_id that ISN'T in this set, so drift
+#: is surfaced rather than silently under-remediated.
+MIRROR_ACCOUNT_IDS = tuple(sorted(KNOWN_MIRROR_ACCOUNT_IDS))
 
 MIRROR_REVIEW_REASON = "superseded_by_duplicate_plaid_item"
 
@@ -106,6 +115,13 @@ class RemediationResult:
     #: children). Surfaced so a human can resolve them by hand.
     skipped_splits: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    #: P2-006 — account_ids that are STRUCTURALLY mirror-shaped (a non-rejected
+    #: plaid row whose raw_data.account_id is not any known Account's
+    #: plaid_account_id) but are NOT in MIRROR_ACCOUNT_IDS. Reported, never
+    #: touched: this is drift between the point-in-time production audit and
+    #: the current run (e.g. a Chase account added since), and the operator
+    #: must decide whether to add it to the allowlist by hand.
+    unrecognized_mirror_candidates: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_changes(self) -> int:
@@ -144,7 +160,8 @@ def _audit_account(
 
 
 def _label(tx: Transaction) -> str:
-    return f"{tx.date} {str(tx.description or '')[:38]:38} {float(tx.amount or 0):>11.2f}"
+    amt = tx.amount or Decimal(0)
+    return f"{tx.date} {str(tx.description or '')[:38]:38} {amt:>11.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +186,44 @@ def find_mirror_rows(session: Session) -> list[Transaction]:
         .order_by(Transaction.date, Transaction.id)
         .all()
     )
+
+
+def find_unrecognized_mirror_candidates(session: Session) -> dict[str, int]:
+    """P2-006: account_ids that are STRUCTURALLY mirror-shaped but not listed.
+
+    The live adapter defines "mirror" structurally (an ``account_id`` absent
+    from the syncing Item's own account index — see
+    ``src.adapters.plaid_transactions.process_added``); this script instead
+    matches the hardcoded ``MIRROR_ACCOUNT_IDS`` exact-match scope so it can
+    NEVER over-reject a row it hasn't been told about. Those two definitions
+    of the same concept can drift (the module docstring's own point-in-time
+    audit could be stale by the time this runs). Rather than silently
+    under-remediating a fourth mirror account_id, this reports it: any
+    non-rejected ``source=plaid`` row whose ``raw_data.account_id`` is NOT any
+    known ``Account.plaid_account_id`` AND NOT already in
+    ``MIRROR_ACCOUNT_IDS`` is a candidate the operator should look at by hand.
+    """
+    known_account_ids = {
+        a.plaid_account_id
+        for a in session.query(Account).filter(Account.plaid_account_id.isnot(None)).all()
+    }
+    rows = (
+        session.query(Transaction)
+        .filter(
+            Transaction.source == Source.PLAID.value,
+            Transaction.status != _REJECTED,
+        )
+        .all()
+    )
+    counts: dict[str, int] = {}
+    for tx in rows:
+        account_id = (tx.raw_data or {}).get("account_id")
+        if not account_id:
+            continue
+        if account_id in known_account_ids or account_id in MIRROR_ACCOUNT_IDS:
+            continue
+        counts[account_id] = counts.get(account_id, 0) + 1
+    return counts
 
 
 def reject_mirror_rows(
@@ -212,9 +267,26 @@ def reject_mirror_rows(
 def find_card_payment_rows(session: Session) -> list[tuple[Transaction, str]]:
     """Non-rejected plaid rows matching the REQ-WBR-LED-015 card-payment rules.
 
-    Rows already at ``direction="transfer"`` with a NULL ``tax_category`` are
-    excluded in SQL, which is what makes a second run report zero changes.
+    Rows already fully reclassified (every field in
+    ``CARD_PAYMENT_DIRECTION_TAX_FIELDS`` already set) are excluded in SQL,
+    which is what makes a second run report zero changes — P2-007:
+    ``deductible_pct`` is part of that check too, so a row a PRE-P2-007 run of
+    this script already reclassified (direction/tax_category only, back when
+    deductible_pct wasn't part of the shared field set) is still a candidate
+    here and gets its deductible_pct corrected on this run.
+
+    ``account_type`` (P1-d7e scoping for the bare ``transaction_code ==
+    "payment"`` signal) is resolved via the register's only account join key —
+    ``Transaction.payment_method`` → ``Account.payment_method`` — since a
+    stored row has no account FK. A row with no payment_method, or one that
+    doesn't match any Account, gets ``account_type=None`` (transaction_code
+    alone won't match; the PFC-detailed and descriptor signals are unaffected).
     """
+    account_type_by_payment_method: dict[str, str] = {
+        a.payment_method: a.account_type
+        for a in session.query(Account).filter(Account.payment_method.isnot(None)).all()
+        if a.payment_method is not None
+    }
     candidates = (
         session.query(Transaction)
         .filter(
@@ -224,6 +296,7 @@ def find_card_payment_rows(session: Session) -> list[tuple[Transaction, str]]:
                 Transaction.direction != Direction.TRANSFER.value,
                 Transaction.direction.is_(None),
                 Transaction.tax_category.isnot(None),
+                Transaction.deductible_pct != 0.0,
             ),
         )
         .order_by(Transaction.date, Transaction.id)
@@ -231,7 +304,8 @@ def find_card_payment_rows(session: Session) -> list[tuple[Transaction, str]]:
     )
     matched: list[tuple[Transaction, str]] = []
     for tx in candidates:
-        signal = card_payment_signal_for_raw(tx.raw_data)
+        account_type = account_type_by_payment_method.get(tx.payment_method or "")
+        signal = card_payment_signal_for_raw(tx.raw_data, account_type=account_type)
         if signal is not None:
             matched.append((tx, signal))
     return matched
@@ -240,7 +314,9 @@ def find_card_payment_rows(session: Session) -> list[tuple[Transaction, str]]:
 def reclassify_card_payments(
     session: Session, rows: list[tuple[Transaction, str]], result: RemediationResult
 ) -> None:
-    """Set ``direction=transfer`` / ``tax_category=NULL``. Amount is NOT touched."""
+    """Apply CARD_PAYMENT_DIRECTION_TAX_FIELDS (direction/tax_category/
+    deductible_pct — P2-007, shared with the live adapter's INSERT path so the
+    two can never diverge again). Amount is NOT touched."""
     for tx, signal in rows:
         if tx.status == _SPLIT_PARENT or tx.parent_id is not None:
             # Re-directing a parent without its children (or vice versa) would
@@ -249,19 +325,15 @@ def reclassify_card_payments(
             continue
         try:
             with session.begin_nested():
-                old_direction, old_category = tx.direction, tx.tax_category
-                if old_direction != Direction.TRANSFER.value:
-                    _audit_transaction(
-                        session, tx, field_changed="direction",
-                        old=old_direction, new=Direction.TRANSFER.value,
-                    )
-                if old_category is not None:
-                    _audit_transaction(
-                        session, tx, field_changed="tax_category",
-                        old=old_category, new=None,
-                    )
-                tx.direction = Direction.TRANSFER.value
-                tx.tax_category = None
+                old_direction = tx.direction
+                for field_name, new_value in CARD_PAYMENT_DIRECTION_TAX_FIELDS.items():
+                    old_value = getattr(tx, field_name)
+                    if old_value != new_value:
+                        _audit_transaction(
+                            session, tx, field_changed=field_name,
+                            old=old_value, new=new_value,
+                        )
+                        setattr(tx, field_name, new_value)
                 session.flush()
             result.card_payments.append(
                 Change(_label(tx), f"{signal} status={tx.status}", "direction",
@@ -352,6 +424,10 @@ def remediate(session: Session, *, apply: bool = False) -> RemediationResult:
     _force_real_transaction(session)
     result = RemediationResult()
     reject_mirror_rows(session, find_mirror_rows(session), result)
+    # P2-006: report (never touch) any account_id that LOOKS like a mirror
+    # structurally but isn't in the hardcoded MIRROR_ACCOUNT_IDS scope — drift
+    # since the point-in-time production audit, surfaced instead of missed.
+    result.unrecognized_mirror_candidates = find_unrecognized_mirror_candidates(session)
     reclassify_card_payments(session, find_card_payment_rows(session), result)
     backfill_chase_6380_payment_method(session, result)
     if apply:
@@ -390,6 +466,15 @@ def main(argv: list[str] | None = None) -> int:
     _print_section("Account payment_method backfilled (REQ-WBR-LED-017)",
                    result.accounts)
 
+    if result.unrecognized_mirror_candidates:
+        print(
+            f"\nUnrecognised mirror candidate(s), NOT touched "
+            f"({len(result.unrecognized_mirror_candidates)}): drift from the "
+            "point-in-time production audit — add to MIRROR_ACCOUNT_IDS by "
+            "hand after confirming these are duplicate-Item rows:"
+        )
+        for account_id, count in sorted(result.unrecognized_mirror_candidates.items()):
+            print(f"  {account_id}: {count} row(s)")
     if result.skipped_splits:
         print(f"\nSkipped, needs a human: {len(result.skipped_splits)}")
         for line in result.skipped_splits:

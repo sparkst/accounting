@@ -20,23 +20,40 @@ REQ-ID: REQ-WBR-LED-010  Income-direction rows stored negative are surfaced
                          positive (mirrors TransactionOut.fix_income_sign).
 REQ-ID: REQ-WBR-LED-011  NULL-amount rows and split children (parent_id set)
                          are excluded so totals never double-count.
+REQ-ID: REQ-WBR-LED-012  direction=transfer rows stay visible in the ledger
+                         list (category "Transfer") but are EXCLUDED from
+                         inflow_total/outflow_total.
+REQ-ID: REQ-WBR-LED-013  Ingest-key entity scope: INGEST_API_KEY may only
+                         query entity=personal (403 otherwise); full API_KEY
+                         may query any entity. week_end is bounded to no more
+                         than 120 days old and never in the future (422).
+
+Golden-date table for ``most_recent_sunday`` (round-2 fix directive P1-a1b —
+the most recent Sunday STRICTLY BEFORE the reference date, in
+America/Los_Angeles; n8n's compute-week-end.js semantics are authoritative).
+The identical table is mirrored in sparkry-crm-wbr's dates.test.ts and
+n8n-render's compute-week-end.js tests.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Generator
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
-from src.api.routes.wbr_ledger import most_recent_sunday
+from src.api.routes import wbr_ledger as wbr_ledger_module
+from src.api.routes.wbr_ledger import WbrLedgerSummary, most_recent_sunday
 from src.models.base import Base
 from src.models.enums import (
     ConfirmedBy,
@@ -123,6 +140,22 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]
 URL = "/api/ingest/wbr/ledger-summary"
 WEEK_END = "2026-07-26"  # a Sunday
 AUTH = {"X-Api-Key": _IK}
+
+
+@pytest.fixture(autouse=True)
+def _freeze_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze "today" (LA calendar date) to `WEEK_END` for every test in this
+    module, decoupling the suite from the real wall-clock date now that the
+    endpoint rejects any `week_end` in the future (round-2 fix directives
+    P1-a1b/P1-a1c/REQ-WBR-LED-013). `WEEK_END` == the frozen "today" sits
+    exactly on the "equal to today is allowed" boundary, so every existing
+    test that passes `WEEK_END` (or omits `week_end` and expects the most
+    recent Sunday before it) keeps working regardless of when the suite
+    actually runs. Individual tests that need a different "today" (the
+    golden-date table, the 120-day boundary tests, the new future-date
+    tests) call `monkeypatch.setattr(..., "_today_la", ...)` again inside
+    the test body, which overrides this default."""
+    monkeypatch.setattr(wbr_ledger_module, "_today_la", lambda: date(2026, 7, 26))
 
 
 def _make_tx(
@@ -255,7 +288,8 @@ class TestAuth:
         assert r.status_code == 401
 
     def test_accepts_ingest_key(self, client: TestClient) -> None:
-        """REQ-ID: REQ-WBR-LED-002 — n8n's INGEST_API_KEY is accepted."""
+        """REQ-ID: REQ-WBR-LED-002 — n8n's INGEST_API_KEY is accepted for the
+        default entity=personal."""
         r = client.get(URL, headers={"X-Api-Key": _IK}, params={"week_end": WEEK_END})
         assert r.status_code == 200
 
@@ -263,6 +297,50 @@ class TestAuth:
         """REQ-ID: REQ-WBR-LED-002 — the browser API_KEY is accepted too."""
         r = client.get(URL, headers={"X-Api-Key": _AK}, params={"week_end": WEEK_END})
         assert r.status_code == 200
+
+    def test_ingest_key_rejected_for_non_personal_entity(
+        self, client: TestClient
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — INGEST_API_KEY + entity=sparkry -> 403."""
+        r = client.get(
+            URL,
+            headers={"X-Api-Key": _IK},
+            params={"week_end": WEEK_END, "entity": "sparkry"},
+        )
+        assert r.status_code == 403
+
+    def test_ingest_key_rejected_for_blackline_entity(
+        self, client: TestClient
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — INGEST_API_KEY + entity=blackline -> 403."""
+        r = client.get(
+            URL,
+            headers={"X-Api-Key": _IK},
+            params={"week_end": WEEK_END, "entity": "blackline"},
+        )
+        assert r.status_code == 403
+
+    def test_ingest_key_explicit_personal_entity_allowed(
+        self, client: TestClient
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — INGEST_API_KEY + explicit entity=personal
+        (not just the default) is still allowed."""
+        r = client.get(
+            URL,
+            headers={"X-Api-Key": _IK},
+            params={"week_end": WEEK_END, "entity": "personal"},
+        )
+        assert r.status_code == 200
+
+    def test_api_key_allowed_for_any_entity(self, client: TestClient) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — the full API_KEY may query any entity."""
+        for entity in ("sparkry", "blackline", "personal"):
+            r = client.get(
+                URL,
+                headers={"X-Api-Key": _AK},
+                params={"week_end": WEEK_END, "entity": entity},
+            )
+            assert r.status_code == 200, (entity, r.text)
 
 
 # ---------------------------------------------------------------------------
@@ -281,30 +359,107 @@ class TestWindow:
         assert names == {"on-end", "on-start"}
 
     def test_default_week_end_is_most_recent_sunday(self, client: TestClient) -> None:
-        """REQ-ID: REQ-WBR-LED-004 — omitted week_end defaults to last Sunday."""
+        """REQ-ID: REQ-WBR-LED-004 — omitted week_end defaults to the most
+        recent Sunday STRICTLY BEFORE today, in America/Los_Angeles. "Today"
+        is frozen by the `_freeze_today` autouse fixture rather than the real
+        wall clock, so this test is deterministic regardless of when the
+        suite runs."""
         r = client.get(URL, headers=AUTH)
         assert r.status_code == 200, r.text
-        expected = most_recent_sunday(date.today()).isoformat()
+        expected = most_recent_sunday(wbr_ledger_module._today_la()).isoformat()
         assert r.json()["week_end"] == expected
 
     @pytest.mark.parametrize(
-        ("today", "sunday"),
+        ("reference", "sunday"),
         [
-            (date(2026, 7, 26), date(2026, 7, 26)),  # Sunday -> itself
+            # Sunday -> the PRIOR Sunday (week not closed yet), NOT itself —
+            # round-2 fix directive P1-a1b; n8n's compute-week-end.js agrees.
+            (date(2026, 7, 26), date(2026, 7, 19)),  # Sunday
             (date(2026, 7, 27), date(2026, 7, 26)),  # Monday
-            (date(2026, 7, 30), date(2026, 7, 26)),  # Thursday
+            (date(2026, 7, 29), date(2026, 7, 26)),  # Wednesday (mid-week)
             (date(2026, 8, 1), date(2026, 7, 26)),  # Saturday
+            (date(2026, 3, 8), date(2026, 3, 1)),  # Sunday, US DST spring-forward day
+            (date(2026, 11, 1), date(2026, 10, 25)),  # Sunday, US DST fall-back day
         ],
     )
-    def test_most_recent_sunday(self, today: date, sunday: date) -> None:
-        """REQ-ID: REQ-WBR-LED-004 — helper handles every weekday."""
-        assert most_recent_sunday(today) == sunday
+    def test_most_recent_sunday(self, reference: date, sunday: date) -> None:
+        """REQ-ID: REQ-WBR-LED-004 — golden-date table shared across all three
+        repos (round-2 fix directive P1-a1b): helper handles every weekday
+        plus DST boundary Sundays with strictly-before semantics."""
+        assert most_recent_sunday(reference) == sunday
+
+    def test_utc_evening_still_resolves_to_la_calendar_sunday(self) -> None:
+        """Golden case: 2026-07-27T05:30:00Z is 2026-07-26 22:30 PT — already
+        Monday in UTC but still Sunday evening in America/Los_Angeles. The
+        LA calendar date must be used, so `most_recent_sunday` still treats
+        it as a Sunday reference (week not closed) and returns the PRIOR
+        Sunday, not the coming one."""
+        utc_instant = datetime(2026, 7, 27, 5, 30, tzinfo=ZoneInfo("UTC"))
+        la_date = utc_instant.astimezone(ZoneInfo("America/Los_Angeles")).date()
+        assert la_date == date(2026, 7, 26)
+        assert most_recent_sunday(la_date) == date(2026, 7, 19)
+
+    def test_default_uses_la_calendar_date_not_utc(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-004 — the endpoint's default resolution is
+        pinned to the LA calendar date, exercised end-to-end by monkeypatching
+        `_today_la` to the UTC/LA boundary-evening golden case above."""
+        monkeypatch.setattr(wbr_ledger_module, "_today_la", lambda: date(2026, 7, 26))
+        r = client.get(URL, headers=AUTH)
+        assert r.status_code == 200, r.text
+        assert r.json()["week_end"] == "2026-07-19"
 
     def test_malformed_week_end_rejected(self, client: TestClient) -> None:
         """REQ-ID: REQ-WBR-LED-009 — non-ISO week_end -> 422."""
         for bad in ("07/26/2026", "2026-13-01", "sunday", "2026-07-26T00:00:00"):
             r = client.get(URL, headers=AUTH, params={"week_end": bad})
             assert r.status_code == 422, f"{bad!r}: {r.status_code}"
+
+    def test_week_end_older_than_120_days_rejected(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — week_end more than 120 days old -> 422,
+        regardless of which credential is used."""
+        monkeypatch.setattr(wbr_ledger_module, "_today_la", lambda: date(2026, 7, 26))
+        too_old = (date(2026, 7, 26) - timedelta(days=121)).isoformat()
+        r = client.get(URL, headers=AUTH, params={"week_end": too_old})
+        assert r.status_code == 422
+        r = client.get(URL, headers={"X-Api-Key": _AK}, params={"week_end": too_old})
+        assert r.status_code == 422
+
+    def test_week_end_exactly_120_days_old_allowed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — exactly 120 days old is still allowed."""
+        monkeypatch.setattr(wbr_ledger_module, "_today_la", lambda: date(2026, 7, 26))
+        exactly_120 = (date(2026, 7, 26) - timedelta(days=120)).isoformat()
+        r = client.get(URL, headers=AUTH, params={"week_end": exactly_120})
+        assert r.status_code == 200, r.text
+
+    def test_week_end_in_the_future_rejected(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — week_end after today (LA calendar date)
+        -> 422, regardless of which credential is used (round-2 fix
+        directives P1-a1b/P1-a1c: "never in the future")."""
+        monkeypatch.setattr(wbr_ledger_module, "_today_la", lambda: date(2026, 7, 26))
+        tomorrow = (date(2026, 7, 26) + timedelta(days=1)).isoformat()
+        r = client.get(URL, headers=AUTH, params={"week_end": tomorrow})
+        assert r.status_code == 422
+        r = client.get(URL, headers={"X-Api-Key": _AK}, params={"week_end": tomorrow})
+        assert r.status_code == 422
+
+    def test_week_end_equal_to_today_allowed(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-013 — week_end == today (LA calendar date) is
+        the boundary and must still be allowed; only strictly-future dates
+        are rejected."""
+        monkeypatch.setattr(wbr_ledger_module, "_today_la", lambda: date(2026, 7, 26))
+        r = client.get(URL, headers=AUTH, params={"week_end": "2026-07-26"})
+        assert r.status_code == 200, r.text
+
 
 
 # ---------------------------------------------------------------------------
@@ -338,14 +493,22 @@ class TestFilters:
         assert names == ["personal"]
 
     def test_explicit_entity_param(self, client: TestClient) -> None:
-        """REQ-ID: REQ-WBR-LED-006 — ?entity=sparkry honored."""
+        """REQ-ID: REQ-WBR-LED-006 — ?entity=sparkry honored (under the full
+        API_KEY; the ingest key is scoped to entity=personal only, see
+        REQ-WBR-LED-013 / TestAuth.test_ingest_key_rejected_for_non_personal_entity)."""
         _make_tx(description="personal", amount=Decimal("-10.00"))
         _make_tx(
             description="business",
             amount=Decimal("-20.00"),
             entity=Entity.SPARKRY.value,
         )
-        body = _get(client, entity="sparkry")
+        r = client.get(
+            URL,
+            headers={"X-Api-Key": _AK},
+            params={"week_end": WEEK_END, "entity": "sparkry"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
         assert [t["name"] for t in body["transactions"]] == ["business"]
         assert body["entity"] == "sparkry"
 
@@ -451,3 +614,118 @@ class TestSignConvention:
         assert row["amount"] == 250.00
         assert body["inflow_total"] == 250.00
         assert body["outflow_total"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Transfers (round-2 fix directive P1-tfr3)
+# ---------------------------------------------------------------------------
+
+
+class TestTransfers:
+    def test_transfer_row_visible_with_transfer_category(
+        self, client: TestClient
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-012 — a transfer row still appears in
+        `transactions`, labeled category "Transfer"."""
+        _make_tx(
+            description="Internal Move to Savings",
+            amount=Decimal("-500.00"),
+            direction=Direction.TRANSFER.value,
+            tax_category=None,
+        )
+        body = _get(client)
+        (row,) = body["transactions"]
+        assert row["name"] == "Internal Move to Savings"
+        assert row["category"] == "Transfer"
+        assert row["amount"] == -500.00
+
+    def test_transfer_row_excluded_from_inflow_outflow_totals(
+        self, client: TestClient
+    ) -> None:
+        """REQ-ID: REQ-WBR-LED-012 — a positive AND a negative transfer row
+        contribute $0 to inflow_total/outflow_total, even though a real
+        expense/income in the same window is still counted normally."""
+        _make_tx(
+            description="Transfer Out",
+            amount=Decimal("-1000.00"),
+            direction=Direction.TRANSFER.value,
+            tax_category=None,
+        )
+        _make_tx(
+            description="Transfer In",
+            amount=Decimal("1000.00"),
+            direction=Direction.TRANSFER.value,
+            tax_category=None,
+        )
+        _make_tx(
+            description="Real Expense",
+            amount=Decimal("-25.00"),
+            direction=Direction.EXPENSE.value,
+        )
+        _make_tx(
+            description="Real Income",
+            amount=Decimal("500.00"),
+            direction=Direction.INCOME.value,
+            tax_category=None,
+        )
+        body = _get(client)
+        assert body["outflow_total"] == 25.00
+        assert body["inflow_total"] == 500.00
+        names = {t["name"] for t in body["transactions"]}
+        assert names == {"Transfer Out", "Transfer In", "Real Expense", "Real Income"}
+
+
+# ---------------------------------------------------------------------------
+# Shared cross-repo golden fixture (round-2 fix directive P2-g7h)
+# ---------------------------------------------------------------------------
+
+_GOLDEN_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "tests"
+    / "fixtures"
+    / "wbr-golden"
+    / "wbr-ledger-golden.json"
+)
+
+
+class TestGoldenFixture:
+    """REQ-ID: REQ-WBR-LED-001/012 — the WbrLedgerSummary response model
+    accepts the identical golden fixture shared with sparkry-crm-wbr and
+    n8n-render, so the three-repo contract is machine-checked against one
+    file instead of three independently hand-written fixtures that can
+    silently drift."""
+
+    def test_golden_fixture_validates_against_the_response_model(self) -> None:
+        raw = json.loads(_GOLDEN_PATH.read_text())
+        # Strip the doc-only _comment key before validating against the
+        # strict (extra-forbidding by default in pydantic v2? no — pydantic
+        # allows extra unless configured) response model.
+        payload = {k: v for k, v in raw.items() if k != "_comment"}
+        parsed = WbrLedgerSummary.model_validate(payload)
+        assert parsed.week_end == "2026-07-26"
+        assert parsed.entity == "personal"
+        assert parsed.truncated is True
+        assert len(parsed.transactions) == 7
+
+    def test_golden_fixture_transfer_rows_are_present_but_excluded_from_totals(
+        self,
+    ) -> None:
+        """The fixture's transfer pair (+/- 800) must NOT be counted in
+        inflow_total/outflow_total (round-2 fix directive P1-tfr3) — this
+        pins the fixture's own internal consistency with that rule so a
+        future edit to the fixture can't silently drift from it."""
+        raw = json.loads(_GOLDEN_PATH.read_text())
+        transfer_rows = [t for t in raw["transactions"] if t["category"] == "Transfer"]
+        assert len(transfer_rows) == 2
+        non_transfer_income = sum(
+            t["amount"]
+            for t in raw["transactions"]
+            if t["category"] != "Transfer" and t["amount"] > 0
+        )
+        non_transfer_expense = sum(
+            -t["amount"]
+            for t in raw["transactions"]
+            if t["category"] != "Transfer" and t["amount"] < 0
+        )
+        assert non_transfer_income == raw["inflow_total"]
+        assert round(non_transfer_expense, 2) == raw["outflow_total"]

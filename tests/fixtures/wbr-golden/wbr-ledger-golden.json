@@ -1,0 +1,52 @@
+{
+  "_comment": "Shared cross-repo golden fixture (round-2 fix directive P2-g7h) for the WBR ledger-summary JSON contract: {week_end, transactions:[{date,name,category,amount}], inflow_total, outflow_total, entity, truncated}. Identical byte-for-byte in accounting-wbr-ledger, sparkry-crm-wbr, and n8n-render — each repo asserts its own side of the contract against this one file rather than three independently hand-written fixtures that can silently drift. Includes: a transfer pair (excluded from inflow_total/outflow_total per P1-tfr3), truncated=true, and a mixed positive/negative amount set.",
+  "week_end": "2026-07-26",
+  "entity": "personal",
+  "truncated": true,
+  "inflow_total": 5200.0,
+  "outflow_total": 3654.32,
+  "transactions": [
+    {
+      "date": "2026-07-20",
+      "name": "Payroll — Cardinal Health Direct Deposit",
+      "category": "income",
+      "amount": 5000.0
+    },
+    {
+      "date": "2026-07-21",
+      "name": "Internal transfer to brokerage",
+      "category": "Transfer",
+      "amount": -800.0
+    },
+    {
+      "date": "2026-07-21",
+      "name": "Internal transfer from checking",
+      "category": "Transfer",
+      "amount": 800.0
+    },
+    {
+      "date": "2026-07-22",
+      "name": "Whole Foods Market #4471",
+      "category": "Groceries",
+      "amount": -284.5
+    },
+    {
+      "date": "2026-07-23",
+      "name": "Mortgage",
+      "category": "housing",
+      "amount": -3200.0
+    },
+    {
+      "date": "2026-07-24",
+      "name": "Interest income",
+      "category": "income",
+      "amount": 200.0
+    },
+    {
+      "date": "2026-07-25",
+      "name": "Gas station",
+      "category": "Auto",
+      "amount": -169.82
+    }
+  ]
+}

@@ -772,13 +772,15 @@ scorecard email); IDs use the `-LED-` infix to avoid colliding with that set.
 | REQ-ID | Requirement |
 |--------|-------------|
 | REQ-WBR-LED-001 | `GET /api/ingest/wbr/ledger-summary` returns `{week_end, transactions[{date, name, category, amount}], inflow_total, outflow_total, entity, truncated}`; amounts signed per DB convention (income +, expense −); `category` = tax_category, else direction, else `uncategorized`. |
-| REQ-WBR-LED-002 | Auth mirrors the ingest routes exactly: route-level `require_api_or_ingest_key` (`X-Api-Key` = browser `API_KEY` or n8n `INGEST_API_KEY`); 401 otherwise. |
+| REQ-WBR-LED-002 | Auth mirrors the ingest routes: route-level `require_api_or_ingest_key` (`X-Api-Key` = browser `API_KEY` or n8n `INGEST_API_KEY`); 401 without a valid key. The dependency reports WHICH credential matched so the route can scope by it — see REQ-WBR-LED-013 (the machine `INGEST_API_KEY` is not equivalent to the full `API_KEY` on this route). |
 | REQ-WBR-LED-003 | Window is the 7 calendar days ending `week_end` inclusive (`[week_end − 6d, week_end]`). |
-| REQ-WBR-LED-004 | `week_end` defaults to the most recent Sunday (today when today is a Sunday). |
+| REQ-WBR-LED-004 | `week_end` defaults to the most recent Sunday STRICTLY BEFORE the reference date (today's own Sunday does NOT map to itself — the week hasn't closed yet), computed against the America/Los_Angeles calendar date. Round-2 fix directive P1-a1b; n8n's `compute-week-end.js` semantics are authoritative and mirrored verbatim (golden-date table incl. Sunday/Monday/mid-week/Saturday/DST-boundary cases in `test_wbr_ledger.py`, plus the same table in sparkry-crm-wbr and n8n-render). |
 | REQ-WBR-LED-005 | `status="rejected"` transactions are excluded (never deleted, per register invariants). |
-| REQ-WBR-LED-006 | Entity filter defaults to `personal`; explicit `entity=` honored; unknown entity → 422. |
+| REQ-WBR-LED-006 | Entity filter defaults to `personal`; explicit `entity=` honored (subject to the ingest-key scope in REQ-WBR-LED-013); unknown entity → 422. |
 | REQ-WBR-LED-007 | Rows sorted by absolute amount descending, capped at 40 with `truncated=true` when capped; `inflow_total`/`outflow_total` always cover the full uncapped window. |
 | REQ-WBR-LED-008 | `inflow_total`/`outflow_total` are positive 2dp numbers computed with `Decimal(str(x))` end-to-end (quantized at the response boundary; no float drift). |
 | REQ-WBR-LED-009 | Malformed `week_end` (non-`YYYY-MM-DD`) → 422. |
 | REQ-WBR-LED-010 | Income-direction rows stored negative (raw Gmail data) are surfaced positive — the same correction as `TransactionOut.fix_income_sign`; totals count them as inflow. |
 | REQ-WBR-LED-011 | NULL-amount rows and split children (`parent_id` set) are excluded so a split never double-counts against its parent. |
+| REQ-WBR-LED-012 | `direction=transfer` rows stay visible in `transactions` (category `"Transfer"`) but are EXCLUDED from `inflow_total`/`outflow_total`, so an internal account-to-account move can't inflate the "money in & out" headline. Round-2 fix directive P1-tfr3. |
+| REQ-WBR-LED-013 | Ingest-key read scope (round-2 fix directive P1-a1c): when the caller authenticated with `INGEST_API_KEY`, `entity` must be `personal` — any other value → 403. The full `API_KEY` may query any entity. `week_end` is bounded to no more than 120 days in the past (`MAX_WEEK_END_AGE_DAYS`) and never in the future, for either credential → 422 outside that range. |

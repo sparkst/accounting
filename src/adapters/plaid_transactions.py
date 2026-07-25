@@ -62,7 +62,12 @@ _AUTO_THRESHOLD = 0.7
 #: loss for a newly-added card on an existing login.
 KNOWN_MIRROR_ACCOUNT_IDS = frozenset(
     {
-        "rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB",
+        # 2026-07-25 Chase-Item consolidation: rJLQP5OJ… (the 6380 card as seen
+        # by the SURVIVING item 91c2419e) was removed from this set — it is now
+        # the card's real feed. The two ids below belonged to the disconnected
+        # duplicate item 01579e18/eJ9mYw… and can never be returned again; they
+        # stay listed as belt-and-braces so a failed/laggy Plaid-side removal
+        # degrades to a silent counted skip instead of a 5am OnFailure page.
         "Z0p7Yzg0MqI1x0rBjgnjs8zZnk6ek8F88QaKg",
         "8wBN3pLwXKUVx51oRzERUnR9J0b40nFYY54X4",
     }

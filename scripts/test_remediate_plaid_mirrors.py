@@ -128,11 +128,14 @@ def test_mirror_rows_are_never_deleted(db: Session) -> None:
     assert db.query(Transaction).count() == 1
 
 
-def test_all_three_mirror_account_ids_match(db: Session) -> None:
+def test_all_mirror_account_ids_match(db: Session) -> None:
+    # Dynamic: the set shrank at the 2026-07-25 Chase-Item consolidation
+    # (rJLQP5OJ… became the 6380 card's REAL feed and must never be rejected
+    # by a rerun). The script stays pinned to the adapter's current set.
     for account_id in MIRROR_ACCOUNT_IDS:
         _tx(db, raw_data=_mirror_raw(account_id))
-    assert len(find_mirror_rows(db)) == 3
-    assert len(remediate(db, apply=True).mirrors) == 3
+    assert len(find_mirror_rows(db)) == len(MIRROR_ACCOUNT_IDS)
+    assert len(remediate(db, apply=True).mirrors) == len(MIRROR_ACCOUNT_IDS)
 
 
 def test_unrecognized_mirror_candidate_is_reported_not_touched(db: Session) -> None:

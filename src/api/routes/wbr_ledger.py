@@ -49,6 +49,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from src.api.auth import require_api_or_ingest_key
 from src.db.connection import SessionLocal
@@ -129,6 +130,32 @@ _ENTITY_QUERY = Query(
     default=Entity.PERSONAL.value,
     description="Entity filter: sparkry | blackline | personal (default personal).",
 )
+
+
+def ledger_window_rows(
+    session: Session, *, start: date, end: date, entity: str
+) -> list[Transaction]:
+    """The row set the WBR ledger feed draws its totals/transactions from.
+
+    Factored out so tests can assert against the REAL filter (P2-h8d) instead
+    of a hand-copied re-implementation, which cannot catch drift between the
+    two. Excludes: rejected rows (never deleted, per the audit-trail rule),
+    split children (``parent_id`` set — a split never double-counts against
+    its parent), and NULL-amount rows; scoped to ``[start, end]`` inclusive
+    and one entity.
+    """
+    return (
+        session.query(Transaction)
+        .filter(
+            Transaction.date >= start.isoformat(),
+            Transaction.date <= end.isoformat(),
+            Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.entity == entity,
+            Transaction.amount.isnot(None),
+            Transaction.parent_id.is_(None),
+        )
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -214,18 +241,7 @@ def wbr_ledger_summary(
 
     session = SessionLocal()
     try:
-        rows: list[Transaction] = (
-            session.query(Transaction)
-            .filter(
-                Transaction.date >= start.isoformat(),
-                Transaction.date <= end.isoformat(),
-                Transaction.status != TransactionStatus.REJECTED.value,
-                Transaction.entity == entity_value,
-                Transaction.amount.isnot(None),
-                Transaction.parent_id.is_(None),
-            )
-            .all()
-        )
+        rows = ledger_window_rows(session, start=start, end=end, entity=entity_value)
 
         inflow = _ZERO
         outflow = _ZERO

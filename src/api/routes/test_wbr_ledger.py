@@ -705,18 +705,19 @@ class TestGoldenFixture:
         assert parsed.week_end == "2026-07-26"
         assert parsed.entity == "personal"
         assert parsed.truncated is True
-        assert len(parsed.transactions) == 7
+        assert len(parsed.transactions) == 8
 
     def test_golden_fixture_transfer_rows_are_present_but_excluded_from_totals(
         self,
     ) -> None:
-        """The fixture's transfer pair (+/- 800) must NOT be counted in
+        """The fixture's transfer pair (+/- 800) AND its card-payment-named
+        transfer row (P0-001/P2-h8d) must NOT be counted in
         inflow_total/outflow_total (round-2 fix directive P1-tfr3) — this
         pins the fixture's own internal consistency with that rule so a
         future edit to the fixture can't silently drift from it."""
         raw = json.loads(_GOLDEN_PATH.read_text())
         transfer_rows = [t for t in raw["transactions"] if t["category"] == "Transfer"]
-        assert len(transfer_rows) == 2
+        assert len(transfer_rows) == 3
         non_transfer_income = sum(
             t["amount"]
             for t in raw["transactions"]
@@ -729,3 +730,15 @@ class TestGoldenFixture:
         )
         assert non_transfer_income == raw["inflow_total"]
         assert round(non_transfer_expense, 2) == raw["outflow_total"]
+
+    def test_golden_fixture_card_payment_named_row_is_a_transfer(self) -> None:
+        """P0-001/P2-h8d: the fixture's "AUTOPAY PAYMENT - THANK YOU" row is
+        `category: "Transfer"` (as the endpoint emits once REQ-WBR-LED-015
+        lands) so the three-repo contract exercises the exact payload shape
+        that used to be double-excluded by the CRM (P0-001/P0-a1c)."""
+        raw = json.loads(_GOLDEN_PATH.read_text())
+        card_payment_row = next(
+            t for t in raw["transactions"] if "AUTOPAY" in t["name"]
+        )
+        assert card_payment_row["category"] == "Transfer"
+        assert card_payment_row["amount"] > 0

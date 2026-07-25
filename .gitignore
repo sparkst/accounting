@@ -5,6 +5,7 @@ __pycache__/
 node_modules/
 .DS_Store
 *.pyc
+*.egg-info/
 dashboard/.svelte-kit/
 dashboard/build/
 .qralph/
@@ -40,3 +41,6 @@ src/api/test_error_handlers*\(*\).py
 # Household tax inputs (W-2s, prior-year tax) — never checked in; ship the
 # .example alongside it (config/tax_profile.example.yaml IS tracked).
 /config/tax_profile.yaml
+
+# Editor/sed-style backup files — never intended to be committed
+*.bak

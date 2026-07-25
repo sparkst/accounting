@@ -39,24 +39,39 @@ def require_api_key(
 
 def require_api_or_ingest_key(
     header_key: str | None = Security(_API_KEY_HEADER),
-) -> None:
+) -> str:
     """Accept the browser API_KEY OR the machine INGEST_API_KEY.
 
-    Used for /api/ingest/run, which is called BOTH by the dashboard 'Sync Now'
-    button (browser API_KEY) and by the n8n automation (INGEST_API_KEY). It is a
-    trigger with no injectable body, so accepting either credential is safe; CF
-    Access gates all callers at the edge. Presence/strength/distinctness of the
-    keys in production is enforced by the lifespan() boot assertion.
+    Returns which credential matched — ``"api"``, ``"ingest"``, or ``"none"``
+    (dev/no-auth mode, when neither key is configured) — so that callers which
+    need to know can distinguish them. Used for two shapes of route:
+
+    - Write-only triggers with no readable body (e.g. ``POST /api/ingest/run``,
+      called BOTH by the dashboard 'Sync Now' button and by n8n): accepting
+      either credential is safe there regardless of the return value, because
+      there is nothing sensitive to read back and CF Access gates all callers
+      at the edge.
+    - Read routes with a caller-selectable scope (e.g.
+      ``GET /api/ingest/wbr/ledger-summary``): the OLD "trigger-only, no
+      readable body" rationale does NOT apply — those routes MUST consume the
+      returned credential and scope their own results by it. The machine
+      INGEST_API_KEY is the weaker credential of the two (it lives in n8n) and
+      must never be allowed to read more than its automation needs;
+      ``wbr_ledger.py`` is the reference implementation (ingest key forced to
+      ``entity=personal``, 403 otherwise).
+
+    Presence/strength/distinctness of the keys in production is enforced by
+    the lifespan() boot assertion.
     """
     api_key = os.environ.get("API_KEY")
     ingest_key = os.environ.get("INGEST_API_KEY")
     if not api_key and not ingest_key:
-        return  # dev/no-auth mode (matches require_api_key behavior)
+        return "none"  # dev/no-auth mode (matches require_api_key behavior)
     if header_key:
         if api_key and hmac.compare_digest(header_key, api_key):
-            return
+            return "api"
         if ingest_key and hmac.compare_digest(header_key, ingest_key):
-            return
+            return "ingest"
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or missing API key",

@@ -10,6 +10,7 @@ import unittest.mock as mock
 from collections.abc import Generator
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -18,6 +19,8 @@ from sqlalchemy.orm import Session
 from src.adapters.plaid_client import RetryablePlaidError, TerminalPlaidError
 from src.adapters.plaid_transactions import (
     build_tx_fields,
+    card_payment_signal_for_raw,
+    card_payment_signal_for_txn,
     fetch_all_pages,
     make_transaction,
     process_added,
@@ -1228,15 +1231,23 @@ def test_supersede_range_is_per_account(db):
 # ── FIX 4: coverage gaps ──────────────────────────────────────────────────────
 
 
-def test_process_added_unmapped_account_creates_needs_review(db):
-    """Account not in account_index -> entity None, status needs_review."""
+def test_process_added_unmapped_account_is_skipped_not_ingested(db):
+    """REQ-WBR-LED-014: an account_id this Item does not own creates NO row.
+
+    Replaces the prior behaviour (ingest with entity=None -> needs_review),
+    which produced 50 phantom mirror rows in production once two Chase Items
+    covered the same login and each /transactions/sync returned all three
+    accounts."""
     item, acct = _mapped(db)
     with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
-        process_added(db, item, [_plaid_txn(transaction_id="u1", account_id="acc_unmapped")],
-                      account_index={})
-    row = db.query(Transaction).filter_by(source_id="u1").one()
-    assert row.entity is None
-    assert row.status == TransactionStatus.NEEDS_REVIEW.value
+        counts = process_added(
+            db, item,
+            [_plaid_txn(transaction_id="u1", account_id="acc_unmapped")],
+            account_index={},
+        )
+    assert db.query(Transaction).filter_by(source_id="u1").first() is None
+    assert counts.inserted == 0
+    assert counts.skipped_unknown_account == {"acc_unmapped": 1}
 
 
 def test_pending_id_nonexistent_prior_inserts_new(db):
@@ -1528,3 +1539,223 @@ def test_make_transaction_clean_auto_classified_has_no_stale_review_reason(db):
 
     assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
     assert tx.review_reason is None
+
+
+# ── REQ-WBR-LED-014: duplicate-Item account allowlist ────────────────────────
+
+
+def test_mirror_txn_skipped_while_mapped_txn_in_same_batch_is_ingested(db):
+    """REQ-WBR-LED-014: one batch, one owned account_id and one mirror.
+
+    Reproduces the production shape — a second Chase Item returning all three
+    accounts of the shared login. Only the owned account's txn becomes a row;
+    the mirror is counted, not ingested.
+    """
+    item, acct = _mapped(db)
+    batch = [
+        _plaid_txn(transaction_id="own1", account_id="acc_1"),
+        _plaid_txn(transaction_id="mir1", account_id="rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB"),
+        _plaid_txn(transaction_id="mir2", account_id="rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB"),
+    ]
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        counts = process_added(db, item, batch, account_index={"acc_1": acct})
+
+    assert counts.inserted == 1
+    assert counts.skipped_unknown_account == {
+        "rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB": 2
+    }
+    assert [r.source_id for r in db.query(Transaction).filter_by(source="plaid").all()] == [
+        "own1"
+    ]
+
+
+def test_mirror_txn_does_not_promote_a_pending_row(db):
+    """REQ-WBR-LED-014: the allowlist is checked before EVERY other branch.
+
+    A mirror carrying pending_transaction_id must not hijack an existing
+    pending row (promoting its source_id would silently rewrite a real row from
+    a duplicate Item's payload).
+    """
+    item, acct = _mapped(db)
+    with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        process_added(
+            db, item,
+            [_plaid_txn(transaction_id="pend1", account_id="acc_1", amount=10.0)],
+            account_index={"acc_1": acct},
+        )
+        counts = process_added(
+            db, item,
+            [_plaid_txn(transaction_id="mirror_post", account_id="acc_mirror",
+                        amount=10.0, pending_transaction_id="pend1")],
+            account_index={"acc_1": acct},
+        )
+
+    assert counts.inserted == 0
+    assert counts.skipped_unknown_account == {"acc_mirror": 1}
+    assert db.query(Transaction).filter_by(source="plaid").one().source_id == "pend1"
+
+
+def test_sync_one_item_surfaces_skipped_unknown_account_counts(db):
+    """REQ-WBR-LED-014: skips reach TxItemResult / TxBatchResult so the sync log
+    line names the unrecognised account_id instead of silently ingesting it."""
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.return_value = _sync_resp(
+        added=[
+            _plaid_txn(transaction_id="own1", account_id="acc_1"),
+            _plaid_txn(transaction_id="mir1", account_id="acc_mirror"),
+        ]
+    )
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        result = sync_one_item(db, item, client=client)
+
+    assert result.status == "ok"
+    assert result.failed == 0          # a skip is not a failure
+    assert result.added == 1
+    assert result.skipped_unknown_account == {"acc_mirror": 1}
+    assert result.skipped_unknown_total == 1
+
+
+def test_sync_all_active_totals_skipped_unknown_account(db):
+    """REQ-WBR-LED-014: the batch-level total is what the CLI log line prints."""
+    item, acct = _mapped(db)
+    client = mock.Mock()
+    client.transactions_sync.return_value = _sync_resp(
+        added=[_plaid_txn(transaction_id="mir1", account_id="acc_mirror")]
+    )
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        batch = sync_all_active(db, client=client, dry_run=True)
+
+    assert batch.total_added == 0
+    assert batch.total_skipped_unknown_account == 1
+
+
+# ── REQ-WBR-LED-015: credit-card payment legs -> direction=transfer ──────────
+
+
+def _card_txn(**kw: Any) -> Any:
+    """A card-side payment credit: Plaid amount negative = money into the card."""
+    base = dict(transaction_id="pay1", account_id="acc_1", amount=-1637.65,
+                date="2026-07-19", name="ONLINE PAYMENT - THANK YOU",
+                merchant_name=None, transaction_code="payment")
+    base.update(kw)
+    return _plaid_txn(**base)
+
+
+def test_card_side_transaction_code_payment_is_transfer(db):
+    """REQ-WBR-LED-015: transaction_code="payment" -> transfer, classifier skipped."""
+    with mock.patch("src.adapters.plaid_transactions.classify") as classify_mock:
+        tx = make_transaction(_card_txn(), session=db, entity="personal",
+                              payment_method="amex_31004")
+
+    classify_mock.assert_not_called()
+    assert tx.direction == Direction.TRANSFER.value
+    assert tx.tax_category is None
+    assert tx.status == TransactionStatus.AUTO_CLASSIFIED.value
+    # Sign passes straight through build_tx_fields — the card-side credit stays
+    # positive, exactly as the +1637.65 row that triggered this fix.
+    assert tx.amount == Decimal("1637.65")
+
+
+def test_card_side_pfc_detailed_is_transfer(db):
+    """REQ-WBR-LED-015: LOAN_PAYMENTS_CREDIT_CARD_PAYMENT alone is enough."""
+    pfc = SimpleNamespace(primary="LOAN_PAYMENTS",
+                          detailed="LOAN_PAYMENTS_CREDIT_CARD_PAYMENT")
+    txn = _card_txn(transaction_id="pay2", transaction_code=None,
+                    personal_finance_category=pfc)
+    with mock.patch("src.adapters.plaid_transactions.classify") as classify_mock:
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="amex_31004")
+
+    classify_mock.assert_not_called()
+    assert tx.direction == Direction.TRANSFER.value
+
+
+def test_checking_side_amex_ach_descriptor_is_transfer(db):
+    """REQ-WBR-LED-015: the outbound leg carries no Plaid metadata — only the
+    bank descriptor identifies it. Its negative amount is preserved."""
+    txn = _plaid_txn(
+        transaction_id="pay3", account_id="acc_1", amount=1637.65,
+        date="2026-07-20", merchant_name=None,
+        name="ORIG CO NAME:AMERICAN EXPRESS ORIG ID:9493560001 DESC DATE:250719 "
+             "CO ENTRY DESCR:ACH PMT SEC:WEB",
+    )
+    with mock.patch("src.adapters.plaid_transactions.classify") as classify_mock:
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="chase_6372")
+
+    classify_mock.assert_not_called()
+    assert tx.direction == Direction.TRANSFER.value
+    assert tx.amount == Decimal("-1637.65")
+
+
+def test_chase_credit_crd_autopay_descriptor_is_transfer(db):
+    """REQ-WBR-LED-015: Chase's own card-payoff descriptor, matched case-insensitively."""
+    txn = _plaid_txn(transaction_id="pay4", account_id="acc_1", amount=588.78,
+                     merchant_name=None, name="Chase Credit Crd Autopay Pmt")
+    with mock.patch("src.adapters.plaid_transactions.classify") as classify_mock:
+        tx = make_transaction(txn, session=db, entity="personal",
+                              payment_method="chase_6372")
+
+    classify_mock.assert_not_called()
+    assert tx.direction == Direction.TRANSFER.value
+
+
+def test_non_payment_row_still_runs_the_classifier(db):
+    """REQ-WBR-LED-015: an ordinary purchase is untouched by the new rule."""
+    with mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls()) as classify_mock:
+        tx = make_transaction(_plaid_txn(transaction_id="buy1"), session=db,
+                              entity="sparkry", payment_method="Chase ****1234")
+
+    classify_mock.assert_called_once()
+    assert tx.direction == Direction.EXPENSE.value
+    assert tx.tax_category == TaxCategory.MEALS.value
+
+
+def test_merchant_autopay_is_not_a_card_payment(db):
+    """REQ-WBR-LED-015: a bare "AUTOPAY" descriptor must NOT match — a merchant
+    autopay is a real deductible expense, and matching it would drop it from
+    P&L and B&O gross."""
+    txn = _plaid_txn(transaction_id="vz1", merchant_name=None,
+                     name="VERIZON WIRELESS AUTOPAY")
+    with mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls()) as classify_mock:
+        tx = make_transaction(txn, session=db, entity="sparkry",
+                              payment_method="Chase ****1234")
+
+    classify_mock.assert_called_once()
+    assert tx.direction == Direction.EXPENSE.value
+
+
+def test_card_payment_with_unmapped_entity_still_needs_review(db):
+    """REQ-WBR-LED-015: the transfer short-circuit does not bypass the
+    unmapped-entity guard."""
+    with mock.patch("src.adapters.plaid_transactions.classify"):
+        tx = make_transaction(_card_txn(transaction_id="pay5"), session=db,
+                              entity=None, payment_method=None)
+
+    assert tx.direction == Direction.TRANSFER.value
+    assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+
+
+def test_card_payment_signal_shared_between_live_txn_and_stored_raw_data(db):
+    """REQ-WBR-LED-015/017: the remediation script re-reads stored raw_data, so
+    both entry points must agree on every signal."""
+    for txn in (
+        _card_txn(),
+        _card_txn(transaction_code=None,
+                  personal_finance_category={"primary": "LOAN_PAYMENTS",
+                                             "detailed": "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"}),
+        _plaid_txn(name="CHASE CREDIT CRD AUTOPAY PMT"),
+    ):
+        live = card_payment_signal_for_txn(txn)
+        stored = card_payment_signal_for_raw(build_tx_fields(txn)["raw_data"])
+        assert live is not None
+        assert live == stored
+
+    ordinary = _plaid_txn(name="STARBUCKS #123")
+    assert card_payment_signal_for_txn(ordinary) is None
+    assert card_payment_signal_for_raw(build_tx_fields(ordinary)["raw_data"]) is None

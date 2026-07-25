@@ -11,7 +11,8 @@ def test_main_dry_run_default_does_not_apply():
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         sync.return_value = mock.Mock(
             items=[], total_added=0, total_reactivated=0, total_modified=0,
-            total_removed=0, total_failed=0, total_superseded=0, dry_run=True,
+            total_removed=0, total_failed=0, total_superseded=0,
+            total_skipped_unknown_account=0, dry_run=True,
         )
         cli.main([])
         _, kwargs = sync.call_args
@@ -24,7 +25,8 @@ def test_main_apply_flag_writes():
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         sync.return_value = mock.Mock(
             items=[], total_added=0, total_reactivated=0, total_modified=0,
-            total_removed=0, total_failed=0, total_superseded=0, dry_run=False,
+            total_removed=0, total_failed=0, total_superseded=0,
+            total_skipped_unknown_account=0, dry_run=False,
         )
         cli.main(["--apply"])
         _, kwargs = sync.call_args
@@ -37,10 +39,12 @@ def test_main_returns_zero_on_clean_sync():
          mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         ok_item = mock.Mock(status="ok", institution_name="Chase", added=1,
-                            reactivated=0, failed=0, error_code=None)
+                            reactivated=0, failed=0, error_code=None,
+                            skipped_unknown_account={})
         sync.return_value = mock.Mock(
             items=[ok_item], total_added=1, total_reactivated=0, total_modified=0,
-            total_removed=0, total_failed=0, total_superseded=0, dry_run=False,
+            total_removed=0, total_failed=0, total_superseded=0,
+            total_skipped_unknown_account=0, dry_run=False,
         )
         assert cli.main([]) == 0
 
@@ -51,10 +55,12 @@ def test_main_returns_nonzero_when_sync_reports_failures():
          mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         bad_item = mock.Mock(status="error", institution_name="Chase", added=0,
-                             reactivated=0, failed=1, error_code=None)
+                             reactivated=0, failed=1, error_code=None,
+                             skipped_unknown_account={})
         sync.return_value = mock.Mock(
             items=[bad_item], total_added=0, total_reactivated=0, total_modified=0,
-            total_removed=0, total_failed=1, total_superseded=0, dry_run=False,
+            total_removed=0, total_failed=1, total_superseded=0,
+            total_skipped_unknown_account=0, dry_run=False,
         )
         assert cli.main([]) == 1
 
@@ -65,10 +71,12 @@ def test_main_returns_nonzero_on_error_status_item():
          mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         err_item = mock.Mock(status="error", institution_name="Chase", added=0,
-                             reactivated=0, failed=0, error_code="ITEM_LOGIN_REQUIRED")
+                             reactivated=0, failed=0, error_code="ITEM_LOGIN_REQUIRED",
+                             skipped_unknown_account={})
         sync.return_value = mock.Mock(
             items=[err_item], total_added=0, total_reactivated=0, total_modified=0,
-            total_removed=0, total_failed=0, total_superseded=0, dry_run=False,
+            total_removed=0, total_failed=0, total_superseded=0,
+            total_skipped_unknown_account=0, dry_run=False,
         )
         assert cli.main([]) == 1
 
@@ -83,9 +91,42 @@ def test_main_returns_nonzero_on_institution_down_item():
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         down_item = mock.Mock(status="institution_down", institution_name="Chase",
                               added=0, reactivated=0, failed=0,
-                              error_code="INSTITUTION_DOWN")
+                              error_code="INSTITUTION_DOWN",
+                              skipped_unknown_account={})
         sync.return_value = mock.Mock(
             items=[down_item], total_added=0, total_reactivated=0, total_modified=0,
-            total_removed=0, total_failed=0, total_superseded=0, dry_run=False,
+            total_removed=0, total_failed=0, total_superseded=0,
+            total_skipped_unknown_account=0, dry_run=False,
         )
         assert cli.main([]) == 1
+
+
+def test_main_logs_skipped_unknown_account_breakdown():
+    """REQ-WBR-LED-014: a skipped account_id must reach the operator's log —
+    it is either a known duplicate-Item mirror or a NEW account needing a
+    mapping, and neither may pass silently.
+
+    Asserts against the logger itself rather than caplog: cli.main() calls
+    logging.basicConfig(), whose no-op-if-already-configured behaviour makes
+    root-handler capture depend on which tests ran first.
+    """
+    with mock.patch.object(cli, "sync_all_active") as sync, \
+         mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
+         mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()), \
+         mock.patch.object(cli, "logger") as log:
+        item = mock.Mock(status="ok", institution_name="Chase", added=1,
+                         reactivated=0, failed=0, error_code=None,
+                         skipped_unknown_account={"acc_mirror": 17})
+        sync.return_value = mock.Mock(
+            items=[item], total_added=1, total_reactivated=0, total_modified=0,
+            total_removed=0, total_failed=0, total_superseded=0,
+            total_skipped_unknown_account=17, dry_run=False,
+        )
+        assert cli.main([]) == 0
+
+    summary = log.info.call_args_list[0]
+    assert "skipped_unknown_account=%d" in summary.args[0]
+    assert summary.args[-1] == 17
+
+    breakdown = log.warning.call_args_list[0]
+    assert breakdown.args[-1] == {"acc_mirror": 17}

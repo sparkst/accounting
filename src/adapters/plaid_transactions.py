@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -31,6 +32,7 @@ from src.models.audit_event import AuditEvent
 from src.models.brokerage import Account
 from src.models.enums import (
     ConfirmedBy,
+    Direction,
     IngestionStatus,
     Source,
     TransactionStatus,
@@ -45,6 +47,30 @@ logger = logging.getLogger(__name__)
 
 SOURCE = "plaid"
 _AUTO_THRESHOLD = 0.7
+
+# ── Credit-card payment legs (REQ-WBR-LED-015) ────────────────────────────────
+# Paying a card off produces TWO register rows: the credit landing on the card
+# account and the matching ACH debit leaving checking. Neither is P&L — they are
+# the two legs of one internal move — but the classifier reads the card-side
+# credit as income and the checking-side debit as an expense, so a single
+# $1,637.65 Amex payoff landed as +1637.65 income AND -1637.65 expense in the
+# same week's ledger.
+#
+# Card side is deterministic from Plaid's own metadata.
+_CARD_PAYMENT_TXN_CODE = "payment"
+_CARD_PAYMENT_PFC_DETAILED = "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"
+
+# Checking side carries none of that metadata (Plaid categorises the outbound
+# ACH inconsistently), so it is matched on the bank descriptor: a
+# case-insensitive substring test against ``name`` + ``original_description``.
+# Every pattern names a card issuer explicitly. A bare "AUTOPAY" is deliberately
+# NOT a pattern — "VERIZON AUTOPAY" is a genuine deductible expense, and
+# matching it would silently drop it from P&L and B&O gross.
+CARD_PAYMENT_DESCRIPTOR_PATTERNS = (
+    "ORIG CO NAME:AMERICAN EXPRESS",  # Amex pulling an ACH card payment
+    "CREDIT CRD AUTOPAY",  # Chase "CHASE CREDIT CRD AUTOPAY PMT"
+    "CREDIT CRD EPAY",  # Chase manual card payment, same descriptor family
+)
 
 
 def _utcnow() -> datetime:
@@ -147,12 +173,127 @@ def _is_plaid_transfer_category(plaid_txn: Any) -> bool:
     return isinstance(code, str) and code.lower() == "transfer"
 
 
+def card_payment_signal(
+    *,
+    transaction_code: Any = None,
+    pfc_detailed: Any = None,
+    descriptor_parts: Iterable[Any] = (),
+) -> str | None:
+    """Return the signal identifying a credit-card payment leg, else None.
+
+    REQ-WBR-LED-015. Returns the matched signal string rather than a bool so a
+    metadata match can be told apart from a descriptor match in logs and in the
+    remediation script's dry-run table. Takes plain values (not a Plaid object)
+    so the live adapter and the one-time remediation over stored ``raw_data``
+    share one implementation.
+    """
+    if (
+        isinstance(transaction_code, str)
+        and transaction_code.lower() == _CARD_PAYMENT_TXN_CODE
+    ):
+        return f"transaction_code={_CARD_PAYMENT_TXN_CODE}"
+    if (
+        isinstance(pfc_detailed, str)
+        and pfc_detailed.upper() == _CARD_PAYMENT_PFC_DETAILED
+    ):
+        return f"pfc_detailed={_CARD_PAYMENT_PFC_DETAILED}"
+    haystack = " ".join(
+        part for part in descriptor_parts if isinstance(part, str)
+    ).upper()
+    for pattern in CARD_PAYMENT_DESCRIPTOR_PATTERNS:
+        if pattern in haystack:
+            return f"descriptor={pattern}"
+    return None
+
+
+def _pfc_detailed(pfc: Any) -> Any:
+    """Read ``personal_finance_category.detailed`` from an object or a dict.
+
+    The Plaid SDK returns an object; tests use SimpleNamespace and stored
+    ``raw_data`` is a plain dict, so both shapes are handled.
+    """
+    if pfc is None:
+        return None
+    detailed = getattr(pfc, "detailed", None)
+    if detailed is None and isinstance(pfc, dict):
+        detailed = pfc.get("detailed")
+    return detailed
+
+
+def card_payment_signal_for_txn(plaid_txn: Any) -> str | None:
+    """``card_payment_signal`` applied to a Plaid SDK transaction object."""
+    return card_payment_signal(
+        transaction_code=getattr(plaid_txn, "transaction_code", None),
+        pfc_detailed=_pfc_detailed(
+            getattr(plaid_txn, "personal_finance_category", None)
+        ),
+        descriptor_parts=(
+            getattr(plaid_txn, "name", None),
+            getattr(plaid_txn, "original_description", None),
+        ),
+    )
+
+
+def card_payment_signal_for_raw(raw: Any) -> str | None:
+    """``card_payment_signal`` applied to a stored ``Transaction.raw_data`` dict."""
+    if not isinstance(raw, dict):
+        return None
+    return card_payment_signal(
+        transaction_code=raw.get("transaction_code"),
+        pfc_detailed=_pfc_detailed(raw.get("personal_finance_category")),
+        descriptor_parts=(raw.get("name"), raw.get("original_description")),
+    )
+
+
+def _make_card_payment_transaction(
+    fields: dict[str, Any], *, entity: str | None, payment_method: str | None
+) -> Transaction:
+    """Build a ``direction=transfer`` row for a credit-card payment leg.
+
+    REQ-WBR-LED-015: ``classify()`` is NOT called. The signal is deterministic,
+    so running the 3-tier pipeline would only spend a Tier-3 LLM call to reach
+    the wrong answer (income on the card-side credit, expense on the
+    checking-side debit). The amount from ``build_tx_fields`` passes through
+    untouched — the DB sign convention already holds for both legs.
+    ``tax_category`` is NULL and ``deductible_pct`` 0.0 because a transfer is
+    not P&L; that mirrors how scripts/remediate_misclassified_income.py records
+    processor payouts. An unmapped entity still forces needs_review, matching
+    the classified path.
+    """
+    unmapped = entity is None
+    return Transaction(
+        **fields,
+        entity=entity,
+        payment_method=payment_method,
+        direction=Direction.TRANSFER.value,
+        tax_category=None,
+        deductible_pct=0.0,
+        confidence=1.0,
+        status=(
+            TransactionStatus.NEEDS_REVIEW.value if unmapped
+            else TransactionStatus.AUTO_CLASSIFIED.value
+        ),
+        review_reason=(
+            "plaid: account not mapped to an entity" if unmapped else None
+        ),
+    )
+
+
 def make_transaction(
     plaid_txn: Any, *, session: Session, entity: str | None, payment_method: str | None
 ) -> Transaction:
     """Build a classified Transaction. Entity is authoritative from the mapped
-    account (overrides the classifier). Unmapped (entity None) -> needs_review."""
+    account (overrides the classifier). Unmapped (entity None) -> needs_review.
+
+    A credit-card payment leg short-circuits to a transfer row before the
+    classifier runs (REQ-WBR-LED-015) — the specific rule wins over the generic
+    ``_is_plaid_transfer_category`` needs_review routing below.
+    """
     fields = build_tx_fields(plaid_txn)
+    if card_payment_signal_for_txn(plaid_txn) is not None:
+        return _make_card_payment_transaction(
+            fields, entity=entity, payment_method=payment_method
+        )
     tx = Transaction(
         **fields, entity=entity, payment_method=payment_method, confidence=0.0,
         status=TransactionStatus.NEEDS_REVIEW.value,
@@ -470,10 +611,14 @@ def supersede_csv_rows(
 class AddedCounts:
     """Outcome of process_added: rows newly inserted vs previously-removed rows
     reactivated (plaid_readded). Operators need the reactivated count separately
-    so a reinstated row isn't invisible in the added metric."""
+    so a reinstated row isn't invisible in the added metric.
+
+    ``skipped_unknown_account`` maps an unrecognised ``account_id`` to how many
+    of its transactions were skipped (REQ-WBR-LED-014)."""
 
     inserted: int = 0
     reactivated: int = 0
+    skipped_unknown_account: dict[str, int] = field(default_factory=dict)
 
 
 def process_added(
@@ -493,6 +638,22 @@ def process_added(
     """
     counts = AddedCounts()
     for ptxn in added:
+        # REQ-WBR-LED-014: account allowlist. Two Plaid Items covering the same
+        # bank login each return the FULL account set for that login, so the
+        # second Item mirrors accounts it does not own — under item-scoped
+        # account_ids that miss this index. Ingesting them created a phantom
+        # duplicate of every transaction (entity None, so the classifier
+        # guessed). Skip anything outside this Item's own accounts and count it
+        # per account_id so a genuinely NEW account shows up in the log line
+        # rather than being silently ingested. Checked before ANY other branch:
+        # a mirror must not promote a pending, reactivate a removed row, or
+        # insert.
+        acct = account_index.get(ptxn.account_id)
+        if acct is None:
+            counts.skipped_unknown_account[ptxn.account_id] = (
+                counts.skipped_unknown_account.get(ptxn.account_id, 0) + 1
+            )
+            continue
         existing = _existing_by_source_id(session, ptxn.transaction_id)
         if existing is not None:
             # Per-site split_parent guard, kept because it changes control flow:
@@ -592,10 +753,12 @@ def process_added(
                     )
                 session.flush()
                 continue
-        acct = account_index.get(ptxn.account_id)
-        entity = acct.entity if acct else None
-        pm = acct.payment_method if acct else None
-        tx = make_transaction(ptxn, session=session, entity=entity, payment_method=pm)
+        tx = make_transaction(
+            ptxn,
+            session=session,
+            entity=acct.entity,
+            payment_method=acct.payment_method,
+        )
         session.add(tx)
         session.flush()
         counts.inserted += 1
@@ -614,6 +777,14 @@ class TxItemResult:
     failed: int = 0
     superseded: int = 0
     error_code: str | None = None
+    #: REQ-WBR-LED-014 — account_id -> count of transactions skipped because the
+    #: account is not one this Item owns (mirror account, or a NEW account that
+    #: still needs mapping).
+    skipped_unknown_account: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def skipped_unknown_total(self) -> int:
+        return sum(self.skipped_unknown_account.values())
 
 
 def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemResult:
@@ -650,6 +821,10 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
                                            account_index=account_index)
                     result.added += counts.inserted
                     result.reactivated += counts.reactivated
+                    for acct_id, n in counts.skipped_unknown_account.items():
+                        result.skipped_unknown_account[acct_id] = (
+                            result.skipped_unknown_account.get(acct_id, 0) + n
+                        )
             except Exception:
                 result.failed += 1
                 logger.exception("plaid tx added failure",
@@ -669,6 +844,19 @@ def sync_one_item(session: Session, item: PlaidItem, *, client: Any) -> TxItemRe
                     result.removed += process_removed(session, [r])
             except Exception:
                 result.failed += 1
+
+        # REQ-WBR-LED-014: skipped account_ids are a WARNING, not a failure —
+        # the expected case is a duplicate Item mirroring a sibling's accounts,
+        # but the same log line is how a genuinely new, unmapped account
+        # announces itself. It must never be silent.
+        if result.skipped_unknown_account:
+            logger.warning(
+                "plaid tx skipped %d txn(s) on account_ids this item does not "
+                "own: %s",
+                result.skipped_unknown_total,
+                dict(sorted(result.skipped_unknown_account.items())),
+                extra={"plaid_item_id": item.id},
+            )
 
         # Supersede is keyed on the dates of THIS sync's added txns, grouped per
         # account. A first sync that returns only modified/removed (no added)
@@ -787,6 +975,12 @@ class TxBatchResult:
     @property
     def total_superseded(self) -> int:
         return sum(i.superseded for i in self.items)
+
+    @property
+    def total_skipped_unknown_account(self) -> int:
+        """REQ-WBR-LED-014 — transactions skipped across all Items because their
+        account_id was not owned by the syncing Item."""
+        return sum(i.skipped_unknown_total for i in self.items)
 
 
 def sync_all_active(session: Session, *, client: Any, dry_run: bool = True) -> TxBatchResult:

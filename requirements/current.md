@@ -784,3 +784,20 @@ scorecard email); IDs use the `-LED-` infix to avoid colliding with that set.
 | REQ-WBR-LED-011 | NULL-amount rows and split children (`parent_id` set) are excluded so a split never double-counts against its parent. |
 | REQ-WBR-LED-012 | `direction=transfer` rows stay visible in `transactions` (category `"Transfer"`) but are EXCLUDED from `inflow_total`/`outflow_total`, so an internal account-to-account move can't inflate the "money in & out" headline. Round-2 fix directive P1-tfr3. |
 | REQ-WBR-LED-013 | Ingest-key read scope (round-2 fix directive P1-a1c): when the caller authenticated with `INGEST_API_KEY`, `entity` must be `personal` — any other value → 403. The full `API_KEY` may query any entity. `week_end` is bounded to no more than 120 days in the past (`MAX_WEEK_END_AGE_DAYS`) and never in the future, for either credential → 422 outside that range. |
+
+### Ledger-integrity fixes at the Plaid source (REQ-WBR-LED-014..018)
+
+The ledger feed reads the register, so a defect at Plaid ingest surfaces
+directly in the WBR "money in & out" numbers. Two were found in production on
+2026-07-24: phantom mirror rows (two Chase Items covering one login, each
+`/transactions/sync` returning all three accounts) and credit-card payment
+legs classified as income/expense instead of `transfer`. These IDs cover the
+ingest-side fixes plus the one-time remediation of rows already written.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-WBR-LED-014 | Plaid `/transactions/sync` account allowlist: a synced transaction whose `account_id` is absent from the syncing Item's own account index is SKIPPED (no register row created, no pending→posted promotion, no reactivation). Skips are counted per `account_id` and surfaced on `TxItemResult` / `TxBatchResult` and in the sync log line, so a genuinely NEW account is visible to ops rather than silently ingested. Per-record isolation is preserved. |
+| REQ-WBR-LED-015 | Credit-card payment legs are stored `direction="transfer"` at Plaid ingest and skip the 3-tier classifier entirely (no Tier-3 LLM call). Card side is detected from Plaid metadata (`transaction_code == "payment"` or `personal_finance_category.detailed == "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT"`); the checking side from issuer-specific bank descriptors (`CARD_PAYMENT_DESCRIPTOR_PATTERNS`, case-insensitive). The amount passes through with the sign `build_tx_fields` already assigned — no negation. `tax_category` is NULL (a transfer is not P&L). A row matching neither signal is unaffected. |
+| REQ-WBR-LED-016 | `scripts/remediate_plaid_mirrors.py` marks existing rows whose `raw_data.account_id` is one of the known mirror `account_id`s `status="rejected"`, `review_reason="superseded_by_duplicate_plaid_item"`. Rows are never deleted; already-rejected rows are left alone. |
+| REQ-WBR-LED-017 | The same script reclassifies existing non-rejected `source="plaid"` rows that match the REQ-WBR-LED-015 card-payment rules to `direction="transfer"` with `tax_category=NULL`; the amount is never touched. It also backfills the Chase 6380 personal `Account.payment_method` when blank. |
+| REQ-WBR-LED-018 | The script is DRY-RUN by default (`--apply` to commit), uses a per-row savepoint so one bad row cannot halt the batch, writes an `AuditEvent` for every field change (transaction mode for register rows, entity mode for the Account), prints a per-change table plus totals in both modes, and is idempotent (a second run reports zero changes). |

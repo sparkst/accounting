@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = "APPLIED" if args.apply else "DRY-RUN"
     logger.info(
         "plaid tx sync %s: items=%d added=%d reactivated=%d modified=%d removed=%d "
-        "failed=%d superseded=%d",
+        "failed=%d superseded=%d skipped_unknown_account=%d",
         mode,
         len(batch.items),
         batch.total_added,
@@ -93,6 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         batch.total_removed,
         batch.total_failed,
         batch.total_superseded,
+        batch.total_skipped_unknown_account,
     )
     for r in batch.items:
         logger.info(
@@ -104,6 +105,14 @@ def main(argv: list[str] | None = None) -> int:
             r.failed,
             r.error_code or "-",
         )
+        # REQ-WBR-LED-014: per-account_id breakdown so ops can tell a known
+        # duplicate-Item mirror from a new account that still needs mapping.
+        if r.skipped_unknown_account:
+            logger.warning(
+                "    %s skipped_unknown_account=%s",
+                r.institution_name,
+                dict(sorted(r.skipped_unknown_account.items())),
+            )
     # Exit non-zero so launchd surfaces a failed/held-cursor sync to ops.
     # Any per-row failure (cursor held) OR any item not in a clean state
     # qualifies. A retryable INSTITUTION_DOWN sets status='institution_down'

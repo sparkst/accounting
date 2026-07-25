@@ -1688,15 +1688,15 @@ def test_mirror_txn_skipped_while_mapped_txn_in_same_batch_is_ingested(db):
     item, acct = _mapped(db)
     batch = [
         _plaid_txn(transaction_id="own1", account_id="acc_1"),
-        _plaid_txn(transaction_id="mir1", account_id="rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB"),
-        _plaid_txn(transaction_id="mir2", account_id="rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB"),
+        _plaid_txn(transaction_id="mir1", account_id="Z0p7Yzg0MqI1x0rBjgnjs8zZnk6ek8F88QaKg"),
+        _plaid_txn(transaction_id="mir2", account_id="Z0p7Yzg0MqI1x0rBjgnjs8zZnk6ek8F88QaKg"),
     ]
     with mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
         counts = process_added(db, item, batch, account_index={"acc_1": acct})
 
     assert counts.inserted == 1
     assert counts.skipped_unknown_account == {
-        "rJLQP5OJJmTx1wPD4aEBI7QKLYYRadiVYdQAB": 2
+        "Z0p7Yzg0MqI1x0rBjgnjs8zZnk6ek8F88QaKg": 2
     }
     assert [r.source_id for r in db.query(Transaction).filter_by(source="plaid").all()] == [
         "own1"

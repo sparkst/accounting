@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from src.models.audit_event import AuditEvent
@@ -58,8 +59,10 @@ def auto_confirm_if_eligible(
 
     On eligible: sets ``status=confirmed`` and ``confirmed_by=auto:rule:<id>``,
     and appends two transaction-mode AuditEvent rows (``status`` and
-    ``confirmed_by``). Does NOT commit — the caller owns the transaction
-    boundary. Ineligible → returns ``False`` and mutates nothing.
+    ``confirmed_by``). A *tx* that is not yet persistent is added and flushed
+    first (REQ-FIX-ING-011) so its audit rows can never precede it. Does NOT
+    commit — the caller owns the transaction boundary. Ineligible → returns
+    ``False`` and mutates nothing.
     """
     if result.tier_used != 1:
         return False
@@ -93,6 +96,20 @@ def auto_confirm_if_eligible(
 
     tx.status = TransactionStatus.CONFIRMED.value
     tx.confirmed_by = marker
+
+    # REQ-FIX-ING-011: make the row itself durable BEFORE the audit rows are
+    # queued. At ingest (plaid_transactions.make_transaction) this helper runs
+    # on a transaction that has not been INSERTed yet; leaving both in one unit
+    # of work put the audit rows on the wire ahead of their FK target, so every
+    # eligible Plaid row failed its per-row savepoint with "FOREIGN KEY
+    # constraint failed", held the cursor, and failed the daily sync. Flushing
+    # here also keeps the INSERT and its audit rows inside the SAME savepoint,
+    # so a later rollback of that savepoint discards both together.
+    state = sa_inspect(tx)
+    if state.transient:
+        session.add(tx)
+    if not state.persistent:
+        session.flush()
 
     session.add(
         AuditEvent(

@@ -7,11 +7,15 @@ transaction. A CHECK constraint enforces exactly-one-of (transaction_id, entity_
 
 import uuid
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, String, Text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
+
+if TYPE_CHECKING:
+    from src.models.transaction import Transaction
 
 
 def _new_uuid() -> str:
@@ -66,6 +70,17 @@ class AuditEvent(Base):
         index=True,
         comment="UUID of the transaction that was modified (transaction mode)",
     )
+
+    # REQ-FIX-ING-011: this relationship exists for its INSERT-ordering side
+    # effect, not for traversal. Without a mapper-level dependency edge
+    # SQLAlchemy's unit of work orders per-mapper INSERTs by mapper sort key —
+    # ``AuditEvent`` sorts ahead of ``Transaction`` — so audit rows for a
+    # transaction created in the SAME flush hit the database before their FK
+    # target and SQLite (PRAGMA foreign_keys=ON in production) rejects the
+    # whole flush. A raw ForeignKey is not enough; the ORM only learns the
+    # dependency from a relationship. ``lazy="raise"`` keeps it from becoming
+    # an accidental N+1 traversal path.
+    transaction: Mapped["Transaction | None"] = relationship(lazy="raise")
 
     # ── What changed: entity-mode target ─────────────────────────────────────
     entity_id: Mapped[str | None] = mapped_column(

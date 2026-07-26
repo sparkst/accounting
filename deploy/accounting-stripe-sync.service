@@ -1,0 +1,32 @@
+# /etc/systemd/system/accounting-stripe-sync.service
+[Unit]
+Description=Daily stripe ingest sync (REQ-FIX-ING-020)
+OnFailure=accounting-alert@%p.service
+After=accounting-api.service
+Wants=accounting-api.service
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python3 -m scripts.adapter_sync --source stripe --apply
+TimeoutStartSec=600
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

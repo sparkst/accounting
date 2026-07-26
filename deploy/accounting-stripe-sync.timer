@@ -1,0 +1,10 @@
+# /etc/systemd/system/accounting-stripe-sync.timer
+[Timer]
+OnCalendar=*-*-* 05:20:00 UTC
+Persistent=true
+
+[Unit]
+Description=Daily stripe ingest sync (05:20 UTC)
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily Plaid investments sync at 04:20 UTC (after the 04:00 balance sync)
+
+[Timer]
+OnCalendar=*-*-* 04:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

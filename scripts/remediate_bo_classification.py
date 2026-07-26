@@ -74,7 +74,6 @@ from src.db.connection import get_session
 from src.models.audit_event import AuditEvent
 from src.models.enums import Direction, Source, TaxCategory, TransactionStatus
 from src.models.transaction import Transaction
-from src.utils.constants import SPARKRY_CONTACT_EMAIL  # noqa: F401  (module import parity)
 
 logger = logging.getLogger("remediate_bo_classification")
 

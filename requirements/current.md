@@ -627,6 +627,7 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-FIX-ING-008 | Classification honors the sign-reconciliation veto end-to-end: `make_transaction` respects `result.status=NEEDS_REVIEW`; a mirror veto routes expense-on-inflow to review; stale mismatch text never persists on auto-classified rows. |
 | REQ-FIX-ING-009 | Tier-1 rule ranking prefers pattern specificity (longer match) before example count, so "amazon web services" beats "amazon" for AWS charges. |
 | REQ-FIX-ING-010 | Tier-3 stays Gemini (decision): docs corrected (CLAUDE.md, engine/classifier docstrings), and the prompt's category list includes every valid enum value (`HEALTH_INSURANCE`, `WHOLESALE_INCOME`, `OTHER_EXPENSE`, `CAPITAL_CONTRIBUTION`). |
+| REQ-FIX-ING-011 | An `audit_events` row never reaches the database ahead of the `transactions` row it references: `AuditEvent` declares the ORM relationship that gives the unit of work its INSERT-ordering dependency, and ingest-time auto-confirm (REQ-MCA-002) makes the transaction durable inside its own per-row savepoint before queueing its audit rows. A row whose INSERT is rolled back discards its audit events with it — no orphans in the outer commit, no poisoned flush for the rows that follow — and the held cursor re-delivers the failed rows cleanly on the next sync. |
 
 ## REQ-FIX-WLT-* — Wealth analytics correctness
 

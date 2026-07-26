@@ -10,7 +10,7 @@ from collections.abc import Generator
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 import src.db.connection  # noqa: F401  (register every ORM table on Base)
@@ -175,3 +175,53 @@ def test_no_self_reinforcement_100_cycles(session: Session) -> None:
     session.refresh(rule)
     after = {c.name: getattr(rule, c.name) for c in VendorRule.__table__.columns}
     assert after == before
+
+
+# ── REQ-FIX-ING-011: audit rows never precede the row they reference ──────────
+
+_FK_ENGINE = create_engine(
+    "sqlite:///:memory:", connect_args={"check_same_thread": False}
+)
+
+
+@event.listens_for(_FK_ENGINE, "connect")
+def _fk_on(dbapi_conn: object, _record: object) -> None:
+    dbapi_conn.execute("PRAGMA foreign_keys=ON")  # type: ignore[attr-defined]
+
+
+Base.metadata.create_all(_FK_ENGINE)
+_FkSession = sessionmaker(bind=_FK_ENGINE)
+
+
+@pytest.fixture()
+def fk_session() -> Generator[Session, None, None]:
+    """Like ``session`` but with SQLite FK enforcement ON, matching production
+    (``_configure_sqlite`` sets ``PRAGMA foreign_keys=ON`` on every connection).
+    Without it the audit_events -> transactions FK is unenforced and an audit
+    row written ahead of its transaction passes silently."""
+    s = _FkSession()
+    yield s
+    s.rollback()
+    s.close()
+
+
+def test_auto_confirm_of_pending_row_flushes_row_before_audit_events(
+    fk_session: Session,
+) -> None:
+    """REQ-FIX-ING-011: auto-confirming a Transaction that has not been INSERTed
+    yet must not queue its AuditEvent rows into the same unit of work as the
+    INSERT. Nothing maps a relationship between the two mappers, so SQLAlchemy
+    orders audit_events (mapper sort key 'a') ahead of transactions ('t') and
+    the audit rows hit the DB before their FK target exists.
+    """
+    rule = _make_rule(fk_session, confidence=0.95)
+    tx = _make_tx(fk_session, flush=False, source_hash="fk-pending-1")
+
+    assert auto_confirm_if_eligible(fk_session, tx, _result(rule)) is True
+    fk_session.flush()
+
+    persisted = fk_session.get(Transaction, tx.id)
+    assert persisted is not None
+    assert persisted.status == TransactionStatus.CONFIRMED.value
+    events = fk_session.query(AuditEvent).filter_by(transaction_id=tx.id).all()
+    assert {e.field_changed for e in events} == {"status", "confirmed_by"}

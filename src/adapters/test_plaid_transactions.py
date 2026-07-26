@@ -1946,3 +1946,197 @@ def test_card_payment_signal_shared_between_live_txn_and_stored_raw_data(db):
     ordinary = _plaid_txn(name="STARBUCKS #123")
     assert card_payment_signal_for_txn(ordinary) is None
     assert card_payment_signal_for_raw(build_tx_fields(ordinary)["raw_data"]) is None
+
+
+# ── REQ-FIX-ING-011: ingest-time auto-confirm audit rows ─────────────────────
+#
+# The auto-confirm pass (REQ-MCA-002) runs inside make_transaction, i.e. before
+# the row it confirms has been INSERTed. Its two AuditEvent rows carry a FK to
+# transactions.id, so if they reach the database ahead of the row they
+# reference SQLite rejects the whole flush with "FOREIGN KEY constraint
+# failed" — every eligible row fails inside its per-row savepoint, the cursor
+# is held, and the daily sync exits non-zero.
+
+
+def _rule(db, *, pattern="starbucks", confidence=0.95):
+    from src.models.vendor_rule import VendorRule
+
+    rule = VendorRule(
+        vendor_pattern=pattern, is_regex=False, entity="sparkry",
+        tax_category=TaxCategory.MEALS.value, direction=Direction.EXPENSE.value,
+        confidence=confidence,
+    )
+    db.add(rule)
+    db.flush()
+    return rule
+
+
+def _cls_tier1(rule):
+    """A Tier-1 ClassificationResult that satisfies every auto-confirm conjunct."""
+    result = _cls()
+    result.rule_id = rule.id
+    return result
+
+
+def _orphan_audit_events(db):
+    """audit_events rows whose transaction_id has no matching transactions row."""
+    from sqlalchemy import text
+
+    return db.execute(
+        text(
+            "SELECT ae.id FROM audit_events ae "
+            "LEFT JOIN transactions t ON t.id = ae.transaction_id "
+            "WHERE ae.transaction_id IS NOT NULL AND t.id IS NULL"
+        )
+    ).fetchall()
+
+
+def test_auto_confirmed_row_ingests_and_commits(db):
+    """REQ-FIX-ING-011: an auto-confirm-eligible Plaid row inserts cleanly and
+    its two audit rows commit with a resolvable FK."""
+    item, acct = _mapped(db)
+    rule = _rule(db)
+    db.commit()
+
+    with mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls_tier1(rule)):
+        counts = process_added(db, item, [_plaid_txn(transaction_id="ac1")],
+                               account_index={"acc_1": acct})
+    db.commit()
+
+    assert counts.inserted == 1
+    tx = db.query(Transaction).filter_by(source="plaid", source_id="ac1").one()
+    assert tx.status == TransactionStatus.CONFIRMED.value
+    assert tx.confirmed_by == f"auto:rule:{rule.id}"
+    events = db.query(AuditEvent).filter_by(transaction_id=tx.id).all()
+    assert {e.field_changed for e in events} == {"status", "confirmed_by"}
+    assert _orphan_audit_events(db) == []
+
+
+def test_sync_of_auto_confirmed_batch_advances_cursor(db):
+    """REQ-FIX-ING-011/REQ-PT-006: a clean batch of auto-confirm-eligible rows
+    reports no failures and advances the cursor — the daily job must not exit
+    non-zero just because the rows qualified for auto-confirm."""
+    item, acct = _mapped(db)
+    rule = _rule(db)
+    db.commit()
+
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="b1", account_id="acc_1"),
+                          _plaid_txn(transaction_id="b2", account_id="acc_1")],
+                   has_more=False, next_cursor="cur_2")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls_tier1(rule)):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+
+    assert (result.added, result.failed, result.status) == (2, 0, "ok")
+    assert item.cursor == "cur_2"
+    assert db.query(AuditEvent).count() == 4
+    assert _orphan_audit_events(db) == []
+
+
+def test_failed_row_discards_its_own_audit_events(db):
+    """REQ-FIX-ING-011: when a row's INSERT is rolled back by its per-row
+    savepoint, the audit events queued for that row must roll back with it —
+    never survive into the outer commit as orphans, and never poison the flush
+    of the rows that follow it.
+
+    The failing row here is the REQ-FIX-ING-007 split-child case: a split child
+    carries its parent's source_id, so `_existing_by_source_id` (parents only)
+    does not see it and the row falls through to an INSERT that collides on the
+    unique source_hash.
+    """
+    from src.utils.dedup import compute_source_hash
+
+    item, acct = _mapped(db)
+    rule = _rule(db)
+    parent = Transaction(source="plaid", source_id="par1",
+                         source_hash=compute_source_hash("plaid", "par1"),
+                         date="2026-05-01", description="Parent", amount=Decimal("-9.00"),
+                         status=TransactionStatus.SPLIT_PARENT.value, entity="sparkry",
+                         raw_data={})
+    db.add(parent)
+    db.flush()
+    db.add(Transaction(source="plaid", source_id="dup1",
+                       source_hash=compute_source_hash("plaid", "dup1"),
+                       date="2026-05-01", description="Child", amount=Decimal("-9.00"),
+                       status=TransactionStatus.CONFIRMED.value, entity="sparkry",
+                       parent_id=parent.id, raw_data={}))
+    db.commit()
+    audits_before = db.query(AuditEvent).count()
+
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="dup1", account_id="acc_1"),
+                          _plaid_txn(transaction_id="good1", account_id="acc_1")],
+                   has_more=False, next_cursor="cur_2")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls_tier1(rule)):
+        result = sync_one_item(db, item, client=client)
+    db.commit()
+
+    # The healthy row lands; only the colliding row is counted as failed.
+    assert (result.added, result.failed) == (1, 1)
+    good = db.query(Transaction).filter_by(source="plaid", source_id="good1").one()
+    assert good.status == TransactionStatus.CONFIRMED.value
+    # Exactly the healthy row's two audit events were added — none for the
+    # rolled-back row.
+    assert db.query(AuditEvent).count() == audits_before + 2
+    assert _orphan_audit_events(db) == []
+    # REQ-PT-006: the cursor is held so the failed row is re-delivered.
+    assert item.cursor is None
+
+
+def test_held_batch_reingests_cleanly_on_retry(db):
+    """REQ-FIX-ING-011/REQ-PT-006: after a failed sync holds the cursor, the
+    next run re-fetches the same page and ingests the rows that were queued
+    behind it — without duplicating the rows (or the audit events) that had
+    already landed."""
+    item, acct = _mapped(db)
+    rule = _rule(db)
+    db.commit()
+
+    page = [_plaid_txn(transaction_id="r1", account_id="acc_1"),
+            _plaid_txn(transaction_id="r2", account_id="acc_9")]  # acc_9 unmapped
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=page, has_more=False, next_cursor="cur_2")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls_tier1(rule)):
+        first = sync_one_item(db, item, client=client)
+    db.commit()
+
+    assert (first.added, first.failed) == (1, 1)
+    assert item.cursor is None  # held — Plaid re-delivers the whole page
+
+    # Operator maps the missing account; the same page is re-delivered.
+    acct9 = Account(broker="chase", account_number="****9999", account_name="Ops 2",
+                    account_type="checking", entity="sparkry",
+                    payment_method="Chase ****9999", plaid_item_id=item.id,
+                    plaid_account_id="acc_9")
+    db.add(acct9)
+    db.commit()
+
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=page, has_more=False, next_cursor="cur_2")
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify",
+                    return_value=_cls_tier1(rule)):
+        second = sync_one_item(db, item, client=client)
+    db.commit()
+
+    assert (second.added, second.failed, second.status) == (1, 0, "ok")
+    assert item.cursor == "cur_2"
+    assert db.query(Transaction).filter_by(source="plaid").count() == 2
+    # Two rows x two audit events; the re-delivered r1 is a no-op, not a re-audit.
+    assert db.query(AuditEvent).count() == 4
+    assert _orphan_audit_events(db) == []

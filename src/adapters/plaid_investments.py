@@ -54,6 +54,13 @@ WEALTH_HOLDINGS_INGEST_SOURCE = "plaid-holdings"
 #: skip-with-log (the wealth Worker treated it the same) — NOT a failure.
 INVALID_PRODUCT_ERROR_CODE = "INVALID_PRODUCT"
 
+#: Per-item skip set: Plaid signals "this Item has no investments product"
+#: as INVALID_PRODUCT for some institutions and ADDITIONAL_CONSENT_REQUIRED
+#: for others (observed live 2026-07-26 on Chase/PenFed/BofA/Citi).
+INVESTMENTS_UNAVAILABLE_ERROR_CODES = frozenset(
+    {INVALID_PRODUCT_ERROR_CODE, "ADDITIONAL_CONSENT_REQUIRED"}
+)
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -275,17 +282,23 @@ def sync_one_item(
                 f"skipped_non_usd={result.holdings_skipped_non_usd}) — "
                 "likely unmapped plaid_account_id(s) in D1"
             )
-        if not dry_run and result.holdings_skipped_unmapped > 0:
-            # P1-part: a partially-unmapped batch (some holdings written,
-            # others skipped-unmapped — e.g. a new account surfaced on an
-            # existing wealth Item, which the wealth-scope balance sync never
-            # discovers via expected_account) previously exited 0. Treat any
-            # unmapped holdings as at minimum a partial failure so the
-            # OnFailure alert fires instead of the run going quietly green.
+        deliverable_holdings = result.holdings - result.holdings_skipped_non_usd
+        if (
+            not dry_run
+            and deliverable_holdings > 0
+            and result.holdings_skipped_unmapped == deliverable_holdings
+        ):
+            # Cutover reality check (first live run 2026-07-26): wealth Items
+            # legitimately carry sub-account holdings D1 never mapped (E*TRADE
+            # 3 of 8), matching the retired wealth Worker's skip-and-count
+            # behavior — a PARTIAL unmapped batch is informational (counted in
+            # the log line below). Only a WHOLLY unmapped item — every
+            # deliverable holding skipped-unmapped — is the mapping-broke
+            # signature that must page.
             raise WealthClientError(
-                f"D1 skipped {result.holdings_skipped_unmapped} unmapped holding "
-                f"row(s) of {result.holdings} pushed (partial delivery) — "
-                "likely a newly-surfaced or not-yet-mapped plaid_account_id in D1"
+                f"D1 skipped ALL {result.holdings_skipped_unmapped} deliverable "
+                f"holding row(s) as unmapped ({result.holdings} pushed) — the "
+                "item's account mapping in D1 is missing or broken"
             )
 
         log_row.records_processed = result.holdings
@@ -323,16 +336,20 @@ def sync_one_item(
         log_row.retryable = True
         log_row.error_detail = exc.error_code
     except (TerminalPlaidError, PlaidErrorBase) as exc:
-        if exc.error_code == INVALID_PRODUCT_ERROR_CODE:
-            # Expected for wealth Items without investment accounts —
-            # skip-with-log, mirroring the retired wealth Worker.
+        if exc.error_code in INVESTMENTS_UNAVAILABLE_ERROR_CODES:
+            # Expected for wealth Items without investment accounts — Plaid
+            # answers INVALID_PRODUCT for some institutions and
+            # ADDITIONAL_CONSENT_REQUIRED for others (first live run
+            # 2026-07-26: Chase/PenFed/BofA/Citi). Skip-with-log, mirroring
+            # the retired wealth Worker's "no investment accounts" skip.
             result.status = "skipped_invalid_product"
             result.error_code = exc.error_code
             log_row.status = IngestionStatus.SUCCESS.value
-            log_row.error_detail = "skipped: INVALID_PRODUCT (no investments product)"
+            log_row.error_detail = f"skipped: {exc.error_code} (no investments product)"
             logger.info(
-                "plaid investments skipped %s: INVALID_PRODUCT",
+                "plaid investments skipped %s: %s",
                 item.institution_name,
+                exc.error_code,
             )
         else:
             result.status = "error"

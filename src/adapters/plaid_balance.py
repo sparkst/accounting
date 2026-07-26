@@ -671,19 +671,23 @@ def push_fresh_balances(
                     f"plaid_account_id row(s) (multiple accounts share a "
                     f"plaid_account_id) of {pr.pushed} pushed"
                 )
-            elif pr.records_skipped_unmapped > 0:
-                # P1-part: a PARTIALLY unmapped batch (some rows wrote, others
-                # were skipped-unmapped) previously exited 0 — the only honest
-                # signal was D1's own ingestion_log 'partial' status, which
-                # nobody watches. Treat any unmapped rows as at minimum a
-                # partial-failure that trips the non-zero exit / OnFailure
-                # alert, so a newly-surfaced account (which the wealth-scope
-                # sync never records via expected_account) is never silently
-                # dropped forever.
+            elif (
+                deliverable > 0
+                and pr.records_processed == 0
+                and pr.records_skipped_unmapped == deliverable
+            ):
+                # Cutover reality check (first live run 2026-07-26): items
+                # legitimately carry sub-accounts D1 never mapped (E*TRADE has
+                # 4 of 5 unmapped, mirroring the retired wealth sync's own
+                # skip-and-count behavior). A PARTIAL unmapped batch is
+                # therefore informational (counted in the log line below);
+                # only a WHOLLY unmapped item — zero rows resolved, every row
+                # skipped-unmapped — is the "mapping broke" signature that
+                # must page.
                 pr.error = (
-                    f"D1 skipped {pr.records_skipped_unmapped} unmapped row(s) of "
-                    f"{pr.pushed} pushed (partial delivery) — "
-                    "likely a newly-surfaced or not-yet-mapped plaid_account_id in D1"
+                    f"D1 skipped ALL {pr.records_skipped_unmapped} row(s) as "
+                    f"unmapped ({pr.pushed} pushed) — the item's account "
+                    "mapping in D1 is missing or broken"
                 )
             elif deliverable > 0 and pr.records_processed == 0:
                 # P2-001: records_processed (unlike records_written) already

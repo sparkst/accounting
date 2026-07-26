@@ -385,21 +385,55 @@ def test_holdings_ambiguous_plaid_account_id_is_failure(session: Session) -> Non
     assert r.holdings_skipped_ambiguous == 1
 
 
-def test_holdings_partial_unmapped_is_failure_even_with_some_writes(
+def test_holdings_partial_unmapped_is_informational_not_a_failure(
     session: Session,
 ) -> None:
-    """P1-part: partially-unmapped holdings (some written, others skipped)
-    must not exit clean."""
+    """Cutover policy 2026-07-26: partially-unmapped holdings mirror the
+    retired wealth sync's skip-and-count behavior (E*TRADE: 3 of 8) — counted,
+    logged, exit clean."""
     _make_item(session)
-    client = _mock_client()
+    client = _mock_client(holdings=[_holding(), _holding(security_id="sec_2")])
 
     def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
-        return {"holdings_processed": 1, "holdings_skipped_unmapped": 5}
+        return {"holdings_processed": 1, "holdings_skipped_unmapped": 1}
+
+    batch = sync_all_wealth(session, client=client, dry_run=False, post=_post)
+    r = batch.items[0]
+    assert r.status == "ok"
+    assert r.holdings_skipped_unmapped == 1
+
+
+def test_holdings_wholly_unmapped_item_is_a_failure(session: Session) -> None:
+    """Every deliverable holding skipped-unmapped = the mapping-broke
+    signature — must page."""
+    _make_item(session)
+    client = _mock_client(holdings=[_holding(), _holding(security_id="sec_2")])
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        return {"holdings_processed": 0, "holdings_skipped_unmapped": 2}
 
     batch = sync_all_wealth(session, client=client, dry_run=False, post=_post)
     r = batch.items[0]
     assert r.status == "error"
-    assert r.holdings_skipped_unmapped == 5
+    assert r.error_code is not None and "D1_PUSH" in r.error_code
+
+
+def test_additional_consent_required_is_a_per_item_skip(session: Session) -> None:
+    """Live 2026-07-26: institutions without investment accounts answer
+    ADDITIONAL_CONSENT_REQUIRED (Chase/PenFed/BofA/Citi) — same skip as
+    INVALID_PRODUCT, never an error, siblings unaffected."""
+    from src.adapters.plaid_client import TerminalPlaidError
+
+    _make_item(session, institution_name="Chase", item_id="plaid_inv_chase")
+    client = MagicMock()
+    client.investments_holdings_get.side_effect = TerminalPlaidError(
+        "ADDITIONAL_CONSENT_REQUIRED", "consent missing"
+    )
+
+    batch = sync_all_wealth(session, client=client, dry_run=False, post=MagicMock())
+    r = batch.items[0]
+    assert r.status == "skipped_invalid_product"
+    assert r.error_code == "ADDITIONAL_CONSENT_REQUIRED"
 
 
 def test_all_holdings_skipped_non_usd_is_not_a_failure(session: Session) -> None:

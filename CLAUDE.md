@@ -164,6 +164,7 @@ if the box is unreachable.
 - **Reimbursable expenses** (Cardinal Health) tracked as `direction: reimbursable`, linked to reimbursement when received, both net to zero on P&L
 - **Amount validation**: split line items must sum to parent total
 - **Reconciliation vs dedup**: Stripe/Shopify payouts matching bank deposits are reconciliation pairs, not duplicates
+- **$0.00 Shopify orders are usually CORRECT, not a broken ingest.** BlackLine comps product regularly (contest prizes, photoshoot models, collaborators). Those go out as `source_name: "shopify_draft_order"` with a 100%-of-line-items `total_discounts`, empty `payment_gateway_names`, and `total_price: "0.00"` — the adapter stores $0 because $0 was received, so they contribute nothing to B&O gross receipts, correctly. Verified for #1017/#1018/#1019/#1020 (Feb 2026) on 2026-07-25; that batch was twice mistaken for an ingestion defect. Before treating a $0 order as a bug, check `total_discounts` vs `total_line_items_price` and `discount_applications[].title`. **Separately**: goods bought for resale and then given away may owe WA **use tax on their cost** (WAC 458-20-178) — a different line from B&O, and not currently tracked anywhere in this system.
 - **FastAPI binds to 127.0.0.1:8000** (localhost only)
 - **Secrets managed via Doppler** — never use `.env` files.
 

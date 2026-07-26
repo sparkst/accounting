@@ -708,6 +708,14 @@ def sync_transactions_now(
     item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
     if item is None:
         raise HTTPException(status_code=404, detail="item not found")
+    # REQ-PC-B1: wealth-scope Items must never reach /transactions/sync — most
+    # lack the transactions product, and none feed the register. Same guard the
+    # batch path applies in sync_all_active; 409 before the rate-limit stamp.
+    if item.scope != "register":
+        raise HTTPException(
+            status_code=409,
+            detail="item is wealth-scope; transactions sync applies to register items only",
+        )
 
     now = time.monotonic()
     last = _tx_sync_now_last_call.get(item_id, 0.0)

@@ -235,3 +235,31 @@ def test_items_listing_includes_scope(client: TestClient, db: Session) -> None:
     assert resp.status_code == 200
     scopes = {row["institution_name"]: row["scope"] for row in resp.json()}
     assert scopes == {"Vanguard": "wealth", "Chase": "register"}
+
+
+# ── manual sync-transactions endpoint rejects wealth-scope items ─────────────
+
+
+def test_manual_sync_transactions_rejects_wealth_scope(
+    client: TestClient, db: Session
+) -> None:
+    """Contract-check fix: the batch path filters scope=='register', but the
+    manual POST /items/{id}/sync-transactions could still reach a wealth-scope
+    Item. It must 409 before the rate-limit stamp (no cooldown consumed)."""
+    item = PlaidItem(
+        item_id="wealth_item_manual",
+        institution_id="ins_115616",
+        institution_name="Vanguard",
+        access_token_encrypted=encrypt_token("tok"),
+        scope="wealth",
+    )
+    db.add(item)
+    db.commit()
+
+    resp = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
+    assert resp.status_code == 409
+    assert "wealth-scope" in resp.json()["detail"]
+
+    # 409 must not consume the cooldown: a second call still 409s (not 429).
+    resp2 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
+    assert resp2.status_code == 409

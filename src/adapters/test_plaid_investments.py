@@ -370,3 +370,67 @@ def test_item_error_does_not_block_siblings(session: Session) -> None:
     )
     statuses = {r.institution_name: r.status for r in batch.items}
     assert statuses == {"Broken": "error", "Healthy": "ok"}
+
+
+# ── A2 chunking (contract-check fix: box must respect the 200-row cap) ───────
+
+
+def test_chunk_holdings_payload_within_caps_is_passthrough() -> None:
+    from src.adapters.plaid_investments import chunk_holdings_payload
+
+    payload = {
+        "item_id": "it",
+        "institution_name": "Vanguard",
+        "pulled_at": "2026-07-25T00:00:00+00:00",
+        "fetched_at": 1,
+        "securities": [{"security_id": f"s{i}"} for i in range(200)],
+        "holdings": [{"security_id": f"s{i}", "account_id": "a"} for i in range(200)],
+    }
+    chunks = chunk_holdings_payload(payload)
+    assert chunks == [payload]
+
+
+def test_chunk_holdings_payload_splits_and_ships_securities_first() -> None:
+    from src.adapters.plaid_investments import chunk_holdings_payload
+
+    payload = {
+        "item_id": "it",
+        "institution_name": "Vanguard",
+        "pulled_at": "2026-07-25T00:00:00+00:00",
+        "fetched_at": 1,
+        "securities": [{"security_id": f"s{i}"} for i in range(201)],
+        "holdings": [{"security_id": f"s{i%201}", "account_id": "a"} for i in range(450)],
+    }
+    chunks = chunk_holdings_payload(payload)
+    # 2 security chunks (201 -> 200+1), then 3 holding chunks (450 -> 200+200+50).
+    assert [len(c["securities"]) for c in chunks] == [200, 1, 0, 0, 0]
+    assert [len(c["holdings"]) for c in chunks] == [0, 0, 200, 200, 50]
+    # Envelope fields carried on every chunk; every chunk within caps.
+    for c in chunks:
+        assert c["item_id"] == "it" and c["fetched_at"] == 1
+        assert len(c["securities"]) <= 200 and len(c["holdings"]) <= 200
+    # Securities all ship before the first holding.
+    first_holding_idx = next(i for i, c in enumerate(chunks) if c["holdings"])
+    assert all(not c["securities"] for c in chunks[first_holding_idx:])
+
+
+def test_sync_one_item_posts_each_chunk(session: Session) -> None:
+    item = _make_item(session)
+    client = MagicMock()
+    client.investments_holdings_get.return_value = SimpleNamespace(
+        securities=[_security(f"sec_{i}") for i in range(201)],
+        holdings=[_holding(security_id=f"sec_{i % 201}") for i in range(5)],
+    )
+    posts: list[tuple[dict[str, Any], str]] = []
+    result = sync_one_item(
+        session,
+        item,
+        client=client,
+        dry_run=False,
+        post=lambda payload, source: posts.append((payload, source)),
+    )
+    assert result.status == "ok" and result.pushed is True
+    assert len(posts) == 3  # 200 + 1 securities chunks, then 1 holdings chunk
+    assert all(src == WEALTH_HOLDINGS_INGEST_SOURCE for _, src in posts)
+    assert [len(p["securities"]) for p, _ in posts] == [200, 1, 0]
+    assert [len(p["holdings"]) for p, _ in posts] == [0, 0, 5]

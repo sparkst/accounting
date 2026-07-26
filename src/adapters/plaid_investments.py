@@ -139,6 +139,37 @@ def build_holdings_payload(
     }
 
 
+#: A2 rejects payloads with more than this many securities OR holdings (413).
+A2_MAX_ROWS = 200
+
+
+def chunk_holdings_payload(
+    payload: dict[str, Any], *, max_rows: int = A2_MAX_ROWS
+) -> list[dict[str, Any]]:
+    """Split an A2 payload into <=``max_rows`` POSTs.
+
+    Securities ship BEFORE any holdings so every holding's ``security_id``
+    is already upserted on the D1 side by the time it arrives (securities
+    persist across requests, so cross-chunk references are safe). A payload
+    already within the caps is returned unchanged as a single element.
+    """
+    securities = payload["securities"]
+    holdings = payload["holdings"]
+    if len(securities) <= max_rows and len(holdings) <= max_rows:
+        return [payload]
+    envelope = {k: v for k, v in payload.items() if k not in ("securities", "holdings")}
+    chunks: list[dict[str, Any]] = []
+    for i in range(0, len(securities), max_rows):
+        chunks.append(
+            {**envelope, "securities": securities[i : i + max_rows], "holdings": []}
+        )
+    for i in range(0, len(holdings), max_rows):
+        chunks.append(
+            {**envelope, "securities": [], "holdings": holdings[i : i + max_rows]}
+        )
+    return chunks
+
+
 # ── Per-Item sync ────────────────────────────────────────────────────────────
 
 
@@ -184,7 +215,8 @@ def sync_one_item(
         result.holdings = len(payload["holdings"])
 
         if not dry_run:
-            post(payload, WEALTH_HOLDINGS_INGEST_SOURCE)
+            for chunk in chunk_holdings_payload(payload):
+                post(chunk, WEALTH_HOLDINGS_INGEST_SOURCE)
             result.pushed = True
 
         log_row.records_processed = result.holdings

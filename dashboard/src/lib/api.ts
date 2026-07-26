@@ -11,6 +11,7 @@ import type {
 	CalendarSession,
 	ICalUploadResult
 } from './types';
+import type { AccountMapCounts } from './plaidAccountMap';
 
 const BASE = '/api';
 
@@ -1287,10 +1288,13 @@ export async function fetchBrokerageAccountDetail(
 
 // ───── Plaid Phase 1 — admin/connections ─────────────────────────────
 
+export type PlaidLinkScope = 'register' | 'wealth';
+
 export interface PlaidLinkTokenResponse {
 	link_token: string;
 	state_nonce: string;
 	expires_at: string;
+	scope: PlaidLinkScope;
 }
 
 export interface PlaidExchangePayload {
@@ -1318,6 +1322,13 @@ export interface PlaidExchangeResponse {
 	item_id: string;
 	plaid_item_id: string;
 	accounts: PlaidAccountFromExchange[];
+	// REQ-PC-B5: scope chosen at link-token time; 'wealth' skips register mapping.
+	scope: PlaidLinkScope;
+	// P1-002/P1-fnf: outcome of the wealth-scope account-map push to D1. Null for
+	// register-scope links (never attempted). See $lib/plaidAccountMap.
+	account_map_pushed?: boolean | null;
+	account_map_counts?: AccountMapCounts | null;
+	account_map_conflict_masks?: string[] | null;
 }
 
 export interface PlaidItemSummary {
@@ -1326,6 +1337,7 @@ export interface PlaidItemSummary {
 	institution_id: string;
 	institution_name: string;
 	status: string;
+	scope: PlaidLinkScope;
 	last_sync_at: string | null;
 	last_sync_status: string | null;
 	last_error: string | null;
@@ -1360,8 +1372,14 @@ export interface PlaidMapAccountsPayload {
 	}>;
 }
 
-export async function plaidCreateLinkToken(): Promise<PlaidLinkTokenResponse> {
-	return request<PlaidLinkTokenResponse>('/plaid/link-token', { method: 'POST' });
+export async function plaidCreateLinkToken(
+	scope: PlaidLinkScope = 'register'
+): Promise<PlaidLinkTokenResponse> {
+	return request<PlaidLinkTokenResponse>('/plaid/link-token', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ scope })
+	});
 }
 
 export async function plaidExchangePublicToken(

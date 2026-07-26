@@ -25,7 +25,7 @@ from src.utils.staleness import compute_source_freshness
 _TEST_DB_URI = "file:staleness_test?mode=memory&cache=shared&uri=true"
 
 _engine = create_engine(
-    "sqlite+pysqlite:///" + _TEST_DB_URI.replace("file:", ""),
+    "sqlite+pysqlite:///" + _TEST_DB_URI,
     connect_args={"check_same_thread": False, "uri": True},
 )
 

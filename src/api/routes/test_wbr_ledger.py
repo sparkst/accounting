@@ -75,7 +75,7 @@ _IK = "i" * 32
 _TEST_DB_URI = "file:accounting_wbr_ledger_test?mode=memory&cache=shared&uri=true"
 
 _test_engine = create_engine(
-    "sqlite+pysqlite:///" + _TEST_DB_URI.replace("file:", ""),
+    "sqlite+pysqlite:///" + _TEST_DB_URI,
     connect_args={"check_same_thread": False, "uri": True},
 )
 

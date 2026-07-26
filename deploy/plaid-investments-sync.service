@@ -1,0 +1,35 @@
+[Unit]
+Description=Daily Plaid investments sync (--apply) — pushes wealth-scope holdings to the wealth D1
+OnFailure=accounting-alert@%p.service
+# Run after the balance sync so a shared Plaid outage surfaces once, first.
+After=plaid-balance-sync.service
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python3 -m scripts.plaid_investments_sync --apply
+TimeoutStartSec=600
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by plaid-investments-sync.timer. REQ-PC-B3: /investments/holdings/get
+# for wealth-scope Items → POST to the wealth Worker ingest/plaid-holdings.
+# INVALID_PRODUCT Items are skipped-with-log; any other error (incl. a failed
+# D1 push) exits non-zero and fires the OnFailure alert.

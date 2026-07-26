@@ -1,0 +1,18 @@
+{
+  "item_id": "item_contract_etrade",
+  "institution_name": "E*TRADE from Morgan Stanley",
+  "pulled_at": "2026-07-25T04:20:00+00:00",
+  "fetched_at": 1784953200000,
+  "securities": [],
+  "holdings": [
+    {
+      "account_id": "plaid_acct_contract_001",
+      "security_id": "sec_aapl_contract",
+      "quantity": 10.123456789,
+      "institution_price": 233.4567891,
+      "institution_value": 2363.125,
+      "cost_basis": 1500.5,
+      "iso_currency_code": "USD"
+    }
+  ]
+}

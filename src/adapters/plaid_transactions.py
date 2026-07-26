@@ -1258,11 +1258,21 @@ class TxBatchResult:
 
 
 def sync_all_active(session: Session, *, client: Any, dry_run: bool = True) -> TxBatchResult:
-    """Sync transactions for every active PlaidItem. DRY-RUN default."""
+    """Sync transactions for every active REGISTER-scope PlaidItem. DRY-RUN default.
+
+    REQ-PC-B1: wealth-scope Items are excluded — they must never hit
+    ``/transactions/sync`` (most lack the product entitlement) and must never
+    produce register Transaction rows. Their balances/holdings flow through
+    ``plaid_balance`` / ``plaid_investments`` to the wealth D1 instead.
+    """
     batch = TxBatchResult(dry_run=dry_run)
     items = (
         session.query(PlaidItem)
-        .filter(PlaidItem.status == "active", ~PlaidItem.item_id.like("placeholder_%"))
+        .filter(
+            PlaidItem.status == "active",
+            PlaidItem.scope == "register",
+            ~PlaidItem.item_id.like("placeholder_%"),
+        )
         .all()
     )
     for item in items:

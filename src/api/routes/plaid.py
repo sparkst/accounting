@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.adapters._shared.ingestion import write_ingestion_log
 from src.adapters.plaid_balance import sync_all_active, sync_one_item
 from src.adapters.plaid_client import PlaidErrorBase, make_plaid_client
 from src.db.connection import SessionLocal
@@ -43,6 +44,7 @@ from src.models.audit_event import (
     AuditEvent,
 )
 from src.models.brokerage import Account, PositionSnapshot
+from src.models.enums import IngestionStatus
 from src.models.history import HistoricalPrice
 from src.models.plaid import (
     PLAID_LIABILITY_TYPES,
@@ -108,10 +110,23 @@ def _plaid_redirect_uri() -> str | None:
 # ── Request / response models ────────────────────────────────────────────────
 
 
+class LinkTokenRequest(BaseModel):
+    """Optional body for POST /link-token — REQ-PC-B5.
+
+    ``scope='register'`` (default) keeps the pre-consolidation flow: the new
+    Item feeds the register and the UI offers the account-mapping step.
+    ``scope='wealth'`` links a wealth-only institution: balances/holdings are
+    pushed to the wealth D1 and the register mapping step is skipped entirely.
+    """
+
+    scope: str = Field(default="register", pattern=r"^(register|wealth)$")
+
+
 class LinkTokenResponse(BaseModel):
     link_token: str
     state_nonce: str
     expires_at: datetime
+    scope: str = "register"
 
 
 class ExchangeRequest(BaseModel):
@@ -133,6 +148,21 @@ class ExchangeResponse(BaseModel):
     item_id: str
     plaid_item_id: str  # our internal UUID
     accounts: list[dict[str, Any]]
+    # REQ-PC-B5: echoes the scope chosen at link-token time so the UI knows
+    # whether to offer the register account-mapping step.
+    scope: str = "register"
+    # P1-002/P1-fnf: surfaces the wealth-scope account-map push outcome so the
+    # Connections UI can show "mapping push failed — re-run" instead of an
+    # unconditional success banner. Always None for register-scope Items
+    # (the push is never attempted for them). P3-r3i: `pushed` is False when
+    # EITHER `failed` or `conflicts` is nonzero — a conflicted account is
+    # unresolved and will not land at A1/A2.
+    account_map_pushed: bool | None = None
+    account_map_counts: dict[str, int] | None = None
+    #: P1-r3c: masks of the accounts D1 refused to map (duplicate broker+mask
+    #: or duplicate plaid_account_id). Shown verbatim in the Connections
+    #: failure banner so the operator knows which account to go retire.
+    account_map_conflict_masks: list[str] | None = None
 
 
 # Note: CreateNewAccount → AccountMapping → MapAccountsRequest defined in that
@@ -181,6 +211,7 @@ class ItemSummary(BaseModel):
     institution_id: str
     institution_name: str
     status: str
+    scope: str = "register"
     last_sync_at: datetime | None
     last_sync_status: str | None
     last_error: str | None
@@ -256,6 +287,7 @@ def _enumerate_accounts_for_response(
 
 @router.post("/link-token", response_model=LinkTokenResponse)
 def create_link_token(
+    payload: LinkTokenRequest | None = None,
     session: Session = Depends(get_db),  # noqa: B008
 ) -> LinkTokenResponse:
     """Create a Plaid Link token and a server-stored state nonce.
@@ -265,6 +297,9 @@ def create_link_token(
     On exchange we promote the placeholder by writing the real item_id and
     encrypted access_token; if exchange never happens, the placeholder is
     pruned the next time create_link_token runs.
+
+    REQ-PC-B5: the optional body's ``scope`` is stored on the placeholder and
+    survives promotion — a wealth-scope Item never enters the register syncs.
     """
     from plaid.model.country_code import CountryCode
     from plaid.model.link_token_create_request import LinkTokenCreateRequest
@@ -273,6 +308,7 @@ def create_link_token(
 
     _prune_stale_placeholders(session)
 
+    scope = payload.scope if payload is not None else "register"
     nonce = secrets.token_urlsafe(32)
     expires_at = _now() + STATE_NONCE_TTL
 
@@ -284,6 +320,7 @@ def create_link_token(
         state_nonce=nonce,
         state_nonce_expires_at=expires_at,
         status="active",
+        scope=scope,
     )
     session.add(placeholder)
     session.flush()  # need placeholder.id for the Plaid request user payload
@@ -307,7 +344,8 @@ def create_link_token(
     resp = client.link_token_create(req)
     session.commit()
     return LinkTokenResponse(
-        link_token=resp.link_token, state_nonce=nonce, expires_at=expires_at
+        link_token=resp.link_token, state_nonce=nonce, expires_at=expires_at,
+        scope=scope,
     )
 
 
@@ -383,8 +421,121 @@ def exchange_public_token(
         new_value=f"{payload.institution_name} ({item_id})",
     )
     session.commit()
+
+    # P0-001: wealth-scope Items skip the register /map-accounts flow (B5) —
+    # without this, their accounts have no D1 account.plaid_account_id row
+    # to resolve against, so A1/A2 would per-row skip every balance/holding
+    # for this Item forever. Best-effort: never fails the exchange response
+    # (the Item is already connected either way); failures are logged and
+    # can be repaired by re-running the push.
+    #
+    # P1-002/P1-fnf: the push's outcome is NOT discarded. `push_account_map`
+    # returns None both when there was nothing to map AND when the push
+    # itself failed (WealthClientError, incl. a misconfigured/rotated
+    # WEALTH_API_BASE / WEALTH_INTERNAL_KEY) — either way we record an
+    # IngestionLog row + AuditEvent and surface the outcome on the response so
+    # a failed mapping push is visible at link time, not hours later at a
+    # different call site when the next balance push reports
+    # records_skipped_unmapped > 0.
+    account_map_pushed: bool | None = None
+    account_map_counts: dict[str, int] | None = None
+    account_map_conflict_masks: list[str] | None = None
+    if placeholder.scope == "wealth":
+        from src.adapters.plaid_account_map import push_account_map
+
+        map_result = push_account_map(accounts, institution_name=payload.institution_name)
+        if map_result is None:
+            # Distinguish "nothing to map" (accounts empty — genuinely OK)
+            # from "the push failed" (accounts non-empty but no result).
+            account_map_pushed = not accounts
+            account_map_counts = {
+                "created": 0,
+                "reattached": 0,
+                "relinked": 0,
+                "already_mapped": 0,
+                "conflicts": 0,
+                "failed": len(accounts),
+            }
+            log_status = (
+                IngestionStatus.SUCCESS if not accounts else IngestionStatus.FAILURE
+            )
+            log_error_detail = (
+                None
+                if not accounts
+                else "push_account_map returned None — WealthClientError or "
+                "unconfigured WEALTH_API_BASE/WEALTH_INTERNAL_KEY"
+            )
+            records_failed = 0 if not accounts else len(accounts)
+        else:
+            failed = int(map_result.get("failed", 0) or 0)
+            conflicts = int(map_result.get("conflicts", 0) or 0)
+            resolved = {
+                "created": int(map_result.get("created", 0) or 0),
+                "reattached": int(map_result.get("reattached", 0) or 0),
+                "relinked": int(map_result.get("relinked", 0) or 0),
+                "already_mapped": int(map_result.get("already_mapped", 0) or 0),
+            }
+            account_map_counts = {**resolved, "conflicts": conflicts, "failed": failed}
+            # P3-r3i: a conflict is an UNRESOLVED account — two D1 rows share
+            # the broker+mask or the plaid_account_id, so the endpoint refused
+            # to guess. It never counts toward records_processed, and it makes
+            # the push a failure exactly like a hard error does: the account
+            # will not resolve at A1/A2 until an operator retires the duplicate.
+            unresolved = failed + conflicts
+            processed = sum(resolved.values())
+            account_map_pushed = unresolved == 0
+            if unresolved == 0:
+                log_status = IngestionStatus.SUCCESS
+            elif processed > 0:
+                log_status = IngestionStatus.PARTIAL_FAILURE
+            else:
+                log_status = IngestionStatus.FAILURE
+            detail_parts = [
+                f"failed={failed} conflicts={conflicts} processed={processed}"
+            ] if unresolved else []
+            detail_parts += map_result.get("errors", [])[:5]
+            log_error_detail = "; ".join(detail_parts) or None
+            records_failed = unresolved
+            account_map_conflict_masks = [
+                str(d.get("mask") or "????")
+                for d in (map_result.get("conflict_details") or [])
+                if isinstance(d, dict)
+            ] or None
+
+        _write_audit(
+            session,
+            entity_id=placeholder.id,
+            entity_type=ENTITY_TYPE_PLAID_ITEM,
+            field_changed="account_map_push",
+            old_value=None,
+            new_value=str(account_map_counts),
+        )
+        # write_ingestion_log commits the session — this also persists the
+        # AuditEvent added just above (both must land or neither does; a
+        # log-write exception is swallowed internally so it never masks the
+        # exchange response itself).
+        write_ingestion_log(
+            session,
+            source="wealth_cloud:plaid_account_map",
+            # P3-r3i: only genuinely-resolved outcomes count as processed —
+            # `conflicts` and `failed` are both excluded (they land in
+            # records_failed instead).
+            records_processed=sum(
+                v
+                for k, v in (account_map_counts or {}).items()
+                if k not in ("failed", "conflicts")
+            ),
+            records_failed=records_failed,
+            status=log_status,
+            error_detail=log_error_detail,
+        )
+
     return ExchangeResponse(
-        item_id=item_id, plaid_item_id=placeholder.id, accounts=accounts
+        item_id=item_id, plaid_item_id=placeholder.id, accounts=accounts,
+        scope=placeholder.scope,
+        account_map_pushed=account_map_pushed,
+        account_map_counts=account_map_counts,
+        account_map_conflict_masks=account_map_conflict_masks,
     )
 
 
@@ -400,6 +551,15 @@ def map_accounts(
     item = session.query(PlaidItem).filter_by(id=payload.item_id, status="active").first()
     if item is None:
         raise HTTPException(status_code=404, detail="item not found")
+    # REQ-PC-B1 / spec non-negotiable #2: wealth-scope Items must NEVER enter
+    # the register transactions path — no Account rows, no expected_account
+    # spam, no payment_method stamps. Same guard shape as the manual
+    # transactions-sync 409 above (sync_transactions_now).
+    if item.scope != "register":
+        raise HTTPException(
+            status_code=409,
+            detail="item is wealth-scope; register account mapping does not apply",
+        )
 
     results: list[dict[str, str]] = []
     for m in payload.mappings:
@@ -561,8 +721,15 @@ def relink_item(
     req = LinkTokenCreateRequest(**req_kwargs)
     resp = client.link_token_create(req)
     session.commit()
+    # REQ-PC-B5/B1: preserve the Item's existing scope across relink — a
+    # wealth-scope Item relinking must keep reporting scope='wealth' so the
+    # UI does not offer the register account-mapping step for it (the
+    # LinkTokenResponse default of 'register' would otherwise mask this).
     return LinkTokenResponse(
-        link_token=resp.link_token, state_nonce=nonce, expires_at=expires_at
+        link_token=resp.link_token,
+        state_nonce=nonce,
+        expires_at=expires_at,
+        scope=item.scope,
     )
 
 
@@ -595,6 +762,7 @@ def list_items(session: Session = Depends(get_db)) -> list[ItemSummary]:  # noqa
             institution_id=r.institution_id,
             institution_name=r.institution_name,
             status=r.status,
+            scope=r.scope,
             last_sync_at=r.last_sync_at,
             last_sync_status=r.last_sync_status,
             last_error=r.last_error,
@@ -682,6 +850,14 @@ def sync_transactions_now(
     item = session.query(PlaidItem).filter_by(id=item_id, status="active").first()
     if item is None:
         raise HTTPException(status_code=404, detail="item not found")
+    # REQ-PC-B1: wealth-scope Items must never reach /transactions/sync — most
+    # lack the transactions product, and none feed the register. Same guard the
+    # batch path applies in sync_all_active; 409 before the rate-limit stamp.
+    if item.scope != "register":
+        raise HTTPException(
+            status_code=409,
+            detail="item is wealth-scope; transactions sync applies to register items only",
+        )
 
     now = time.monotonic()
     last = _tx_sync_now_last_call.get(item_id, 0.0)

@@ -108,10 +108,23 @@ def _plaid_redirect_uri() -> str | None:
 # ── Request / response models ────────────────────────────────────────────────
 
 
+class LinkTokenRequest(BaseModel):
+    """Optional body for POST /link-token — REQ-PC-B5.
+
+    ``scope='register'`` (default) keeps the pre-consolidation flow: the new
+    Item feeds the register and the UI offers the account-mapping step.
+    ``scope='wealth'`` links a wealth-only institution: balances/holdings are
+    pushed to the wealth D1 and the register mapping step is skipped entirely.
+    """
+
+    scope: str = Field(default="register", pattern=r"^(register|wealth)$")
+
+
 class LinkTokenResponse(BaseModel):
     link_token: str
     state_nonce: str
     expires_at: datetime
+    scope: str = "register"
 
 
 class ExchangeRequest(BaseModel):
@@ -133,6 +146,9 @@ class ExchangeResponse(BaseModel):
     item_id: str
     plaid_item_id: str  # our internal UUID
     accounts: list[dict[str, Any]]
+    # REQ-PC-B5: echoes the scope chosen at link-token time so the UI knows
+    # whether to offer the register account-mapping step.
+    scope: str = "register"
 
 
 # Note: CreateNewAccount → AccountMapping → MapAccountsRequest defined in that
@@ -181,6 +197,7 @@ class ItemSummary(BaseModel):
     institution_id: str
     institution_name: str
     status: str
+    scope: str = "register"
     last_sync_at: datetime | None
     last_sync_status: str | None
     last_error: str | None
@@ -256,6 +273,7 @@ def _enumerate_accounts_for_response(
 
 @router.post("/link-token", response_model=LinkTokenResponse)
 def create_link_token(
+    payload: LinkTokenRequest | None = None,
     session: Session = Depends(get_db),  # noqa: B008
 ) -> LinkTokenResponse:
     """Create a Plaid Link token and a server-stored state nonce.
@@ -265,6 +283,9 @@ def create_link_token(
     On exchange we promote the placeholder by writing the real item_id and
     encrypted access_token; if exchange never happens, the placeholder is
     pruned the next time create_link_token runs.
+
+    REQ-PC-B5: the optional body's ``scope`` is stored on the placeholder and
+    survives promotion — a wealth-scope Item never enters the register syncs.
     """
     from plaid.model.country_code import CountryCode
     from plaid.model.link_token_create_request import LinkTokenCreateRequest
@@ -273,6 +294,7 @@ def create_link_token(
 
     _prune_stale_placeholders(session)
 
+    scope = payload.scope if payload is not None else "register"
     nonce = secrets.token_urlsafe(32)
     expires_at = _now() + STATE_NONCE_TTL
 
@@ -284,6 +306,7 @@ def create_link_token(
         state_nonce=nonce,
         state_nonce_expires_at=expires_at,
         status="active",
+        scope=scope,
     )
     session.add(placeholder)
     session.flush()  # need placeholder.id for the Plaid request user payload
@@ -307,7 +330,8 @@ def create_link_token(
     resp = client.link_token_create(req)
     session.commit()
     return LinkTokenResponse(
-        link_token=resp.link_token, state_nonce=nonce, expires_at=expires_at
+        link_token=resp.link_token, state_nonce=nonce, expires_at=expires_at,
+        scope=scope,
     )
 
 
@@ -384,7 +408,8 @@ def exchange_public_token(
     )
     session.commit()
     return ExchangeResponse(
-        item_id=item_id, plaid_item_id=placeholder.id, accounts=accounts
+        item_id=item_id, plaid_item_id=placeholder.id, accounts=accounts,
+        scope=placeholder.scope,
     )
 
 
@@ -595,6 +620,7 @@ def list_items(session: Session = Depends(get_db)) -> list[ItemSummary]:  # noqa
             institution_id=r.institution_id,
             institution_name=r.institution_name,
             status=r.status,
+            scope=r.scope,
             last_sync_at=r.last_sync_at,
             last_sync_status=r.last_sync_status,
             last_error=r.last_error,

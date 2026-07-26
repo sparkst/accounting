@@ -31,6 +31,11 @@
 
 	let plaidLinkLoaded = $state(false);
 
+	// REQ-PC-B5: per-link scope choice. 'register' feeds the cash-basis register
+	// (with the account-mapping step); 'wealth' pushes balances/holdings to the
+	// wealth D1 only and skips register mapping entirely.
+	let newLinkScope = $state<'register' | 'wealth'>('register');
+
 	// State for in-flight Plaid Link sessions. The OAuth-return page postMessages
 	// back here so we can finalize OAuth-bank flows by reopening Link with
 	// receivedRedirectUri (Plaid's required signal after the bank redirect).
@@ -82,7 +87,7 @@
 		try {
 			await loadPlaidLinkScript();
 			// link_token must be requested at click time — 30 min TTL.
-			const { link_token, state_nonce } = await plaidCreateLinkToken();
+			const { link_token, state_nonce } = await plaidCreateLinkToken(newLinkScope);
 			activeLinkToken = link_token;
 			activeStateNonce = state_nonce;
 			activeIsRelinkItemId = null;
@@ -326,6 +331,10 @@
 
 	<section class="action-row">
 		<button onclick={startAddConnection} class="primary">+ Add connection</button>
+		<select bind:value={newLinkScope} aria-label="Connection scope">
+			<option value="register">Register (transactions)</option>
+			<option value="wealth">Wealth-only (balances + holdings)</option>
+		</select>
 		<span class="slot-count">{items.length} of 10 slots used</span>
 	</section>
 
@@ -374,6 +383,9 @@
 						<div class="item-meta">
 							<strong>{item.institution_name}</strong>
 							<span class="badge {statusBadgeClass(item)}">{statusLabel(item)}</span>
+							{#if item.scope === 'wealth'}
+								<span class="badge badge-neutral">wealth</span>
+							{/if}
 							<span class="accts">{item.mapped_account_count} mapped account{item.mapped_account_count === 1 ? '' : 's'}</span>
 							{#if item.last_sync_at}
 								<time>{new Date(item.last_sync_at).toLocaleString()}</time>

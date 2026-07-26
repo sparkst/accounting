@@ -2140,3 +2140,53 @@ def test_held_batch_reingests_cleanly_on_retry(db):
     # Two rows x two audit events; the re-delivered r1 is a no-op, not a re-audit.
     assert db.query(AuditEvent).count() == 4
     assert _orphan_audit_events(db) == []
+
+
+# ── REQ-PC-B1: wealth-scope Items are excluded from the transactions sync ─────
+
+
+def test_sync_all_active_excludes_wealth_scope_items(db):
+    """A wealth-scope Item must NEVER hit /transactions/sync or produce
+    register Transaction rows — only register-scope Items enter the loop."""
+    _mapped(db)  # register-scope item "it_1"
+    wealth = PlaidItem(item_id="it_wealth", institution_id="ins_129473",
+                       institution_name="ETRADE",
+                       access_token_encrypted="REVOKED", status="active",
+                       scope="wealth")
+    db.add(wealth)
+    db.commit()
+
+    client = mock.Mock()
+    client.transactions_sync.side_effect = [
+        _sync_resp(added=[_plaid_txn(transaction_id="reg1", account_id="acc_1")],
+                   has_more=False, next_cursor="c1"),
+    ]
+    with mock.patch("src.adapters.plaid_transactions.decrypt_token", return_value="tok"), \
+         mock.patch("src.adapters.plaid_transactions.classify", return_value=_cls()):
+        batch = sync_all_active(db, client=client, dry_run=False)
+
+    # Only the register item was synced — ONE transactions_sync call total.
+    assert len(batch.items) == 1
+    assert batch.items[0].institution_name == "Chase"
+    assert client.transactions_sync.call_count == 1
+    # No register rows attributable to the wealth item; its cursor untouched.
+    db.refresh(wealth)
+    assert wealth.cursor is None
+    assert wealth.last_sync_at is None
+
+
+def test_wealth_only_universe_syncs_nothing(db):
+    """With only wealth-scope Items active, the sync is a no-op."""
+    wealth = PlaidItem(item_id="it_wealth_only", institution_id="ins_115616",
+                       institution_name="Vanguard",
+                       access_token_encrypted="REVOKED", status="active",
+                       scope="wealth")
+    db.add(wealth)
+    db.commit()
+    client = mock.Mock()
+
+    batch = sync_all_active(db, client=client, dry_run=False)
+
+    assert batch.items == []
+    client.transactions_sync.assert_not_called()
+    assert db.query(Transaction).count() == 0

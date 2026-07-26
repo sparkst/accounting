@@ -1011,29 +1011,48 @@ def test_push_ambiguous_plaid_account_id_trips_failure(session: Session) -> None
     assert "ambiguous" in item.error
 
 
-def test_push_partial_unmapped_trips_failure_even_with_some_writes(
+def test_push_partial_unmapped_is_informational_not_a_failure(
     session: Session,
 ) -> None:
-    """P1-part: a batch where SOME rows wrote and others were skipped-unmapped
-    (e.g. a newly-surfaced account on an existing wealth Item) must not exit
-    clean — only D1's own ingestion_log 'partial' status caught this before,
-    and nobody watches that from the box side."""
+    """Cutover policy 2026-07-26: wealth Items legitimately carry sub-accounts
+    D1 never mapped (E*TRADE: 4 of 5), matching the retired wealth sync's own
+    skip-and-count behavior. PARTIAL unmapped = counted + logged, exit clean."""
     from src.adapters.plaid_balance import push_fresh_balances
 
     def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
         return {
             "records_written": 1,
             "records_processed": 1,
-            "records_skipped_unmapped": 40,
+            "records_skipped_unmapped": 4,
         }
 
     batch = _batch_with({"Mixed": [_row(1)]})
     push = push_fresh_balances(batch, session=session, post=_post)
 
+    assert push.failed is False
+    item = push.items[0]
+    assert item.records_skipped_unmapped == 4
+    assert item.error is None
+
+
+def test_push_wholly_unmapped_item_is_a_failure(session: Session) -> None:
+    """The mapping-broke signature: EVERY deliverable row skipped-unmapped and
+    nothing resolved — must trip the non-zero exit / OnFailure alert."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        return {
+            "records_written": 0,
+            "records_processed": 0,
+            "records_skipped_unmapped": len(payload["snapshots"]),
+        }
+
+    batch = _batch_with({"Broken": [_row(1)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
     assert push.failed is True
     item = push.items[0]
-    assert item.records_skipped_unmapped == 40
-    assert item.error is not None
+    assert item.error is not None and "ALL" in item.error
 
 
 def test_push_skips_register_scope_items_entirely(session: Session) -> None:

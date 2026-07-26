@@ -46,6 +46,14 @@ def _now() -> datetime:
 
 PLAID_ITEM_STATUSES = ("active", "disconnected", "pending_oauth", "abandoned")
 PLAID_SYNC_STATUSES = ("ok", "error", "pending", "institution_down")
+# REQ-PC-B1 (Plaid consolidation): what an Item's data feeds.
+#   'register' — transactions land in the cash-basis register; balance snapshots
+#                map to local Account rows and unmapped accounts surface as
+#                ExpectedAccount rows (the pre-consolidation behavior).
+#   'wealth'   — balances/holdings are pushed to the wealth D1 only. A wealth
+#                Item must NEVER produce register transactions, local snapshot
+#                mappings, or expected_account rows.
+PLAID_ITEM_SCOPES = ("register", "wealth")
 PLAID_ACCOUNT_TYPES = (
     "depository",
     "credit",
@@ -83,6 +91,10 @@ class PlaidItem(Base):
             f"({', '.join(repr(s) for s in PLAID_SYNC_STATUSES)})",
             name="ck_plaid_item_last_sync_status",
         ),
+        CheckConstraint(
+            f"scope IN ({', '.join(repr(s) for s in PLAID_ITEM_SCOPES)})",
+            name="ck_plaid_item_scope",
+        ),
         Index("ix_plaid_item_status", "status"),
         Index("ix_plaid_item_institution_id", "institution_id"),
     )
@@ -103,6 +115,10 @@ class PlaidItem(Base):
     state_nonce_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="active", server_default="active"
+    )
+    # REQ-PC-B1: 'register' | 'wealth' — see PLAID_ITEM_SCOPES above.
+    scope: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="register", server_default="register"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(

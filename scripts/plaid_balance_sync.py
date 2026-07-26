@@ -23,7 +23,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
-from src.adapters.plaid_balance import sync_all_active  # noqa: E402
+from src.adapters.plaid_balance import (  # noqa: E402
+    push_fresh_balances,
+    sync_all_active,
+)
 from src.adapters.plaid_client import make_plaid_client  # noqa: E402
 from src.db.connection import SessionLocal, init_db  # noqa: E402
 
@@ -64,22 +67,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     for r in batch.items:
         logger.info(
-            "  %s status=%s processed=%d failed=%d unmapped=%d non_usd=%d error=%s",
+            "  %s scope=%s status=%s processed=%d failed=%d unmapped=%d non_usd=%d "
+            "fresh=%d error=%s",
             r.institution_name,
+            r.scope,
             r.status,
             r.accounts_processed,
             r.accounts_failed,
             r.accounts_skipped_unmapped,
             r.accounts_skipped_non_usd,
+            len(r.fresh_balances),
             r.error_code or "-",
         )
+
+    # REQ-PC-B2: push all fresh balances (both scopes) to the wealth D1 after
+    # the local sync. DRY-RUN never POSTs — it only reports what would push.
+    push_failed = False
+    if args.apply:
+        with SessionLocal() as session:
+            push = push_fresh_balances(batch, session=session)
+        logger.info("wealth D1 push: pushed=%d failed=%s", push.total_pushed, push.failed)
+        for p in push.items:
+            if p.error:
+                logger.error("  %s push FAILED: %s", p.institution_name, p.error)
+        push_failed = push.failed
+    else:
+        would_push = sum(len(r.fresh_balances) for r in batch.items)
+        logger.info("wealth D1 push skipped (dry-run): %d row(s) would push", would_push)
+
     # REQ-FIX-PLD-002: mirror plaid_transactions_sync.py's exit policy — any
     # accounts_failed>0 OR any Item not in a clean 'ok' state is a failure.
     # The prior policy (only terminal, non-retryable errors) silently exited 0
     # on a retryable INSTITUTION_DOWN or a partial per-account failure, hiding
     # them from the OnFailure alert. Idempotent double-runs stay exit-0
     # (IntegrityError collisions count as accounts_processed, not accounts_failed).
-    has_failures = batch.total_failed > 0 or any(r.status != "ok" for r in batch.items)
+    # REQ-PC-B2: a failed D1 push is ALSO a failure — the non-zero exit trips
+    # the OnFailure alert and replaces the wealth cron's silent-failure mode.
+    has_failures = (
+        batch.total_failed > 0
+        or any(r.status != "ok" for r in batch.items)
+        or push_failed
+    )
     return 1 if has_failures else 0
 
 

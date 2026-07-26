@@ -581,3 +581,254 @@ def test_ignored_expected_account_not_counted_as_unmapped(session: Session) -> N
     # The ignored row itself is untouched (still 'ignored', not overwritten).
     ignored = session.query(ExpectedAccount).filter_by(account_name="Chase Total Checking").one()
     assert ignored.status == "ignored"
+
+
+# ── REQ-PC-B1/B2: item scope + fresh-balance collection + D1 push ────────────
+
+
+def _make_wealth_item(session: Session, *, institution_name: str = "ETRADE") -> PlaidItem:
+    item = PlaidItem(
+        item_id=f"plaid_wealth_{institution_name.lower()}",
+        institution_id="ins_129473",
+        institution_name=institution_name,
+        access_token_encrypted=encrypt_token("access-sandbox-test-token"),
+        scope="wealth",
+    )
+    session.add(item)
+    session.commit()
+    return item
+
+
+def test_wealth_scope_item_never_writes_register_rows(session: Session) -> None:
+    """REQ-PC-B1: a wealth-scope Item produces NO snapshot rows and NO
+    expected_account rows — only in-memory fresh_balances for the D1 push."""
+    item = _make_wealth_item(session)
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert result.scope == "wealth"
+    assert result.status == "ok"
+    assert result.accounts_processed == 3
+    assert result.accounts_failed == 0
+    assert result.accounts_skipped_unmapped == 0
+    assert len(result.fresh_balances) == 3
+    # The two register side-effect tables stay EMPTY.
+    assert session.query(PlaidAccountBalanceSnapshot).count() == 0
+    assert session.query(ExpectedAccount).count() == 0
+    # IngestionLog still records the run, with the scope in the detail.
+    log = session.query(IngestionLog).filter_by(
+        source=f"plaid_balance:{item.institution_name}"
+    ).one()
+    assert log.error_detail is not None
+    assert "scope=wealth" in log.error_detail
+    assert "fresh_balances=3" in log.error_detail
+    # Item bookkeeping still updates (staleness surface).
+    session.refresh(item)
+    assert item.last_sync_status == "ok"
+
+
+def test_wealth_scope_null_balance_counts_failed(session: Session) -> None:
+    """A wealth account with no current balance is a failure, mirroring the
+    register path's null-balance rule."""
+    from types import SimpleNamespace
+
+    item = _make_wealth_item(session)
+    acct = SimpleNamespace(
+        account_id="p_wealth_null",
+        type="investment",
+        subtype="ira",
+        balances=SimpleNamespace(current=None, available=None, iso_currency_code="USD"),
+    )
+    client = MagicMock()
+    client.accounts_get.return_value = SimpleNamespace(accounts=[acct])
+
+    result = sync_one_item(session, item, client=client)
+    assert result.accounts_failed == 1
+    assert result.accounts_processed == 0
+    assert result.fresh_balances == []
+
+
+def test_fresh_balances_collected_for_register_scope_including_unmapped(
+    session: Session,
+) -> None:
+    """REQ-PC-B2: register-scope Items collect a payload row for EVERY USD
+    account with a balance — mapped or not (the D1's own account table decides
+    what maps endpoint-side)."""
+    item = _make_item(session, institution_name="Chase")
+    _make_account(
+        session, item=item, plaid_account_id="plaid_acct_chase_checking_0001",
+        account_number="1111",
+    )
+    # savings + card left unmapped locally.
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert result.scope == "register"
+    assert len(result.fresh_balances) == 3
+    by_id = {row["plaid_account_id"]: row for row in result.fresh_balances}
+    checking = by_id["plaid_acct_chase_checking_0001"]
+    assert checking["current_balance"] == "4523.18"
+    assert checking["available_balance"] == "4523.18"
+    assert checking["plaid_account_type"] == "depository"
+    assert checking["plaid_account_subtype"] == "checking"
+    assert checking["iso_currency_code"] == "USD"
+    assert checking["snapshot_date"] == date.today().isoformat()
+    assert isinstance(checking["fetched_at"], int)
+    assert checking["fetched_at"] > 1_500_000_000_000  # epoch MILLISECONDS
+    # 2dp string formatting (12500.0 → "12500.00") — mirrors toFixed(2).
+    assert by_id["plaid_acct_chase_savings_0002"]["current_balance"] == "12500.00"
+    # Credit card stays positive-as-returned (liability negation is a D1
+    # READ-side rule, never applied at write time).
+    assert by_id["plaid_acct_chase_card_0003"]["current_balance"] == "583.45"
+    # Register behavior unchanged: 1 snapshot + 2 expected_account rows.
+    assert session.query(PlaidAccountBalanceSnapshot).count() == 1
+    assert session.query(ExpectedAccount).count() == 2
+
+
+def test_fresh_balances_still_collected_on_same_day_duplicate(session: Session) -> None:
+    """A same-day re-run collides on UNIQUE locally (savepoint rollback) but
+    must STILL collect the payload row — D1's conditional upsert on fetched_at
+    wants the freshest value."""
+    item = _make_item(session)
+    _make_account(
+        session, item=item, plaid_account_id="plaid_acct_chase_checking_0001",
+        account_number="1111",
+    )
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    r1 = sync_one_item(session, item, client=client)
+    session.commit()
+    r2 = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert len(r1.fresh_balances) == 3
+    assert len(r2.fresh_balances) == 3
+
+
+def test_non_usd_account_not_collected_for_push(session: Session) -> None:
+    """Non-USD accounts are skipped for the D1 push too (endpoint convention)."""
+    item = _make_wealth_item(session, institution_name="ForeignBank")
+    client = _mock_client_returning("accounts_balance_get_non_usd")
+
+    result = sync_one_item(session, item, client=client)
+    assert result.accounts_skipped_non_usd == 1
+    assert result.fresh_balances == []
+
+
+# ── push_fresh_balances (REQ-PC-B2) ──────────────────────────────────────────
+
+
+def _batch_with(rows_by_item: dict[str, list[dict[str, Any]]]) -> Any:
+    from src.adapters.plaid_balance import BatchResult, ItemSyncResult
+
+    batch = BatchResult(dry_run=False)
+    for name, rows in rows_by_item.items():
+        batch.items.append(
+            ItemSyncResult(
+                item_id=f"id-{name}", institution_name=name, status="ok",
+                fresh_balances=rows,
+            )
+        )
+    return batch
+
+
+def _row(i: int) -> dict[str, Any]:
+    return {"plaid_account_id": f"acct-{i}", "current_balance": "1.00"}
+
+
+def test_push_posts_snapshots_payload_with_correct_slug(session: Session) -> None:
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    calls: list[tuple[dict[str, Any], str]] = []
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        calls.append((payload, source))
+        return {"ok": True}
+
+    batch = _batch_with({"Chase": [_row(1), _row(2)]})
+    push = push_fresh_balances(batch, post=_post)
+
+    assert push.total_pushed == 2
+    assert push.failed is False
+    assert len(calls) == 1
+    payload, source = calls[0]
+    assert source == "plaid-balance"
+    assert list(payload.keys()) == ["snapshots"]
+    assert payload["snapshots"] == [_row(1), _row(2)]
+
+
+def test_push_chunks_at_batch_cap(session: Session) -> None:
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    calls: list[int] = []
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        calls.append(len(payload["snapshots"]))
+        return {"ok": True}
+
+    batch = _batch_with({"Big": [_row(i) for i in range(450)]})
+    push = push_fresh_balances(batch, post=_post)
+
+    assert calls == [200, 200, 50]
+    assert push.total_pushed == 450
+
+
+def test_push_per_item_isolation_and_failure_flag(session: Session) -> None:
+    """One Item's failed push never blocks the next Item's push; the batch is
+    flagged failed so the CLI exits non-zero (the staleness alert)."""
+    from src.adapters._shared.wealth_client import WealthHTTPError
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    calls: list[str] = []
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        first = payload["snapshots"][0]["plaid_account_id"]
+        calls.append(first)
+        if first == "acct-1":
+            raise WealthHTTPError(500, "boom")
+        return {"ok": True}
+
+    batch = _batch_with({"Failing": [_row(1)], "Healthy": [_row(2)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert calls == ["acct-1", "acct-2"]
+    assert push.failed is True
+    failing = next(p for p in push.items if p.institution_name == "Failing")
+    healthy = next(p for p in push.items if p.institution_name == "Healthy")
+    assert failing.error is not None and "WealthHTTPError" in failing.error
+    assert failing.pushed == 0
+    assert healthy.error is None
+    assert healthy.pushed == 1
+    # Partial failure recorded on the local delivery-health log.
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status == "partial_failure"
+    assert log.records_processed == 1
+    assert log.records_failed == 1
+
+
+def test_push_success_writes_success_ingestion_log(session: Session) -> None:
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    batch = _batch_with({"Chase": [_row(1)]})
+    push = push_fresh_balances(batch, session=session, post=lambda p, s: {"ok": True})
+
+    assert push.failed is False
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status == "success"
+    assert log.records_processed == 1
+
+
+def test_push_with_no_rows_never_posts(session: Session) -> None:
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        raise AssertionError("post should not be called for empty batches")
+
+    batch = _batch_with({"Empty": []})
+    push = push_fresh_balances(batch, post=_post)
+    assert push.total_pushed == 0
+    assert push.failed is False

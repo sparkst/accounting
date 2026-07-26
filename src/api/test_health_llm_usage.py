@@ -28,7 +28,7 @@ from src.models.llm_usage import LLMUsageLog, estimate_cost
 _TEST_DB_URI = "file:health_llm_test?mode=memory&cache=shared&uri=true"
 
 _test_engine = create_engine(
-    "sqlite+pysqlite:///" + _TEST_DB_URI.replace("file:", ""),
+    "sqlite+pysqlite:///" + _TEST_DB_URI,
     connect_args={"check_same_thread": False, "uri": True},
 )
 

@@ -14,6 +14,7 @@
 		type PlaidExchangeResponse,
 		type PlaidAccountFromExchange
 	} from '$lib/api';
+	import { accountMapBanner } from '$lib/plaidAccountMap';
 
 	const PLAID_LINK_SCRIPT_URL = 'https://cdn.plaid.com/link/v2/stable/link-initialize.js';
 
@@ -35,6 +36,15 @@
 	// (with the account-mapping step); 'wealth' pushes balances/holdings to the
 	// wealth D1 only and skips register mapping entirely.
 	let newLinkScope = $state<'register' | 'wealth'>('register');
+
+	// P1-a1x/P1-r3e/P1-r3c: a wealth link is only usable if its account-map push
+	// to the wealth D1 landed cleanly — otherwise every balance/holding for the
+	// new Item is skipped there. Derived rather than assumed.
+	const wealthBanner = $derived(
+		pendingExchange && pendingExchange.scope === 'wealth'
+			? accountMapBanner(pendingExchange, pendingInstitutionName)
+			: null
+	);
 
 	// State for in-flight Plaid Link sessions. The OAuth-return page postMessages
 	// back here so we can finalize OAuth-bank flows by reopening Link with
@@ -338,7 +348,31 @@
 		<span class="slot-count">{items.length} of 10 slots used</span>
 	</section>
 
-	{#if pendingExchange}
+	{#if wealthBanner}
+		<!-- REQ-PC-B5 / spec non-negotiable #2: wealth-scope links skip the
+		     register account-mapping step entirely — no Account rows, no
+		     payment_method stamps. Confirm-only; map-accounts also 409s a
+		     wealth-scope Item server-side as defense in depth.
+		     P1-a1x: the success banner is conditional on the D1 account-map push
+		     having landed — a failed push means this connection produces nothing. -->
+		<section class="mapping-card" class:map-failed={!wealthBanner.ok}>
+			<h2>{wealthBanner.title}</h2>
+			<p class="hint">{wealthBanner.message}</p>
+			{#if !wealthBanner.ok}
+				<p class="map-counts">{wealthBanner.countsSummary}</p>
+				{#if wealthBanner.conflictMasks.length > 0}
+					<p class="map-counts">
+						Conflicting account masks: {wealthBanner.conflictMasks.join(', ')}
+					</p>
+				{/if}
+			{/if}
+			<div class="mapping-actions">
+				<button onclick={() => (pendingExchange = null)} class="primary">
+					{wealthBanner.ok ? 'Done' : 'Dismiss'}
+				</button>
+			</div>
+		</section>
+	{:else if pendingExchange}
 		<section class="mapping-card">
 			<h2>Map accounts from {pendingInstitutionName}</h2>
 			<p class="hint">
@@ -532,6 +566,19 @@
 		border-radius: 10px;
 		padding: 16px;
 		margin-bottom: 24px;
+	}
+	.mapping-card.map-failed {
+		background: #fee;
+		border-color: #fcc;
+	}
+	.mapping-card.map-failed h2 {
+		color: #900;
+	}
+	.map-counts {
+		font-family: SF Mono, Menlo, monospace;
+		font-size: 13px;
+		color: #900;
+		margin: 0 0 8px;
 	}
 	.mapping-list {
 		list-style: none;

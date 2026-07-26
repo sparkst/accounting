@@ -11,6 +11,7 @@ import type {
 	CalendarSession,
 	ICalUploadResult
 } from './types';
+import type { AccountMapCounts } from './plaidAccountMap';
 
 const BASE = '/api';
 
@@ -1323,6 +1324,11 @@ export interface PlaidExchangeResponse {
 	accounts: PlaidAccountFromExchange[];
 	// REQ-PC-B5: scope chosen at link-token time; 'wealth' skips register mapping.
 	scope: PlaidLinkScope;
+	// P1-002/P1-fnf: outcome of the wealth-scope account-map push to D1. Null for
+	// register-scope links (never attempted). See $lib/plaidAccountMap.
+	account_map_pushed?: boolean | null;
+	account_map_counts?: AccountMapCounts | null;
+	account_map_conflict_masks?: string[] | null;
 }
 
 export interface PlaidItemSummary {

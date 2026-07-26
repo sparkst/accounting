@@ -110,11 +110,13 @@ def test_main_returns_nonzero_on_terminal_error_item() -> None:
 # ── REQ-PC-B2: D1 push wiring ────────────────────────────────────────────────
 
 
-def _ok_item(fresh: list | None = None) -> mock.Mock:
+def _ok_item(fresh: list | None = None, *, scope: str = "wealth") -> mock.Mock:
+    """P0-r3a: only wealth-scope Items carry fresh_balances, so the push-wiring
+    tests below default to that scope."""
     return mock.Mock(
-        status="ok", institution_name="Chase", accounts_processed=1,
+        status="ok", institution_name="Schwab", accounts_processed=1,
         accounts_failed=0, accounts_skipped_unmapped=0, accounts_skipped_non_usd=0,
-        error_code=None, scope="register", fresh_balances=fresh or [],
+        error_code=None, scope=scope, fresh_balances=fresh or [],
     )
 
 
@@ -160,6 +162,41 @@ def test_apply_exits_nonzero_on_push_failure() -> None:
         )
         push.return_value = mock.Mock(
             total_pushed=0, failed=True,
-            items=[mock.Mock(institution_name="Chase", error="WealthHTTPError: 500")],
+            items=[mock.Mock(institution_name="Schwab", error="WealthHTTPError: 500")],
         )
         assert cli.main(["--apply"]) == 1
+
+
+def test_apply_with_only_register_items_exits_zero_and_pushes_nothing() -> None:
+    """P0-r3a: a register-only run never contacts the wealth Worker. The real
+    push helper is used here (not a mock) so the scope filter itself is under
+    test end-to-end from the CLI."""
+    real_push = cli.push_fresh_balances
+    results: list = []
+
+    def _never(payload: dict, source: str) -> dict:
+        raise AssertionError("register balances must never be POSTed to D1")
+
+    def _push_with_exploding_post(batch, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_push(batch, session=kwargs.get("session"), post=_never)
+        results.append(result)
+        return result
+
+    with mock.patch.object(cli, "sync_all_active") as sync, \
+         mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
+         mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()), \
+         mock.patch.object(cli, "push_fresh_balances", _push_with_exploding_post):
+        sync.return_value = mock.Mock(
+            items=[
+                _ok_item([{"plaid_account_id": "a"}], scope="register"),
+                _ok_item([{"plaid_account_id": "b"}], scope="register"),
+            ],
+            total_processed=2, total_failed=0, dry_run=False,
+        )
+        assert cli.main(["--apply"]) == 0
+
+    # The REAL helper ran (with a post() that explodes if called) and produced
+    # no per-Item push results at all.
+    assert len(results) == 1
+    assert results[0].items == []
+    assert results[0].failed is False

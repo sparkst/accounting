@@ -10,8 +10,10 @@ to load realistic JSON-shaped responses.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -23,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from src.adapters.fixtures.plaid.fixtures import make_response_from_fixture
 from src.adapters.plaid_balance import (
+    _fresh_balance_row,
     sync_all_active,
     sync_one_item,
 )
@@ -491,22 +494,26 @@ def test_accounts_get_with_null_last_updated_datetime_stamps_run_date(
 ) -> None:
     """REQ-FIX-PLD-001: /accounts/get's balances.last_updated_datetime is
     typically None (non-Capital-One institutions) — snapshot_date must still be
-    stamped as the run date (today), never derived from that field, and the
-    snapshot writes normally even when the underlying value is unchanged from
-    a prior day (freshness is a digest-level concern, not a write-time one)."""
+    stamped as the run date, never derived from that field, and the snapshot
+    writes normally even when the underlying value is unchanged from a prior
+    day (freshness is a digest-level concern, not a write-time one).
+
+    P3-r3m: "run date" means the UTC day of ``pulled_at``, so pin pulled_at
+    rather than comparing against the host's local ``date.today()``."""
     item = _make_item(session, institution_name="Chase")
     _make_account(
         session, item=item, plaid_account_id="plaid_acct_chase_checking_0001", account_number="1111"
     )
     client = _mock_client_returning("accounts_get_null_last_updated")
 
-    result = sync_one_item(session, item, client=client)
+    pulled_at = datetime(2026, 12, 31, 23, 59, 0)  # 1 minute before UTC midnight
+    result = sync_one_item(session, item, client=client, pulled_at=pulled_at)
     session.commit()
 
     assert result.status == "ok"
     assert result.accounts_processed == 1
     snap = session.query(PlaidAccountBalanceSnapshot).one()
-    assert snap.snapshot_date == date.today()
+    assert snap.snapshot_date == date(2026, 12, 31)
     assert snap.current_balance == Decimal("4523.18")
 
 
@@ -650,12 +657,14 @@ def test_wealth_scope_null_balance_counts_failed(session: Session) -> None:
     assert result.fresh_balances == []
 
 
-def test_fresh_balances_collected_for_register_scope_including_unmapped(
-    session: Session,
-) -> None:
-    """REQ-PC-B2: register-scope Items collect a payload row for EVERY USD
-    account with a balance — mapped or not (the D1's own account table decides
-    what maps endpoint-side)."""
+def test_register_scope_collects_no_fresh_balances(session: Session) -> None:
+    """P0-r3a: register-scope Items collect NOTHING for the D1 push.
+
+    D1 has never contained the box's register accounts — Plaid account_ids are
+    per-Item, and D1's own Chase balances come from its own migrated Item — so
+    a register row could only ever produce an unmapped skip there. Register
+    balances stay in the local snapshot table, exactly as pre-consolidation.
+    """
     item = _make_item(session, institution_name="Chase")
     _make_account(
         session, item=item, plaid_account_id="plaid_acct_chase_checking_0001",
@@ -664,10 +673,32 @@ def test_fresh_balances_collected_for_register_scope_including_unmapped(
     # savings + card left unmapped locally.
     client = _mock_client_returning("accounts_balance_get_mixed")
 
-    result = sync_one_item(session, item, client=client)
+    pulled_at = datetime(2026, 7, 25, 23, 45, 0)
+    result = sync_one_item(session, item, client=client, pulled_at=pulled_at)
     session.commit()
 
     assert result.scope == "register"
+    assert result.fresh_balances == []
+    # Register behavior unchanged: 1 snapshot + 2 expected_account rows.
+    assert session.query(PlaidAccountBalanceSnapshot).count() == 1
+    assert session.query(ExpectedAccount).count() == 2
+
+
+def test_wealth_scope_fresh_balance_row_shape(session: Session) -> None:
+    """REQ-PC-B2: the payload row a wealth Item contributes to the A1 push."""
+    item = _make_wealth_item(session, institution_name="Schwab")
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    # P2-003: pin pulled_at explicitly (rather than relying on the ambient
+    # system clock via the default _utcnow()) so this assertion is
+    # deterministic regardless of the test runner's local timezone or the
+    # wall-clock instant it happens to run at — and so it actually exercises
+    # the invariant under test: snapshot_date is the UTC day of pulled_at,
+    # not the host's local date.today().
+    pulled_at = datetime(2026, 7, 25, 23, 45, 0)
+    result = sync_one_item(session, item, client=client, pulled_at=pulled_at)
+    session.commit()
+
     assert len(result.fresh_balances) == 3
     by_id = {row["plaid_account_id"]: row for row in result.fresh_balances}
     checking = by_id["plaid_acct_chase_checking_0001"]
@@ -676,7 +707,7 @@ def test_fresh_balances_collected_for_register_scope_including_unmapped(
     assert checking["plaid_account_type"] == "depository"
     assert checking["plaid_account_subtype"] == "checking"
     assert checking["iso_currency_code"] == "USD"
-    assert checking["snapshot_date"] == date.today().isoformat()
+    assert checking["snapshot_date"] == "2026-07-25"  # UTC day of pulled_at
     assert isinstance(checking["fetched_at"], int)
     assert checking["fetched_at"] > 1_500_000_000_000  # epoch MILLISECONDS
     # 2dp string formatting (12500.0 → "12500.00") — mirrors toFixed(2).
@@ -684,15 +715,72 @@ def test_fresh_balances_collected_for_register_scope_including_unmapped(
     # Credit card stays positive-as-returned (liability negation is a D1
     # READ-side rule, never applied at write time).
     assert by_id["plaid_acct_chase_card_0003"]["current_balance"] == "583.45"
-    # Register behavior unchanged: 1 snapshot + 2 expected_account rows.
-    assert session.query(PlaidAccountBalanceSnapshot).count() == 1
-    assert session.query(ExpectedAccount).count() == 2
 
 
-def test_fresh_balances_still_collected_on_same_day_duplicate(session: Session) -> None:
-    """A same-day re-run collides on UNIQUE locally (savepoint rollback) but
-    must STILL collect the payload row — D1's conditional upsert on fetched_at
-    wants the freshest value."""
+def test_fresh_balance_row_snapshot_date_is_utc_day_of_fetched_at(session: Session) -> None:
+    """P2-003: snapshot_date must be the UTC day of fetched_at/pulled_at, not
+    the box's system-local date.today() — the D1 (account_id, snapshot_date)
+    key, the fresher-wins upsert, and the drift baseline's
+    `snapshot_date < ?` query all depend on a UTC day key. Pin pulled_at just
+    before UTC midnight so a local-date bug (date.today() picking the NEXT
+    local day in a timezone ahead of UTC, or the PREVIOUS local day behind
+    UTC) would be caught regardless of the host's timezone."""
+    item = _make_wealth_item(session, institution_name="Schwab")
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    pulled_at = datetime(2026, 12, 31, 23, 59, 0)  # 1 minute before UTC midnight
+    result = sync_one_item(session, item, client=client, pulled_at=pulled_at)
+    session.commit()
+
+    row = next(
+        r for r in result.fresh_balances
+        if r["plaid_account_id"] == "plaid_acct_chase_checking_0001"
+    )
+    assert row["snapshot_date"] == "2026-12-31"
+    assert row["fetched_at"] == int(pulled_at.replace(tzinfo=UTC).timestamp() * 1000)
+
+
+def test_local_snapshot_date_matches_pushed_snapshot_date(session: Session) -> None:
+    """P3-r3m: the local snapshot row and the D1 payload row must key off the
+    SAME instant. Both now derive from ``pulled_at.date()``; neither may fall
+    back to the host's local ``date.today()``, or a run straddling local
+    midnight would write two different day keys for one pull."""
+    register_item = _make_item(session, institution_name="Chase")
+    _make_account(
+        session, item=register_item, plaid_account_id="plaid_acct_chase_checking_0001",
+        account_number="1111",
+    )
+    wealth_item = _make_wealth_item(session, institution_name="Schwab")
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    pulled_at = datetime(2026, 12, 31, 23, 59, 0)
+    sync_one_item(session, register_item, client=client, pulled_at=pulled_at)
+    wealth = sync_one_item(session, wealth_item, client=client, pulled_at=pulled_at)
+    session.commit()
+
+    snap = session.query(PlaidAccountBalanceSnapshot).one()
+    assert snap.snapshot_date == date(2026, 12, 31)
+    assert {r["snapshot_date"] for r in wealth.fresh_balances} == {"2026-12-31"}
+
+
+def test_wealth_fresh_balances_still_collected_on_same_day_rerun(session: Session) -> None:
+    """A same-day re-run must STILL collect the payload rows — D1's conditional
+    upsert on fetched_at wants the freshest value on every run."""
+    item = _make_wealth_item(session, institution_name="Schwab")
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    r1 = sync_one_item(session, item, client=client)
+    session.commit()
+    r2 = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert len(r1.fresh_balances) == 3
+    assert len(r2.fresh_balances) == 3
+
+
+def test_register_same_day_duplicate_stays_idempotent(session: Session) -> None:
+    """The register path's UNIQUE(account_id, snapshot_date) savepoint-rollback
+    idempotency is unaffected by the wealth-only push change."""
     item = _make_item(session)
     _make_account(
         session, item=item, plaid_account_id="plaid_acct_chase_checking_0001",
@@ -705,8 +793,11 @@ def test_fresh_balances_still_collected_on_same_day_duplicate(session: Session) 
     r2 = sync_one_item(session, item, client=client)
     session.commit()
 
-    assert len(r1.fresh_balances) == 3
-    assert len(r2.fresh_balances) == 3
+    assert session.query(PlaidAccountBalanceSnapshot).count() == 1
+    assert r1.accounts_failed == 0
+    assert r2.accounts_failed == 0
+    assert r1.fresh_balances == []
+    assert r2.fresh_balances == []
 
 
 def test_non_usd_account_not_collected_for_push(session: Session) -> None:
@@ -722,7 +813,11 @@ def test_non_usd_account_not_collected_for_push(session: Session) -> None:
 # ── push_fresh_balances (REQ-PC-B2) ──────────────────────────────────────────
 
 
-def _batch_with(rows_by_item: dict[str, list[dict[str, Any]]]) -> Any:
+def _batch_with(
+    rows_by_item: dict[str, list[dict[str, Any]]], *, scope: str = "wealth"
+) -> Any:
+    """Build a BatchResult. Defaults to wealth scope — P0-r3a: only wealth-scope
+    Items are eligible for the D1 push at all."""
     from src.adapters.plaid_balance import BatchResult, ItemSyncResult
 
     batch = BatchResult(dry_run=False)
@@ -730,7 +825,7 @@ def _batch_with(rows_by_item: dict[str, list[dict[str, Any]]]) -> Any:
         batch.items.append(
             ItemSyncResult(
                 item_id=f"id-{name}", institution_name=name, status="ok",
-                fresh_balances=rows,
+                scope=scope, fresh_balances=rows,
             )
         )
     return batch
@@ -747,7 +842,8 @@ def test_push_posts_snapshots_payload_with_correct_slug(session: Session) -> Non
 
     def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
         calls.append((payload, source))
-        return {"ok": True}
+        n = len(payload["snapshots"])
+        return {"records_written": n, "records_processed": n}
 
     batch = _batch_with({"Chase": [_row(1), _row(2)]})
     push = push_fresh_balances(batch, post=_post)
@@ -767,8 +863,9 @@ def test_push_chunks_at_batch_cap(session: Session) -> None:
     calls: list[int] = []
 
     def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
-        calls.append(len(payload["snapshots"]))
-        return {"ok": True}
+        n = len(payload["snapshots"])
+        calls.append(n)
+        return {"records_written": n, "records_processed": n}
 
     batch = _batch_with({"Big": [_row(i) for i in range(450)]})
     push = push_fresh_balances(batch, post=_post)
@@ -790,7 +887,8 @@ def test_push_per_item_isolation_and_failure_flag(session: Session) -> None:
         calls.append(first)
         if first == "acct-1":
             raise WealthHTTPError(500, "boom")
-        return {"ok": True}
+        n = len(payload["snapshots"])
+        return {"records_written": n, "records_processed": n}
 
     batch = _batch_with({"Failing": [_row(1)], "Healthy": [_row(2)]})
     push = push_fresh_balances(batch, session=session, post=_post)
@@ -814,7 +912,14 @@ def test_push_success_writes_success_ingestion_log(session: Session) -> None:
     from src.adapters.plaid_balance import push_fresh_balances
 
     batch = _batch_with({"Chase": [_row(1)]})
-    push = push_fresh_balances(batch, session=session, post=lambda p, s: {"ok": True})
+    push = push_fresh_balances(
+        batch,
+        session=session,
+        post=lambda p, s: {
+            "records_written": len(p["snapshots"]),
+            "records_processed": len(p["snapshots"]),
+        },
+    )
 
     assert push.failed is False
     log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
@@ -831,4 +936,270 @@ def test_push_with_no_rows_never_posts(session: Session) -> None:
     batch = _batch_with({"Empty": []})
     push = push_fresh_balances(batch, post=_post)
     assert push.total_pushed == 0
+
+
+def test_push_all_skipped_unmapped_trips_failure_not_silent_success(
+    session: Session,
+) -> None:
+    """P1-b2r/P1-002: a 200 response where the endpoint resolved ZERO
+    plaid_account_ids (e.g. a freshly re-linked Item — P0-001) must NOT look
+    like success. `pushed` (rows sent) is nonzero but `records_written` is 0
+    — the push must flag `failed`, not silently report a clean run."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        n = len(payload["snapshots"])
+        return {"records_written": 0, "records_skipped_unmapped": n, "records_failed": 0}
+
+    batch = _batch_with({"FreshlyRelinked": [_row(1), _row(2)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.total_pushed == 2
+    assert push.failed is True
+    item = push.items[0]
+    assert item.records_written == 0
+    assert item.records_skipped_unmapped == 2
+    assert item.error is not None
+    assert "unmapped" in item.error
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status != "success"
+
+
+def test_push_idempotent_resend_does_not_trip_failure(session: Session) -> None:
+    """P2-001: A1's `records_written` excludes idempotent no-ops (the
+    conditional upsert didn't change anything) but `records_processed`
+    includes them. An exact re-push of an already-written batch — every row a
+    legitimate no-op — must NOT be reported as a D1 write failure."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        n = len(payload["snapshots"])
+        # Every row was accepted but stale/idempotent — the conditional
+        # upsert made no changes, so records_written is 0 even though
+        # records_processed (accepted rows, written OR no-op) is nonzero.
+        return {"records_written": 0, "records_processed": n, "records_failed": 0}
+
+    batch = _batch_with({"ReSent": [_row(1), _row(2)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.total_pushed == 2
     assert push.failed is False
+    item = push.items[0]
+    assert item.records_written == 0
+    assert item.records_processed == 2
+    assert item.error is None
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status == "success"
+
+
+def test_push_ambiguous_plaid_account_id_trips_failure(session: Session) -> None:
+    """P2-002: `records_skipped_ambiguous` (multiple D1 accounts share a
+    plaid_account_id) is a data-integrity problem — it must trip the push
+    failure flag even when other rows in the same batch wrote cleanly."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        return {"records_written": 1, "records_processed": 1, "records_skipped_ambiguous": 1}
+
+    batch = _batch_with({"Ambiguous": [_row(1), _row(2)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.failed is True
+    item = push.items[0]
+    assert item.records_skipped_ambiguous == 1
+    assert item.error is not None
+    assert "ambiguous" in item.error
+
+
+def test_push_partial_unmapped_trips_failure_even_with_some_writes(
+    session: Session,
+) -> None:
+    """P1-part: a batch where SOME rows wrote and others were skipped-unmapped
+    (e.g. a newly-surfaced account on an existing wealth Item) must not exit
+    clean — only D1's own ingestion_log 'partial' status caught this before,
+    and nobody watches that from the box side."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        return {
+            "records_written": 1,
+            "records_processed": 1,
+            "records_skipped_unmapped": 40,
+        }
+
+    batch = _batch_with({"Mixed": [_row(1)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.failed is True
+    item = push.items[0]
+    assert item.records_skipped_unmapped == 40
+    assert item.error is not None
+
+
+def test_push_skips_register_scope_items_entirely(session: Session) -> None:
+    """P0-r3a: a mixed batch pushes ONLY the wealth-scope Item's rows. The
+    register Item is absent from the payload AND from the push result, and the
+    run is clean (exit 0) — its balances belong in the local snapshot table."""
+    from src.adapters.plaid_balance import BatchResult, ItemSyncResult, push_fresh_balances
+
+    posted: list[list[dict[str, Any]]] = []
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        posted.append(payload["snapshots"])
+        n = len(payload["snapshots"])
+        return {"records_written": n, "records_processed": n}
+
+    batch = BatchResult(dry_run=False)
+    batch.items.append(
+        ItemSyncResult(
+            item_id="id-chase", institution_name="Chase", status="ok",
+            scope="register", fresh_balances=[_row(1)],
+        )
+    )
+    batch.items.append(
+        ItemSyncResult(
+            item_id="id-schwab", institution_name="Schwab", status="ok",
+            scope="wealth", fresh_balances=[_row(2)],
+        )
+    )
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.failed is False
+    assert [p.institution_name for p in push.items] == ["Schwab"]
+    assert push.total_pushed == 1
+    # Exactly one POST, carrying only the wealth row.
+    assert posted == [[_row(2)]]
+    assert all(r["plaid_account_id"] != "acct-1" for chunk in posted for r in chunk)
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status == "success"
+    assert log.records_processed == 1
+
+
+def test_push_all_register_batch_never_posts(session: Session) -> None:
+    """P0-r3a: with no wealth-scope Items there is no push at all — no HTTP
+    call, no push results, no delivery-health log row, and a clean exit."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        raise AssertionError("register-scope balances must never be POSTed to D1")
+
+    batch = _batch_with({"Chase": [_row(1)], "Amex": [_row(2)]}, scope="register")
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.items == []
+    assert push.total_pushed == 0
+    assert push.failed is False
+    assert session.query(IngestionLog).filter_by(
+        source="wealth_cloud:plaid_balance"
+    ).count() == 0
+
+
+def test_push_skipped_non_usd_is_informational_not_a_failure(session: Session) -> None:
+    """P1-r3c-2: ``records_skipped_non_usd`` never trips a failure — even when
+    it accounts for every row in the batch (aligning with the CRM-side
+    decision). Only unmapped/ambiguous/failed rows are errors."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        n = len(payload["snapshots"])
+        return {"records_written": 0, "records_processed": 0, "records_skipped_non_usd": n}
+
+    batch = _batch_with({"ForeignBank": [_row(1), _row(2)]})
+    push = push_fresh_balances(batch, session=session, post=_post)
+
+    assert push.failed is False
+    assert push.items[0].records_skipped_non_usd == 2
+    assert push.items[0].error is None
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status == "success"
+
+
+def test_push_endpoint_reported_records_failed_trips_failure(session: Session) -> None:
+    """The endpoint's own `records_failed` count (per-row DB errors on its
+    side) must also trip the push failure flag, not just transport errors."""
+    from src.adapters.plaid_balance import push_fresh_balances
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        return {"records_written": 1, "records_failed": 1}
+
+    batch = _batch_with({"Flaky": [_row(1), _row(2)]})
+    push = push_fresh_balances(batch, post=_post)
+
+    assert push.failed is True
+    assert "1 failed row" in (push.items[0].error or "")
+
+
+# ── P2-006: A1 golden-row cross-repo contract fixture ───────────────────────
+#
+# Mirrors the P1-xct pattern already established for A2
+# (test_plaid_investments.py::test_contract_fixture_matches_committed_json /
+# tests/fixtures/plaid-consolidation-contract/{01,02}-*.json): a payload built
+# from the REAL box builder (`_fresh_balance_row`), committed verbatim to a
+# fixture file both repos load, so a change to the builder's output shape
+# fails a test in THIS repo instead of silently drifting from what
+# sparkry-crm-plaidcons's endpoint test suite happens to hand-write.
+#
+# Covers the two cases the artifact review flagged as under-tested on the A1
+# side: a plain USD depository row (exercising the float->2dp-string money
+# path) and a credit/loan-type row (exercising the read-side liability-
+# negation predicate, which keys on `plaid_account_type` ∈ {credit, loan}).
+
+_CONTRACT_FIXTURE_DIR = (
+    Path(__file__).resolve().parent.parent.parent
+    / "tests"
+    / "fixtures"
+    / "plaid-consolidation-contract"
+)
+
+
+def _contract_balance_account(
+    *,
+    account_id: str,
+    acct_type: str,
+    subtype: str | None,
+    current: Any,
+    available: Any = None,
+) -> Any:
+    balances = SimpleNamespace(current=current, available=available, iso_currency_code="USD")
+    return SimpleNamespace(account_id=account_id, type=acct_type, subtype=subtype, balances=balances)
+
+
+def _build_contract_balance_snapshots() -> dict[str, Any]:
+    """Reconstruct the exact payload the 03-balance-chunk.json fixture was
+    generated from — a plain USD depository row (money as a Python float,
+    exercising the ROUND_HALF_UP-to-2dp string path) and a credit/loan row
+    (the liability-negation case)."""
+    pulled_at = datetime(2026, 7, 25, 4, 20, tzinfo=UTC).replace(tzinfo=None)
+    checking = _contract_balance_account(
+        account_id="plaid_acct_contract_checking",
+        acct_type="depository",
+        subtype="checking",
+        current=1234.5,
+        available=1000,
+    )
+    credit = _contract_balance_account(
+        account_id="plaid_acct_contract_credit",
+        acct_type="credit",
+        subtype="credit card",
+        current="500.005",  # string input — HALF_UP quantize to "500.01"
+        available=None,
+    )
+    rows = [
+        _fresh_balance_row(checking, pulled_at=pulled_at),
+        _fresh_balance_row(credit, pulled_at=pulled_at),
+    ]
+    return {"snapshots": rows}
+
+
+def test_balance_contract_fixture_matches_committed_json() -> None:
+    """The committed A1 golden-row fixture is byte-identical to a fresh
+    `_fresh_balance_row` build.
+
+    If this fails, either `_fresh_balance_row`'s output shape changed (update
+    BOTH this repo's fixture AND sparkry-crm-plaidcons's copy — see the
+    fixture dir's README) or this helper drifted from the documented
+    generation recipe.
+    """
+    payload = _build_contract_balance_snapshots()
+    committed = json.loads((_CONTRACT_FIXTURE_DIR / "03-balance-chunk.json").read_text())
+    assert payload == committed

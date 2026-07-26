@@ -1,0 +1,24 @@
+{
+  "snapshots": [
+    {
+      "plaid_account_id": "plaid_acct_contract_checking",
+      "snapshot_date": "2026-07-25",
+      "plaid_account_type": "depository",
+      "plaid_account_subtype": "checking",
+      "current_balance": "1234.50",
+      "available_balance": "1000.00",
+      "iso_currency_code": "USD",
+      "fetched_at": 1784953200000
+    },
+    {
+      "plaid_account_id": "plaid_acct_contract_credit",
+      "snapshot_date": "2026-07-25",
+      "plaid_account_type": "credit",
+      "plaid_account_subtype": "credit card",
+      "current_balance": "500.01",
+      "available_balance": null,
+      "iso_currency_code": "USD",
+      "fetched_at": 1784953200000
+    }
+  ]
+}

@@ -80,8 +80,9 @@ def main(argv: list[str] | None = None) -> int:
             r.error_code or "-",
         )
 
-    # REQ-PC-B2: push all fresh balances (both scopes) to the wealth D1 after
-    # the local sync. DRY-RUN never POSTs — it only reports what would push.
+    # REQ-PC-B2: push WEALTH-scope fresh balances to the wealth D1 after the
+    # local sync (P0-r3a: register-scope balances are local-only and never
+    # pushed). DRY-RUN never POSTs — it only reports what would push.
     push_failed = False
     if args.apply:
         with SessionLocal() as session:
@@ -92,7 +93,9 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("  %s push FAILED: %s", p.institution_name, p.error)
         push_failed = push.failed
     else:
-        would_push = sum(len(r.fresh_balances) for r in batch.items)
+        would_push = sum(
+            len(r.fresh_balances) for r in batch.items if r.scope == "wealth"
+        )
         logger.info("wealth D1 push skipped (dry-run): %d row(s) would push", would_push)
 
     # REQ-FIX-PLD-002: mirror plaid_transactions_sync.py's exit policy — any

@@ -8,19 +8,18 @@ For every active PlaidItem (BOTH scopes — register and wealth):
      Plaid's regular Transactions syncs and needs no extra product
      entitlement. Response shape and snapshot write path are unchanged.
   3. For each Plaid account in the response:
-      - Collect a wealth-D1 payload row (``fresh_balances``) for every USD
-        account with a non-null current balance — REQ-PC-B2: after the sync,
-        ``push_fresh_balances`` POSTs these to the wealth Worker's
-        ``ingest/plaid-balance`` endpoint (the D1 wants register-scope
-        accounts' balances too, as it received them pre-consolidation).
-      - REGISTER scope only:
+      - REGISTER scope: purely local.
           * If mapped to a local Account → INSERT a row in
             plaid_account_balance_snapshot (UNIQUE(account_id, snapshot_date)
             makes double-runs idempotent).
           * If unmapped → upsert an ExpectedAccount row with
             status='unconfirmed' so it surfaces in the missing-accounts panel.
+          * NOTHING is ever pushed to the wealth D1 (P0-r3a — see
+            ``push_fresh_balances``).
       - WEALTH scope (REQ-PC-B1): NO local Account mapping, NO snapshot rows,
-        NO expected_account writes — the payload row is the only output.
+        NO expected_account writes. The only output is a ``fresh_balances``
+        payload row (REQ-PC-B2), which ``push_fresh_balances`` POSTs to the
+        wealth Worker's ``ingest/plaid-balance`` endpoint after the sync.
       - Non-USD → skip with warning (never collected, never written).
   4. Write one IngestionLog row per Item per run.
 
@@ -36,7 +35,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -93,9 +92,9 @@ class ItemSyncResult:
     # listed accounts are excluded — they no longer count as unmapped).
     unmapped: list[str] = field(default_factory=list)
     #: REQ-PC-B2: A1-shaped payload rows (one per USD account with a non-null
-    #: current balance, BOTH scopes) collected in memory for the post-sync D1
-    #: push. Never persisted locally; survives per-row savepoint rollbacks by
-    #: design (a same-day duplicate snapshot locally must still refresh D1).
+    #: current balance) collected in memory for the post-sync D1 push. Never
+    #: persisted locally. P0-r3a: populated for WEALTH-scope Items ONLY —
+    #: always empty for register scope, whose balances are local-only.
     fresh_balances: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -142,7 +141,11 @@ def _build_snapshot(
 
     return PlaidAccountBalanceSnapshot(
         account_id=account.id,
-        snapshot_date=date.today(),
+        # P3-r3m: the UTC day of ``pulled_at``, never the box's system-local
+        # date.today(). Every snapshot_date in this module now derives from the
+        # same instant (see _fresh_balance_row), so a run straddling local
+        # midnight can't key two rows to different days.
+        snapshot_date=pulled_at.date(),
         plaid_account_type=plaid_type,
         plaid_account_subtype=plaid_subtype,
         # Decimal at the JSON boundary, per CLAUDE.md.
@@ -186,7 +189,13 @@ def _fresh_balance_row(plaid_account: Any, *, pulled_at: datetime) -> dict[str, 
     subtype = getattr(plaid_account, "subtype", None)
     return {
         "plaid_account_id": plaid_account.account_id,
-        "snapshot_date": date.today().isoformat(),
+        # P2-003: derive snapshot_date from the SAME instant as fetched_at
+        # (pulled_at, always UTC per _utcnow()) rather than the box's
+        # system-local date. The D1 (account_id, snapshot_date) key, the
+        # fresher-wins upsert ordering, and the drift baseline's
+        # `snapshot_date < ?` query all depend on this being a UTC day key —
+        # date.today() only coincidentally agrees while the box's TZ is UTC.
+        "snapshot_date": pulled_at.date().isoformat(),
         "plaid_account_type": str(plaid_account.type),
         "plaid_account_subtype": str(subtype) if subtype else None,
         "current_balance": _money_str(current),
@@ -424,22 +433,27 @@ def _process_plaid_account(
         result.accounts_skipped_non_usd += 1
         return
 
-    # REQ-PC-B2: collect the wealth-D1 payload row for BOTH scopes, before any
-    # register-mapping decisions — the D1 wants register accounts' balances
-    # too, and its own account table decides what maps (unknown ids are
-    # per-row skipped endpoint-side). Appended before the local INSERT so a
-    # same-day UNIQUE collision (savepoint rollback) still refreshes D1.
-    fresh_row = _fresh_balance_row(plaid_account, pulled_at=pulled_at)
-    if fresh_row is not None:
-        result.fresh_balances.append(fresh_row)
-
     # REQ-PC-B1: wealth-scope Items stop here — NO local Account mapping, NO
-    # snapshot rows, NO expected_account writes. The payload row above is the
-    # only output; a missing balance counts as a failure like the local path.
+    # snapshot rows, NO expected_account writes. A ``fresh_balances`` payload
+    # row is the only output; a missing balance counts as a failure like the
+    # local path.
+    #
+    # P0-r3a: the payload row is collected for WEALTH scope ONLY. The earlier
+    # "push both scopes" reading of the spec was wrong: D1 has never contained
+    # the box's register accounts. Plaid account_ids are per-Item, and D1's own
+    # Chase balances come from ITS migrated Item, not the box's — so pushing
+    # register rows could only ever produce unmapped skips (or, worse, resolve
+    # against an unrelated account). Register balances stay in the local
+    # snapshot table, exactly as before the consolidation.
     if result.scope != "register":
+        fresh_row = _fresh_balance_row(plaid_account, pulled_at=pulled_at)
         if fresh_row is None:
             result.accounts_failed += 1
         else:
+            # Appended regardless of any local write outcome — nothing local
+            # happens for this scope, and D1's conditional upsert wants the
+            # freshest value on every run.
+            result.fresh_balances.append(fresh_row)
             result.accounts_processed += 1
         return
 
@@ -536,6 +550,19 @@ class PushItemResult:
     institution_name: str
     rows: int = 0
     pushed: int = 0
+    # P1-b2r/P1-002: counts parsed from the endpoint's own response body (not
+    # just the local send count) — a 200 that wrote nothing is not success.
+    # P2-001: records_processed also parsed (includes idempotent no-op rows,
+    # unlike records_written) so an exact re-push of an already-written batch
+    # isn't misread as a total D1 write failure. P2-002: records_skipped_ambiguous
+    # parsed so a batch with duplicate-plaid_account_id collisions is visible
+    # rather than silently absorbed into "success".
+    records_processed: int = 0
+    records_written: int = 0
+    records_skipped_unmapped: int = 0
+    records_skipped_non_usd: int = 0
+    records_skipped_ambiguous: int = 0
+    records_failed_endpoint: int = 0
     error: str | None = None
 
 
@@ -562,7 +589,13 @@ def push_fresh_balances(
     session: Session | None = None,
     post: Any = post_to_wealth,
 ) -> PushResult:
-    """POST every Item's ``fresh_balances`` to the wealth Worker (A1 endpoint).
+    """POST every WEALTH-scope Item's ``fresh_balances`` to the wealth Worker.
+
+    P0-r3a: register-scope Items are skipped outright — not merely empty, but
+    never enumerated and never POSTed. Their balances live only in the local
+    ``plaid_account_balance_snapshot`` table (D1 has never held them). An
+    all-register batch therefore performs no HTTP call at all and reports a
+    clean result.
 
     REQ-PC-B2: per-Item error isolation — one Item's failed push never blocks
     the rest. A failed push is recorded on the result (``failed`` property);
@@ -580,7 +613,8 @@ def push_fresh_balances(
     ``post`` is injectable for tests.
     """
     push = PushResult()
-    for item_result in batch.items:
+    wealth_items = [i for i in batch.items if i.scope == "wealth"]
+    for item_result in wealth_items:
         pr = PushItemResult(
             item_id=item_result.item_id,
             institution_name=item_result.institution_name,
@@ -591,8 +625,77 @@ def push_fresh_balances(
             continue
         try:
             for chunk in _chunked(item_result.fresh_balances, WEALTH_BALANCE_BATCH_CAP):
-                post({"snapshots": chunk}, WEALTH_BALANCE_INGEST_SOURCE)
+                resp = post({"snapshots": chunk}, WEALTH_BALANCE_INGEST_SOURCE)
                 pr.pushed += len(chunk)
+                # P1-b2r/P1-002: the endpoint never 400s a batch for
+                # unresolvable rows — it 200s with per-row skip/write counts.
+                # Without inspecting them, a push where EVERY row was
+                # unmapped (e.g. a freshly re-linked Item whose Plaid
+                # account_ids don't exist in D1 yet — see P0-001) looks
+                # identical to full success: exit 0, no OnFailure alert, D1
+                # silently stale. Tolerate a response shape mismatch
+                # (older/mocked endpoint) by treating missing keys as 0/absent
+                # rather than crashing the push.
+                if isinstance(resp, dict):
+                    pr.records_processed += int(resp.get("records_processed", 0) or 0)
+                    pr.records_written += int(resp.get("records_written", 0) or 0)
+                    pr.records_skipped_unmapped += int(
+                        resp.get("records_skipped_unmapped", 0) or 0
+                    )
+                    pr.records_skipped_non_usd += int(
+                        resp.get("records_skipped_non_usd", 0) or 0
+                    )
+                    pr.records_skipped_ambiguous += int(
+                        resp.get("records_skipped_ambiguous", 0) or 0
+                    )
+                    pr.records_failed_endpoint += int(resp.get("records_failed", 0) or 0)
+            # P1-r3c-2: failure semantics for a WEALTH push. A wealth account
+            # should ALWAYS resolve on the D1 side — migrated ones already
+            # exist, and re-linked ones are provisioned at exchange time by
+            # ``plaid_account_map.push_account_map``. So an unmapped or
+            # ambiguous row is a real defect, never routine. ``skipped_non_usd``
+            # is the one informational counter: it is never an error, and it is
+            # subtracted out before the "nothing resolved" check below.
+            deliverable = pr.pushed - pr.records_skipped_non_usd
+            if pr.records_failed_endpoint > 0:
+                pr.error = (
+                    f"D1 reported {pr.records_failed_endpoint} failed row(s) of "
+                    f"{pr.pushed} pushed"
+                )
+            elif pr.records_skipped_ambiguous > 0:
+                # P2-002: an ambiguous plaid_account_id (multiple D1 accounts
+                # share it) is a data-integrity problem regardless of how many
+                # OTHER rows in the batch landed cleanly — never silence it.
+                pr.error = (
+                    f"D1 reported {pr.records_skipped_ambiguous} ambiguous "
+                    f"plaid_account_id row(s) (multiple accounts share a "
+                    f"plaid_account_id) of {pr.pushed} pushed"
+                )
+            elif pr.records_skipped_unmapped > 0:
+                # P1-part: a PARTIALLY unmapped batch (some rows wrote, others
+                # were skipped-unmapped) previously exited 0 — the only honest
+                # signal was D1's own ingestion_log 'partial' status, which
+                # nobody watches. Treat any unmapped rows as at minimum a
+                # partial-failure that trips the non-zero exit / OnFailure
+                # alert, so a newly-surfaced account (which the wealth-scope
+                # sync never records via expected_account) is never silently
+                # dropped forever.
+                pr.error = (
+                    f"D1 skipped {pr.records_skipped_unmapped} unmapped row(s) of "
+                    f"{pr.pushed} pushed (partial delivery) — "
+                    "likely a newly-surfaced or not-yet-mapped plaid_account_id in D1"
+                )
+            elif deliverable > 0 and pr.records_processed == 0:
+                # P2-001: records_processed (unlike records_written) already
+                # counts idempotent no-op rows on the endpoint side, so an
+                # exact re-push of an already-written batch — every row a
+                # legitimate no-op — does NOT trip this branch. Zero
+                # *processed* rows means nothing resolved at all.
+                pr.error = (
+                    f"D1 processed 0 of {deliverable} deliverable row(s) "
+                    f"(skipped_non_usd={pr.records_skipped_non_usd}) — "
+                    "likely unmapped plaid_account_id(s) in D1"
+                )
         except WealthClientError as exc:
             pr.error = f"{type(exc).__name__}: {exc}"
             logger.error(
@@ -601,7 +704,10 @@ def push_fresh_balances(
                 type(exc).__name__,
             )
 
-    if session is not None:
+    # P0-r3a: with no wealth-scope Items there is no delivery to report on —
+    # writing a "success, 0 records" row would misrepresent a run that never
+    # contacted the Worker as healthy delivery.
+    if session is not None and wealth_items:
         errors = [
             f"{i.institution_name}: {i.error}" for i in push.items if i.error
         ]

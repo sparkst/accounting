@@ -87,6 +87,17 @@ class InvestmentsItemResult:
     pushed: bool = False
     error_code: str | None = None
     retryable: bool = False
+    # P1-b2r/P1-002: counts parsed from the A2 response body — the endpoint
+    # 200s a batch that resolved zero accounts, so `pushed=True` alone does
+    # not mean anything landed in D1.
+    holdings_written: int = 0
+    holdings_skipped_unmapped: int = 0
+    holdings_skipped_ambiguous: int = 0
+    #: P1-r3c-2: informational ONLY — a non-USD holding is expected to be
+    #: dropped endpoint-side and never counts as a push failure (mirrors the
+    #: A1/balance decision).
+    holdings_skipped_non_usd: int = 0
+    holdings_failed_endpoint: int = 0
 
 
 @dataclass
@@ -216,27 +227,89 @@ def sync_one_item(
 
         if not dry_run:
             for chunk in chunk_holdings_payload(payload):
-                post(chunk, WEALTH_HOLDINGS_INGEST_SOURCE)
+                resp = post(chunk, WEALTH_HOLDINGS_INGEST_SOURCE)
+                # P1-b2r/P1-002: A2 never 400s a batch for unresolvable
+                # holdings — it 200s with per-row skip/failure counts.
+                # Without inspecting them, an Item whose plaid_account_ids
+                # are all unmapped in D1 (e.g. a freshly re-linked Item —
+                # P0-001) looks identical to a fully successful push.
+                # Tolerate a response shape mismatch by defaulting to 0.
+                if isinstance(resp, dict):
+                    result.holdings_written += int(resp.get("holdings_processed", 0) or 0)
+                    result.holdings_skipped_unmapped += int(
+                        resp.get("holdings_skipped_unmapped", 0) or 0
+                    )
+                    # P2-002: holdings_skipped_ambiguous parsed so a batch with
+                    # duplicate-plaid_account_id collisions is visible rather
+                    # than silently absorbed into apparent success.
+                    result.holdings_skipped_ambiguous += int(
+                        resp.get("holdings_skipped_ambiguous", 0) or 0
+                    )
+                    result.holdings_skipped_non_usd += int(
+                        resp.get("holdings_skipped_non_usd", 0) or 0
+                    )
+                    result.holdings_failed_endpoint += int(
+                        resp.get("holdings_failed", 0) or 0
+                    )
             result.pushed = True
+
+        if result.holdings_failed_endpoint > 0:
+            raise WealthClientError(
+                f"D1 reported {result.holdings_failed_endpoint} failed holding row(s)"
+            )
+        if result.holdings_skipped_ambiguous > 0:
+            # P2-002: ambiguous plaid_account_id is a data-integrity problem
+            # regardless of how many other holdings in the batch landed.
+            raise WealthClientError(
+                f"D1 reported {result.holdings_skipped_ambiguous} ambiguous "
+                "plaid_account_id holding row(s) (multiple accounts share a "
+                "plaid_account_id)"
+            )
+        # P1-r3c-2: non-USD holdings are subtracted before the "nothing landed"
+        # check — an all-non-USD batch is a legitimate no-op, not a failure.
+        deliverable = result.holdings - result.holdings_skipped_non_usd
+        if not dry_run and deliverable > 0 and result.holdings_written == 0:
+            raise WealthClientError(
+                f"D1 wrote 0 of {deliverable} deliverable holding row(s) "
+                f"(skipped_unmapped={result.holdings_skipped_unmapped}, "
+                f"skipped_non_usd={result.holdings_skipped_non_usd}) — "
+                "likely unmapped plaid_account_id(s) in D1"
+            )
+        if not dry_run and result.holdings_skipped_unmapped > 0:
+            # P1-part: a partially-unmapped batch (some holdings written,
+            # others skipped-unmapped — e.g. a new account surfaced on an
+            # existing wealth Item, which the wealth-scope balance sync never
+            # discovers via expected_account) previously exited 0. Treat any
+            # unmapped holdings as at minimum a partial failure so the
+            # OnFailure alert fires instead of the run going quietly green.
+            raise WealthClientError(
+                f"D1 skipped {result.holdings_skipped_unmapped} unmapped holding "
+                f"row(s) of {result.holdings} pushed (partial delivery) — "
+                "likely a newly-surfaced or not-yet-mapped plaid_account_id in D1"
+            )
 
         log_row.records_processed = result.holdings
         log_row.records_failed = 0
         log_row.error_detail = (
             f"securities={result.securities} holdings={result.holdings}"
-            f" pushed={result.pushed}"
+            f" pushed={result.pushed} written={result.holdings_written}"
+            f" skipped_unmapped={result.holdings_skipped_unmapped}"
+            f" skipped_non_usd={result.holdings_skipped_non_usd}"
         )
 
     except WealthClientError as exc:
         # The Plaid fetch succeeded but the D1 push failed — a real failure
         # (the D1 goes stale silently otherwise). Non-zero exit → OnFailure.
+        # Includes the endpoint-reported-skip case raised above, whose
+        # message carries the skip counts for diagnosability (P2-log/P1-002).
         result.status = "error"
         result.error_code = f"D1_PUSH:{type(exc).__name__}"
         log_row.status = IngestionStatus.FAILURE.value
-        log_row.error_detail = result.error_code
+        log_row.error_detail = f"{result.error_code}: {exc}"
         logger.error(
             "plaid investments D1 push failed for %s: %s",
             item.institution_name,
-            type(exc).__name__,
+            exc,
         )
     except RetryablePlaidError as exc:
         result.status = (

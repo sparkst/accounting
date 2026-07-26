@@ -1,0 +1,1609 @@
+{
+  "item_id": "item_contract_etrade",
+  "institution_name": "E*TRADE from Morgan Stanley",
+  "pulled_at": "2026-07-25T04:20:00+00:00",
+  "fetched_at": 1784953200000,
+  "securities": [
+    {
+      "security_id": "sec_aapl_contract",
+      "isin": "US0378331005",
+      "cusip": "037833100",
+      "ticker_symbol": "AAPL",
+      "name": "Apple Inc",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_0",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL0",
+      "name": "Filler Security 0",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_1",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL1",
+      "name": "Filler Security 1",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_2",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL2",
+      "name": "Filler Security 2",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_3",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL3",
+      "name": "Filler Security 3",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_4",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL4",
+      "name": "Filler Security 4",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_5",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL5",
+      "name": "Filler Security 5",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_6",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL6",
+      "name": "Filler Security 6",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_7",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL7",
+      "name": "Filler Security 7",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_8",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL8",
+      "name": "Filler Security 8",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_9",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL9",
+      "name": "Filler Security 9",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_10",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL10",
+      "name": "Filler Security 10",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_11",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL11",
+      "name": "Filler Security 11",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_12",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL12",
+      "name": "Filler Security 12",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_13",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL13",
+      "name": "Filler Security 13",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_14",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL14",
+      "name": "Filler Security 14",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_15",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL15",
+      "name": "Filler Security 15",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_16",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL16",
+      "name": "Filler Security 16",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_17",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL17",
+      "name": "Filler Security 17",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_18",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL18",
+      "name": "Filler Security 18",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_19",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL19",
+      "name": "Filler Security 19",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_20",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL20",
+      "name": "Filler Security 20",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_21",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL21",
+      "name": "Filler Security 21",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_22",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL22",
+      "name": "Filler Security 22",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_23",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL23",
+      "name": "Filler Security 23",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_24",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL24",
+      "name": "Filler Security 24",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_25",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL25",
+      "name": "Filler Security 25",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_26",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL26",
+      "name": "Filler Security 26",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_27",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL27",
+      "name": "Filler Security 27",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_28",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL28",
+      "name": "Filler Security 28",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_29",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL29",
+      "name": "Filler Security 29",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_30",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL30",
+      "name": "Filler Security 30",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_31",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL31",
+      "name": "Filler Security 31",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_32",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL32",
+      "name": "Filler Security 32",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_33",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL33",
+      "name": "Filler Security 33",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_34",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL34",
+      "name": "Filler Security 34",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_35",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL35",
+      "name": "Filler Security 35",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_36",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL36",
+      "name": "Filler Security 36",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_37",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL37",
+      "name": "Filler Security 37",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_38",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL38",
+      "name": "Filler Security 38",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_39",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL39",
+      "name": "Filler Security 39",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_40",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL40",
+      "name": "Filler Security 40",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_41",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL41",
+      "name": "Filler Security 41",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_42",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL42",
+      "name": "Filler Security 42",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_43",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL43",
+      "name": "Filler Security 43",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_44",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL44",
+      "name": "Filler Security 44",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_45",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL45",
+      "name": "Filler Security 45",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_46",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL46",
+      "name": "Filler Security 46",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_47",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL47",
+      "name": "Filler Security 47",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_48",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL48",
+      "name": "Filler Security 48",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_49",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL49",
+      "name": "Filler Security 49",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_50",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL50",
+      "name": "Filler Security 50",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_51",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL51",
+      "name": "Filler Security 51",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_52",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL52",
+      "name": "Filler Security 52",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_53",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL53",
+      "name": "Filler Security 53",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_54",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL54",
+      "name": "Filler Security 54",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_55",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL55",
+      "name": "Filler Security 55",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_56",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL56",
+      "name": "Filler Security 56",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_57",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL57",
+      "name": "Filler Security 57",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_58",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL58",
+      "name": "Filler Security 58",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_59",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL59",
+      "name": "Filler Security 59",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_60",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL60",
+      "name": "Filler Security 60",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_61",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL61",
+      "name": "Filler Security 61",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_62",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL62",
+      "name": "Filler Security 62",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_63",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL63",
+      "name": "Filler Security 63",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_64",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL64",
+      "name": "Filler Security 64",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_65",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL65",
+      "name": "Filler Security 65",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_66",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL66",
+      "name": "Filler Security 66",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_67",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL67",
+      "name": "Filler Security 67",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_68",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL68",
+      "name": "Filler Security 68",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_69",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL69",
+      "name": "Filler Security 69",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_70",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL70",
+      "name": "Filler Security 70",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_71",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL71",
+      "name": "Filler Security 71",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_72",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL72",
+      "name": "Filler Security 72",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_73",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL73",
+      "name": "Filler Security 73",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_74",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL74",
+      "name": "Filler Security 74",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_75",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL75",
+      "name": "Filler Security 75",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_76",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL76",
+      "name": "Filler Security 76",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_77",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL77",
+      "name": "Filler Security 77",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_78",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL78",
+      "name": "Filler Security 78",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_79",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL79",
+      "name": "Filler Security 79",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_80",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL80",
+      "name": "Filler Security 80",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_81",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL81",
+      "name": "Filler Security 81",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_82",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL82",
+      "name": "Filler Security 82",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_83",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL83",
+      "name": "Filler Security 83",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_84",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL84",
+      "name": "Filler Security 84",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_85",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL85",
+      "name": "Filler Security 85",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_86",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL86",
+      "name": "Filler Security 86",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_87",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL87",
+      "name": "Filler Security 87",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_88",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL88",
+      "name": "Filler Security 88",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_89",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL89",
+      "name": "Filler Security 89",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_90",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL90",
+      "name": "Filler Security 90",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_91",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL91",
+      "name": "Filler Security 91",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_92",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL92",
+      "name": "Filler Security 92",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_93",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL93",
+      "name": "Filler Security 93",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_94",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL94",
+      "name": "Filler Security 94",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_95",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL95",
+      "name": "Filler Security 95",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_96",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL96",
+      "name": "Filler Security 96",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_97",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL97",
+      "name": "Filler Security 97",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_98",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL98",
+      "name": "Filler Security 98",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_99",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL99",
+      "name": "Filler Security 99",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_100",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL100",
+      "name": "Filler Security 100",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_101",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL101",
+      "name": "Filler Security 101",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_102",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL102",
+      "name": "Filler Security 102",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_103",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL103",
+      "name": "Filler Security 103",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_104",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL104",
+      "name": "Filler Security 104",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_105",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL105",
+      "name": "Filler Security 105",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_106",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL106",
+      "name": "Filler Security 106",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_107",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL107",
+      "name": "Filler Security 107",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_108",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL108",
+      "name": "Filler Security 108",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_109",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL109",
+      "name": "Filler Security 109",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_110",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL110",
+      "name": "Filler Security 110",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_111",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL111",
+      "name": "Filler Security 111",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_112",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL112",
+      "name": "Filler Security 112",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_113",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL113",
+      "name": "Filler Security 113",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_114",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL114",
+      "name": "Filler Security 114",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_115",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL115",
+      "name": "Filler Security 115",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_116",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL116",
+      "name": "Filler Security 116",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_117",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL117",
+      "name": "Filler Security 117",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_118",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL118",
+      "name": "Filler Security 118",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_119",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL119",
+      "name": "Filler Security 119",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_120",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL120",
+      "name": "Filler Security 120",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_121",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL121",
+      "name": "Filler Security 121",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_122",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL122",
+      "name": "Filler Security 122",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_123",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL123",
+      "name": "Filler Security 123",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_124",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL124",
+      "name": "Filler Security 124",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_125",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL125",
+      "name": "Filler Security 125",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_126",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL126",
+      "name": "Filler Security 126",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_127",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL127",
+      "name": "Filler Security 127",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_128",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL128",
+      "name": "Filler Security 128",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_129",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL129",
+      "name": "Filler Security 129",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_130",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL130",
+      "name": "Filler Security 130",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_131",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL131",
+      "name": "Filler Security 131",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_132",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL132",
+      "name": "Filler Security 132",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_133",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL133",
+      "name": "Filler Security 133",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_134",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL134",
+      "name": "Filler Security 134",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_135",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL135",
+      "name": "Filler Security 135",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_136",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL136",
+      "name": "Filler Security 136",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_137",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL137",
+      "name": "Filler Security 137",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_138",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL138",
+      "name": "Filler Security 138",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_139",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL139",
+      "name": "Filler Security 139",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_140",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL140",
+      "name": "Filler Security 140",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_141",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL141",
+      "name": "Filler Security 141",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_142",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL142",
+      "name": "Filler Security 142",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_143",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL143",
+      "name": "Filler Security 143",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_144",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL144",
+      "name": "Filler Security 144",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_145",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL145",
+      "name": "Filler Security 145",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_146",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL146",
+      "name": "Filler Security 146",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_147",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL147",
+      "name": "Filler Security 147",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_148",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL148",
+      "name": "Filler Security 148",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_149",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL149",
+      "name": "Filler Security 149",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_150",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL150",
+      "name": "Filler Security 150",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_151",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL151",
+      "name": "Filler Security 151",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_152",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL152",
+      "name": "Filler Security 152",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_153",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL153",
+      "name": "Filler Security 153",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_154",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL154",
+      "name": "Filler Security 154",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_155",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL155",
+      "name": "Filler Security 155",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_156",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL156",
+      "name": "Filler Security 156",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_157",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL157",
+      "name": "Filler Security 157",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_158",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL158",
+      "name": "Filler Security 158",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_159",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL159",
+      "name": "Filler Security 159",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_160",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL160",
+      "name": "Filler Security 160",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_161",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL161",
+      "name": "Filler Security 161",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_162",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL162",
+      "name": "Filler Security 162",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_163",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL163",
+      "name": "Filler Security 163",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_164",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL164",
+      "name": "Filler Security 164",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_165",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL165",
+      "name": "Filler Security 165",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_166",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL166",
+      "name": "Filler Security 166",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_167",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL167",
+      "name": "Filler Security 167",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_168",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL168",
+      "name": "Filler Security 168",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_169",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL169",
+      "name": "Filler Security 169",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_170",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL170",
+      "name": "Filler Security 170",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_171",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL171",
+      "name": "Filler Security 171",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_172",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL172",
+      "name": "Filler Security 172",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_173",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL173",
+      "name": "Filler Security 173",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_174",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL174",
+      "name": "Filler Security 174",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_175",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL175",
+      "name": "Filler Security 175",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_176",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL176",
+      "name": "Filler Security 176",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_177",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL177",
+      "name": "Filler Security 177",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_178",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL178",
+      "name": "Filler Security 178",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_179",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL179",
+      "name": "Filler Security 179",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_180",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL180",
+      "name": "Filler Security 180",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_181",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL181",
+      "name": "Filler Security 181",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_182",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL182",
+      "name": "Filler Security 182",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_183",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL183",
+      "name": "Filler Security 183",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_184",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL184",
+      "name": "Filler Security 184",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_185",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL185",
+      "name": "Filler Security 185",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_186",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL186",
+      "name": "Filler Security 186",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_187",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL187",
+      "name": "Filler Security 187",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_188",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL188",
+      "name": "Filler Security 188",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_189",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL189",
+      "name": "Filler Security 189",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_190",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL190",
+      "name": "Filler Security 190",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_191",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL191",
+      "name": "Filler Security 191",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_192",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL192",
+      "name": "Filler Security 192",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_193",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL193",
+      "name": "Filler Security 193",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_194",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL194",
+      "name": "Filler Security 194",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_195",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL195",
+      "name": "Filler Security 195",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_196",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL196",
+      "name": "Filler Security 196",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_197",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL197",
+      "name": "Filler Security 197",
+      "type": "equity"
+    },
+    {
+      "security_id": "sec_filler_198",
+      "isin": null,
+      "cusip": null,
+      "ticker_symbol": "FIL198",
+      "name": "Filler Security 198",
+      "type": "equity"
+    }
+  ],
+  "holdings": []
+}

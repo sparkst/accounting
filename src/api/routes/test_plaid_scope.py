@@ -208,6 +208,159 @@ def test_exchange_register_placeholder_echoes_register(
     assert resp.json()["scope"] == "register"
 
 
+# ── exchange pushes the D1 account map for wealth-scope Items (P0-001) ──────
+
+
+def test_exchange_wealth_scope_pushes_account_map(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """A wealth-scope Item has no register /map-accounts step (B5) — exchange
+    must push the D1 account↔plaid mapping itself, or a freshly re-linked
+    Item's accounts can never resolve at A1/A2 (P0-001)."""
+    _placeholder(db, nonce="wealth-map-nonce", scope="wealth")
+    with patch("src.adapters.plaid_account_map.push_account_map") as mock_push:
+        resp = _do_exchange(client, plaid_client_mock, "wealth-map-nonce")
+    assert resp.status_code == 200, resp.text
+    mock_push.assert_called_once()
+    _, kwargs = mock_push.call_args
+    assert kwargs["institution_name"] == "ETRADE"
+
+
+def test_exchange_register_scope_never_pushes_account_map(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """Register-scope Items keep the existing /map-accounts UI flow — the D1
+    account map push is wealth-scope only."""
+    _placeholder(db, nonce="reg-map-nonce", scope="register")
+    with patch("src.adapters.plaid_account_map.push_account_map") as mock_push:
+        resp = _do_exchange(client, plaid_client_mock, "reg-map-nonce")
+    assert resp.status_code == 200, resp.text
+    mock_push.assert_not_called()
+
+
+def test_exchange_wealth_scope_account_map_failure_surfaced_on_response(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """P1-002/P1-fnf: when push_account_map fails (returns None — e.g. a
+    WealthClientError from a misconfigured WEALTH_API_BASE/WEALTH_INTERNAL_KEY),
+    the exchange response must surface the failure rather than silently
+    reporting success (the discard-and-hope pattern this fix closes)."""
+    _placeholder(db, nonce="wealth-map-fail-nonce", scope="wealth")
+    with patch("src.adapters.plaid_account_map.push_account_map", return_value=None):
+        resp = _do_exchange(client, plaid_client_mock, "wealth-map-fail-nonce")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["account_map_pushed"] is False
+    assert body["account_map_counts"]["failed"] == 1
+
+    import src.models.ingestion_log as il_mod
+
+    log = (
+        db.query(il_mod.IngestionLog)
+        .filter_by(source="wealth_cloud:plaid_account_map")
+        .order_by(il_mod.IngestionLog.run_at.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "failure"
+
+
+def test_exchange_wealth_scope_account_map_success_surfaced_on_response(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """A clean account-map push surfaces account_map_pushed=True with counts,
+    and writes a `success` IngestionLog row."""
+    _placeholder(db, nonce="wealth-map-ok-nonce", scope="wealth")
+    with patch(
+        "src.adapters.plaid_account_map.push_account_map",
+        return_value={"created": 1, "reattached": 0, "already_mapped": 0, "failed": 0},
+    ):
+        resp = _do_exchange(client, plaid_client_mock, "wealth-map-ok-nonce")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["account_map_pushed"] is True
+    assert body["account_map_counts"]["created"] == 1
+
+    import src.models.ingestion_log as il_mod
+
+    log = (
+        db.query(il_mod.IngestionLog)
+        .filter_by(source="wealth_cloud:plaid_account_map")
+        .order_by(il_mod.IngestionLog.run_at.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "success"
+
+
+def test_exchange_account_map_conflicts_are_not_counted_as_processed(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """P3-r3i: a `conflict` is an account the D1 endpoint refused to resolve
+    (two rows share the broker+mask or the plaid_account_id). It must never be
+    counted as processed — it goes in records_failed, drops the run to
+    partial_failure, and clears account_map_pushed, because that account will
+    not resolve at A1/A2 until an operator retires the duplicate."""
+    _placeholder(db, nonce="wealth-map-conflict-nonce", scope="wealth")
+    with patch(
+        "src.adapters.plaid_account_map.push_account_map",
+        return_value={
+            "created": 1,
+            "reattached": 0,
+            "relinked": 0,
+            "already_mapped": 0,
+            "conflicts": 2,
+            "failed": 0,
+        },
+    ):
+        resp = _do_exchange(client, plaid_client_mock, "wealth-map-conflict-nonce")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["account_map_pushed"] is False
+    assert body["account_map_counts"]["conflicts"] == 2
+
+    import src.models.ingestion_log as il_mod
+
+    log = (
+        db.query(il_mod.IngestionLog)
+        .filter_by(source="wealth_cloud:plaid_account_map")
+        .order_by(il_mod.IngestionLog.run_at.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "partial_failure"
+    assert log.records_processed == 1  # only the created row
+    assert log.records_failed == 2  # the conflicts
+    assert log.error_detail is not None and "conflicts=2" in log.error_detail
+
+
+def test_exchange_account_map_all_conflicts_is_a_failure(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """P3-r3i: when NOTHING resolved, the run is a hard failure, not partial."""
+    _placeholder(db, nonce="wealth-map-allconflict-nonce", scope="wealth")
+    with patch(
+        "src.adapters.plaid_account_map.push_account_map",
+        return_value={"created": 0, "already_mapped": 0, "conflicts": 3, "failed": 0},
+    ):
+        resp = _do_exchange(client, plaid_client_mock, "wealth-map-allconflict-nonce")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["account_map_pushed"] is False
+
+    import src.models.ingestion_log as il_mod
+
+    log = (
+        db.query(il_mod.IngestionLog)
+        .filter_by(source="wealth_cloud:plaid_account_map")
+        .order_by(il_mod.IngestionLog.run_at.desc())
+        .first()
+    )
+    assert log is not None
+    assert log.status == "failure"
+    assert log.records_processed == 0
+    assert log.records_failed == 3
+
+
 # ── items listing surfaces scope ─────────────────────────────────────────────
 
 
@@ -263,3 +416,119 @@ def test_manual_sync_transactions_rejects_wealth_scope(
     # 409 must not consume the cooldown: a second call still 409s (not 429).
     resp2 = client.post(f"/api/plaid/items/{item.id}/sync-transactions")
     assert resp2.status_code == 409
+
+
+# ── map-accounts rejects wealth-scope items (P0-002 / P2-mac) ───────────────
+
+
+def test_map_accounts_rejects_wealth_scope_item(client: TestClient, db: Session) -> None:
+    """A wealth-scope Item must never gain register Account mappings — no
+    Account rows, no payment_method stamps — via a direct map-accounts call.
+    Mirrors the sync_transactions_now 409 guard shape."""
+    item = PlaidItem(
+        item_id="wealth_item_map",
+        institution_id="ins_115616",
+        institution_name="Vanguard",
+        access_token_encrypted=encrypt_token("tok"),
+        scope="wealth",
+    )
+    db.add(item)
+    db.commit()
+
+    resp = client.post(
+        "/api/plaid/map-accounts",
+        json={
+            "item_id": item.id,
+            "mappings": [
+                {
+                    "plaid_account_id": "p_acct_wealth",
+                    "create_new": {
+                        "broker": "vanguard",
+                        "account_number": "1234",
+                        "account_type": "brokerage",
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 409
+    assert "wealth-scope" in resp.json()["detail"]
+
+    # No Account row was created by the rejected call.
+    assert db.query(Account).filter_by(plaid_item_id=item.id).count() == 0
+
+
+def test_map_accounts_succeeds_for_register_scope_item(
+    client: TestClient, db: Session
+) -> None:
+    item = PlaidItem(
+        item_id="register_item_map",
+        institution_id="ins_56",
+        institution_name="Chase",
+        access_token_encrypted=encrypt_token("tok"),
+        scope="register",
+    )
+    db.add(item)
+    db.commit()
+
+    resp = client.post(
+        "/api/plaid/map-accounts",
+        json={
+            "item_id": item.id,
+            "mappings": [
+                {
+                    "plaid_account_id": "p_acct_register",
+                    "create_new": {
+                        "broker": "chase",
+                        "account_number": "5678",
+                        "account_type": "checking",
+                    },
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["mappings"][0]["plaid_account_id"] == "p_acct_register"
+
+
+# ── relink preserves scope (P0-002) ─────────────────────────────────────────
+
+
+def test_relink_preserves_wealth_scope(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    """Relinking a wealth-scope Item must report scope='wealth' in the
+    LinkTokenResponse, not silently default back to 'register' — otherwise
+    the UI would offer the register account-mapping step on the exact path
+    the consolidation cutover relies on for re-linking migrated Items."""
+    item = PlaidItem(
+        item_id="wealth_item_relink",
+        institution_id="ins_115616",
+        institution_name="Vanguard",
+        access_token_encrypted=encrypt_token("tok"),
+        scope="wealth",
+    )
+    db.add(item)
+    db.commit()
+
+    resp = client.post(f"/api/plaid/relink/{item.id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["scope"] == "wealth"
+
+
+def test_relink_preserves_register_scope(
+    client: TestClient, db: Session, plaid_client_mock: MagicMock
+) -> None:
+    item = PlaidItem(
+        item_id="register_item_relink",
+        institution_id="ins_56",
+        institution_name="Chase",
+        access_token_encrypted=encrypt_token("tok"),
+        scope="register",
+    )
+    db.add(item)
+    db.commit()
+
+    resp = client.post(f"/api/plaid/relink/{item.id}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["scope"] == "register"

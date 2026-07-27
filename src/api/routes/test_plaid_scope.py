@@ -127,28 +127,30 @@ def _placeholder(db: Session, *, nonce: str, scope: str = "register") -> PlaidIt
 # ── link-token scope ─────────────────────────────────────────────────────────
 
 
-def test_link_token_default_scope_is_register(client: TestClient, db: Session) -> None:
+def test_link_token_default_scope_is_wealth(client: TestClient, db: Session) -> None:
+    """REQ-PC-B5a: after two wrong-scope mislinks (Schwab + Vanguard 2026-07-27),
+    every layer defaults to wealth — the register's two feeds are long-linked."""
     resp = client.post("/api/plaid/link-token", json={})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["scope"] == "register"
-    ph = db.query(PlaidItem).filter(PlaidItem.item_id.like("placeholder_%")).one()
-    assert ph.scope == "register"
-
-
-def test_link_token_no_body_defaults_to_register(client: TestClient, db: Session) -> None:
-    resp = client.post("/api/plaid/link-token")
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["scope"] == "register"
-
-
-def test_link_token_wealth_scope_stored_on_placeholder(
-    client: TestClient, db: Session
-) -> None:
-    resp = client.post("/api/plaid/link-token", json={"scope": "wealth"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["scope"] == "wealth"
     ph = db.query(PlaidItem).filter(PlaidItem.item_id.like("placeholder_%")).one()
     assert ph.scope == "wealth"
+
+
+def test_link_token_no_body_defaults_to_wealth(client: TestClient, db: Session) -> None:
+    resp = client.post("/api/plaid/link-token")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["scope"] == "wealth"
+
+
+def test_link_token_register_scope_stored_on_placeholder(
+    client: TestClient, db: Session
+) -> None:
+    resp = client.post("/api/plaid/link-token", json={"scope": "register"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["scope"] == "register"
+    ph = db.query(PlaidItem).filter(PlaidItem.item_id.like("placeholder_%")).one()
+    assert ph.scope == "register"
 
 
 def test_link_token_rejects_invalid_scope(client: TestClient) -> None:

@@ -113,20 +113,25 @@ def _plaid_redirect_uri() -> str | None:
 class LinkTokenRequest(BaseModel):
     """Optional body for POST /link-token — REQ-PC-B5.
 
-    ``scope='register'`` (default) keeps the pre-consolidation flow: the new
-    Item feeds the register and the UI offers the account-mapping step.
-    ``scope='wealth'`` links a wealth-only institution: balances/holdings are
-    pushed to the wealth D1 and the register mapping step is skipped entirely.
+    ``scope='wealth'`` (default) links a wealth-only institution:
+    balances/holdings are pushed to the wealth D1 and the register mapping step
+    is skipped entirely. ``scope='register'`` keeps the pre-consolidation flow:
+    the new Item feeds the register and the UI offers the account-mapping step.
+
+    Wealth is the default at EVERY layer (UI select, api.ts client, this
+    schema, the no-body fallback) — the register's two feeds (Chase, Amex) are
+    long-linked, and a register default at any single layer caused two
+    mislinked institutions needing server-side repair (2026-07-27).
     """
 
-    scope: str = Field(default="register", pattern=r"^(register|wealth)$")
+    scope: str = Field(default="wealth", pattern=r"^(register|wealth)$")
 
 
 class LinkTokenResponse(BaseModel):
     link_token: str
     state_nonce: str
     expires_at: datetime
-    scope: str = "register"
+    scope: str = "wealth"
 
 
 class ExchangeRequest(BaseModel):
@@ -308,7 +313,7 @@ def create_link_token(
 
     _prune_stale_placeholders(session)
 
-    scope = payload.scope if payload is not None else "register"
+    scope = payload.scope if payload is not None else "wealth"
     nonce = secrets.token_urlsafe(32)
     expires_at = _now() + STATE_NONCE_TTL
 

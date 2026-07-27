@@ -53,3 +53,14 @@ def pytest_configure(config):  # noqa: ARG001
             f"{stray}",
             file=sys.stderr,
         )
+
+
+def pytest_addoption(parser):  # noqa: ANN001, ANN201 — pytest hook signature
+    """--golden-update: regenerate the classification golden fixture
+    (src/classification/test_golden_oracle.py) instead of asserting against it."""
+    parser.addoption(
+        "--golden-update",
+        action="store_true",
+        default=False,
+        help="Rewrite golden fixtures from current classifier output.",
+    )

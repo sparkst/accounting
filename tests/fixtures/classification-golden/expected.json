@@ -1,0 +1,167 @@
+[
+  {
+    "description": "ANTHROPIC PBC subscription",
+    "amount": -238.03,
+    "entity": "sparkry",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.97,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "OPENROUTER.AI credits",
+    "amount": -50.0,
+    "entity": "sparkry",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.97,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "RUNPOD GPU rental",
+    "amount": -12.4,
+    "entity": "sparkry",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.97,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "AWS.AMAZON billing",
+    "amount": -87.12,
+    "entity": "sparkry",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.97,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "GOOGLE WORKSPACE sparkry.ai",
+    "amount": -21.6,
+    "entity": "sparkry",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.95,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "HISCOX INSURANCE payment",
+    "amount": -104.0,
+    "entity": "sparkry",
+    "tax_category": "INSURANCE",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.97,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "CLOUDFLARE hosting",
+    "amount": -25.0,
+    "entity": "sparkry",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.95,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "SHOPIFY monthly plan",
+    "amount": -39.0,
+    "entity": "blackline",
+    "tax_category": "SALES_INCOME",
+    "direction": "income",
+    "deductible_pct": 1.0,
+    "confidence": 0.95,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "STICKERMULE decals order",
+    "amount": -156.2,
+    "entity": "blackline",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.95,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "FEDEX shipment 7741",
+    "amount": -32.55,
+    "entity": "blackline",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.93,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "USA CYCLING event license",
+    "amount": -75.0,
+    "entity": "blackline",
+    "tax_category": "ADVERTISING",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.95,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "CARDINAL HEALTH reimbursable expense",
+    "amount": -500.0,
+    "entity": "sparkry",
+    "tax_category": "CONSULTING_INCOME",
+    "direction": "income",
+    "deductible_pct": 1.0,
+    "confidence": 0.97,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "STRIPE INC processing fee",
+    "amount": -14.21,
+    "entity": "blackline",
+    "tax_category": "SUPPLIES",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.9,
+    "tier_used": 1,
+    "status": "auto_classified"
+  },
+  {
+    "description": "Some Totally Unknown Vendor LLC",
+    "amount": -60.0,
+    "entity": "personal",
+    "tax_category": "PERSONAL_NON_DEDUCTIBLE",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.0,
+    "tier_used": 3,
+    "status": "needs_review"
+  },
+  {
+    "description": "APPLE.COM/BILL subscription",
+    "amount": -9.99,
+    "entity": "personal",
+    "tax_category": "PERSONAL_NON_DEDUCTIBLE",
+    "direction": "expense",
+    "deductible_pct": 1.0,
+    "confidence": 0.9,
+    "tier_used": 1,
+    "status": "auto_classified"
+  }
+]

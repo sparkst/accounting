@@ -1373,7 +1373,9 @@ export interface PlaidMapAccountsPayload {
 }
 
 export async function plaidCreateLinkToken(
-	scope: PlaidLinkScope = 'register'
+	// Wealth default at every layer (UI, here, API schema, no-body fallback) —
+	// a register default at any one layer caused two mislinks (2026-07-27).
+	scope: PlaidLinkScope = 'wealth'
 ): Promise<PlaidLinkTokenResponse> {
 	return request<PlaidLinkTokenResponse>('/plaid/link-token', {
 		method: 'POST',

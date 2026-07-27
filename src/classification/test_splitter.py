@@ -535,3 +535,76 @@ class TestSuggestHotelSplits:
         assert suggestion is not None
         for item in suggestion.as_line_items:
             assert item.entity == Entity.BLACKLINE.value
+
+
+class TestSplitInheritance:
+    """Reliability-audit P0 (2026-07-27): children silently dropped the
+    parent's entity (→ NULL, excluded from every tax export while the parent
+    is excluded as SPLIT_PARENT — the amount vanishes from Schedule C/B&O)
+    and deductible_pct (→ column default 1.0 — a 50%-deductible meals split
+    became 100% on a filed return)."""
+
+    def test_child_inherits_parent_entity_when_line_omits_it(self) -> None:
+        with _TestSession() as s:
+            parent = _make_tx(s, entity=Entity.BLACKLINE.value)
+            parent_id = parent.id
+            items = [
+                SplitLineItem(amount=Decimal("-70.00"), description="A"),
+                SplitLineItem(amount=Decimal("-50.00"), description="B"),
+            ]
+            split_transaction(s, parent, items)
+            s.commit()
+        with _TestSession() as s:
+            children = s.query(Transaction).filter(Transaction.parent_id == parent_id).all()
+            assert [c.entity for c in children] == [
+                Entity.BLACKLINE.value,
+                Entity.BLACKLINE.value,
+            ]
+
+    def test_line_entity_overrides_parent(self) -> None:
+        with _TestSession() as s:
+            parent = _make_tx(s, entity=Entity.BLACKLINE.value)
+            parent_id = parent.id
+            items = [
+                SplitLineItem(
+                    amount=Decimal("-120.00"),
+                    entity=Entity.PERSONAL.value,
+                    description="A",
+                )
+            ]
+            split_transaction(s, parent, items)
+            s.commit()
+        with _TestSession() as s:
+            child = s.query(Transaction).filter(Transaction.parent_id == parent_id).one()
+            assert child.entity == Entity.PERSONAL.value
+
+    def test_child_inherits_parent_deductible_pct(self) -> None:
+        with _TestSession() as s:
+            parent = _make_tx(s)
+            parent.deductible_pct = 0.5
+            parent_id = parent.id
+            items = [
+                SplitLineItem(amount=Decimal("-60.00"), description="A"),
+                SplitLineItem(amount=Decimal("-60.00"), description="B"),
+            ]
+            split_transaction(s, parent, items)
+            s.commit()
+        with _TestSession() as s:
+            children = s.query(Transaction).filter(Transaction.parent_id == parent_id).all()
+            assert [c.deductible_pct for c in children] == [0.5, 0.5]
+
+    def test_line_deductible_pct_overrides_parent(self) -> None:
+        with _TestSession() as s:
+            parent = _make_tx(s)
+            parent.deductible_pct = 0.5
+            parent_id = parent.id
+            items = [
+                SplitLineItem(
+                    amount=Decimal("-120.00"), description="A", deductible_pct=1.0
+                )
+            ]
+            split_transaction(s, parent, items)
+            s.commit()
+        with _TestSession() as s:
+            child = s.query(Transaction).filter(Transaction.parent_id == parent_id).one()
+            assert child.deductible_pct == 1.0

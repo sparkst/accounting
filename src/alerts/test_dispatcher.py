@@ -433,3 +433,43 @@ def test_apply_records_payload_json_and_delivery_channel(
     assert row.payload_json is not None
     payload = json.loads(row.payload_json)
     assert payload["alert_key"] == "k1"
+
+
+def test_compute_exception_counts_as_failed(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent-failure audit 2026-07-27: a raising alert computation must make
+    the run exit non-zero (summary.failed > 0) so OnFailure pages — previously
+    every day printed sent=0 failed=0 and exited 0 while EA B&O reminders were
+    dead."""
+
+    def _boom(today: date) -> list[Alert]:
+        raise RuntimeError("NULL due_date")
+
+    monkeypatch.setattr(dispatcher_mod, "compute_tax_alerts", _boom)
+    monkeypatch.setattr(dispatcher_mod, "compute_invoice_alerts", lambda today, s: [])
+
+    summary = dispatch_alerts(session, date(2026, 5, 10), apply=True)
+
+    assert summary.failed >= 1
+
+
+def test_sweep_still_failed_counts_into_summary(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent-failure audit 2026-07-27: sweep_failed_rows' still_failed rows
+    were discarded — on a day with no new alerts due, a dead webhook exited 0
+    while the whole backlog failed redelivery."""
+    from src.alerts.sweep import SweepSummary
+
+    monkeypatch.setattr(
+        dispatcher_mod,
+        "sweep_failed_rows",
+        lambda *a, **k: SweepSummary(resent=0, still_failed=2, candidates=2),
+    )
+    monkeypatch.setattr(dispatcher_mod, "compute_tax_alerts", lambda today: [])
+    monkeypatch.setattr(dispatcher_mod, "compute_invoice_alerts", lambda today, s: [])
+
+    summary = dispatch_alerts(session, date(2026, 5, 10), apply=True)
+
+    assert summary.failed >= 2

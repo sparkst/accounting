@@ -101,17 +101,21 @@ def dispatch_balance_alerts(
     summary = DispatchSummary()
 
     if apply:
-        sweep_failed_rows(
+        swept = sweep_failed_rows(
             session, today, post=_sweep_post, apply=True, alert_types=ALERT_TYPES
         )
+        # Backlog rows that failed redelivery again must reach the exit code.
+        summary.failed += swept.still_failed
 
     try:
         alerts = compute_balance_alerts(today, session)
     except Exception:  # noqa: BLE001 — a compute-phase failure must not crash
-        # the whole run (mirrors src/alerts/dispatcher.py's per-day guard);
-        # return an empty summary and write nothing rather than propagate.
-        logger.exception("compute_balance_alerts raised; returning empty summary")
+        # the whole run (mirrors src/alerts/dispatcher.py's per-day guard) and
+        # writes nothing, but it MUST count as failed — an all-zero summary
+        # exits 0 and lets overdraft/cash-floor alerting die invisibly.
+        logger.exception("compute_balance_alerts raised; counting run as failed")
         session.rollback()
+        summary.failed += 1
         return summary
 
     for alert in alerts:

@@ -138,17 +138,24 @@ def dispatch_alerts(session: Session, today: date, *, apply: bool) -> DispatchSu
     summary = DispatchSummary()
 
     if apply:
-        sweep_failed_rows(
+        swept = sweep_failed_rows(
             session, today, post=_sweep_post, apply=True, alert_types=ALERT_TYPES
         )
+        # A backlog row that failed redelivery again must reach the exit code —
+        # on a day with no new alerts due, a dead webhook otherwise exits 0
+        # while the whole backlog ages out of the sweep window.
+        summary.failed += swept.still_failed
 
     for day in _catch_up_days(session, today):
         try:
             alerts = compute_tax_alerts(day) + compute_invoice_alerts(day, session)
         except Exception:  # noqa: BLE001 — one bad day never halts the catch-up
-            # loop or blocks the run-marker write for later (working) days.
+            # loop or blocks the run-marker write for later (working) days, but
+            # it MUST fail the run (non-zero exit → OnFailure page): a raising
+            # computation once killed EA B&O reminders invisibly for good.
             logger.exception("alert computation for %s raised; skipping that day", day)
             session.rollback()
+            summary.failed += 1
             continue
 
         for alert in alerts:

@@ -293,3 +293,41 @@ def test_ingest_run_invalid_source_returns_422() -> None:
     client = TestClient(app, raise_server_exceptions=False)
     response = client.post("/api/ingest/run?source=nonexistent_source")
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Requested-source unavailable adapter is an ERROR, not a warning
+# (silent-failure audit 2026-07-27: a missing credential made the daily
+# stripe/shopify timers report "OK — ingested 0" indefinitely)
+# ---------------------------------------------------------------------------
+
+
+def test_requested_source_unavailable_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /api/ingest/run?source=stripe with no STRIPE_API_KEY must surface
+    the unavailable adapter in `errors` (which the adapter_sync wrapper turns
+    into a non-zero exit), not bury it in `warnings`."""
+    monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+    from src.api.main import app  # noqa: PLC0415
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post("/api/ingest/run?source=stripe")
+    assert response.status_code == 200
+    body = response.json()
+    assert any("unavailable" in e for e in body["errors"]), body
+    assert not any("unavailable" in w for w in body["warnings"]), body
+
+
+def test_run_all_unavailable_adapter_stays_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unfiltered run-all keeps warning semantics for sources that are
+    legitimately unconfigured in a given environment."""
+    monkeypatch.delenv("STRIPE_API_KEY", raising=False)
+    monkeypatch.delenv("SHOPIFY_API_KEY", raising=False)
+    from src.api.main import app  # noqa: PLC0415
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post("/api/ingest/run")
+    assert response.status_code == 200
+    body = response.json()
+    assert any("unavailable" in w for w in body["warnings"]), body

@@ -423,8 +423,149 @@ def check_report_freshness(
     return []
 
 
+MIN_REGISTER_ITEMS = 1
+MIN_WEALTH_ITEMS = 1
+
+#: D1 accounts must have a snapshot within this many days (matches the
+#: register-side SNAPSHOT_MAX_AGE_DAYS).
+D1_SNAPSHOT_MAX_AGE_DAYS = 2
+
+
+def check_item_floor(
+    session: Session,
+    *,
+    min_register: int = MIN_REGISTER_ITEMS,
+    min_wealth: int = MIN_WEALTH_ITEMS,
+) -> list[Violation]:
+    """REQ-SEN-010: the active-item set never silently empties.
+
+    Every sync reports success over an empty work set (``any()`` over zero
+    items is False), and the derived ingestion expectations shrink with the
+    item set — an accidental mass-disconnect would look perfectly healthy.
+    The floor pins the minimum shape of production (2 register / 8 wealth as
+    of 2026-07-27; floors set to 1 to allow deliberate pruning).
+    """
+    items = _active_items(session)
+    register = sum(1 for i in items if i.scope == "register")
+    wealth = sum(1 for i in items if i.scope == "wealth")
+    violations: list[Violation] = []
+    if register < min_register:
+        violations.append(
+            Violation(
+                "item_floor",
+                SEV2,
+                "register items",
+                f"{register} active (floor {min_register}) — syncs report success"
+                " over an empty work set",
+            )
+        )
+    if wealth < min_wealth:
+        violations.append(
+            Violation(
+                "item_floor",
+                SEV2,
+                "wealth items",
+                f"{wealth} active (floor {min_wealth}) — syncs report success"
+                " over an empty work set",
+            )
+        )
+    return violations
+
+
+def check_d1_freshness(
+    d1_freshness: tuple[str, dict[str, object] | None],
+    now: datetime,
+    *,
+    max_age_days: int = D1_SNAPSHOT_MAX_AGE_DAYS,
+) -> list[Violation]:
+    """REQ-SEN-009: every plaid-mapped D1 dossier has a recent snapshot.
+
+    Box-push-succeeded is NOT the same as D1-data-fresh: a dossier whose
+    mapping is deleted skips 'informationally' while its balance freezes —
+    the 30-day incident class. The payload comes from the CRM's
+    ``GET /wealth/api/internal/freshness`` (fetched in ``dispatch_sentinel``);
+    this check is pure.
+
+    ``status``: 'ok' → assert per-account recency; 'error' → the surface is
+    unreachable, which itself violates (can't verify = can't trust);
+    'unconfigured' → clean skip (local dev without wealth env).
+    """
+    status, payload = d1_freshness
+    if status == "unconfigured":
+        return []
+    if status != "ok" or payload is None:
+        return [
+            Violation(
+                "d1_freshness_unavailable",
+                SEV2,
+                "wealth D1",
+                "freshness endpoint unreachable — cannot verify wealth data age",
+            )
+        ]
+    cutoff = (now - timedelta(days=max_age_days)).date().isoformat()
+    violations: list[Violation] = []
+    accounts_raw = payload.get("accounts", [])
+    accounts = accounts_raw if isinstance(accounts_raw, list) else []
+    for acct in accounts:
+        if not isinstance(acct, dict):
+            continue
+        latest = acct.get("latest_snapshot_date")
+        name = str(acct.get("account_name") or acct.get("account_id") or "?")
+        if latest is None:
+            violations.append(
+                Violation("d1_freshness", SEV2, name, "no snapshot rows in D1")
+            )
+        elif latest < cutoff:
+            violations.append(
+                Violation(
+                    "d1_freshness",
+                    SEV2,
+                    name,
+                    f"latest D1 snapshot {latest} (limit {max_age_days}d)",
+                )
+            )
+    return violations
+
+
+def fetch_d1_freshness(timeout: float = 15.0) -> tuple[str, dict[str, object] | None]:
+    """Fetch the CRM freshness payload. Returns (status, payload).
+
+    'unconfigured' when WEALTH_API_BASE/WEALTH_INTERNAL_KEY are absent (local
+    dev); 'error' on any network/HTTP failure — the check treats that as a
+    violation. The secret travels only in the header and is never logged.
+    """
+    import os
+
+    import httpx
+
+    base = os.environ.get("WEALTH_API_BASE", "").rstrip("/")
+    key = os.environ.get("WEALTH_INTERNAL_KEY", "")
+    if not base or not key:
+        return ("unconfigured", None)
+    try:
+        resp = httpx.get(
+            f"{base}/wealth/api/internal/freshness",
+            headers={"X-Internal-Key": key},
+            timeout=timeout,
+        )
+    except httpx.HTTPError:
+        logger.warning("d1 freshness fetch failed (network)")
+        return ("error", None)
+    if resp.status_code != 200:
+        logger.warning("d1 freshness fetch failed (HTTP %s)", resp.status_code)
+        return ("error", None)
+    try:
+        return ("ok", resp.json())
+    except ValueError:
+        return ("error", None)
+
+
 def run_sentinel(
-    session: Session, now: datetime, *, report_path: Path
+    session: Session,
+    now: datetime,
+    *,
+    report_path: Path,
+    d1_freshness: tuple[str, dict[str, object] | None] | None = None,
 ) -> list[Violation]:
     """REQ-SEN-001: run every check; return all violations (worst first).
 
@@ -432,6 +573,9 @@ def run_sentinel(
     becomes a ``check_failed`` violation instead of suppressing the other
     checks' findings — a real incident that breaks one check must not degrade
     the digest into a bare OnFailure email naming nothing.
+
+    ``d1_freshness``: pre-fetched CRM payload (REQ-SEN-009); None = not
+    attempted (the check is skipped entirely — dispatch_sentinel fetches it).
     """
     checks: list[tuple[str, Callable[[], list[Violation]]]] = [
         ("check_item_staleness", lambda: check_item_staleness(session, now)),
@@ -443,7 +587,11 @@ def run_sentinel(
         ("check_scope_anomalies", lambda: check_scope_anomalies(session, now)),
         ("check_register_tx_staleness", lambda: check_register_tx_staleness(session, now)),
         ("check_report_freshness", lambda: check_report_freshness(report_path, now)),
+        ("check_item_floor", lambda: check_item_floor(session)),
     ]
+    if d1_freshness is not None:
+        d1 = d1_freshness
+        checks.append(("check_d1_freshness", lambda: check_d1_freshness(d1, now)))
     violations: list[Violation] = []
     for name, fn in checks:
         try:
@@ -500,7 +648,9 @@ def dispatch_sentinel(
     there was nothing to send. ``post_payload`` owns DRY-RUN semantics, the
     HTTPS guard, and never-log-the-secret discipline — one POST path repo-wide.
     """
-    violations = run_sentinel(session, now, report_path=report_path)
+    violations = run_sentinel(
+        session, now, report_path=report_path, d1_freshness=fetch_d1_freshness()
+    )
     payload = build_sentinel_payload(violations, now)
     result: WebhookResult | None = None
     if payload is not None:

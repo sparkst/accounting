@@ -679,3 +679,59 @@ def test_contract_fixture_matches_committed_json() -> None:
     committed_holdings = json.loads((_CONTRACT_FIXTURE_DIR / "02-holdings-chunk.json").read_text())
     assert securities_chunk == committed_securities
     assert holdings_chunk == committed_holdings
+
+
+def test_additional_consent_on_previously_serving_item_is_an_error(
+    session: Session,
+) -> None:
+    """Reliability-audit P1 (2026-07-27): ADDITIONAL_CONSENT_REQUIRED on an
+    item that has PREVIOUSLY delivered holdings is an expiring-consent
+    condition (user-actionable, must page), not "this login has no
+    investments product". History is the discriminator — depository logins
+    (Chase/PenFed/BofA/Citi) have no productive investments runs and keep
+    the clean skip."""
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock
+
+    from src.adapters.plaid_client import TerminalPlaidError
+
+    _make_item(session, institution_name="Charles Schwab", item_id="plaid_inv_schwab")
+    session.add(
+        IngestionLog(
+            source="plaid_investments:Charles Schwab",
+            run_at=datetime.now(UTC).replace(tzinfo=None),
+            status="success",
+            records_processed=29,
+        )
+    )
+    session.commit()
+
+    client = MagicMock()
+    client.investments_holdings_get.side_effect = TerminalPlaidError(
+        "ADDITIONAL_CONSENT_REQUIRED", "consent expired"
+    )
+
+    batch = sync_all_wealth(session, client=client, dry_run=False, post=MagicMock())
+    r = batch.items[0]
+    assert r.status == "error"
+    assert r.error_code == "ADDITIONAL_CONSENT_REQUIRED"
+    assert batch.total_failed_items >= 1
+
+
+def test_additional_consent_without_history_stays_clean_skip(
+    session: Session,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from src.adapters.plaid_client import TerminalPlaidError
+
+    _make_item(session, institution_name="PenFed Credit Union", item_id="plaid_inv_penfed")
+    client = MagicMock()
+    client.investments_holdings_get.side_effect = TerminalPlaidError(
+        "ADDITIONAL_CONSENT_REQUIRED", "consent missing"
+    )
+
+    batch = sync_all_wealth(session, client=client, dry_run=False, post=MagicMock())
+    r = batch.items[0]
+    assert r.status == "skipped_invalid_product"
+    assert batch.total_failed_items == 0

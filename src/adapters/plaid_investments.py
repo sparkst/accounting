@@ -66,6 +66,26 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _has_served_investments(session: Session, item: PlaidItem) -> bool:
+    """True when this institution has ever logged a productive investments run.
+
+    Discriminates an expiring consent (item previously delivered holdings —
+    must page) from a structural "no investments product" login (never
+    delivered — clean skip). Keyed by institution_name like every other
+    ingestion_log source string.
+    """
+    return (
+        session.query(IngestionLog)
+        .filter(
+            IngestionLog.source == f"plaid_investments:{item.institution_name}",
+            IngestionLog.status == IngestionStatus.SUCCESS.value,
+            IngestionLog.records_processed > 0,
+        )
+        .first()
+        is not None
+    )
+
+
 def _epoch_ms(dt: datetime) -> int:
     """Naive-UTC datetime → epoch milliseconds (D1 ``fetched_at`` ordering key)."""
     return int(dt.replace(tzinfo=UTC).timestamp() * 1000)
@@ -336,12 +356,20 @@ def sync_one_item(
         log_row.retryable = True
         log_row.error_detail = exc.error_code
     except (TerminalPlaidError, PlaidErrorBase) as exc:
-        if exc.error_code in INVESTMENTS_UNAVAILABLE_ERROR_CODES:
+        if exc.error_code in INVESTMENTS_UNAVAILABLE_ERROR_CODES and not (
+            exc.error_code == "ADDITIONAL_CONSENT_REQUIRED"
+            and _has_served_investments(session, item)
+        ):
             # Expected for wealth Items without investment accounts — Plaid
             # answers INVALID_PRODUCT for some institutions and
             # ADDITIONAL_CONSENT_REQUIRED for others (first live run
             # 2026-07-26: Chase/PenFed/BofA/Citi). Skip-with-log, mirroring
             # the retired wealth Worker's "no investment accounts" skip.
+            # EXCEPTION (audit 2026-07-27): ADDITIONAL_CONSENT_REQUIRED on an
+            # item that has previously DELIVERED holdings is an expiring
+            # consent (user-actionable, must page), not a structural absence —
+            # history is the discriminator, so a Schwab/E*TRADE consent lapse
+            # cannot hide behind the depository logins' clean skip.
             result.status = "skipped_invalid_product"
             result.error_code = exc.error_code
             log_row.status = IngestionStatus.SUCCESS.value

@@ -1222,3 +1222,65 @@ def test_balance_contract_fixture_matches_committed_json() -> None:
     payload = _build_contract_balance_snapshots()
     committed = json.loads((_CONTRACT_FIXTURE_DIR / "03-balance-chunk.json").read_text())
     assert payload == committed
+
+
+# ---------------------------------------------------------------------------
+# Reliability-audit P1 (2026-07-27): the per-account IntegrityError absorb is
+# scoped to the idempotency UNIQUE — any other integrity failure is a FAILED
+# write, not a processed account.
+# ---------------------------------------------------------------------------
+
+
+def test_non_unique_integrity_error_counts_failed(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    import src.adapters.plaid_balance as mod
+
+    item = _make_item(session)
+    _make_account(
+        session, item=item, plaid_account_id="plaid_acct_chase_checking_0001", account_number="1111"
+    )
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise SAIntegrityError(
+            "INSERT ...", {}, Exception("CHECK constraint failed: ck_plaid_bal_snap_account_type")
+        )
+
+    monkeypatch.setattr(mod, "_process_plaid_account", _boom)
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+    assert result.accounts_failed >= 1
+    assert result.accounts_processed == 0
+
+
+def test_unique_snapshot_collision_still_absorbed(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+    import src.adapters.plaid_balance as mod
+
+    item = _make_item(session)
+    _make_account(
+        session, item=item, plaid_account_id="plaid_acct_chase_checking_0001", account_number="1111"
+    )
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    def _dup(*args: object, **kwargs: object) -> None:
+        raise SAIntegrityError(
+            "INSERT ...",
+            {},
+            Exception(
+                "UNIQUE constraint failed: plaid_account_balance_snapshot.account_id,"
+                " plaid_account_balance_snapshot.snapshot_date"
+            ),
+        )
+
+    monkeypatch.setattr(mod, "_process_plaid_account", _dup)
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+    assert result.accounts_failed == 0
+    assert result.accounts_processed >= 1

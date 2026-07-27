@@ -111,3 +111,23 @@ class TestRsyncCommand:
         cmd = build_rsync_command(repo, "t@h:/dst/")
         assert cmd[-2] == f"{repo}/"
         assert cmd[-1] == "t@h:/dst/"
+
+
+class TestWithDashboard:
+    def test_with_dashboard_includes_sveltekit_before_gitignore_merge(
+        self, repo: Path
+    ) -> None:
+        """--with-dashboard must ADD include filters ahead of the .gitignore
+        merge — .svelte-kit is gitignored, so lifting the protect filter alone
+        still excludes the build from the transfer entirely."""
+        cmd = build_rsync_command(repo, "t@h:/dst/", with_dashboard=True)
+        filters = [a for a in cmd if a.startswith("--filter=")]
+        include_idx = next(
+            i for i, a in enumerate(filters) if a == "--filter=+ /dashboard/.svelte-kit/***"
+        )
+        gitignore_idx = next(i for i, a in enumerate(filters) if ":- .gitignore" in a)
+        assert include_idx < gitignore_idx
+
+    def test_without_dashboard_no_include(self, repo: Path) -> None:
+        cmd = build_rsync_command(repo, "t@h:/dst/")
+        assert all("+ /dashboard/.svelte-kit" not in a for a in cmd)

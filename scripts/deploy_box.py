@@ -88,6 +88,14 @@ def build_rsync_command(
         if with_dashboard and p.startswith("dashboard/.svelte-kit"):
             continue  # explicitly pushing a fresh build this run
         cmd.append(f"--filter=protect {p}")
+    if with_dashboard:
+        # .svelte-kit is gitignored, so lifting the protect filter alone is not
+        # enough — an explicit include must precede the .gitignore merge or the
+        # build never transfers (first matching filter rule wins in rsync).
+        cmd += [
+            "--filter=+ /dashboard/.svelte-kit/",
+            "--filter=+ /dashboard/.svelte-kit/***",
+        ]
     cmd += [
         "--exclude=.git",
         "--filter=:- .gitignore",

@@ -8,7 +8,7 @@
 schema_version: 1
 name: accounting
 repo: github.com/sparkst/accounting
-last_commit: "2026-07-27T03:50Z  (62e9658)"
+last_commit: "2026-07-27T20:54Z  (14ce6a6)"
 last_synced: "2026-06-25T00:27Z"
 languages: [css, html, js, python, shell, sql, ts]
 deps_changed: false

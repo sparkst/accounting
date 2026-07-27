@@ -817,3 +817,13 @@ Process-level monitoring (systemd exit codes + OnFailure) repeatedly stayed gree
 | REQ-SEN-006 | Register transaction recency: while any active register-scope item exists, the newest non-rejected `source='plaid'` transaction must be within 10 days — else `sev3`. |
 | REQ-SEN-007 | Report artifact freshness: `reports/weekly-pl-latest.txt` must exist and be modified within 8 days — else `sev3` (catches the deleted-runtime-dir failure class of 2026-07-27 at the data level). |
 | REQ-SEN-008 | Dispatch: violations aggregate into ONE webhook payload per day (`alert_key=sentinel:<date>`, `type` = worst severity present). Exit 0 when checks ran (violations included); exit 1 only on sentinel infrastructure failure (DB unreachable / webhook send failed) so `OnFailure=` covers the sentinel itself — the exit-code contract is pinned by CLI tests against `main()`. All time comparisons are UTC-naive on both sides (`datetime.now(UTC)`-derived `now`; report mtime read via `fromtimestamp(…, UTC)`), matching the repo's DB-timestamp convention regardless of box TZ. Timer: `accounting-freshness-sentinel.timer`, daily 13:45 UTC. |
+## REQ-DEP-* — Deterministic box deploys
+
+Hand-rolled per-session rsyncs deleted the box's runtime `reports/` dir on 2026-07-26 (Monday's weekly-P&L failed on mount namespacing) and shipped untracked HEIC photos to prod.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-DEP-001 | `scripts/deploy_box.py` builds ONE deterministic rsync from the repo state: `--filter=':- .gitignore'` excludes all gitignored paths; `.git` never transfers. |
+| REQ-DEP-002 | Clean-worktree guard: modified tracked files or untracked non-ignored files abort the deploy with the offending paths listed. Gitignored runtime files do not block. |
+| REQ-DEP-003 | `--delete` removes stale tracked files on the box, but protect filters (ordered BEFORE the gitignore merge) make `data/`, `reports/`, `.venv/`, `dashboard/node_modules/`, `dashboard/.svelte-kit/` undeletable. `--with-dashboard` lifts only the `.svelte-kit` protection to push a fresh srv-config build. |
+| REQ-DEP-004 | DRY-RUN by default (itemized); `--apply` transfers; `--restart <units…>` bounces systemd units via `ssh root@ubuntu` only after an applied transfer. Restart-noise drop-ins (`SuccessExitStatus`) are versioned under `deploy/overrides/`. |

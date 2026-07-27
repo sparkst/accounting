@@ -111,7 +111,11 @@ class VendorRuleCreate(BaseModel):
     tax_subcategory: str | None = None
     direction: str
     deductible_pct: float = Field(default=1.0, ge=0, le=1)
-    confidence: float = Field(default=1.0, ge=0, le=1)
+    # Default matches the learning loop's mint (0.80) — BELOW the 0.90
+    # auto-confirm threshold, so a rule created on form defaults still routes
+    # its matches through human review. Raising it is a deliberate act
+    # (seeded rules top out at 0.95/0.97).
+    confidence: float = Field(default=0.8, ge=0, le=1)
     source: str = VendorRuleSource.HUMAN.value
 
     def validate_enums(self) -> None:

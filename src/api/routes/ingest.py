@@ -149,8 +149,17 @@ def _run_ingest_locked(source: Source | None) -> IngestSummary:
                 f"Adapter for source '{src.value}' is unavailable — "
                 "check that required API keys are set."
             )
-            warnings.append(msg)
-            logger.warning(msg)
+            # An explicitly requested source that can't run is a FAILURE: the
+            # daily stripe/shopify timers call with ?source=..., and a rotated
+            # credential must trip their non-zero exit, not report "OK —
+            # ingested 0" forever (silent-failure audit 2026-07-27). Run-all
+            # keeps warning semantics for legitimately unconfigured sources.
+            if source is not None:
+                errors.append(msg)
+                logger.error(msg)
+            else:
+                warnings.append(msg)
+                logger.warning(msg)
             continue
 
         session = SessionLocal()

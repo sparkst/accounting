@@ -166,8 +166,10 @@ def test_failed_post_not_marked_sent_so_retries(
     s1 = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
     assert s1.failed == 1
     # Recorded as "failed" (not "sent") → next run retries rather than skips.
+    # 2026-07-27: failed = 2 — the sweep re-attempts run 1's failed row
+    # (still_failed=1, now counted) plus the fresh dispatch failure.
     s2 = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
-    assert s2.failed == 1
+    assert s2.failed == 2
     assert s2.skipped == 0
 
 
@@ -186,7 +188,9 @@ def test_compute_balance_alerts_exception_returns_empty_summary(
 
     summary = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
 
-    assert (summary.sent, summary.skipped, summary.failed, summary.dry_run) == (0, 0, 0, 0)
+    # 2026-07-27: the raise now counts as failed (non-zero exit) — an all-zero
+    # summary let overdraft alerting die invisibly. Still writes nothing.
+    assert (summary.sent, summary.skipped, summary.failed, summary.dry_run) == (0, 0, 1, 0)
     assert session.query(AlertDispatch).count() == 0
 
 
@@ -269,3 +273,38 @@ def test_same_key_different_day_both_send(
     ).all()
     assert {r.occurrence_date for r in rows} == {"2026-06-14", "2026-06-16"}
     assert all(r.status == "sent" for r in rows)
+
+
+def test_compute_exception_counts_as_failed(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Silent-failure audit 2026-07-27: a compute_balance_alerts raise returned
+    an all-zero summary, so the script exited 0 and balance/overdraft alerting
+    could die invisibly. The raise must surface as summary.failed."""
+
+    def _boom(today: date, s: Session) -> list[BalanceAlert]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(disp, "compute_balance_alerts", _boom)
+
+    summary = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+
+    assert summary.failed >= 1
+    assert session.query(AlertDispatch).count() == 0
+
+
+def test_sweep_still_failed_counts_into_summary(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.alerts.sweep import SweepSummary
+
+    monkeypatch.setattr(
+        disp,
+        "sweep_failed_rows",
+        lambda *a, **k: SweepSummary(resent=0, still_failed=3, candidates=3),
+    )
+    monkeypatch.setattr(disp, "compute_balance_alerts", lambda today, s: [])
+
+    summary = dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+
+    assert summary.failed >= 3

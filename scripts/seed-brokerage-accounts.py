@@ -5,8 +5,8 @@ Sets account_type, tax_sheltered, beneficiary, parent_account_id, and notes
 for known accounts. Idempotent — safe to re-run.
 
 Usage:
-    python scripts/seed-brokerage-accounts.py            # apply changes
-    python scripts/seed-brokerage-accounts.py --dry-run  # show what would change
+    python scripts/seed-brokerage-accounts.py            # DRY-RUN (default)
+    python scripts/seed-brokerage-accounts.py --apply    # apply changes
 
 REQ-005a.
 """
@@ -127,12 +127,15 @@ def _diff(spec: AccountSpec, acct: Account, parent_id: str | None) -> dict[str, 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    # 2026-07-27: flipped to the house DRY-RUN-default pattern (CLAUDE.md
+    # Critical Patterns) — this was the only script that applied by default.
     parser.add_argument(
-        "--dry-run",
+        "--apply",
         action="store_true",
-        help="Show what would change without applying",
+        help="Apply changes (default: DRY-RUN, show what would change)",
     )
     args = parser.parse_args(argv)
+    args.dry_run = not args.apply
 
     session = SessionLocal()
     changed = 0

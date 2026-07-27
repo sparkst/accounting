@@ -53,13 +53,17 @@
 
 	// Add rule form
 	let showAddForm = $state(false);
+	// Audit P0 (2026-07-27): no pre-picked entity/category — a rule is a
+	// STANDING instruction, and the old sparkry/OFFICE_EXPENSE/confidence-1.0
+	// pre-fill created max-confidence wrong rules on an accidental save.
+	// Confidence 0.8 = the learning-loop mint, below the 0.90 auto-confirm bar.
 	let addForm = $state<VendorRuleCreate>({
 		vendor_pattern: '',
-		entity: 'sparkry',
-		tax_category: 'OFFICE_EXPENSE',
+		entity: '',
+		tax_category: '',
 		direction: 'expense',
 		deductible_pct: 1.0,
-		confidence: 1.0,
+		confidence: 0.8,
 		source: 'human'
 	});
 	let addError = $state('');
@@ -192,15 +196,23 @@
 		}
 	}
 
+	// Meals are 50%-deductible by default (mirrors seed_rules) — only when the
+	// user hasn't already set a custom fraction.
+	function onAddCategoryChange() {
+		if (addForm.tax_category === 'MEALS' && addForm.deductible_pct === 1.0) {
+			addForm.deductible_pct = 0.5;
+		}
+	}
+
 	// ── Add rule ──────────────────────────────────────────────────────────────
 	function resetAddForm() {
 		addForm = {
 			vendor_pattern: '',
-			entity: 'sparkry',
-			tax_category: 'OFFICE_EXPENSE',
+			entity: '',
+			tax_category: '',
 			direction: 'expense',
 			deductible_pct: 1.0,
-			confidence: 1.0,
+			confidence: 0.8,
 			source: 'human'
 		};
 		addError = '';
@@ -209,6 +221,14 @@
 	async function submitAdd() {
 		if (!addForm.vendor_pattern.trim()) {
 			addError = 'Vendor pattern is required.';
+			return;
+		}
+		if (!addForm.entity) {
+			addError = 'Pick an entity — a rule applies to every future match.';
+			return;
+		}
+		if (!addForm.tax_category) {
+			addError = 'Pick a tax category.';
 			return;
 		}
 		addSaving = true;
@@ -386,6 +406,7 @@
 					<label class="form-field">
 						<span class="form-label">Entity</span>
 						<select class="form-select" bind:value={addForm.entity}>
+							<option value="" disabled>— select entity —</option>
 							{#each ENTITIES as e}
 								<option value={e}>{entityLabel(e)}</option>
 							{/each}
@@ -393,7 +414,8 @@
 					</label>
 					<label class="form-field">
 						<span class="form-label">Tax Category</span>
-						<select class="form-select" bind:value={addForm.tax_category}>
+						<select class="form-select" bind:value={addForm.tax_category} onchange={onAddCategoryChange}>
+							<option value="" disabled>— select category —</option>
 							{#each TAX_CATEGORIES as c}
 								<option value={c}>{fmtCategory(c)}</option>
 							{/each}

@@ -62,6 +62,9 @@ def session() -> Generator[Session, None, None]:
     s.close()
 
 
+_ITEM_SEQ = iter(range(1_000_000))
+
+
 def _item(
     *,
     institution: str = "Chase",
@@ -71,7 +74,7 @@ def _item(
     last_sync_status: str | None = "ok",
 ) -> PlaidItem:
     return PlaidItem(
-        item_id=f"item-{institution}-{scope}-{id(object())}",
+        item_id=f"item-{institution}-{scope}-{next(_ITEM_SEQ)}",
         institution_id=f"ins_{institution.lower()}",
         institution_name=institution,
         access_token_encrypted="enc",
@@ -538,3 +541,175 @@ def _wr(status: str):
     from src.alerts.webhook import WebhookResult
 
     return WebhookResult(status, 200 if status == "sent" else None, None)
+
+
+
+# ---------------------------------------------------------------------------
+# qreview P1 fixes (2026-07-27): TZ discipline, dup-institution ambiguity,
+# conditional wealth_cloud expectation, CLI exit-code contract
+# ---------------------------------------------------------------------------
+
+
+class TestUtcDiscipline:
+    def test_report_mtime_compared_in_utc(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P1-001: st_mtime must be interpreted as UTC-naive to match `now`
+        (NOW is UTC-naive by repo convention). Under TZ=US Pacific a local-time
+        `fromtimestamp` reads the same instant 7-8h older, so a file that is
+        FRESH in UTC terms (7d20h < 8d) would falsely violate."""
+        import os
+        import time
+
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        try:
+            from datetime import UTC
+
+            f = tmp_path / "weekly-pl-latest.txt"
+            f.write_text("x")
+            mtime = (NOW.replace(tzinfo=UTC) - timedelta(days=7, hours=20)).timestamp()
+            os.utime(f, (mtime, mtime))
+            assert check_report_freshness(f, NOW) == []
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            time.tzset()
+
+    def test_cli_now_is_utc_naive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P1-001: main() must reference UTC-naive now (repo convention for
+        every DB timestamp it compares against), not system-local now."""
+        import time
+        from datetime import UTC
+
+        import scripts.freshness_sentinel as cli
+
+        monkeypatch.setenv("TZ", "America/Los_Angeles")
+        time.tzset()
+        try:
+            monkeypatch.setattr(cli, "init_db", lambda: None)
+
+            class _S:
+                def close(self) -> None: ...
+
+            monkeypatch.setattr(cli, "SessionLocal", lambda: _S())
+            seen: list[datetime] = []
+
+            def _capture(session, now, **kwargs):  # type: ignore[no-untyped-def]
+                seen.append(now)
+                return [], None
+
+            monkeypatch.setattr(cli, "dispatch_sentinel", _capture)
+            assert cli.main([]) == 0
+            utc_now = datetime.now(UTC).replace(tzinfo=None)
+            assert abs((seen[0] - utc_now).total_seconds()) < 300
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            time.tzset()
+
+
+class TestDuplicateInstitutionAmbiguity:
+    def test_two_active_items_same_institution_emit_ambiguity_violation(
+        self, session: Session
+    ) -> None:
+        """P1-002: two active Vanguard items share ingestion_log source keys, so
+        one failing item is masked by the other's success. Surface the degraded
+        coverage explicitly."""
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.add(_log("plaid_balance:Vanguard", NOW - timedelta(hours=9)))
+        session.add(_log("plaid_investments:Vanguard", NOW - timedelta(hours=9)))
+        for source in ("stripe", "shopify", "wealth_cloud:plaid_balance"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        ambiguous = [v for v in violations if v.check == "ingest_source_ambiguous"]
+        assert len(ambiguous) == 1
+        assert ambiguous[0].severity == SEV3
+        assert "Vanguard" in ambiguous[0].subject
+
+    def test_single_item_per_institution_no_ambiguity(self, session: Session) -> None:
+        session.add(_item(institution="Chase", scope="register"))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert all(v.check != "ingest_source_ambiguous" for v in violations)
+
+
+class TestConditionalWealthCloudExpectation:
+    def test_no_wealth_items_no_wealth_cloud_expectation(self, session: Session) -> None:
+        """P1-003: the producer only writes wealth_cloud:plaid_balance when
+        wealth items exist — expecting it unconditionally would cry a false
+        sev2 daily forever after the last wealth item is disconnected."""
+        session.add(_item(institution="Chase", scope="register"))
+        for source in ("stripe", "shopify", "plaid_balance:Chase", "plaid_tx:Chase"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert all(v.subject != "wealth_cloud:plaid_balance" for v in violations)
+
+    def test_wealth_item_present_expects_wealth_cloud(self, session: Session) -> None:
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        for source in ("stripe", "shopify", "plaid_balance:Vanguard", "plaid_investments:Vanguard"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert any(v.subject == "wealth_cloud:plaid_balance" for v in violations)
+
+
+class TestCliExitContract:
+    """P1-004: REQ-SEN-008's exit-code contract, tested against main()."""
+
+    def _run_main(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        argv: list[str],
+        violations: list[Violation],
+        webhook_status: str | None,
+    ) -> int:
+        import scripts.freshness_sentinel as cli
+
+        monkeypatch.setattr(cli, "init_db", lambda: None)
+
+        class _S:
+            def close(self) -> None: ...
+
+        monkeypatch.setattr(cli, "SessionLocal", lambda: _S())
+        result = None if webhook_status is None else _wr(webhook_status)
+        monkeypatch.setattr(
+            cli, "dispatch_sentinel", lambda *a, **k: (violations, result)
+        )
+        return cli.main(argv)
+
+    def test_clean_run_exits_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._run_main(monkeypatch, argv=[], violations=[], webhook_status=None) == 0
+
+    def test_violations_with_sent_webhook_exit_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        v = [Violation("item_stale", SEV2, "Chase", "40h")]
+        rc = self._run_main(
+            monkeypatch, argv=["--apply"], violations=v, webhook_status="sent"
+        )
+        assert rc == 0
+
+    def test_violations_with_failed_webhook_exit_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        v = [Violation("item_stale", SEV2, "Chase", "40h")]
+        rc = self._run_main(
+            monkeypatch, argv=["--apply"], violations=v, webhook_status="failed"
+        )
+        assert rc == 1
+
+    def test_dry_run_violations_exit_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        v = [Violation("report_stale", SEV3, "weekly-pl", "9d")]
+        rc = self._run_main(monkeypatch, argv=[], violations=v, webhook_status="dry_run")
+        assert rc == 0
+
+    def test_infra_failure_exits_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import scripts.freshness_sentinel as cli
+
+        def _boom() -> None:
+            raise RuntimeError("db unreachable")
+
+        monkeypatch.setattr(cli, "init_db", _boom)
+        assert cli.main([]) == 1

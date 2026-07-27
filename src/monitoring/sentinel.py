@@ -37,7 +37,7 @@ All functions take an explicit ``now`` so tests never depend on the clock.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -62,8 +62,13 @@ SNAPSHOT_MAX_AGE_DAYS = 2
 REGISTER_TX_MAX_AGE_DAYS = 10
 REPORT_MAX_AGE_DAYS = 8
 
-# Sources expected regardless of Plaid item state (daily timers).
-STATIC_EXPECTED_SOURCES = ("stripe", "shopify", "wealth_cloud:plaid_balance")
+# Sources expected regardless of Plaid item state (daily timers). The
+# wealth-D1 push source is NOT here: its producer only writes a log row when
+# wealth-scope items exist (src/adapters/plaid_balance.py P0-r3a guard), so it
+# is derived in _expected_sources — an unconditional expectation would cry a
+# false sev2 daily forever after the last wealth item is disconnected.
+STATIC_EXPECTED_SOURCES = ("stripe", "shopify")
+WEALTH_PUSH_SOURCE = "wealth_cloud:plaid_balance"
 
 
 @dataclass(frozen=True)
@@ -124,7 +129,19 @@ def _expected_sources(session: Session) -> set[str]:
             expected.add(f"plaid_tx:{item.institution_name}")
         elif item.scope == "wealth":
             expected.add(f"plaid_investments:{item.institution_name}")
+            expected.add(WEALTH_PUSH_SOURCE)
     return expected
+
+
+def _ambiguous_institutions(session: Session) -> list[tuple[str, int]]:
+    """Institutions with >1 active item — their ingestion_log source keys
+    collapse (the log carries institution_name, not item id), so one item's
+    failure is masked by a sibling's success. Production has this today: two
+    active Vanguard items (Travis's and Amy's logins)."""
+    counts: dict[str, int] = {}
+    for item in _active_items(session):
+        counts[item.institution_name] = counts.get(item.institution_name, 0) + 1
+    return sorted((name, n) for name, n in counts.items() if n > 1)
 
 
 def check_ingestion_staleness(
@@ -166,6 +183,19 @@ def check_ingestion_staleness(
                     f" (limit {max_age_hours}h)",
                 )
             )
+    # Degraded-coverage marker: duplicate institution names share one source
+    # key, so per-item ingest failures can hide behind a sibling's success
+    # (REQ-SEN-002's last_sync_at check still catches the item itself).
+    for name, n in _ambiguous_institutions(session):
+        violations.append(
+            Violation(
+                "ingest_source_ambiguous",
+                SEV3,
+                name,
+                f"{n} active items share this institution name — per-item "
+                "ingest staleness cannot be distinguished for them",
+            )
+        )
     return violations
 
 
@@ -304,7 +334,13 @@ def check_report_freshness(
                 "report_stale", SEV3, report_path.name, "report file missing"
             )
         ]
-    age = now - datetime.fromtimestamp(report_path.stat().st_mtime)
+    # UTC-naive on both sides: `now` is UTC-naive by repo convention, and a
+    # bare fromtimestamp() would read the mtime in SYSTEM-LOCAL time, skewing
+    # the staleness axis by the TZ offset on any non-UTC box.
+    mtime_utc = datetime.fromtimestamp(report_path.stat().st_mtime, UTC).replace(
+        tzinfo=None
+    )
+    age = now - mtime_utc
     if age > timedelta(days=max_age_days):
         return [
             Violation(

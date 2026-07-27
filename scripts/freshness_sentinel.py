@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -55,9 +55,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    now = args.now or datetime.now()
-    init_db()
-    session = SessionLocal()
+    # UTC-naive to match every DB timestamp the checks compare against (repo
+    # convention: _now() = datetime.now(UTC).replace(tzinfo=None)). A local
+    # now() would shift the whole staleness axis by the box's TZ offset.
+    now = args.now or datetime.now(UTC).replace(tzinfo=None)
+    try:
+        init_db()
+        session = SessionLocal()
+    except Exception as exc:  # noqa: BLE001 — infra failure must exit 1 loudly
+        print(f"sentinel: infrastructure failure: {type(exc).__name__}", file=sys.stderr)
+        return 1
     try:
         violations, result = dispatch_sentinel(
             session, now, report_path=args.report_path, apply=args.apply

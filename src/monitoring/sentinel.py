@@ -133,15 +133,32 @@ def _expected_sources(session: Session) -> set[str]:
     return expected
 
 
-def _ambiguous_institutions(session: Session) -> list[tuple[str, int]]:
-    """Institutions with >1 active item — their ingestion_log source keys
-    collapse (the log carries institution_name, not item id), so one item's
-    failure is masked by a sibling's success. Production has this today: two
-    active Vanguard items (Travis's and Amy's logins)."""
-    counts: dict[str, int] = {}
+def _masked_ambiguous_institutions(
+    session: Session, now: datetime, max_age_hours: int
+) -> list[tuple[str, int]]:
+    """Institutions where source-key masking is actually happening.
+
+    >1 active item sharing an institution_name collapses their ingestion_log
+    source keys (the log carries institution_name, not item id), so one item's
+    ingest failure hides behind a sibling's success. Production has duplicate
+    names PERMANENTLY (Chase register+wealth; Travis's and Amy's Vanguard
+    logins), so flagging mere duplication would cry daily forever — the marker
+    fires only while a name-sharing item is itself sync-stale, i.e. exactly
+    when the shared key may be lying."""
+    cutoff = now - timedelta(hours=max_age_hours)
+    by_name: dict[str, list[PlaidItem]] = {}
     for item in _active_items(session):
-        counts[item.institution_name] = counts.get(item.institution_name, 0) + 1
-    return sorted((name, n) for name, n in counts.items() if n > 1)
+        by_name.setdefault(item.institution_name, []).append(item)
+    flagged: list[tuple[str, int]] = []
+    for name, items in sorted(by_name.items()):
+        if len(items) < 2:
+            continue
+        if any(
+            i.last_sync_at is None or i.last_sync_at < cutoff or i.last_sync_status != "ok"
+            for i in items
+        ):
+            flagged.append((name, len(items)))
+    return flagged
 
 
 def check_ingestion_staleness(
@@ -185,8 +202,9 @@ def check_ingestion_staleness(
             )
     # Degraded-coverage marker: duplicate institution names share one source
     # key, so per-item ingest failures can hide behind a sibling's success
-    # (REQ-SEN-002's last_sync_at check still catches the item itself).
-    for name, n in _ambiguous_institutions(session):
+    # (REQ-SEN-002's last_sync_at check still catches the item itself). Fires
+    # only while one of the name-sharers is actually stale — see helper.
+    for name, n in _masked_ambiguous_institutions(session, now, max_age_hours):
         violations.append(
             Violation(
                 "ingest_source_ambiguous",

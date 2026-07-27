@@ -606,14 +606,21 @@ class TestUtcDiscipline:
 
 
 class TestDuplicateInstitutionAmbiguity:
-    def test_two_active_items_same_institution_emit_ambiguity_violation(
+    def test_stale_item_behind_fresh_shared_source_emits_ambiguity(
         self, session: Session
     ) -> None:
         """P1-002: two active Vanguard items share ingestion_log source keys, so
-        one failing item is masked by the other's success. Surface the degraded
-        coverage explicitly."""
+        one failing item is masked by the other's success. The marker fires
+        exactly when masking is possible — a name-sharing item is stale while
+        the shared source key looks fresh."""
         session.add(_item(institution="Vanguard", scope="wealth"))
-        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.add(
+            _item(
+                institution="Vanguard",
+                scope="wealth",
+                last_sync_at=NOW - timedelta(hours=40),
+            )
+        )
         session.add(_log("plaid_balance:Vanguard", NOW - timedelta(hours=9)))
         session.add(_log("plaid_investments:Vanguard", NOW - timedelta(hours=9)))
         for source in ("stripe", "shopify", "wealth_cloud:plaid_balance"):
@@ -624,6 +631,22 @@ class TestDuplicateInstitutionAmbiguity:
         assert len(ambiguous) == 1
         assert ambiguous[0].severity == SEV3
         assert "Vanguard" in ambiguous[0].subject
+
+    def test_all_fresh_duplicate_institutions_stay_quiet(
+        self, session: Session
+    ) -> None:
+        """Two healthy items sharing a name is production's PERMANENT state
+        (Chase register+wealth; Travis + Amy Vanguard logins) — a daily
+        violation for it would be pure alert fatigue (the incident-5 lesson)."""
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.add(_log("plaid_balance:Vanguard", NOW - timedelta(hours=9)))
+        session.add(_log("plaid_investments:Vanguard", NOW - timedelta(hours=9)))
+        for source in ("stripe", "shopify", "wealth_cloud:plaid_balance"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert all(v.check != "ingest_source_ambiguous" for v in violations)
 
     def test_single_item_per_institution_no_ambiguity(self, session: Session) -> None:
         session.add(_item(institution="Chase", scope="register"))

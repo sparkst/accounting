@@ -34,8 +34,11 @@
 
 	// REQ-PC-B5: per-link scope choice. 'register' feeds the cash-basis register
 	// (with the account-mapping step); 'wealth' pushes balances/holdings to the
-	// wealth D1 only and skips register mapping entirely.
-	let newLinkScope = $state<'register' | 'wealth'>('register');
+	// wealth D1 only and skips register mapping entirely. Wealth is the default:
+	// the register's two feeds (Chase, Amex) are long-linked, so nearly every new
+	// link is a wealth connection — a register default caused two accidental
+	// register links (Schwab + Vanguard, 2026-07-27) that needed server-side repair.
+	let newLinkScope = $state<'register' | 'wealth'>('wealth');
 
 	// P1-a1x/P1-r3e/P1-r3c: a wealth link is only usable if its account-map push
 	// to the wealth D1 landed cleanly — otherwise every balance/holding for the
@@ -342,8 +345,8 @@
 	<section class="action-row">
 		<button onclick={startAddConnection} class="primary">+ Add connection</button>
 		<select bind:value={newLinkScope} aria-label="Connection scope">
-			<option value="register">Register (transactions)</option>
 			<option value="wealth">Wealth-only (balances + holdings)</option>
+			<option value="register">Register (transactions — Chase/Amex spending only)</option>
 		</select>
 		<span class="slot-count">{items.length} of 10 slots used</span>
 	</section>

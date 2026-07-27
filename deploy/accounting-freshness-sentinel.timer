@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the accounting freshness sentinel daily at 13:45 UTC (~06:45 Pacific, before the 14:00 alert window)
+
+[Timer]
+OnCalendar=*-*-* 13:45:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

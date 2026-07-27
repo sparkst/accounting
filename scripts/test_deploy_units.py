@@ -86,3 +86,43 @@ def test_plaid_investments_sync_timer_daily_0420() -> None:
     text = (_DEPLOY_DIR / "plaid-investments-sync.timer").read_text()
     assert "OnCalendar=*-*-* 04:20:00 UTC" in text
     assert "Persistent=true" in text
+
+
+# ── REQ-SEN-008: freshness-sentinel units ────────────────────────────────────
+
+
+def test_freshness_sentinel_units_exist_in_git() -> None:
+    assert (_DEPLOY_DIR / "accounting-freshness-sentinel.service").is_file()
+    assert (_DEPLOY_DIR / "accounting-freshness-sentinel.timer").is_file()
+
+
+def test_freshness_sentinel_service_wiring() -> None:
+    text = (_DEPLOY_DIR / "accounting-freshness-sentinel.service").read_text()
+    assert "OnFailure=accounting-alert@%p.service" in text
+    assert "scripts.freshness_sentinel --apply" in text
+    assert "env -u DOPPLER_TOKEN" in text
+
+
+def test_freshness_sentinel_orders_after_producers_without_wants() -> None:
+    """Ordering only — the sentinel must still run (and page) when a producer
+    unit is broken or missing; that is exactly its job."""
+    text = (_DEPLOY_DIR / "accounting-freshness-sentinel.service").read_text()
+    after_lines = [line for line in text.splitlines() if line.startswith("After=")]
+    joined = " ".join(after_lines)
+    for producer in (
+        "plaid-balance-sync.service",
+        "plaid-transactions-sync.service",
+        "accounting-stripe-sync.service",
+        "accounting-shopify-sync.service",
+    ):
+        assert producer in joined
+    for line in text.splitlines():
+        if line.startswith(("Wants=", "Requires=")):
+            assert ".service" not in line or "network-online" in line
+
+
+def test_freshness_sentinel_timer_daily_1345_persistent() -> None:
+    """13:45 UTC — after every overnight sync, ahead of the 14:00 alert window."""
+    text = (_DEPLOY_DIR / "accounting-freshness-sentinel.timer").read_text()
+    assert "OnCalendar=*-*-* 13:45:00 UTC" in text
+    assert "Persistent=true" in text

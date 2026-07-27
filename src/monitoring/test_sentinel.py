@@ -449,6 +449,13 @@ class TestRunSentinel:
         )
         session.add(_txn(date_s=(NOW - timedelta(days=1)).date().isoformat()))
         _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        # REQ-SEN-010 floor: production always has ≥1 wealth item too.
+        session.add(_item(institution="PenFed Credit Union", scope="wealth"))
+        session.add(_log("plaid_balance:PenFed Credit Union", NOW - timedelta(hours=9)))
+        session.add(
+            _log("plaid_investments:PenFed Credit Union", NOW - timedelta(hours=9))
+        )
+        session.add(_log("wealth_cloud:plaid_balance", NOW - timedelta(hours=9)))
         session.commit()
         f = tmp_path / "weekly-pl-latest.txt"
         f.write_text("report")
@@ -506,7 +513,33 @@ class TestDispatch:
             "post_payload",
             lambda payload, *, key, apply: posted.append(payload) or _wr("sent"),
         )
-        for source in ("stripe", "shopify", "wealth_cloud:plaid_balance"):
+        session.add(_item(institution="Chase", scope="register"))
+        session.add(_item(institution="PenFed Credit Union", scope="wealth"))
+        session.add(_txn(date_s=(NOW - timedelta(days=1)).date().isoformat()))
+        acct_item = session.query(PlaidItem).filter_by(scope="register").one()
+        session.flush()
+        acct = _account(acct_item, number="9990")
+        session.add(acct)
+        session.flush()
+        session.add(
+            PlaidAccountBalanceSnapshot(
+                account_id=acct.id,
+                snapshot_date=(NOW - timedelta(days=1)).date(),
+                plaid_account_type="depository",
+                current_balance=100,
+                pulled_at=NOW - timedelta(days=1),
+                raw_data={},
+            )
+        )
+        for source in (
+            "stripe",
+            "shopify",
+            "wealth_cloud:plaid_balance",
+            "plaid_balance:Chase",
+            "plaid_tx:Chase",
+            "plaid_balance:PenFed Credit Union",
+            "plaid_investments:PenFed Credit Union",
+        ):
             session.add(_log(source, NOW - timedelta(hours=9)))
         session.commit()
         f = tmp_path / "weekly-pl-latest.txt"
@@ -936,3 +969,114 @@ class TestHeartbeat:
         session.commit()
         violations = check_ingestion_staleness(session, NOW)
         assert any(v.subject == "freshness_sentinel" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-010: active-item floor (empty work set looks like success)
+# ---------------------------------------------------------------------------
+
+
+class TestItemFloor:
+    def test_counts_at_floor_are_clean(self, session: Session) -> None:
+        from src.monitoring.sentinel import check_item_floor
+
+        session.add(_item(institution="Chase", scope="register"))
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.commit()
+        assert check_item_floor(session) == []
+
+    def test_zero_register_items_violates_sev2(self, session: Session) -> None:
+        from src.monitoring.sentinel import check_item_floor
+
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.commit()
+        violations = check_item_floor(session)
+        assert len(violations) == 1
+        assert violations[0].check == "item_floor"
+        assert violations[0].severity == SEV2
+        assert "register" in violations[0].subject
+
+    def test_zero_wealth_items_violates(self, session: Session) -> None:
+        from src.monitoring.sentinel import check_item_floor
+
+        session.add(_item(institution="Chase", scope="register"))
+        session.commit()
+        violations = check_item_floor(session)
+        assert [v.subject for v in violations] == ["wealth items"]
+
+    def test_disconnected_items_do_not_count(self, session: Session) -> None:
+        from src.monitoring.sentinel import check_item_floor
+
+        session.add(_item(institution="Chase", scope="register", status="disconnected"))
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        session.commit()
+        assert any(v.check == "item_floor" for v in check_item_floor(session))
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-009: D1-side per-account freshness (the 30-day-freeze class,
+# end-to-end — box-push-succeeded is NOT the same as D1-data-fresh)
+# ---------------------------------------------------------------------------
+
+
+class TestD1Freshness:
+    def _payload(self, *accounts: tuple[str, str | None]) -> dict:
+        return {
+            "accounts": [
+                {
+                    "account_id": f"id-{name}",
+                    "account_name": name,
+                    "broker": "schwab",
+                    "latest_snapshot_date": date_s,
+                }
+                for name, date_s in accounts
+            ],
+            "generated_at": "2026-07-27T14:00:00Z",
+        }
+
+    def test_fresh_accounts_are_clean(self) -> None:
+        from src.monitoring.sentinel import check_d1_freshness
+
+        payload = self._payload(("Schwab Stocks", "2026-07-27"), ("IRA", "2026-07-26"))
+        assert check_d1_freshness(("ok", payload), NOW) == []
+
+    def test_stale_account_violates_sev2(self) -> None:
+        from src.monitoring.sentinel import check_d1_freshness
+
+        payload = self._payload(("Frozen IRA", "2026-06-25"))
+        violations = check_d1_freshness(("ok", payload), NOW)
+        assert len(violations) == 1
+        assert violations[0].check == "d1_freshness"
+        assert violations[0].severity == SEV2
+        assert "Frozen IRA" in violations[0].subject
+
+    def test_null_date_violates(self) -> None:
+        from src.monitoring.sentinel import check_d1_freshness
+
+        payload = self._payload(("Never Synced", None))
+        assert len(check_d1_freshness(("ok", payload), NOW)) == 1
+
+    def test_fetch_error_violates_sev2(self) -> None:
+        from src.monitoring.sentinel import check_d1_freshness
+
+        violations = check_d1_freshness(("error", None), NOW)
+        assert len(violations) == 1
+        assert violations[0].check == "d1_freshness_unavailable"
+        assert violations[0].severity == SEV2
+
+    def test_unconfigured_env_is_clean_skip(self) -> None:
+        from src.monitoring.sentinel import check_d1_freshness
+
+        assert check_d1_freshness(("unconfigured", None), NOW) == []
+
+    def test_run_sentinel_includes_d1_when_provided(
+        self, session: Session, tmp_path: Path
+    ) -> None:
+        payload = self._payload(("Frozen IRA", "2026-06-25"))
+        violations = run_sentinel(
+            session,
+            NOW,
+            report_path=tmp_path / "missing.txt",
+            d1_freshness=("ok", payload),
+        )
+        assert any(v.check == "d1_freshness" for v in violations)

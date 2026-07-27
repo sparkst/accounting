@@ -316,10 +316,25 @@ def sync_one_item(
                         result=result,
                         pulled_at=pulled_at,
                     )
-            except IntegrityError:
-                # UNIQUE(account_id, snapshot_date) — today already snapshotted.
-                # Idempotent on double-run.
-                result.accounts_processed += 1
+            except IntegrityError as exc:
+                # ONLY the idempotency UNIQUE (account_id, snapshot_date) is
+                # benign — today already snapshotted, double-run absorbed. Any
+                # other integrity failure (FK, CHECK, NOT NULL) means the
+                # write FAILED and must count as such, not as processed
+                # (reliability audit 2026-07-27: a blanket absorb reported
+                # failed writes as healthy).
+                msg = str(exc.orig or exc)
+                if (
+                    "UNIQUE constraint failed" in msg
+                    and "plaid_account_balance_snapshot" in msg
+                ):
+                    result.accounts_processed += 1
+                else:
+                    result.accounts_failed += 1
+                    logger.exception(
+                        "plaid snapshot integrity failure (non-idempotency)",
+                        extra={"plaid_item_id": item.id},
+                    )
             except Exception:
                 result.accounts_failed += 1
                 logger.exception(

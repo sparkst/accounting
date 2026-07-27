@@ -422,8 +422,12 @@
 							<span class="badge {statusBadgeClass(item)}">{statusLabel(item)}</span>
 							{#if item.scope === 'wealth'}
 								<span class="badge badge-neutral">wealth</span>
+								<!-- The mapped-count is register-only bookkeeping; "0 mapped
+								     accounts" on a healthy wealth item reads as broken. -->
+								<span class="accts">balances → wealth D1</span>
+							{:else}
+								<span class="accts">{item.mapped_account_count} mapped account{item.mapped_account_count === 1 ? '' : 's'}</span>
 							{/if}
-							<span class="accts">{item.mapped_account_count} mapped account{item.mapped_account_count === 1 ? '' : 's'}</span>
 							{#if item.last_sync_at}
 								<time>{new Date(item.last_sync_at).toLocaleString()}</time>
 							{/if}

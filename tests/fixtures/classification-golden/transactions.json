@@ -1,0 +1,17 @@
+[
+  {"description": "ANTHROPIC PBC subscription", "amount": -238.03},
+  {"description": "OPENROUTER.AI credits", "amount": -50.00},
+  {"description": "RUNPOD GPU rental", "amount": -12.40},
+  {"description": "AWS.AMAZON billing", "amount": -87.12},
+  {"description": "GOOGLE WORKSPACE sparkry.ai", "amount": -21.60},
+  {"description": "HISCOX INSURANCE payment", "amount": -104.00},
+  {"description": "CLOUDFLARE hosting", "amount": -25.00},
+  {"description": "SHOPIFY monthly plan", "amount": -39.00},
+  {"description": "STICKERMULE decals order", "amount": -156.20},
+  {"description": "FEDEX shipment 7741", "amount": -32.55},
+  {"description": "USA CYCLING event license", "amount": -75.00},
+  {"description": "CARDINAL HEALTH reimbursable expense", "amount": -500.00},
+  {"description": "STRIPE INC processing fee", "amount": -14.21},
+  {"description": "Some Totally Unknown Vendor LLC", "amount": -60.00},
+  {"description": "APPLE.COM/BILL subscription", "amount": -9.99}
+]

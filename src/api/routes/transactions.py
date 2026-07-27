@@ -1071,12 +1071,17 @@ def patch_transaction(
 
 
 class SplitLineItemRequest(BaseModel):
-    """One line item in a split request."""
+    """One line item in a split request.
+
+    ``entity`` / ``deductible_pct`` omitted → the child inherits the parent's
+    values (a split must never silently drop them).
+    """
 
     amount: Decimal
     entity: str | None = None
     tax_category: str | None = None
     description: str | None = None
+    deductible_pct: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @field_validator("entity")
     @classmethod
@@ -1177,6 +1182,7 @@ def split_transaction_endpoint(
                 entity=item.entity,
                 tax_category=item.tax_category,
                 description=item.description,
+                deductible_pct=item.deductible_pct,
             )
             for item in body.line_items
         ]

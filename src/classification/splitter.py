@@ -75,12 +75,21 @@ def is_hotel_transaction(description: str) -> bool:
 
 @dataclass
 class SplitLineItem:
-    """One line item in a split request."""
+    """One line item in a split request.
+
+    ``entity`` and ``deductible_pct`` are per-line OVERRIDES — when omitted the
+    child inherits the parent's values. Without inheritance an entity-less
+    split produced entity=NULL children (excluded from every tax export while
+    the parent is excluded as SPLIT_PARENT — the amount vanished), and the
+    deductible_pct column default (1.0) silently overstated deductions on
+    partially-deductible parents.
+    """
 
     amount: Decimal
     entity: str | None = None
     tax_category: str | None = None
     description: str | None = None
+    deductible_pct: float | None = None
 
 
 @dataclass
@@ -215,9 +224,17 @@ def split_transaction(
     # ── Create children ───────────────────────────────────────────────────────
     children: list[Transaction] = []
     for i, item in enumerate(line_items):
+        # Per-line values override; otherwise inherit from the parent so a
+        # split can never silently drop the entity or the deductible fraction.
+        child_entity = item.entity if item.entity is not None else parent.entity
+        child_deductible = (
+            item.deductible_pct
+            if item.deductible_pct is not None
+            else parent.deductible_pct
+        )
         child_status = (
             TransactionStatus.AUTO_CLASSIFIED.value
-            if (item.entity and item.tax_category)
+            if (child_entity and item.tax_category)
             else TransactionStatus.NEEDS_REVIEW.value
         )
 
@@ -233,9 +250,10 @@ def split_transaction(
             description=child_description,
             amount=item.amount,
             currency=parent.currency,
-            entity=item.entity,
+            entity=child_entity,
             direction=parent.direction,
             tax_category=item.tax_category,
+            deductible_pct=child_deductible,
             status=child_status,
             confidence=0.0,
             parent_id=parent.id,

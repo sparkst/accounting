@@ -802,3 +802,18 @@ ingest-side fixes plus the one-time remediation of rows already written.
 | REQ-WBR-LED-016 | `scripts/remediate_plaid_mirrors.py` marks existing rows whose `raw_data.account_id` is one of the known mirror `account_id`s `status="rejected"`, `review_reason="superseded_by_duplicate_plaid_item"`. Rows are never deleted; already-rejected rows are left alone. |
 | REQ-WBR-LED-017 | The same script reclassifies existing non-rejected `source="plaid"` rows that match the REQ-WBR-LED-015 card-payment rules to `direction="transfer"` with `tax_category=NULL`; the amount is never touched. It also backfills the Chase 6380 personal `Account.payment_method` when blank. |
 | REQ-WBR-LED-018 | The script is DRY-RUN by default (`--apply` to commit), uses a per-row savepoint so one bad row cannot halt the batch, writes an `AuditEvent` for every field change (transaction mode for register rows, entity mode for the Account), prints a per-change table plus totals in both modes, and is idempotent (a second run reports zero changes). |
+
+## REQ-SEN-* — Feature: Data-level freshness/invariant sentinel
+
+Process-level monitoring (systemd exit codes + OnFailure) repeatedly stayed green while data went stale or wrong (30-day frozen wealth balances; 6 silent weeks of Stripe/Shopify ingest; two consecutive wrong-scope Plaid links). The sentinel asserts data invariants against the box DB daily, independent of what the producing processes claim.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-SEN-001 | `scripts/freshness_sentinel.py` runs every check (`src/monitoring/sentinel.py`) and reports all violations, worst severity first. DRY-RUN by default; `--apply` POSTs one aggregated digest to the n8n severity webhook via the shared `post_payload` path. |
+| REQ-SEN-002 | Item staleness: every `status='active'` PlaidItem must have `last_sync_at` within 26h AND `last_sync_status='ok'` — else `sev2` (never-synced counts as stale). Inactive items are ignored. |
+| REQ-SEN-003 | Ingestion recency: every expected `ingestion_log` source must have a `status='success'` row within 26h — else `sev2`. Expected sources are **derived from active items** (`plaid_balance:<inst>` for all; `plaid_tx:<inst>` for register scope; `plaid_investments:<inst>` for wealth scope) plus static daily sources (`stripe`, `shopify`, `wealth_cloud:plaid_balance`), so a newly linked institution is monitored automatically. A recent `failed` row does not satisfy the assertion. |
+| REQ-SEN-004 | Register snapshot recency: every account mapped to an active register-scope item must have a `plaid_account_balance_snapshot` within 2 days — else `sev3` (these rows are the balance-milestone baseline; if they stop, milestone alerting silently dies). |
+| REQ-SEN-005 | Scope anomaly (the mislink signature): an active register-scope item with zero mapped accounts → `sev2`; an active wealth-scope item that still has register mappings → `sev3` (half-done scope repair). |
+| REQ-SEN-006 | Register transaction recency: while any active register-scope item exists, the newest non-rejected `source='plaid'` transaction must be within 10 days — else `sev3`. |
+| REQ-SEN-007 | Report artifact freshness: `reports/weekly-pl-latest.txt` must exist and be modified within 8 days — else `sev3` (catches the deleted-runtime-dir failure class of 2026-07-27 at the data level). |
+| REQ-SEN-008 | Dispatch: violations aggregate into ONE webhook payload per day (`alert_key=sentinel:<date>`, `type` = worst severity present). Exit 0 when checks ran (violations included); exit 1 only on sentinel infrastructure failure (DB unreachable / webhook send failed) so `OnFailure=` covers the sentinel itself. Timer: `accounting-freshness-sentinel.timer`, daily 13:45 UTC. |

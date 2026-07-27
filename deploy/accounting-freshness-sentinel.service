@@ -1,0 +1,39 @@
+[Unit]
+Description=Accounting data-level freshness/invariant sentinel (REQ-SEN-001..008)
+After=network-online.target plaid-balance-sync.service plaid-transactions-sync.service accounting-stripe-sync.service accounting-shopify-sync.service
+Wants=network-online.target
+OnFailure=accounting-alert@%p.service
+# Ordering only (no Wants=/Requires=) — the sentinel must still run and page
+# when a producer unit is broken or missing; that is exactly its job.
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+# Doppler config is selected by the service token in /etc/accounting/doppler.env
+# (scoped to accounting/srv). Requires N8N_SEVERITY_WEBHOOK_URL/SECRET.
+# Drop --apply to run DRY-RUN (checks + print, no n8n POST).
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python -m scripts.freshness_sentinel --apply
+TimeoutStartSec=120
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+# reports/ is only *read* (freshness stat) — no write path needed. ProtectHome
+# read-only still allows stat/read of /home/travis/accounting/reports.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by accounting-freshness-sentinel.timer — no [Install] here.

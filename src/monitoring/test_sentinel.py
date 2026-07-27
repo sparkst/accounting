@@ -1,0 +1,540 @@
+"""Tests for the data-level freshness/invariant sentinel (REQ-SEN-001..008).
+
+Process-level monitoring (exit codes + OnFailure) has repeatedly stayed green
+while data went stale or wrong — the sentinel asserts *data* invariants daily:
+item sync recency, per-source ingestion recency, register snapshot recency,
+scope anomalies (the Schwab/Vanguard mislink signature), register transaction
+recency, and report artifact freshness.
+
+Pure check functions take an explicit `now` — no clock reads inside.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Generator
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from src.models.base import Base
+from src.models.brokerage import Account
+from src.models.ingestion_log import IngestionLog
+from src.models.plaid import PlaidAccountBalanceSnapshot, PlaidItem
+from src.models.transaction import Transaction
+from src.monitoring.sentinel import (
+    SEV2,
+    SEV3,
+    Violation,
+    build_sentinel_payload,
+    check_ingestion_staleness,
+    check_item_staleness,
+    check_register_snapshot_staleness,
+    check_register_tx_staleness,
+    check_report_freshness,
+    check_scope_anomalies,
+    run_sentinel,
+)
+
+NOW = datetime(2026, 7, 27, 14, 0, 0)
+
+_ENGINE = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+Base.metadata.create_all(_ENGINE)
+_Session = sessionmaker(bind=_ENGINE)
+
+
+@pytest.fixture()
+def session() -> Generator[Session, None, None]:
+    s = _Session()
+    yield s
+    s.rollback()
+    for model in (
+        PlaidAccountBalanceSnapshot,
+        IngestionLog,
+        Transaction,
+        Account,
+        PlaidItem,
+    ):
+        s.query(model).delete()
+    s.commit()
+    s.close()
+
+
+def _item(
+    *,
+    institution: str = "Chase",
+    scope: str = "register",
+    status: str = "active",
+    last_sync_at: datetime | None = None,
+    last_sync_status: str | None = "ok",
+) -> PlaidItem:
+    return PlaidItem(
+        item_id=f"item-{institution}-{scope}-{id(object())}",
+        institution_id=f"ins_{institution.lower()}",
+        institution_name=institution,
+        access_token_encrypted="enc",
+        status=status,
+        scope=scope,
+        last_sync_at=last_sync_at if last_sync_at is not None else NOW - timedelta(hours=10),
+        last_sync_status=last_sync_status,
+    )
+
+
+def _account(item: PlaidItem, *, number: str = "1234") -> Account:
+    return Account(
+        broker="chase",
+        account_number=number,
+        account_name=f"Acct {number}",
+        account_type="checking",
+        entity="personal",
+        plaid_item_id=item.id,
+        plaid_account_id=f"plaid-acct-{number}",
+    )
+
+
+def _log(source: str, run_at: datetime, status: str = "success") -> IngestionLog:
+    return IngestionLog(source=source, run_at=run_at, status=status)
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-002: item staleness
+# ---------------------------------------------------------------------------
+
+
+class TestItemStaleness:
+    def test_fresh_ok_item_is_clean(self, session: Session) -> None:
+        session.add(_item(last_sync_at=NOW - timedelta(hours=10)))
+        session.commit()
+        assert check_item_staleness(session, NOW) == []
+
+    def test_stale_item_violates_sev2(self, session: Session) -> None:
+        session.add(_item(last_sync_at=NOW - timedelta(hours=30)))
+        session.commit()
+        violations = check_item_staleness(session, NOW)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV2
+        assert violations[0].check == "item_stale"
+        assert "Chase" in violations[0].subject
+
+    def test_error_sync_status_violates_sev2(self, session: Session) -> None:
+        session.add(
+            _item(last_sync_at=NOW - timedelta(hours=1), last_sync_status="error")
+        )
+        session.commit()
+        violations = check_item_staleness(session, NOW)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV2
+
+    def test_never_synced_item_violates(self, session: Session) -> None:
+        item = _item(last_sync_status=None)
+        item.last_sync_at = None
+        session.add(item)
+        session.commit()
+        assert len(check_item_staleness(session, NOW)) == 1
+
+    def test_inactive_items_ignored(self, session: Session) -> None:
+        session.add(
+            _item(status="disconnected", last_sync_at=NOW - timedelta(days=30))
+        )
+        session.commit()
+        assert check_item_staleness(session, NOW) == []
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-003: per-source ingestion recency, expectations derived from items
+# ---------------------------------------------------------------------------
+
+
+def _seed_all_expected_logs(session: Session, when: datetime) -> None:
+    for source in (
+        "stripe",
+        "shopify",
+        "wealth_cloud:plaid_balance",
+        "plaid_balance:Chase",
+        "plaid_tx:Chase",
+    ):
+        session.add(_log(source, when))
+
+
+class TestIngestionStaleness:
+    def test_all_fresh_is_clean(self, session: Session) -> None:
+        session.add(_item(institution="Chase", scope="register"))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.commit()
+        assert check_ingestion_staleness(session, NOW) == []
+
+    def test_missing_source_violates_sev2(self, session: Session) -> None:
+        session.add(_item(institution="Chase", scope="register"))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.query(IngestionLog).filter_by(source="stripe").delete()
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert [v.subject for v in violations] == ["stripe"]
+        assert violations[0].severity == SEV2
+
+    def test_stale_success_violates(self, session: Session) -> None:
+        session.add(_item(institution="Chase", scope="register"))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.query(IngestionLog).filter_by(source="shopify").delete()
+        session.add(_log("shopify", NOW - timedelta(hours=40)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert [v.subject for v in violations] == ["shopify"]
+
+    def test_recent_failure_with_old_success_violates(self, session: Session) -> None:
+        """A fresh 'failed' row does not satisfy the recency assertion."""
+        session.add(_item(institution="Chase", scope="register"))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.query(IngestionLog).filter_by(source="stripe").delete()
+        session.add(_log("stripe", NOW - timedelta(hours=40), status="success"))
+        session.add(_log("stripe", NOW - timedelta(hours=2), status="failed"))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert [v.subject for v in violations] == ["stripe"]
+
+    def test_wealth_item_expects_investments_source(self, session: Session) -> None:
+        session.add(_item(institution="Vanguard", scope="wealth"))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.add(_log("plaid_balance:Vanguard", NOW - timedelta(hours=9)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert [v.subject for v in violations] == ["plaid_investments:Vanguard"]
+        # plaid_tx is NOT expected for wealth-scope items
+        assert all(v.subject != "plaid_tx:Vanguard" for v in violations)
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-004: register-mapped accounts have a recent balance snapshot
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterSnapshotStaleness:
+    def test_fresh_snapshot_is_clean(self, session: Session) -> None:
+        item = _item()
+        session.add(item)
+        session.flush()
+        acct = _account(item)
+        session.add(acct)
+        session.flush()
+        session.add(
+            PlaidAccountBalanceSnapshot(
+                account_id=acct.id,
+                snapshot_date=(NOW - timedelta(days=1)).date(),
+                plaid_account_type="depository",
+                current_balance=100,
+                pulled_at=NOW - timedelta(days=1),
+                raw_data={},
+            )
+        )
+        session.commit()
+        assert check_register_snapshot_staleness(session, NOW) == []
+
+    def test_missing_snapshot_violates_sev3(self, session: Session) -> None:
+        item = _item()
+        session.add(item)
+        session.flush()
+        session.add(_account(item))
+        session.commit()
+        violations = check_register_snapshot_staleness(session, NOW)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV3
+
+    def test_stale_snapshot_violates(self, session: Session) -> None:
+        item = _item()
+        session.add(item)
+        session.flush()
+        acct = _account(item)
+        session.add(acct)
+        session.flush()
+        session.add(
+            PlaidAccountBalanceSnapshot(
+                account_id=acct.id,
+                snapshot_date=(NOW - timedelta(days=5)).date(),
+                plaid_account_type="depository",
+                current_balance=100,
+                pulled_at=NOW - timedelta(days=5),
+                raw_data={},
+            )
+        )
+        session.commit()
+        assert len(check_register_snapshot_staleness(session, NOW)) == 1
+
+    def test_wealth_scope_accounts_ignored(self, session: Session) -> None:
+        item = _item(scope="wealth")
+        session.add(item)
+        session.flush()
+        session.add(_account(item))
+        session.commit()
+        assert check_register_snapshot_staleness(session, NOW) == []
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-005: scope anomalies (the mislink signature)
+# ---------------------------------------------------------------------------
+
+
+class TestScopeAnomalies:
+    def test_register_item_with_zero_mapped_accounts_is_sev2(
+        self, session: Session
+    ) -> None:
+        session.add(_item(institution="Charles Schwab", scope="register"))
+        session.commit()
+        violations = check_scope_anomalies(session)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV2
+        assert violations[0].check == "scope_anomaly"
+        assert "Charles Schwab" in violations[0].subject
+
+    def test_register_item_with_mapped_account_is_clean(
+        self, session: Session
+    ) -> None:
+        item = _item()
+        session.add(item)
+        session.flush()
+        session.add(_account(item))
+        session.commit()
+        assert check_scope_anomalies(session) == []
+
+    def test_wealth_item_with_mapped_register_account_is_sev3(
+        self, session: Session
+    ) -> None:
+        item = _item(institution="Vanguard", scope="wealth")
+        session.add(item)
+        session.flush()
+        session.add(_account(item))
+        session.commit()
+        violations = check_scope_anomalies(session)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV3
+
+    def test_inactive_items_ignored(self, session: Session) -> None:
+        session.add(_item(status="abandoned", scope="register"))
+        session.commit()
+        assert check_scope_anomalies(session) == []
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-006: register plaid transactions keep flowing
+# ---------------------------------------------------------------------------
+
+
+def _txn(*, date_s: str, source: str = "plaid", status: str = "auto_classified") -> Transaction:
+    return Transaction(
+        source=source,
+        source_hash=f"h-{date_s}-{id(object())}",
+        date=date_s,
+        description="t",
+        amount=-1,
+        entity="personal",
+        status=status,
+        raw_data={},
+    )
+
+
+class TestRegisterTxStaleness:
+    def test_recent_plaid_txn_is_clean(self, session: Session) -> None:
+        session.add(_item())  # an active register item exists
+        session.add(_txn(date_s=(NOW - timedelta(days=3)).date().isoformat()))
+        session.commit()
+        assert check_register_tx_staleness(session, NOW) == []
+
+    def test_old_plaid_txn_violates_sev3(self, session: Session) -> None:
+        session.add(_item())
+        session.add(_txn(date_s=(NOW - timedelta(days=12)).date().isoformat()))
+        session.commit()
+        violations = check_register_tx_staleness(session, NOW)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV3
+
+    def test_rejected_rows_do_not_count_as_fresh(self, session: Session) -> None:
+        session.add(_item())
+        session.add(_txn(date_s=(NOW - timedelta(days=12)).date().isoformat()))
+        session.add(
+            _txn(date_s=(NOW - timedelta(days=1)).date().isoformat(), status="rejected")
+        )
+        session.commit()
+        assert len(check_register_tx_staleness(session, NOW)) == 1
+
+    def test_no_register_items_no_expectation(self, session: Session) -> None:
+        session.add(_item(scope="wealth", institution="Vanguard"))
+        session.commit()
+        assert check_register_tx_staleness(session, NOW) == []
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-007: report artifact freshness
+# ---------------------------------------------------------------------------
+
+
+class TestReportFreshness:
+    def test_missing_file_violates_sev3(self, tmp_path: Path) -> None:
+        violations = check_report_freshness(tmp_path / "weekly-pl-latest.txt", NOW)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV3
+
+    def test_fresh_file_is_clean(self, tmp_path: Path) -> None:
+        f = tmp_path / "weekly-pl-latest.txt"
+        f.write_text("report")
+        import os
+
+        mtime = (NOW - timedelta(days=2)).timestamp()
+        os.utime(f, (mtime, mtime))
+        assert check_report_freshness(f, NOW) == []
+
+    def test_old_file_violates(self, tmp_path: Path) -> None:
+        f = tmp_path / "weekly-pl-latest.txt"
+        f.write_text("report")
+        import os
+
+        mtime = (NOW - timedelta(days=9)).timestamp()
+        os.utime(f, (mtime, mtime))
+        assert len(check_report_freshness(f, NOW)) == 1
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-001/008: composition + webhook payload aggregation
+# ---------------------------------------------------------------------------
+
+
+class TestRunSentinel:
+    def test_clean_db_and_fresh_report_yield_no_violations(
+        self, session: Session, tmp_path: Path
+    ) -> None:
+        item = _item()
+        session.add(item)
+        session.flush()
+        acct = _account(item)
+        session.add(acct)
+        session.flush()
+        session.add(
+            PlaidAccountBalanceSnapshot(
+                account_id=acct.id,
+                snapshot_date=(NOW - timedelta(days=1)).date(),
+                plaid_account_type="depository",
+                current_balance=100,
+                pulled_at=NOW - timedelta(days=1),
+                raw_data={},
+            )
+        )
+        session.add(_txn(date_s=(NOW - timedelta(days=1)).date().isoformat()))
+        _seed_all_expected_logs(session, NOW - timedelta(hours=9))
+        session.commit()
+        f = tmp_path / "weekly-pl-latest.txt"
+        f.write_text("report")
+        import os
+
+        mtime = (NOW - timedelta(days=1)).timestamp()
+        os.utime(f, (mtime, mtime))
+
+        assert run_sentinel(session, NOW, report_path=f) == []
+
+    def test_violations_from_multiple_checks_aggregate(
+        self, session: Session, tmp_path: Path
+    ) -> None:
+        session.add(_item(last_sync_at=NOW - timedelta(hours=40)))
+        session.commit()
+        violations = run_sentinel(
+            session, NOW, report_path=tmp_path / "missing.txt"
+        )
+        checks = {v.check for v in violations}
+        assert "item_stale" in checks
+        assert "report_stale" in checks
+
+
+class TestPayload:
+    def test_no_violations_returns_none(self) -> None:
+        assert build_sentinel_payload([], NOW) is None
+
+    def test_payload_type_is_max_severity(self) -> None:
+        violations = [
+            Violation("report_stale", SEV3, "weekly-pl", "9 days old"),
+            Violation("item_stale", SEV2, "Chase", "no sync 40h"),
+        ]
+        payload = build_sentinel_payload(violations, NOW)
+        assert payload is not None
+        assert payload["type"] == SEV2
+        assert "Chase" in (payload["message"] or "")
+        assert "weekly-pl" in (payload["message"] or "")
+        assert payload["alert_key"] == "sentinel:2026-07-27"
+
+
+# ---------------------------------------------------------------------------
+# REQ-SEN-008: dispatch — post when violations exist, exit semantics
+# ---------------------------------------------------------------------------
+
+
+class TestDispatch:
+    def test_clean_run_posts_nothing(
+        self, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.monitoring import sentinel as mod
+
+        posted: list[dict] = []
+        monkeypatch.setattr(
+            mod,
+            "post_payload",
+            lambda payload, *, key, apply: posted.append(payload) or _wr("sent"),
+        )
+        for source in ("stripe", "shopify", "wealth_cloud:plaid_balance"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        f = tmp_path / "weekly-pl-latest.txt"
+        f.write_text("x")
+        import os
+
+        mtime = (NOW - timedelta(days=1)).timestamp()
+        os.utime(f, (mtime, mtime))
+        violations, result = mod.dispatch_sentinel(
+            session, NOW, report_path=f, apply=True
+        )
+        assert violations == []
+        assert result is None
+        assert posted == []
+
+    def test_violations_posted_once_with_apply(
+        self, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.monitoring import sentinel as mod
+
+        posted: list[dict] = []
+        monkeypatch.setattr(
+            mod,
+            "post_payload",
+            lambda payload, *, key, apply: posted.append(payload) or _wr("sent"),
+        )
+        session.add(_item(last_sync_at=NOW - timedelta(hours=40)))
+        session.commit()
+        violations, result = mod.dispatch_sentinel(
+            session, NOW, report_path=tmp_path / "missing.txt", apply=True
+        )
+        assert len(violations) >= 2
+        assert len(posted) == 1
+        assert result is not None and result.status == "sent"
+
+    def test_dry_run_does_not_post(
+        self, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.monitoring import sentinel as mod
+
+        posted: list[dict] = []
+        monkeypatch.setattr(
+            mod,
+            "post_payload",
+            lambda payload, *, key, apply: posted.append((payload, apply)) or _wr("dry_run"),
+        )
+        session.add(_item(last_sync_at=NOW - timedelta(hours=40)))
+        session.commit()
+        violations, result = mod.dispatch_sentinel(
+            session, NOW, report_path=tmp_path / "missing.txt", apply=False
+        )
+        assert violations
+        # post_payload is still called (it handles dry-run itself) with apply=False
+        assert posted and posted[0][1] is False
+
+
+def _wr(status: str):
+    from src.alerts.webhook import WebhookResult
+
+    return WebhookResult(status, 200 if status == "sent" else None, None)

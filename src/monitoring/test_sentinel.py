@@ -63,6 +63,7 @@ def session() -> Generator[Session, None, None]:
 
 
 _ITEM_SEQ = iter(range(1_000_000))
+_TXN_SEQ = iter(range(1_000_000))
 
 
 def _item(
@@ -82,6 +83,9 @@ def _item(
         scope=scope,
         last_sync_at=last_sync_at if last_sync_at is not None else NOW - timedelta(hours=10),
         last_sync_status=last_sync_status,
+        # Older than the scope-anomaly onboarding grace window relative to the
+        # fixed test NOW (the column default would be the real wall clock).
+        created_at=NOW - timedelta(days=3),
     )
 
 
@@ -187,12 +191,17 @@ class TestIngestionStaleness:
         assert [v.subject for v in violations] == ["shopify"]
 
     def test_recent_failure_with_old_success_violates(self, session: Session) -> None:
-        """A fresh 'failed' row does not satisfy the recency assertion."""
+        """A fresh hard-failure row does not satisfy the recency assertion
+        (real IngestionStatus.FAILURE value, not an arbitrary string)."""
+        from src.models.enums import IngestionStatus
+
         session.add(_item(institution="Chase", scope="register"))
         _seed_all_expected_logs(session, NOW - timedelta(hours=9))
         session.query(IngestionLog).filter_by(source="stripe").delete()
         session.add(_log("stripe", NOW - timedelta(hours=40), status="success"))
-        session.add(_log("stripe", NOW - timedelta(hours=2), status="failed"))
+        session.add(
+            _log("stripe", NOW - timedelta(hours=2), IngestionStatus.FAILURE.value)
+        )
         session.commit()
         violations = check_ingestion_staleness(session, NOW)
         assert [v.subject for v in violations] == ["stripe"]
@@ -284,7 +293,7 @@ class TestScopeAnomalies:
     ) -> None:
         session.add(_item(institution="Charles Schwab", scope="register"))
         session.commit()
-        violations = check_scope_anomalies(session)
+        violations = check_scope_anomalies(session, NOW)
         assert len(violations) == 1
         assert violations[0].severity == SEV2
         assert violations[0].check == "scope_anomaly"
@@ -298,7 +307,7 @@ class TestScopeAnomalies:
         session.flush()
         session.add(_account(item))
         session.commit()
-        assert check_scope_anomalies(session) == []
+        assert check_scope_anomalies(session, NOW) == []
 
     def test_wealth_item_with_mapped_register_account_is_sev3(
         self, session: Session
@@ -308,14 +317,31 @@ class TestScopeAnomalies:
         session.flush()
         session.add(_account(item))
         session.commit()
-        violations = check_scope_anomalies(session)
+        violations = check_scope_anomalies(session, NOW)
         assert len(violations) == 1
         assert violations[0].severity == SEV3
 
     def test_inactive_items_ignored(self, session: Session) -> None:
         session.add(_item(status="abandoned", scope="register"))
         session.commit()
-        assert check_scope_anomalies(session) == []
+        assert check_scope_anomalies(session, NOW) == []
+
+    def test_unknown_scope_violates_sev3(
+        self, session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P3-scp: an unrecognized scope emits a defensive violation. The DB
+        CHECK constraint makes this unreachable through SQL today, so the
+        defensive branch is exercised with an in-memory item."""
+        from src.monitoring import sentinel as mod
+
+        item = _item(institution="Unknown Broker", scope="register")
+        item.scope = "invalid"
+        monkeypatch.setattr(mod, "_active_items", lambda s: [item])
+        violations = check_scope_anomalies(session, NOW)
+        assert len(violations) == 1
+        assert violations[0].severity == SEV3
+        assert violations[0].check == "scope_anomaly"
+        assert "unrecognized scope" in violations[0].detail
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +352,7 @@ class TestScopeAnomalies:
 def _txn(*, date_s: str, source: str = "plaid", status: str = "auto_classified") -> Transaction:
     return Transaction(
         source=source,
-        source_hash=f"h-{date_s}-{id(object())}",
+        source_hash=f"h-{date_s}-{next(_TXN_SEQ)}",
         date=date_s,
         description="t",
         amount=-1,
@@ -543,6 +569,30 @@ def _wr(status: str):
     return WebhookResult(status, 200 if status == "sent" else None, None)
 
 
+# ---------------------------------------------------------------------------
+# Helper function tests: _as_date (P3-n4c)
+# ---------------------------------------------------------------------------
+
+
+class TestAsDate:
+    def test_as_date_with_date_object(self) -> None:
+        from src.monitoring.sentinel import _as_date
+
+        d = datetime(2026, 7, 27).date()
+        assert _as_date(d) == d
+
+    def test_as_date_with_iso_date_string(self) -> None:
+        from src.monitoring.sentinel import _as_date
+
+        d = _as_date("2026-07-27")
+        assert d == datetime(2026, 7, 27).date()
+
+    def test_as_date_with_iso_datetime_string(self) -> None:
+        from src.monitoring.sentinel import _as_date
+
+        d = _as_date("2026-07-27T14:00:00")
+        assert d == datetime(2026, 7, 27).date()
+
 
 # ---------------------------------------------------------------------------
 # qreview P1 fixes (2026-07-27): TZ discipline, dup-institution ambiguity,
@@ -736,3 +786,153 @@ class TestCliExitContract:
 
         monkeypatch.setattr(cli, "init_db", _boom)
         assert cli.main([]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review fixes: partial_failure semantics (P1-a1f/P2-g7b), per-check
+# isolation (P2-c3d), digest cap (P2-e5f), heartbeat (P2-f6a), order (P2-d4e)
+# ---------------------------------------------------------------------------
+
+
+class TestPartialFailureSemantics:
+    def _seed_static(self, session: Session) -> None:
+        session.add(_item(institution="Chase", scope="register"))
+        for source in ("plaid_balance:Chase", "plaid_tx:Chase", "shopify"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+
+    def test_recent_partial_failure_satisfies_recency_but_flags_degraded(
+        self, session: Session
+    ) -> None:
+        """P1-a1f: per-record isolation means one bad row downgrades a healthy
+        run to partial_failure — that must NOT read as 'source dead' (sev2
+        daily forever), but as a sev3 degraded marker."""
+        from src.models.enums import IngestionStatus
+
+        self._seed_static(session)
+        session.add(
+            _log("stripe", NOW - timedelta(hours=2), IngestionStatus.PARTIAL_FAILURE.value)
+        )
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert all(
+            not (v.check == "ingest_stale" and v.subject == "stripe") for v in violations
+        )
+        degraded = [v for v in violations if v.check == "ingest_degraded"]
+        assert [v.subject for v in degraded] == ["stripe"]
+        assert degraded[0].severity == SEV3
+
+    def test_success_newer_than_partial_failure_is_clean(self, session: Session) -> None:
+        from src.models.enums import IngestionStatus
+
+        self._seed_static(session)
+        session.add(
+            _log("stripe", NOW - timedelta(hours=9), IngestionStatus.PARTIAL_FAILURE.value)
+        )
+        session.add(_log("stripe", NOW - timedelta(hours=2), IngestionStatus.SUCCESS.value))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert all(v.subject != "stripe" for v in violations)
+
+    def test_recent_hard_failure_only_violates_sev2(self, session: Session) -> None:
+        from src.models.enums import IngestionStatus
+
+        self._seed_static(session)
+        session.add(
+            _log("stripe", NOW - timedelta(hours=2), IngestionStatus.FAILURE.value)
+        )
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        stale = [v for v in violations if v.check == "ingest_stale" and v.subject == "stripe"]
+        assert len(stale) == 1
+        assert stale[0].severity == SEV2
+
+
+class TestRunSentinelResilience:
+    def test_one_raising_check_does_not_suppress_others(
+        self, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2-c3d: per-check isolation (the house per-record pattern) — a
+        broken check becomes a violation, not a dead sentinel."""
+        from src.monitoring import sentinel as mod
+
+        def _boom(session: Session, now: datetime, **kw: object) -> list[Violation]:
+            raise RuntimeError("schema drift")
+
+        monkeypatch.setattr(mod, "check_item_staleness", _boom)
+        violations = run_sentinel(session, NOW, report_path=tmp_path / "missing.txt")
+        checks = {v.check for v in violations}
+        assert "check_failed" in checks
+        assert "report_stale" in checks  # the other checks still ran
+
+    def test_worst_severity_sorts_first(self, session: Session, tmp_path: Path) -> None:
+        """P2-d4e: REQ-SEN-001's worst-first ordering, asserted end-to-end."""
+        session.add(_item(last_sync_at=NOW - timedelta(hours=40)))  # sev2
+        session.commit()
+        violations = run_sentinel(session, NOW, report_path=tmp_path / "missing.txt")
+        severities = [v.severity for v in violations]
+        assert SEV2 in severities and SEV3 in severities
+        assert severities == sorted(severities, key=lambda s: {SEV2: 0, SEV3: 1}[s])
+
+
+class TestPayloadCap:
+    def test_digest_caps_lines_with_footer(self) -> None:
+        """P2-e5f: Telegram hard-limits messages at 4096 chars — an unbounded
+        digest would drop the alert for exactly the worst incidents."""
+        violations = [
+            Violation("item_stale", SEV2, f"Institution {i}", "x" * 80)
+            for i in range(60)
+        ]
+        payload = build_sentinel_payload(violations, NOW)
+        assert payload is not None
+        message = payload["message"] or ""
+        assert len(message) < 3600
+        assert "+35 more violation(s)" in message
+
+
+class TestHeartbeat:
+    def test_apply_run_writes_heartbeat_row(
+        self, session: Session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2-f6a: the sentinel records its own run in ingestion_log so other
+        surfaces (delivery-health, monthly close, its own next run) can see the
+        watchdog went quiet."""
+        from src.monitoring import sentinel as mod
+
+        monkeypatch.setattr(
+            mod, "post_payload", lambda payload, *, key, apply: _wr("sent")
+        )
+        for source in ("stripe", "shopify"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        f = tmp_path / "weekly-pl-latest.txt"
+        f.write_text("x")
+        import os
+
+        mtime = (NOW - timedelta(days=1)).timestamp()
+        os.utime(f, (mtime, mtime))
+        mod.dispatch_sentinel(session, NOW, report_path=f, apply=True)
+        rows = session.query(IngestionLog).filter_by(source="freshness_sentinel").all()
+        assert len(rows) == 1
+        assert rows[0].status == "success"
+
+    def test_dry_run_writes_no_heartbeat(
+        self, session: Session, tmp_path: Path
+    ) -> None:
+        from src.monitoring import sentinel as mod
+
+        mod.dispatch_sentinel(
+            session, NOW, report_path=tmp_path / "missing.txt", apply=False
+        )
+        assert session.query(IngestionLog).filter_by(source="freshness_sentinel").count() == 0
+
+    def test_prior_heartbeat_makes_sentinel_self_expected(
+        self, session: Session
+    ) -> None:
+        """Once a heartbeat exists, a stale one violates — the sentinel watches
+        itself. No heartbeat history → no expectation (fresh installs clean)."""
+        session.add(_log("freshness_sentinel", NOW - timedelta(hours=40)))
+        for source in ("stripe", "shopify"):
+            session.add(_log(source, NOW - timedelta(hours=9)))
+        session.commit()
+        violations = check_ingestion_staleness(session, NOW)
+        assert any(v.subject == "freshness_sentinel" for v in violations)

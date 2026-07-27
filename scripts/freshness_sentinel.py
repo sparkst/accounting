@@ -59,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     # convention: _now() = datetime.now(UTC).replace(tzinfo=None)). A local
     # now() would shift the whole staleness axis by the box's TZ offset.
     now = args.now or datetime.now(UTC).replace(tzinfo=None)
+    # Normalize tz-aware --now to UTC-naive to avoid comparison errors with DB timestamps.
+    if now.tzinfo is not None:
+        now = now.astimezone(UTC).replace(tzinfo=None)
     try:
         init_db()
         session = SessionLocal()

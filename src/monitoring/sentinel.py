@@ -36,8 +36,10 @@ All functions take an explicit ``now`` so tests never depend on the clock.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import func, select
@@ -50,11 +52,14 @@ from src.models.ingestion_log import IngestionLog
 from src.models.plaid import PlaidAccountBalanceSnapshot, PlaidItem
 from src.models.transaction import Transaction
 
+logger = logging.getLogger(__name__)
+
 SEV2 = "sev2"
 SEV3 = "sev3"
 
 # Ordered worst-first for payload aggregation.
 _SEVERITY_ORDER = (SEV2, SEV3)
+_SEVERITY_RANK = {SEV2: 0, SEV3: 1, "info": 2}
 
 ITEM_MAX_AGE_HOURS = 26
 INGEST_MAX_AGE_HOURS = 26
@@ -69,6 +74,11 @@ REPORT_MAX_AGE_DAYS = 8
 # false sev2 daily forever after the last wealth item is disconnected.
 STATIC_EXPECTED_SOURCES = ("stripe", "shopify")
 WEALTH_PUSH_SOURCE = "wealth_cloud:plaid_balance"
+HEARTBEAT_SOURCE = "freshness_sentinel"
+
+# Telegram (the loudest downstream channel) hard-limits messages at 4096
+# chars — cap the digest so the worst incidents can't drop their own alert.
+DIGEST_MAX_LINES = 25
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,16 @@ def _active_items(session: Session) -> list[PlaidItem]:
     return list(
         session.scalars(select(PlaidItem).where(PlaidItem.status == "active"))
     )
+
+
+def _as_date(value: date | str) -> date:
+    """Coerce a date or ISO date string to a date object.
+
+    SQLite may return date aggregates as strings, so this handles both forms.
+    """
+    if isinstance(value, str):
+        return datetime.fromisoformat(value).date()
+    return value
 
 
 def check_item_staleness(
@@ -171,33 +191,50 @@ def check_ingestion_staleness(
     no way to forget it.
     """
     cutoff = now - timedelta(hours=max_age_hours)
+    # All rows in the window, newest-state per source computed in Python: a
+    # `partial_failure` run DID move data (per-record isolation downgrades a
+    # whole run on one bad row), so it satisfies recency — but flags degraded.
     rows = session.execute(
-        select(IngestionLog.source, func.max(IngestionLog.run_at))
-        .where(IngestionLog.status == "success")
-        .group_by(IngestionLog.source)
+        select(IngestionLog.source, IngestionLog.run_at, IngestionLog.status).where(
+            IngestionLog.run_at >= cutoff
+        )
     ).all()
-    latest_success = {source: run_at for source, run_at in rows}
+    ran_ok: set[str] = set()  # success|partial_failure seen in window
+    newest: dict[str, tuple[datetime, str]] = {}
+    for source, run_at, status in rows:
+        if status in ("success", "partial_failure"):
+            ran_ok.add(source)
+        prev = newest.get(source)
+        if prev is None or run_at > prev[0]:
+            newest[source] = (run_at, status)
+
+    expected = _expected_sources(session)
+    # Self-expectation (heartbeat): once the sentinel has ever recorded a run,
+    # its own silence becomes a violation. No history → no expectation, so
+    # fresh installs and tests stay clean.
+    if session.query(
+        session.query(IngestionLog).filter_by(source=HEARTBEAT_SOURCE).exists()
+    ).scalar():
+        expected.add(HEARTBEAT_SOURCE)
 
     violations: list[Violation] = []
-    for source in sorted(_expected_sources(session)):
-        last = latest_success.get(source)
-        if last is None:
+    for source in sorted(expected):
+        if source not in ran_ok:
             violations.append(
                 Violation(
                     "ingest_stale",
                     SEV2,
                     source,
-                    "no successful run on record",
+                    f"no successful run within {max_age_hours}h",
                 )
             )
-        elif last < cutoff:
+        elif newest[source][1] == "partial_failure":
             violations.append(
                 Violation(
-                    "ingest_stale",
-                    SEV2,
+                    "ingest_degraded",
+                    SEV3,
                     source,
-                    f"last success {(now - last).total_seconds() / 3600:.0f}h ago"
-                    f" (limit {max_age_hours}h)",
+                    "latest run was partial_failure — data moved but rows failed",
                 )
             )
     # Degraded-coverage marker: duplicate institution names share one source
@@ -235,7 +272,8 @@ def check_register_snapshot_staleness(
         .join(PlaidItem, PlaidItem.id == Account.plaid_item_id)
         .outerjoin(
             PlaidAccountBalanceSnapshot,
-            PlaidAccountBalanceSnapshot.account_id == Account.id,
+            (PlaidAccountBalanceSnapshot.account_id == Account.id)
+            & (PlaidAccountBalanceSnapshot.snapshot_date >= cutoff_date),
         )
         .where(
             PlaidItem.status == "active",
@@ -252,10 +290,7 @@ def check_register_snapshot_staleness(
                 Violation("snapshot_stale", SEV3, name or _acct_id, "no snapshot rows")
             )
         else:
-            # SQLite may hand back a str for a Date aggregate.
-            latest_date = (
-                latest if not isinstance(latest, str) else datetime.fromisoformat(latest).date()
-            )
+            latest_date = _as_date(latest)
             if latest_date < cutoff_date:
                 violations.append(
                     Violation(
@@ -268,13 +303,17 @@ def check_register_snapshot_staleness(
     return violations
 
 
-def check_scope_anomalies(session: Session) -> list[Violation]:
+def check_scope_anomalies(
+    session: Session, now: datetime, *, min_age_hours: int = 24
+) -> list[Violation]:
     """REQ-SEN-005: the wrong-scope-link signature, both directions.
 
     A register-scope item with zero mapped register accounts is exactly what
     the Schwab and Vanguard mislinks looked like (2026-07-27) — data landing
     nowhere. The inverse (a wealth item still holding register mappings) means
-    a scope repair was left half-done.
+    a scope repair was left half-done. Violations only fire for items older
+    than min_age_hours to allow a grace window for onboarding (exchange token
+    then map accounts as separate calls).
     """
     violations: list[Violation] = []
     mapped_counts: dict[str, int] = {
@@ -286,7 +325,11 @@ def check_scope_anomalies(session: Session) -> list[Violation]:
         ).all()
         if item_id is not None
     }
+    grace_cutoff = now - timedelta(hours=min_age_hours)
     for item in _active_items(session):
+        # Skip items newer than grace period
+        if item.created_at > grace_cutoff:
+            continue
         mapped = mapped_counts.get(item.id, 0)
         if item.scope == "register" and mapped == 0:
             violations.append(
@@ -304,6 +347,15 @@ def check_scope_anomalies(session: Session) -> list[Violation]:
                     SEV3,
                     item.institution_name,
                     f"wealth-scope item still has {mapped} register mapping(s)",
+                )
+            )
+        elif item.scope not in ("register", "wealth"):
+            violations.append(
+                Violation(
+                    "scope_anomaly",
+                    SEV3,
+                    item.institution_name,
+                    f"unrecognized scope {item.scope!r}",
                 )
             )
     return violations
@@ -374,16 +426,34 @@ def check_report_freshness(
 def run_sentinel(
     session: Session, now: datetime, *, report_path: Path
 ) -> list[Violation]:
-    """REQ-SEN-001: run every check; return all violations (worst first)."""
-    violations = [
-        *check_item_staleness(session, now),
-        *check_ingestion_staleness(session, now),
-        *check_register_snapshot_staleness(session, now),
-        *check_scope_anomalies(session),
-        *check_register_tx_staleness(session, now),
-        *check_report_freshness(report_path, now),
+    """REQ-SEN-001: run every check; return all violations (worst first).
+
+    Per-check isolation (the house per-record pattern): a raising check
+    becomes a ``check_failed`` violation instead of suppressing the other
+    checks' findings — a real incident that breaks one check must not degrade
+    the digest into a bare OnFailure email naming nothing.
+    """
+    checks: list[tuple[str, Callable[[], list[Violation]]]] = [
+        ("check_item_staleness", lambda: check_item_staleness(session, now)),
+        ("check_ingestion_staleness", lambda: check_ingestion_staleness(session, now)),
+        (
+            "check_register_snapshot_staleness",
+            lambda: check_register_snapshot_staleness(session, now),
+        ),
+        ("check_scope_anomalies", lambda: check_scope_anomalies(session, now)),
+        ("check_register_tx_staleness", lambda: check_register_tx_staleness(session, now)),
+        ("check_report_freshness", lambda: check_report_freshness(report_path, now)),
     ]
-    violations.sort(key=lambda v: _SEVERITY_ORDER.index(v.severity))
+    violations: list[Violation] = []
+    for name, fn in checks:
+        try:
+            violations.extend(fn())
+        except Exception as exc:  # noqa: BLE001 — isolate per check
+            logger.exception("sentinel check %s raised", name)
+            violations.append(
+                Violation("check_failed", SEV2, name, type(exc).__name__)
+            )
+    violations.sort(key=lambda v: _SEVERITY_RANK.get(v.severity, 99))
     return violations
 
 
@@ -397,10 +467,17 @@ def build_sentinel_payload(
     """
     if not violations:
         return None
-    worst = min(violations, key=lambda v: _SEVERITY_ORDER.index(v.severity))
+    worst = min(violations, key=lambda v: _SEVERITY_RANK.get(v.severity, 99))
     lines = [
         f"[{v.severity}] {v.check}: {v.subject} — {v.detail}" for v in violations
     ]
+    if len(lines) > DIGEST_MAX_LINES:
+        overflow = len(lines) - DIGEST_MAX_LINES
+        lines = lines[:DIGEST_MAX_LINES]
+        lines.append(
+            f"… +{overflow} more violation(s); run scripts/freshness_sentinel.py "
+            "for the full list"
+        )
     return {
         "source": "freshness_sentinel",
         "type": worst.severity,
@@ -425,7 +502,23 @@ def dispatch_sentinel(
     """
     violations = run_sentinel(session, now, report_path=report_path)
     payload = build_sentinel_payload(violations, now)
-    if payload is None:
-        return violations, None
-    result = post_payload(payload, key=str(payload["alert_key"]), apply=apply)
+    result: WebhookResult | None = None
+    if payload is not None:
+        result = post_payload(payload, key=str(payload["alert_key"]), apply=apply)
+    if apply:
+        # Heartbeat: record the run so the delivery-health surface, the
+        # monthly close, and the sentinel's own next run can see the watchdog
+        # went quiet. Success even when violations were found — the run RAN;
+        # failure only when the webhook send failed.
+        heartbeat_failed = result is not None and result.status == "failed"
+        session.add(
+            IngestionLog(
+                source=HEARTBEAT_SOURCE,
+                run_at=now,
+                status="failure" if heartbeat_failed else "success",
+                records_processed=len(violations),
+                error_detail=result.error if heartbeat_failed and result else None,
+            )
+        )
+        session.commit()
     return violations, result

@@ -38,13 +38,19 @@ _GOOD_ENV = {
 }
 
 
-def _mock_response(status_code: int, json_body: Any = None, text: str = "") -> MagicMock:
+def _mock_response(
+    status_code: int,
+    json_body: Any = None,
+    text: str = "",
+    headers: dict[str, str] | None = None,
+) -> MagicMock:
     """Return a mock that mimics an httpx.Response."""
     resp = MagicMock()
     resp.status_code = status_code
     resp.is_success = 200 <= status_code < 300
     resp.text = text if text else str(json_body or "")
     resp.json.return_value = json_body or {}
+    resp.headers = headers if headers is not None else {}
     return resp
 
 
@@ -215,16 +221,133 @@ def test_401_raises_wealth_unauthorized_error(
 def test_429_raises_wealth_rate_limit_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """HTTP 429 raises WealthRateLimitError."""
+    """REQ-FIX-WLT-008: persistent HTTP 429 raises WealthRateLimitError after
+    the bounded retries are exhausted."""
     monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
     monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
 
-    with patch("src.adapters._shared.wealth_client.httpx.post") as mock_post:
+    with (
+        patch("src.adapters._shared.wealth_client.httpx.post") as mock_post,
+        patch("src.adapters._shared.wealth_client.time.sleep") as mock_sleep,
+    ):
         mock_post.return_value = _mock_response(429, text="Too Many Requests")
         with pytest.raises(WealthRateLimitError) as exc_info:
             post_to_wealth({}, "brokerage-csv")
 
     assert exc_info.value.status_code == 429
+    # 1 initial attempt + 2 retries, sleeping before each retry
+    assert mock_post.call_count == 3
+    assert mock_sleep.call_count == 2
+
+
+def test_429_then_success_retries_and_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-FIX-WLT-008: a transient 429 (WAF rate rule during a multi-item
+    push run) is retried after a backoff and the eventual 2xx is returned."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    expected = {"inserted": 2, "errors": []}
+    with (
+        patch("src.adapters._shared.wealth_client.httpx.post") as mock_post,
+        patch("src.adapters._shared.wealth_client.time.sleep") as mock_sleep,
+    ):
+        mock_post.side_effect = [
+            _mock_response(429, text="Too Many Requests"),
+            _mock_response(200, json_body=expected),
+        ]
+        result = post_to_wealth({}, "plaid-balance")
+
+    assert result == expected
+    assert mock_post.call_count == 2
+    mock_sleep.assert_called_once()
+    # default backoff outlives the WAF window
+    assert mock_sleep.call_args[0][0] >= 60.0
+
+
+def test_429_retry_honors_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-FIX-WLT-008: a numeric Retry-After header sets the backoff (capped)."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    with (
+        patch("src.adapters._shared.wealth_client.httpx.post") as mock_post,
+        patch("src.adapters._shared.wealth_client.time.sleep") as mock_sleep,
+    ):
+        mock_post.side_effect = [
+            _mock_response(429, text="slow down", headers={"Retry-After": "15"}),
+            _mock_response(200, json_body={}),
+        ]
+        post_to_wealth({}, "plaid-balance")
+
+    mock_sleep.assert_called_once_with(15.0)
+
+
+def test_429_retry_caps_absurd_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-FIX-WLT-008: an oversized Retry-After is capped so a sync run can
+    never hang for hours on a hostile/buggy header."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    with (
+        patch("src.adapters._shared.wealth_client.httpx.post") as mock_post,
+        patch("src.adapters._shared.wealth_client.time.sleep") as mock_sleep,
+    ):
+        mock_post.side_effect = [
+            _mock_response(429, text="slow down", headers={"Retry-After": "86400"}),
+            _mock_response(200, json_body={}),
+        ]
+        post_to_wealth({}, "plaid-balance")
+
+    assert mock_sleep.call_args[0][0] <= 120.0
+
+
+def test_429_retry_defaults_on_malformed_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-FIX-WLT-008: an HTTP-date (or garbage) Retry-After falls back to the
+    default backoff rather than crashing."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    with (
+        patch("src.adapters._shared.wealth_client.httpx.post") as mock_post,
+        patch("src.adapters._shared.wealth_client.time.sleep") as mock_sleep,
+    ):
+        mock_post.side_effect = [
+            _mock_response(
+                429, text="slow down", headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+            ),
+            _mock_response(200, json_body={}),
+        ]
+        post_to_wealth({}, "plaid-balance")
+
+    assert mock_sleep.call_args[0][0] >= 60.0
+
+
+def test_429_no_retry_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REQ-FIX-WLT-008: rate_limit_retries=0 preserves the old fail-fast
+    behavior for interactive callers."""
+    monkeypatch.setenv("WEALTH_API_BASE", "https://internal.sparkry.ai")
+    monkeypatch.setenv("WEALTH_INTERNAL_KEY", "k")
+
+    with (
+        patch("src.adapters._shared.wealth_client.httpx.post") as mock_post,
+        patch("src.adapters._shared.wealth_client.time.sleep") as mock_sleep,
+    ):
+        mock_post.return_value = _mock_response(429, text="Too Many Requests")
+        with pytest.raises(WealthRateLimitError):
+            post_to_wealth({}, "brokerage-csv", rate_limit_retries=0)
+
+    assert mock_post.call_count == 1
+    mock_sleep.assert_not_called()
 
 
 def test_500_raises_wealth_server_error(

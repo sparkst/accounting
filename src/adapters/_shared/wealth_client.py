@@ -19,10 +19,33 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# REQ-FIX-WLT-008: the zone WAF rate rule on /wealth/api/internal/* can 429 a
+# single multi-item sync run (8+ wealth items push back-to-back), so a bounded
+# in-process retry is required for the nightly timers to be reliable.
+_RATE_LIMIT_DEFAULT_BACKOFF_S = 70.0
+_RATE_LIMIT_MAX_BACKOFF_S = 120.0
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """Backoff for a 429: numeric Retry-After (capped), else the default.
+
+    HTTP-date Retry-After values and garbage fall back to the default — the
+    WAF window is short, so a parse failure must never stall or crash a sync.
+    """
+    raw = response.headers.get("Retry-After")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return _RATE_LIMIT_DEFAULT_BACKOFF_S
+    if seconds <= 0:
+        return _RATE_LIMIT_DEFAULT_BACKOFF_S
+    return min(seconds, _RATE_LIMIT_MAX_BACKOFF_S)
 
 # ---------------------------------------------------------------------------
 # Typed exception hierarchy
@@ -105,6 +128,7 @@ def post_to_wealth(
     source: str,
     *,
     timeout: float = 30.0,
+    rate_limit_retries: int = 2,
 ) -> dict:  # type: ignore[type-arg]
     """POST *payload* to ``WEALTH_API_BASE/wealth/api/internal/ingest/{source}``.
 
@@ -116,6 +140,10 @@ def post_to_wealth(
         The ingest slug (e.g. ``"brokerage-csv"``, ``"xlsx-snapshot"``).
     timeout:
         Total request timeout in seconds. Default 30 s.
+    rate_limit_retries:
+        REQ-FIX-WLT-008: how many times a 429 is retried after a backoff
+        (Retry-After header when numeric, else 70 s, capped at 120 s) before
+        :class:`WealthRateLimitError` is raised. Pass ``0`` to fail fast.
 
     Returns
     -------
@@ -163,18 +191,33 @@ def post_to_wealth(
         "Content-Type": "application/json",
     }
 
-    try:
-        response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
-    except httpx.HTTPError as exc:
-        # DNS / TLS / connect / timeout — keep it inside the WealthClientError
-        # hierarchy so batch callers don't crash on a transient network fault.
-        logger.error(
-            "wealth_client: transport error POSTing %s (source=%s): %s",
+    for attempt in range(rate_limit_retries + 1):
+        try:
+            response = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        except httpx.HTTPError as exc:
+            # DNS / TLS / connect / timeout — keep it inside the WealthClientError
+            # hierarchy so batch callers don't crash on a transient network fault.
+            logger.error(
+                "wealth_client: transport error POSTing %s (source=%s): %s",
+                url,
+                source,
+                type(exc).__name__,
+            )
+            raise WealthTransportError(str(exc)) from exc
+
+        if response.status_code != 429 or attempt >= rate_limit_retries:
+            break
+
+        wait = _retry_after_seconds(response)
+        logger.warning(
+            "wealth_client: 429 from %s (source=%s, attempt %d/%d) — retrying in %.0fs",
             url,
             source,
-            type(exc).__name__,
+            attempt + 1,
+            rate_limit_retries + 1,
+            wait,
         )
-        raise WealthTransportError(str(exc)) from exc
+        time.sleep(wait)
 
     if response.is_success:
         try:

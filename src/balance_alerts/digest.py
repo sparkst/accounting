@@ -45,7 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import Decimal
 
@@ -55,6 +55,7 @@ from sqlalchemy.orm import Session
 
 from src.alerts.models import AlertDispatch
 from src.alerts.webhook import WebhookResult
+from src.balance_alerts.flash_config import AUTO_HIDE_BELOW, FLASH_ACCOUNTS
 from src.balance_alerts.rules import (
     CHECKING_MILESTONES,
     CREDIT_STEP,
@@ -87,6 +88,8 @@ class PulseLine:
     # immediately before the latest one (local rows or wealth-D1 payload).
     previous_balance: Decimal | None = None
     previous_date: date | None = None
+    # REQ-DFB-006: hidden lines still count in totals/net worth but render no row.
+    hidden: bool = False
 
     @property
     def day_change(self) -> Decimal | None:
@@ -174,76 +177,92 @@ def build_pulse(today: date, session: Session) -> list[PulseLine]:
 # (any flagged account still surfaces at the top of its group with a ⚠️).
 _PULSE_KIND_ORDER = ("checking", "savings", "credit", "investment")
 _PULSE_KIND_LABEL = {
-    "checking": "💵 Checking",
-    "savings": "🏦 Savings",
-    "credit": "💳 Credit",
-    "investment": "📈 Investment",
+    "checking": "💵 CHECKING",
+    "savings": "🏦 SAVINGS",
+    "credit": "💳 CREDIT",
+    "investment": "📈 INVESTMENT",
 }
 
-# ── Phone-first rendering (REQ-DFB-005) ─────────────────────────────────────
-# Telegram on a phone shows ~30 proportional chars per line; the 2026-08-02
-# format wrapped nearly every line at the delta. Rules: whole dollars, zero
-# deltas omitted, ▲/▼ arrows, compact ⏳ dates, names capped, heavy-rule
-# separators, section totals in headers. Deltas render Mon–Fri only —
-# weekend investment "changes" are zero-noise against Friday's close.
+# ── Phone-first rendering (REQ-DFB-005/006) ─────────────────────────────────
+# Travis's 2026-08-02 template: the whole body ships inside a <pre> block
+# (the n8n Telegram formatter allows pre/code — verified in UT-Send Alert
+# Message v10), so amounts right-align in a fixed-width column. Whole
+# dollars, ▲/▼ one-day deltas Mon–Fri only, compact ⏳M/D stale tags,
+# heavy-rule framed section headers with totals, and a net-worth breakdown.
 
-_SECTION_SEP = "━━━━━━━━━"
-_NAME_MAX = 26
+_SECTION_SEP = "━━━━━━━━━━━━━━"
+#: Right-alignment column for amounts (fits an iPhone-width <pre> block).
+_ROW_WIDTH = 31
 
 
 def _fmt_money(v: Decimal) -> str:
     return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
 
 
-def _short_date(d: date, today: date) -> str:
-    out = f"{d.strftime('%b')} {d.day}"
-    return out if d.year == today.year else f"{out} '{d.year % 100:02d}"
+def _mdy(d: date, today: date) -> str:
+    out = f"{d.month}/{d.day}"
+    return out if d.year == today.year else f"{out}/{d.year % 100:02d}"
 
 
-def _short_name(name: str) -> str:
-    return name if len(name) <= _NAME_MAX else name[: _NAME_MAX - 1] + "…"
+def _delta_tag(ln: PulseLine, today: date) -> str:
+    """` ▲12,694` — one-day moves only, Mon–Fri only (REQ-DFB-005/006).
 
-
-def _render_day_change(ln: PulseLine, today: date) -> str:
-    """REQ-DFB-002/005: ` ▲$1,135` vs the previous snapshot, Mon–Fri only.
-
-    Zero (sub-dollar) deltas are omitted. A baseline that is not exactly
-    yesterday gets ` since <date>` so a multi-day (or stale-window) move is
-    never presented as a one-day change.
+    A baseline older than yesterday renders NOTHING (the ⏳ tag already says
+    the value is old) — multi-day moves never masquerade as day changes.
     """
-    if today.weekday() >= 5:  # Sat/Sun — no deltas (REQ-DFB-005)
+    if today.weekday() >= 5:
         return ""
     delta = ln.day_change
     if delta is None or abs(delta) < Decimal("0.5"):
         return ""
-    arrow = "▲" if delta > 0 else "▼"
-    out = f" {arrow}${abs(delta):,.0f}"
-    if ln.previous_date is not None and ln.previous_date != today - timedelta(days=1):
-        out += f" since {_short_date(ln.previous_date, today)}"
-    return out
-
-
-def _render_stale(ln: PulseLine, today: date) -> str:
-    if not ln.stale(today):
+    if ln.previous_date != today - timedelta(days=1):
         return ""
-    return f" ⏳{_short_date(ln.effective_date, today)}"
+    arrow = "▲" if delta > 0 else "▼"
+    return f" {arrow}{abs(delta):,.0f}"
 
 
-def _render_section(
-    label: str, group: list[PulseLine], today: date, *, flags: bool
-) -> str:
-    total = sum((ln.balance for ln in group), Decimal(0))
-    rows = [f"{label} · {_fmt_money(total)}"]
-    for ln in group:
-        warn = " ⚠️" if flags and ln.breached else ""
-        rows.append(
-            f"• {_short_name(ln.account_name)}: {_fmt_money(ln.balance)}"
-            f"{_render_day_change(ln, today)}{_render_stale(ln, today)}{warn}"
-        )
-    return "\n".join(rows)
+def _stale_tag(ln: PulseLine, today: date) -> str:
+    return f" ⏳{_mdy(ln.effective_date, today)}" if ln.stale(today) else ""
+
+
+def _aligned_row(left: str, amount: str) -> str:
+    """`left……amount` with the amount right-aligned at _ROW_WIDTH.
+
+    An over-long left segment is truncated with an ellipsis so the amount
+    column never moves and no line soft-wraps on the phone.
+    """
+    pad = _ROW_WIDTH - len(left) - len(amount)
+    if pad < 1:
+        left = left[: _ROW_WIDTH - len(amount) - 2] + "…"
+        pad = _ROW_WIDTH - len(left) - len(amount)
+    return f"{left}{' ' * pad}{amount}"
+
+
+def _account_row(ln: PulseLine, today: date, *, flags: bool = False) -> str:
+    """One account line; ▲/▼/⏳ tags drop to an indented continuation line
+    when they would push past the amount column — the column never moves and
+    nothing soft-wraps mid-number on the phone."""
+    amount = _fmt_money(ln.balance)
+    warn = " ⚠️" if flags and ln.breached else ""
+    tags = f"{_delta_tag(ln, today)}{_stale_tag(ln, today)}"
+    left = f"• {ln.account_name}:{warn}{tags}"
+    if len(left) + len(amount) + 1 <= _ROW_WIDTH:
+        return _aligned_row(left, amount)
+    row = _aligned_row(f"• {ln.account_name}:{warn}", amount)
+    if tags:
+        row += f"\n {tags}"
+    return row
+
+
+def _section_block(label: str, total: Decimal, rows: list[str]) -> str:
+    return (
+        f"{_SECTION_SEP}\n{label} · {_fmt_money(total)}\n{_SECTION_SEP}\n"
+        + "\n".join(rows)
+    )
 
 
 def render_pulse(lines: list[PulseLine], today: date) -> str:
+    """Business flash body (REQ-DFB-006 template) — <pre>-wrapped monospace."""
     if not lines:
         return "No monitored accounts."
     blocks: list[str] = []
@@ -252,51 +271,83 @@ def render_pulse(lines: list[PulseLine], today: date) -> str:
         if not group:
             continue
         group.sort(key=lambda x: (not x.breached, -x.balance))
-        blocks.append(_render_section(_PULSE_KIND_LABEL[kind], group, today, flags=True))
+        total = sum((ln.balance for ln in group), Decimal(0))
+        rows = [_account_row(ln, today, flags=True) for ln in group]
+        blocks.append(_section_block(_PULSE_KIND_LABEL[kind], total, rows))
     breached = sum(1 for x in lines if x.breached)
     stale = sum(1 for x in lines if x.stale(today))
     n = len(lines)
     footer = f"{n} account{'s' if n != 1 else ''} · {breached} flagged · {stale} stale"
-    return f"\n{_SECTION_SEP}\n".join(blocks) + f"\n{_SECTION_SEP}\n" + footer
+    body = "BUSINESS ACCOUNTS\n" + "\n\n".join(blocks) + f"\n{_SECTION_SEP}\n{footer}"
+    return f"<pre>{body}</pre>"
 
 
 # ── Wealth-D1-sourced pulse lines (REQ-DFB-001/003/004) ─────────────────────
 
-#: Wealth section kind per Plaid account type (plaid-fed rows).
-_WEALTH_KIND_BY_PLAID_TYPE = {
-    "depository": "cash",
-    "credit": "credit",
-    "investment": "investment",
-    "brokerage": "investment",
-    "loan": "loan",
-    "other": "other",
-}
-
-#: Wealth section kind per D1 account_type (statement-fed rows, no Plaid type).
-_WEALTH_KIND_BY_ACCOUNT_TYPE = {
+#: Default section per D1 account_type — used for accounts NOT in
+#: flash_config.FLASH_ACCOUNTS (a newly-linked account lands somewhere
+#: sensible instead of vanishing).
+_WEALTH_SECTION_BY_ACCOUNT_TYPE = {
     "checking": "cash",
     "savings": "cash",
     "credit_card": "credit",
+    "taxable": "stocks",
+    "joint": "stocks",
+    "tod": "stocks",
+    "rsu": "stocks",
+    "roth_ira": "retirement",
+    "trad_ira": "retirement",
+    "401k": "retirement",
+    "403b": "retirement",
+    "brokeragelink": "retirement",
+    "hsa": "retirement",
+    "529": "529",
     "other": "other",
-    # every remaining AccountType value (taxable/joint/IRAs/401k/529/rsu/...)
-    # is an investment vehicle — handled by the .get() default below.
 }
 
-_WEALTH_KIND_ORDER = ("cash", "credit", "investment", "loan", "other")
-_WEALTH_KIND_LABEL = {
-    "cash": "💵 Cash",
-    "credit": "💳 Credit",
-    "investment": "📈 Investment",
-    "loan": "🏦 Loan",
-    "other": "📦 Other",
+#: Fallback for plaid-typed rows whose account_type is missing/unknown.
+_WEALTH_SECTION_BY_PLAID_TYPE = {
+    "depository": "cash",
+    "credit": "credit",
+    "investment": "stocks",
+    "brokerage": "stocks",
+    "loan": "loans",
+    "other": "other",
+}
+
+_WEALTH_SECTION_ORDER = ("cash", "credit", "stocks", "retirement", "529", "loans", "life", "other")
+_WEALTH_SECTION_LABEL = {
+    "cash": "💵 CASH",
+    "credit": "💳 CREDIT",
+    "stocks": "📈 STOCKS",
+    "retirement": "📈 RETIREMENT",
+    "529": "📈 529s",
+    "loans": "🏦 LOANS",
+    "life": "📦 LIFE INSURANCE",
+    "other": "📦 OTHER",
+}
+
+#: Net-worth breakdown label per section (template's 💰 block).
+_WEALTH_SECTION_NW_LABEL = {
+    "cash": "Cash",
+    "credit": "Credit",
+    "stocks": "Stocks",
+    "retirement": "Retirement",
+    "529": "529s",
+    "loans": "Loans",
+    "life": "Life Ins Cash Value",
+    "other": "Other",
 }
 
 #: Net-worth sign per section: credit/loan balances are amounts OWED.
-_WEALTH_KIND_SIGN = {
+_WEALTH_SECTION_SIGN = {
     "cash": 1,
     "credit": -1,
-    "investment": 1,
-    "loan": -1,
+    "stocks": 1,
+    "retirement": 1,
+    "529": 1,
+    "loans": -1,
+    "life": 1,
     "other": 1,
 }
 
@@ -337,11 +388,13 @@ def fetch_wealth_freshness() -> tuple[str, dict[str, object] | None]:
         return ("error", None)
 
 
-def _wealth_kind(acct: dict[str, object]) -> str:
+def _wealth_section(acct: dict[str, object]) -> str:
+    """Default section for an account NOT in FLASH_ACCOUNTS."""
+    section = _WEALTH_SECTION_BY_ACCOUNT_TYPE.get(str(acct.get("account_type")))
+    if section is not None:
+        return section
     plaid_type = acct.get("plaid_account_type")
-    if plaid_type is not None:
-        return _WEALTH_KIND_BY_PLAID_TYPE.get(str(plaid_type), "other")
-    return _WEALTH_KIND_BY_ACCOUNT_TYPE.get(str(acct.get("account_type")), "investment")
+    return _WEALTH_SECTION_BY_PLAID_TYPE.get(str(plaid_type), "other")
 
 
 def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int]:
@@ -370,11 +423,23 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
             raw_date = acct.get("latest_snapshot_date")
             if raw_balance is None or raw_date is None:
                 continue
-            # A nameless account must never render its raw UUID (observed
-            # live 2026-08-02 — a bare id took three phone lines).
-            name = str(
-                acct.get("account_name") or f"unnamed · {acct.get('broker', '?')}"
-            )
+            balance = Decimal(str(raw_balance))
+            # REQ-DFB-006: per-account alias/section/hide from flash_config;
+            # dust below AUTO_HIDE_BELOW auto-hides. Hidden lines still count
+            # toward totals/net worth.
+            cfg = FLASH_ACCOUNTS.get(str(acct.get("account_id")))
+            if cfg is not None:
+                name = cfg.alias
+                section = cfg.section
+                hidden = cfg.hide or abs(balance) < AUTO_HIDE_BELOW
+            else:
+                # A nameless account must never render its raw UUID (observed
+                # live 2026-08-02 — a bare id took three phone lines).
+                name = str(
+                    acct.get("account_name") or f"unnamed · {acct.get('broker', '?')}"
+                )
+                section = _wealth_section(acct)
+                hidden = abs(balance) < AUTO_HIDE_BELOW
             name = name[:80]  # institution-controlled — cap before display
             raw_prev_balance = acct.get("previous_balance")
             raw_prev_date = acct.get("previous_snapshot_date")
@@ -395,13 +460,14 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
             lines.append(
                 PulseLine(
                     name,
-                    _wealth_kind(acct),
-                    Decimal(str(raw_balance)),
+                    section,
+                    balance,
                     False,
                     date.fromisoformat(str(raw_date)),
                     None,
                     prev_balance,
                     prev_date,
+                    hidden,
                 )
             )
         except Exception:  # noqa: BLE001 — per-row isolation
@@ -416,51 +482,73 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
 def render_wealth_pulse(
     lines: list[PulseLine], today: date, note: str | None = None
 ) -> str:
-    """Wealth flash body (REQ-DFB-005 phone format): sections with totals in
-    the header, heavy-rule separators, net worth (assets − credit − loans) at
-    the bottom with its own Mon–Fri day change.
+    """Wealth flash body — Travis's 2026-08-02 template (REQ-DFB-006).
+
+    <pre>-wrapped monospace: framed section headers with totals, right-aligned
+    amounts, ⏳M/D stale tags, ▲/▼ one-day deltas Mon–Fri, hidden rows counted
+    but not rendered, and a 💰 NET WORTH block with per-section breakdown.
 
     ``note`` (degradation signal — unreachable source, skipped rows) renders
     as a trailing ⚠️ line so a wealth-source failure is never invisible.
     """
+    if not lines:
+        return "No wealth accounts." + (f"\n⚠️ wealth source: {note}" if note else "")
+
     blocks: list[str] = []
-    for kind in _WEALTH_KIND_ORDER:
+    section_totals: dict[str, Decimal] = {}
+    for section in _WEALTH_SECTION_ORDER:
         group = sorted(
-            (ln for ln in lines if ln.kind == kind), key=lambda x: -x.balance
+            (ln for ln in lines if ln.kind == section), key=lambda x: -x.balance
         )
         if not group:
             continue
-        blocks.append(_render_section(_WEALTH_KIND_LABEL[kind], group, today, flags=False))
-    if not blocks:
-        body = "No wealth accounts."
-    else:
-        net = sum(
-            (_WEALTH_KIND_SIGN[ln.kind] * ln.balance for ln in lines), Decimal(0)
+        total = sum((ln.balance for ln in group), Decimal(0))
+        section_totals[section] = total
+        rows = [_account_row(ln, today) for ln in group if not ln.hidden]
+        blocks.append(_section_block(_WEALTH_SECTION_LABEL[section], total, rows))
+
+    net = sum(
+        (_WEALTH_SECTION_SIGN[s] * t for s, t in section_totals.items()), Decimal(0)
+    )
+    nw_header = f"💰 NET WORTH · {_fmt_money(net)}"
+    if today.weekday() < 5:  # REQ-DFB-005: deltas Mon–Fri only
+        deltas = [
+            _WEALTH_SECTION_SIGN[ln.kind] * ln.day_change
+            for ln in lines
+            # NW delta sums only true one-day moves — a months-old statement
+            # baseline would swamp today's change.
+            if ln.day_change is not None
+            and ln.previous_date == today - timedelta(days=1)
+        ]
+        net_delta = sum(deltas, Decimal(0))
+        if deltas and abs(net_delta) >= Decimal("0.5"):
+            arrow = "▲" if net_delta > 0 else "▼"
+            nw_header += f" {arrow}{abs(net_delta):,.0f}"
+    nw_rows = [
+        _aligned_row(
+            f"• {_WEALTH_SECTION_NW_LABEL[s]}:",
+            _fmt_money(_WEALTH_SECTION_SIGN[s] * section_totals[s]),
         )
-        nw = f"💰 Net worth: {_fmt_money(net)}"
-        if today.weekday() < 5:  # REQ-DFB-005: deltas Mon–Fri only
-            deltas = [
-                _WEALTH_KIND_SIGN[ln.kind] * ln.day_change
-                for ln in lines
-                # NW delta sums only true one-day moves — a months-old
-                # statement baseline (`since`) would swamp today's change.
-                if ln.day_change is not None
-                and ln.previous_date == today - timedelta(days=1)
-            ]
-            net_delta = sum(deltas, Decimal(0))
-            if deltas and abs(net_delta) >= Decimal("0.5"):
-                arrow = "▲" if net_delta > 0 else "▼"
-                nw += f" {arrow}${abs(net_delta):,.0f}"
-        stale = sum(1 for x in lines if x.stale(today))
-        n = len(lines)
-        footer = f"{n} account{'s' if n != 1 else ''} · {stale} stale"
-        body = (
-            f"\n{_SECTION_SEP}\n".join(blocks)
-            + f"\n{_SECTION_SEP}\n{nw}\n{footer}"
-        )
+        for s in _WEALTH_SECTION_ORDER
+        if s in section_totals
+    ]
+    nw_block = (
+        f"{_SECTION_SEP}\n{nw_header}\n{_SECTION_SEP}\n" + "\n".join(nw_rows)
+    )
+
+    visible = [ln for ln in lines if not ln.hidden]
+    stale = sum(1 for x in visible if x.stale(today))
+    n = len(visible)
+    footer = f"{n} account{'s' if n != 1 else ''} · {stale} stale"
+
+    body = (
+        "PERSONAL ACCOUNTS\n"
+        + "\n\n".join(blocks)
+        + f"\n\n{nw_block}\n{_SECTION_SEP}\n{footer}"
+    )
     if note:
         body += f"\n⚠️ wealth source: {note}"
-    return body
+    return f"<pre>{body}</pre>"
 
 
 # ── Delivery-health block (REQ-DHL-001/002) ─────────────────────────────────
@@ -724,7 +812,13 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
     if not wealth_lines:
         # Degraded: last local investment rows (frozen at the 2026-07-27
         # consolidation) with their stale markers beat a missing flash.
-        wealth_lines = [ln for ln in local_lines if ln.kind == "investment"]
+        # Local rows carry the register kind "investment" — re-home them into
+        # the v2 template's STOCKS section so they actually render.
+        wealth_lines = [
+            replace(ln, kind="stocks")
+            for ln in local_lines
+            if ln.kind == "investment"
+        ]
 
     wealth_result: WebhookResult | None = None
     # An empty wealth flash with nothing to warn about (local dev without

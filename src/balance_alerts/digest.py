@@ -195,7 +195,9 @@ _PULSE_KIND_LABEL = {
 
 _SECTION_SEP = "━━━━━━━━━━━━━━"
 #: Right-alignment column in DISPLAY CELLS (fits an iPhone-width pre block).
-_ROW_WIDTH = 30
+#: 34 verified on-device 2026-08-02 — account rows contain no emoji (the
+#: stale marker is a plain `*`), so cell math is effectively len().
+_ROW_WIDTH = 34
 
 #: Chars rendered double-width in monospace fonts beyond east_asian_width
 #: 'W'/'F' (⚠ is EAW 'A' but renders wide with its emoji presentation).
@@ -222,12 +224,10 @@ def _fmt_money(v: Decimal) -> str:
     return f"-{abs(v):,.0f}" if v < 0 else f"{v:,.0f}"
 
 
-def _row_prefix(ln: PulseLine, today: date) -> str:
-    """REQ-DFB-007: staleness as the bullet — 🟡 1–5 days old, 🔴 older."""
-    days = (today - ln.effective_date).days
-    if days <= 0:
-        return "• "
-    return "🟡 " if days <= 5 else "🔴 "
+def _stale_star(ln: PulseLine, today: date) -> str:
+    """REQ-DFB-007 v2: staleness is a plain `*` after the colon — emoji
+    bullets are variable-width in monospace fonts and skewed the column."""
+    return "*" if ln.stale(today) else ""
 
 
 def _expected_baseline(today: date) -> date:
@@ -277,11 +277,11 @@ def _account_row(ln: PulseLine, today: date, *, flags: bool = False) -> str:
     amount = _fmt_money(ln.balance)
     warn = " ⚠️" if flags and ln.breached else ""
     delta = _delta_tag(ln, today)
-    prefix = _row_prefix(ln, today)
-    left = f"{prefix}{ln.account_name}:{warn}{delta}"
+    base = f"• {ln.account_name}:{_stale_star(ln, today)}{warn}"
+    left = f"{base}{delta}"
     if _dwidth(left) + _dwidth(amount) + 1 <= _ROW_WIDTH:
         return _aligned_row(left, amount)
-    row = _aligned_row(f"{prefix}{ln.account_name}:{warn}", amount)
+    row = _aligned_row(base, amount)
     if delta:
         row += f"\n {delta}"
     return row

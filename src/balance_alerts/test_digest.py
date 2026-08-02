@@ -277,7 +277,7 @@ def test_stale_snapshot_renders_as_of_marker_and_stale_count(session: Session) -
     text = render_pulse(build_pulse(today, session), today)
     assert "• Fresh Checking:" in text
     assert "5,000" in text
-    assert "🟡 Stale Checking:" in text  # 3 days old → yellow (REQ-DFB-007)
+    assert "• Stale Checking:*" in text  # 3 days old → star (REQ-DFB-007 v2)
     assert "1 stale" in text
 
 
@@ -286,31 +286,19 @@ def test_fresh_snapshot_renders_bare_no_marker(session: Session) -> None:
     _add(session, "a", "Fresh Checking", "depository", "checking", "5000.00", d=today)
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "🟡" not in text
+    assert ":*" not in text
     assert "0 stale" in text
 
 
-def test_1_day_old_snapshot_is_yellow(session: Session) -> None:
-    """REQ-DFB-007: 1-5 days out of date → 🟡 and counted stale."""
+def test_1_day_old_snapshot_is_starred(session: Session) -> None:
+    """REQ-DFB-007 v2: any snapshot before today → `*` after the colon."""
     today = date(2026, 7, 6)
     _add(session, "a", "Yesterday Checking", "depository", "checking", "5000.00",
          d=today - timedelta(days=1))
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "🟡 Yesterday Checking:" in text
-    assert "🔴" not in text
+    assert "• Yesterday Checking:*" in text
     assert "1 stale" in text
-
-
-def test_over_5_days_old_is_red(session: Session) -> None:
-    """REQ-DFB-007: >5 days out of date → 🔴."""
-    today = date(2026, 7, 6)
-    _add(session, "a", "Old Checking", "depository", "checking", "5000.00",
-         d=today - timedelta(days=6))
-    session.commit()
-    text = render_pulse(build_pulse(today, session), today)
-    assert "🔴 Old Checking:" in text
-    assert "🟡" not in text
 
 
 def test_two_identical_consecutive_snapshots_do_not_trigger_stale_marker(
@@ -348,7 +336,7 @@ def test_two_identical_consecutive_snapshots_do_not_trigger_stale_marker(
         )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "🟡" not in text
+    assert ":*" not in text
     assert "0 stale" in text
 
 
@@ -384,7 +372,7 @@ def test_stale_cached_balance_marks_stale_even_when_snapshot_date_is_today(
     )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "🟡 Stale Cache Checking:" in text  # cache date 7/2 → 4 days old
+    assert "• Stale Cache Checking:*" in text  # cache date 7/2 → 4 days old
     assert "1 stale" in text
 
 
@@ -453,12 +441,12 @@ def test_dhl_full_block_golden_text(session: Session) -> None:
         "━━━━━━━━━━━━━━\n"
         "💵 CHECKING · 68,334\n"
         "━━━━━━━━━━━━━━\n"
-        "• Sparkry Checking:     66,318\n"
-        "🟡 BlackLine Checking:   2,015\n\n"
+        "• Sparkry Checking:         66,318\n"
+        "• BlackLine Checking:*       2,015\n\n"
         "━━━━━━━━━━━━━━\n"
         "💳 CREDIT · 1,913\n"
         "━━━━━━━━━━━━━━\n"
-        "• Blue Business Plus:    1,913\n"
+        "• Blue Business Plus:        1,913\n"
         "━━━━━━━━━━━━━━\n"
         "3 accounts · 0 flagged · 1 stale\n\n"
         "Delivery\n"
@@ -588,8 +576,7 @@ def test_day_change_rendered_vs_friday_on_monday(session: Session) -> None:
     _add_snap(session, "a", "99000.19", _FRIDAY)
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    # Delta overflows the amount column → indented continuation line.
-    assert "• Sparkry Checking:    100,135\n  ▲1,135" in text
+    assert "• Sparkry Checking: ▲1,135 100,135" in text
 
 
 def test_sunday_delta_vs_friday(session: Session) -> None:
@@ -762,13 +749,13 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
     nw_i = text.index("💰 NET WORTH · 2,238,379 ▲13,594")
     assert cash_i < credit_i < stocks_i < f29_i < other_i < nw_i
     # Aligned rows; over-long delta drops to a continuation line.
-    assert "• Prime Visa: ▲100       1,500" in text
-    assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in text
-    # >5-day-old statement row: red bullet, no date tag, no multi-day delta.
-    assert "🔴 Whole Life:          52,000" in text
+    assert "• Prime Visa: ▲100           1,500" in text
+    assert "• E-Trade Stocks:        2,082,694\n  ▲12,694" in text
+    # >5-day-old statement row: star after the colon, no emoji.
+    assert "• Whole Life:*              52,000" in text
     # NW breakdown rows, credit sign-flipped.
-    assert "• Credit:               -1,500" in text
-    assert "• Stocks:            2,082,694" in text
+    assert "• Credit:                   -1,500" in text
+    assert "• Stocks:                2,082,694" in text
     assert "5 accounts · 1 stale" in text
     assert "$" not in text
     assert "flagged" not in text
@@ -866,7 +853,7 @@ def test_wealth_stale_line_renders_as_of_marker() -> None:
     }
     lines, _ = build_wealth_lines(payload)
     text = render_wealth_pulse(lines, today)
-    assert "🔴 Stuck IRA:          400,186" in text
+    assert "• Stuck IRA:*              400,186" in text
     assert "1 stale" in text
 
 
@@ -974,7 +961,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     wealth = cap.by_title_prefix("📊 Wealth Snapshot")
     assert wealth is not None
     wmsg = str(wealth["message"])
-    assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in wmsg
+    assert "• E-Trade Stocks:        2,082,694\n  ▲12,694" in wmsg
     assert wealth.get("pre") is True
     assert "Sparks Checking" in wmsg
     assert "Joint Tenant" not in wmsg  # frozen local line replaced
@@ -984,7 +971,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     business = cap.by_title_prefix("🏢 Business Accounts")
     assert business is not None
     bmsg = str(business["message"])
-    assert "• Sparkry Checking:    100,135" in bmsg
+    assert "• Sparkry Checking:        100,135" in bmsg
     assert "Joint Tenant" not in bmsg  # frozen investment rows are dead
     assert "E-Trade Stocks" not in bmsg
     assert "Delivery" not in bmsg
@@ -1021,7 +1008,7 @@ def test_post_pulse_wealth_error_degrades_with_note(
     assert wealth is not None
     wmsg = str(wealth["message"])
     assert "Joint Tenant" in wmsg
-    assert "🔴 Joint Tenant:" in wmsg
+    assert "• Joint Tenant:*" in wmsg
     assert "⚠️ wealth source: unreachable — showing last local values" in wmsg
 
 

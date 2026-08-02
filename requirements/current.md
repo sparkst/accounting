@@ -688,6 +688,8 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 |--------|-------------|
 | REQ-DFB-001 | The daily pulse's Investment section renders current values from the wealth Worker's freshness payload (extended with `plaid_account_type`, `latest_balance`, `previous_snapshot_date`, `previous_balance` — dashboard PR #83) whenever it is reachable, superseding the local snapshot rows frozen at the 2026-07-27 Plaid consolidation; on fetch failure it degrades to the local (stale-marked) lines. |
 | REQ-DFB-002 | Every pulse line with a previous-snapshot baseline renders a signed day-change amount (`(+$1,135.00)`); a baseline older than yesterday is labeled `since <date>` so a multi-day move is never presented as a one-day change. |
+| REQ-DFB-003 | The freshness endpoint's `?include_statement=1` opt-in appends statement-fed accounts (valued from `account_balance_snapshot`, latest + previous) — digest-only; the sentinel's default call never receives them (annual statements inside a 2-day window would page sev2 daily). |
+| REQ-DFB-004 | The daily flash is two messages (2026-08-02): `📊 Wealth Snapshot` — every /wealth-page account (cash, credit, investment, loan, statement-fed) from the wealth D1 with day changes — and `🏢 Business Accounts` — local register, non-investment kinds. No delivery-health block on either; independent dedup keys `wealth:pulse:<date>` / `balance:pulse:<date>`. |
 
 ## REQ-ARC-* — Feature: AR chaser (draft-for-approval)
 

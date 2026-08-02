@@ -32,6 +32,13 @@ kept only as a degraded fallback when it is not.
 REQ-DFB-002: every line with a previous-snapshot baseline renders a signed
 day-change amount; a baseline older than yesterday is labeled
 `since <date>` so a multi-day move is never mis-read as one day.
+
+REQ-DFB-004 (2026-08-02): the daily flash is TWO messages — `📊 Wealth
+Snapshot` (every /wealth-page account from the D1 freshness surface,
+including statement-fed rows via REQ-DFB-003) and `🏢 Business Accounts`
+(local register, non-investment kinds). The delivery-health block no longer
+rides the flash; `build_delivery_health`/`render_delivery_health` stay
+exported for the alerting-consolidation workstream to re-home.
 """
 
 from __future__ import annotations
@@ -213,39 +220,94 @@ def render_pulse(lines: list[PulseLine], today: date) -> str:
     return "\n\n".join(blocks) + "\n\n" + footer
 
 
-# ── Wealth-D1-sourced investment lines (REQ-DFB-001) ────────────────────────
+# ── Wealth-D1-sourced pulse lines (REQ-DFB-001/003/004) ─────────────────────
 
-#: Plaid account types that belong in the pulse's Investment section.
-WEALTH_INVESTMENT_TYPES = frozenset({"investment", "brokerage"})
+#: Wealth section kind per Plaid account type (plaid-fed rows).
+_WEALTH_KIND_BY_PLAID_TYPE = {
+    "depository": "cash",
+    "credit": "credit",
+    "investment": "investment",
+    "brokerage": "investment",
+    "loan": "loan",
+    "other": "other",
+}
+
+#: Wealth section kind per D1 account_type (statement-fed rows, no Plaid type).
+_WEALTH_KIND_BY_ACCOUNT_TYPE = {
+    "checking": "cash",
+    "savings": "cash",
+    "credit_card": "credit",
+    "other": "other",
+    # every remaining AccountType value (taxable/joint/IRAs/401k/529/rsu/...)
+    # is an investment vehicle — handled by the .get() default below.
+}
+
+_WEALTH_KIND_ORDER = ("cash", "credit", "investment", "loan", "other")
+_WEALTH_KIND_LABEL = {
+    "cash": "Cash",
+    "credit": "Credit",
+    "investment": "Investment",
+    "loan": "Loan",
+    "other": "Other",
+}
 
 
 def fetch_wealth_freshness() -> tuple[str, dict[str, object] | None]:
-    """Fetch the wealth Worker's freshness payload (latest/previous balances).
+    """Fetch the wealth Worker's freshness payload with statement rows.
 
-    Same endpoint + env gating the sentinel uses: ('unconfigured', None) when
-    WEALTH_API_BASE/WEALTH_INTERNAL_KEY are absent, ('error', None) on any
-    network/HTTP failure.
+    Same endpoint + env gating the sentinel uses, plus ``include_statement=1``
+    (REQ-DFB-003) — digest-only; the sentinel's own call must never receive
+    statement rows. ('unconfigured', None) when WEALTH_API_BASE /
+    WEALTH_INTERNAL_KEY are absent, ('error', None) on any network/HTTP
+    failure. The key travels only in the header and is never logged.
     """
-    from src.monitoring.sentinel import fetch_d1_freshness
+    import os
 
-    return fetch_d1_freshness()
+    import httpx
+
+    base = os.environ.get("WEALTH_API_BASE", "").rstrip("/")
+    key = os.environ.get("WEALTH_INTERNAL_KEY", "")
+    if not base or not key:
+        return ("unconfigured", None)
+    try:
+        resp = httpx.get(
+            f"{base}/wealth/api/internal/freshness",
+            params={"include_statement": "1"},
+            headers={"X-Internal-Key": key},
+            timeout=15.0,
+        )
+    except httpx.HTTPError:
+        logger.warning("wealth freshness fetch failed (network)")
+        return ("error", None)
+    if resp.status_code != 200:
+        logger.warning("wealth freshness fetch failed (HTTP %s)", resp.status_code)
+        return ("error", None)
+    try:
+        return ("ok", resp.json())
+    except ValueError:
+        return ("error", None)
 
 
-def build_wealth_investment_lines(
-    payload: dict[str, object],
-) -> tuple[list[PulseLine], int]:
-    """(PulseLines, skipped_count) for the payload's investment accounts.
+def _wealth_kind(acct: dict[str, object]) -> str:
+    plaid_type = acct.get("plaid_account_type")
+    if plaid_type is not None:
+        return _WEALTH_KIND_BY_PLAID_TYPE.get(str(plaid_type), "other")
+    return _WEALTH_KIND_BY_ACCOUNT_TYPE.get(str(acct.get("account_type")), "investment")
+
+
+def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int]:
+    """(PulseLines, skipped_count) for EVERY account in the wealth payload.
+
+    REQ-DFB-004: the daily flash mirrors the /wealth page — all personal
+    accounts (cash, credit, investment, loan, statement-fed), never the
+    business register.
 
     Per-row isolation (house pattern): one malformed account row is skipped
-    with a log line, never blanking the whole Investment section. Skipped rows
-    are COUNTED so the Delivery block can surface them — the local lines for
-    these accounts are frozen at 2026-07-27, so a quietly-dropped row would
-    otherwise vanish from the flash with no signal at all. Rows with no
-    snapshot (null balance/date) have nothing to render and skip silently.
-
-    The previous-snapshot pair is atomic: if either half is missing or
-    unparseable, both are dropped — a delta with no baseline date would render
-    as a same-day change (the exact misread REQ-DFB-002 exists to prevent).
+    with a log line + COUNT (surfaced to the flash) — never silently gone.
+    Rows with no snapshot (null balance/date) have nothing to render and skip
+    silently. The previous-snapshot pair is atomic: if either half is missing
+    or unparseable, both are dropped — a delta with no baseline date would
+    render as a same-day change (the exact misread REQ-DFB-002 prevents).
     """
     accounts_raw = payload.get("accounts", []) if isinstance(payload, dict) else []
     accounts = accounts_raw if isinstance(accounts_raw, list) else []
@@ -254,8 +316,6 @@ def build_wealth_investment_lines(
     for acct in accounts:
         try:
             if not isinstance(acct, dict):
-                continue
-            if acct.get("plaid_account_type") not in WEALTH_INVESTMENT_TYPES:
                 continue
             raw_balance = acct.get("latest_balance")
             raw_date = acct.get("latest_snapshot_date")
@@ -273,8 +333,8 @@ def build_wealth_investment_lines(
                     prev_date = date.fromisoformat(str(raw_prev_date))
                 except Exception:  # noqa: BLE001 — baseline is optional
                     logger.warning(
-                        "build_wealth_investment_lines: unparseable previous "
-                        "snapshot for %r; rendering without day change",
+                        "build_wealth_lines: unparseable previous snapshot "
+                        "for %r; rendering without day change",
                         acct.get("account_id"),
                     )
                     prev_balance = None
@@ -282,7 +342,7 @@ def build_wealth_investment_lines(
             lines.append(
                 PulseLine(
                     name,
-                    "investment",
+                    _wealth_kind(acct),
                     Decimal(str(raw_balance)),
                     False,
                     date.fromisoformat(str(raw_date)),
@@ -294,25 +354,43 @@ def build_wealth_investment_lines(
         except Exception:  # noqa: BLE001 — per-row isolation
             skipped += 1
             logger.exception(
-                "build_wealth_investment_lines: skipping malformed row %r",
+                "build_wealth_lines: skipping malformed row %r",
                 acct.get("account_id") if isinstance(acct, dict) else acct,
             )
     return lines, skipped
 
 
-def merge_wealth_lines(
-    local: list[PulseLine], wealth: list[PulseLine]
-) -> list[PulseLine]:
-    """Replace local investment lines with wealth-D1-sourced ones.
+def render_wealth_pulse(
+    lines: list[PulseLine], today: date, note: str | None = None
+) -> str:
+    """Wealth flash body: sections in _WEALTH_KIND_ORDER, largest first.
 
-    Local investment lines are the frozen pre-consolidation leftovers — when
-    the wealth surface produced lines, they are superseded wholesale. With no
-    wealth lines (fetch failed / unconfigured / empty), keep the local ones:
-    a stale-marked value beats a silently missing section.
+    ``note`` (degradation signal — unreachable source, skipped rows) renders
+    as a trailing ⚠️ line so a wealth-source failure is never invisible.
     """
-    if not wealth:
-        return local
-    return [ln for ln in local if ln.kind != "investment"] + wealth
+    blocks: list[str] = []
+    for kind in _WEALTH_KIND_ORDER:
+        group = sorted(
+            (ln for ln in lines if ln.kind == kind), key=lambda x: -x.balance
+        )
+        if not group:
+            continue
+        rows = []
+        for ln in group:
+            chg = _render_day_change(ln, today)
+            as_of = f" (as of {ln.effective_date.isoformat()}) ⏳" if ln.stale(today) else ""
+            rows.append(f"  {ln.account_name} — ${ln.balance:,.2f}{chg}{as_of}")
+        blocks.append(_WEALTH_KIND_LABEL[kind] + "\n" + "\n".join(rows))
+    if not blocks:
+        body = "No wealth accounts."
+    else:
+        stale = sum(1 for x in lines if x.stale(today))
+        n = len(lines)
+        footer = f"{n} account{'s' if n != 1 else ''} · {stale} stale"
+        body = "\n\n".join(blocks) + "\n\n" + footer
+    if note:
+        body += f"\n⚠️ wealth source: {note}"
+    return body
 
 
 # ── Delivery-health block (REQ-DHL-001/002) ─────────────────────────────────
@@ -468,6 +546,9 @@ def _record_pulse(
     occ: str,
     result: WebhookResult,
     payload: dict[str, str | None],
+    *,
+    alert_type: str = "balance_pulse",
+    subject: str = "Business Account Snapshot",
 ) -> None:
     # Update an existing same-day row in place (e.g. a prior `failed` flips to
     # `sent` on retry) so the audit trail stays accurate — mirrors dispatcher._record.
@@ -488,9 +569,9 @@ def _record_pulse(
     row = AlertDispatch(
         alert_key=key,
         occurrence_date=occ,
-        alert_type="balance_pulse",
+        alert_type=alert_type,
         entity="all",
-        subject=f"Business Account Snapshot — {occ}",
+        subject=f"{subject} — {occ}",
         status=result.status,
         http_status=result.http_status,
         error_detail=result.error,
@@ -505,58 +586,111 @@ def _record_pulse(
         session.rollback()
 
 
-def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
-    """Build and (when apply) POST the daily pulse as an `info` alert.
-
-    Deduped + audited via `alert_dispatch` so a same-day re-run never double-sends.
-    """
-    occ = today.isoformat()
-    key = f"balance:pulse:{occ}"
-    try:
-        lines = build_pulse(today, session)
-    except Exception:
-        logger.exception("pulse compute failed; skipping digest send")
-        session.rollback()
-        return WebhookResult("failed", None, "digest compute error")
-    # REQ-DFB-001: swap the frozen local investment lines for current wealth-D1
-    # values. Any failure here degrades to the local (stale-marked) lines — the
-    # day's pulse must still send — and the degradation surfaces in the
-    # Delivery block instead of hiding behind stale markers.
-    wealth_note: str | None = None
-    try:
-        wealth_status, wealth_payload = fetch_wealth_freshness()
-        if wealth_status == "ok" and wealth_payload is not None:
-            wealth_lines, wealth_skipped = build_wealth_investment_lines(wealth_payload)
-            if wealth_skipped:
-                wealth_note = f"{wealth_skipped} malformed row(s) skipped"
-        else:
-            wealth_lines = []
-            if wealth_status != "unconfigured":
-                wealth_note = "unreachable — showing last local values"
-    except Exception:  # noqa: BLE001 — degraded pulse beats a lost pulse
-        logger.exception("wealth freshness fetch failed; keeping local investment lines")
-        wealth_lines = []
-        wealth_note = "fetch crashed — showing last local values"
-    lines = merge_wealth_lines(lines, wealth_lines)
-    # The pulse must still go out even if the delivery-health block can't be
-    # computed — degrade to a pulse without the block rather than losing the day.
-    try:
-        health = build_delivery_health(today, session, lines, wealth_note=wealth_note)
-        health_text = "\n\n" + render_delivery_health(health)
-    except Exception:
-        logger.exception("delivery-health compute failed; sending degraded pulse")
-        session.rollback()
-        health_text = "\n\n⚠️ Delivery-health block unavailable (compute error — check logs)"
-    message = render_pulse(lines, today) + health_text
+def _post_one_pulse(
+    session: Session,
+    *,
+    key: str,
+    occ: str,
+    title: str,
+    message: str,
+    alert_type: str,
+    subject: str,
+    apply: bool,
+) -> WebhookResult:
+    """Dedup + POST + ledger-record one pulse message."""
     payload = build_payload_dict(
-        severity="info",
-        title=f"📊 Business Account Snapshot · {today:%b} {today.day}",
-        message=message,
-        alert_key=key,
+        severity="info", title=title, message=message, alert_key=key
     )
     if apply and _pulse_already_sent(session, key, occ):
         return WebhookResult("skipped", None, None)
     result = post_payload(payload, key=key, apply=apply, timeout=10.0)
     if apply:
-        _record_pulse(session, key, occ, result, payload)
+        _record_pulse(
+            session, key, occ, result, payload, alert_type=alert_type, subject=subject
+        )
     return result
+
+
+def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
+    """Build and (when apply) POST the daily flash as TWO `info` alerts.
+
+    REQ-DFB-004 (2026-08-02): the daily flash is the /wealth page — every
+    personal account (cash, credit, investment, loan, statement-fed) from the
+    wealth D1, with day changes. Business register accounts ride a SEPARATE
+    `🏢 Business Accounts` message. No delivery-health block on either — the
+    sentinel owns operational alerting.
+
+    Each message is deduped + audited via its own `alert_dispatch` row
+    (`wealth:pulse:<date>` / `balance:pulse:<date>`) so a same-day re-run
+    never double-sends. Returns the worst of the two results (failed > sent >
+    skipped/dry_run) so the timer's exit status reflects any lost message.
+    """
+    occ = today.isoformat()
+
+    # ── Wealth flash (REQ-DFB-004) ──────────────────────────────────────────
+    wealth_note: str | None = None
+    wealth_lines: list[PulseLine] = []
+    try:
+        wealth_status, wealth_payload = fetch_wealth_freshness()
+        if wealth_status == "ok" and wealth_payload is not None:
+            wealth_lines, wealth_skipped = build_wealth_lines(wealth_payload)
+            if wealth_skipped:
+                wealth_note = f"{wealth_skipped} malformed row(s) skipped"
+        elif wealth_status != "unconfigured":
+            wealth_note = "unreachable — showing last local values"
+    except Exception:  # noqa: BLE001 — degraded flash beats a lost flash
+        logger.exception("wealth freshness fetch failed; degrading to local lines")
+        wealth_note = "fetch crashed — showing last local values"
+
+    local_lines: list[PulseLine] = []
+    try:
+        local_lines = build_pulse(today, session)
+    except Exception:
+        logger.exception("local pulse compute failed")
+        session.rollback()
+        if not wealth_lines:
+            return WebhookResult("failed", None, "digest compute error")
+
+    if not wealth_lines:
+        # Degraded: last local investment rows (frozen at the 2026-07-27
+        # consolidation) with their stale markers beat a missing flash.
+        wealth_lines = [ln for ln in local_lines if ln.kind == "investment"]
+
+    wealth_result: WebhookResult | None = None
+    # An empty wealth flash with nothing to warn about (local dev without
+    # wealth env) is noise — send only when there are lines or a note.
+    if wealth_lines or wealth_note is not None:
+        wealth_result = _post_one_pulse(
+            session,
+            key=f"wealth:pulse:{occ}",
+            occ=occ,
+            title=f"📊 Wealth Snapshot · {today:%b} {today.day}",
+            message=render_wealth_pulse(wealth_lines, today, wealth_note),
+            alert_type="wealth_pulse",
+            subject="Wealth Snapshot",
+            apply=apply,
+        )
+
+    # ── Business flash (register accounts, non-investment) ─────────────────
+    business_lines = [ln for ln in local_lines if ln.kind != "investment"]
+    business_result: WebhookResult | None = None
+    if business_lines:
+        business_result = _post_one_pulse(
+            session,
+            key=f"balance:pulse:{occ}",
+            occ=occ,
+            title=f"🏢 Business Accounts · {today:%b} {today.day}",
+            message=render_pulse(business_lines, today),
+            alert_type="balance_pulse",
+            subject="Business Accounts",
+            apply=apply,
+        )
+
+    results = [r for r in (wealth_result, business_result) if r is not None]
+    if not results:
+        return WebhookResult("skipped", None, None)
+    for status in ("failed", "sent", "dry_run"):
+        for r in results:
+            if r.status == status:
+                return r
+    return results[0]

@@ -17,6 +17,8 @@ from src.balance_alerts import webhook as wh
 from src.balance_alerts.digest import (
     build_delivery_health,
     build_pulse,
+    build_wealth_investment_lines,
+    merge_wealth_lines,
     post_pulse,
     render_delivery_health,
     render_pulse,
@@ -537,6 +539,349 @@ def test_dhl_stale_sync_produces_sync_line_with_hourglass(session: Session) -> N
     assert health.healthy is False
     text = render_delivery_health(health)
     assert "sync: chase ⏳5d" in text
+
+
+# ── REQ-DFB-002: day-change amounts ─────────────────────────────────────────
+
+
+def _add_snap(session: Session, acct_id: str, bal: str, d: date) -> None:
+    session.add(
+        Snap(
+            account_id=acct_id,
+            snapshot_date=d,
+            plaid_account_type="depository",
+            plaid_account_subtype="checking",
+            current_balance=Decimal(bal),
+            pulled_at=datetime.combine(d, datetime.min.time()),
+            raw_data={},
+        )
+    )
+
+
+def test_day_change_rendered_from_previous_snapshot(session: Session) -> None:
+    today = date(2026, 8, 2)
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "100135.19", d=today)
+    _add_snap(session, "a", "99000.19", today - timedelta(days=1))
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "Sparkry Checking — $100,135.19 (+$1,135.00)" in text
+
+
+def test_day_change_negative_with_multiday_window_labeled(session: Session) -> None:
+    """A previous snapshot more than 1 day older is a multi-day move — the
+    delta must carry its baseline date so it is never mis-read as one day."""
+    today = date(2026, 8, 2)
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "900.00", d=today)
+    _add_snap(session, "a", "950.00", today - timedelta(days=3))
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "Sparkry Checking — $900.00 (-$50.00 since 2026-07-30)" in text
+
+
+def test_no_previous_snapshot_renders_no_change_segment(session: Session) -> None:
+    today = date(2026, 8, 2)
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=today)
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "Sparkry Checking — $5,000.00\n" in text or text.endswith(
+        "Sparkry Checking — $5,000.00\n\n1 account · 0 flagged · 0 stale"
+    )
+    assert "(+$" not in text
+    assert "(-$" not in text
+
+
+def test_zero_day_change_rendered_explicitly(session: Session) -> None:
+    today = date(2026, 8, 2)
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=today)
+    _add_snap(session, "a", "5000.00", today - timedelta(days=1))
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "Sparkry Checking — $5,000.00 (+$0.00)" in text
+
+
+# ── REQ-DFB-001: wealth-D1-sourced investment lines ─────────────────────────
+# The 2026-07-27 Plaid consolidation stopped local snapshot rows for
+# wealth-scope Items; current investment values live only in the wealth D1.
+# The pulse's Investment section must render from the (extended) freshness
+# payload, replacing any frozen local investment lines.
+
+
+_WEALTH_PAYLOAD: dict[str, object] = {
+    "accounts": [
+        {
+            "account_id": "d1-etrade",
+            "account_name": "E-Trade Stocks",
+            "broker": "etrade",
+            "latest_snapshot_date": "2026-08-02",
+            "plaid_account_type": "brokerage",
+            "latest_balance": "2082694.0000",
+            "previous_snapshot_date": "2026-08-01",
+            "previous_balance": "2070000.0000",
+        },
+        {
+            "account_id": "d1-529",
+            "account_name": "Aiden 529",
+            "broker": "vanguard",
+            "latest_snapshot_date": "2026-08-02",
+            "plaid_account_type": "investment",
+            "latest_balance": "93185.0600",
+            "previous_snapshot_date": None,
+            "previous_balance": None,
+        },
+        {
+            # depository — NOT an investment line; must never enter the pulse
+            # (business checking stays register-sourced).
+            "account_id": "d1-checking",
+            "account_name": "Sparks Checking",
+            "broker": "chase",
+            "latest_snapshot_date": "2026-08-02",
+            "plaid_account_type": "depository",
+            "latest_balance": "12000.0000",
+            "previous_snapshot_date": "2026-08-01",
+            "previous_balance": "11000.0000",
+        },
+        {
+            # zero snapshots — no renderable value.
+            "account_id": "d1-empty",
+            "account_name": "Frozen IRA",
+            "broker": "vanguard",
+            "latest_snapshot_date": None,
+            "plaid_account_type": None,
+            "latest_balance": None,
+            "previous_snapshot_date": None,
+            "previous_balance": None,
+        },
+    ],
+    "generated_at": "2026-08-02T14:00:00Z",
+}
+
+
+def test_wealth_lines_built_from_payload_investment_types_only() -> None:
+    lines, skipped = build_wealth_investment_lines(_WEALTH_PAYLOAD)
+    assert skipped == 0
+    assert {ln.account_name for ln in lines} == {"E-Trade Stocks", "Aiden 529"}
+    etrade = next(ln for ln in lines if ln.account_name == "E-Trade Stocks")
+    assert etrade.kind == "investment"
+    assert etrade.balance == Decimal("2082694.0000")
+    assert etrade.day_change == Decimal("12694.0000")
+    assert etrade.snapshot_date == date(2026, 8, 2)
+    a529 = next(ln for ln in lines if ln.account_name == "Aiden 529")
+    assert a529.day_change is None
+
+
+def test_wealth_line_malformed_row_isolated() -> None:
+    payload: dict[str, object] = {
+        "accounts": [
+            {"account_name": "Bad", "plaid_account_type": "investment",
+             "latest_balance": "not-a-number", "latest_snapshot_date": "2026-08-02"},
+            dict(_WEALTH_PAYLOAD["accounts"][0]),  # type: ignore[index]
+        ]
+    }
+    lines, skipped = build_wealth_investment_lines(payload)
+    assert skipped == 1  # surfaced in the Delivery block, never silently gone
+    assert {ln.account_name for ln in lines} == {"E-Trade Stocks"}
+
+
+def test_merge_replaces_frozen_local_investment_lines(session: Session) -> None:
+    today = date(2026, 8, 2)
+    _add(session, "loc-chk", "Sparkry Checking", "depository", "checking", "100135.19", d=today)
+    # Frozen wealth-scope leftover: local investment row stuck at 2026-07-27.
+    _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
+         d=date(2026, 7, 27))
+    session.commit()
+    local = build_pulse(today, session)
+    merged = merge_wealth_lines(local, build_wealth_investment_lines(_WEALTH_PAYLOAD)[0])
+    names = {ln.account_name for ln in merged}
+    assert "Joint Tenant" not in names  # frozen local line replaced
+    assert {"Sparkry Checking", "E-Trade Stocks", "Aiden 529"} == names
+
+
+def test_merge_with_no_wealth_lines_keeps_local_investment(session: Session) -> None:
+    """Degraded mode: wealth fetch failed/empty → keep the local (stale)
+    investment lines rather than silently dropping the whole section."""
+    today = date(2026, 8, 2)
+    _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
+         d=date(2026, 7, 27))
+    session.commit()
+    local = build_pulse(today, session)
+    merged = merge_wealth_lines(local, [])
+    assert {ln.account_name for ln in merged} == {"Joint Tenant"}
+
+
+def test_wealth_stale_line_renders_as_of_marker() -> None:
+    today = date(2026, 8, 2)
+    payload: dict[str, object] = {
+        "accounts": [
+            {
+                "account_id": "d1-x",
+                "account_name": "Stuck IRA",
+                "broker": "vanguard",
+                "latest_snapshot_date": "2026-07-27",
+                "plaid_account_type": "investment",
+                "latest_balance": "400186.1300",
+                "previous_snapshot_date": "2026-07-26",
+                "previous_balance": "400000.0000",
+            }
+        ]
+    }
+    text = render_pulse(build_wealth_investment_lines(payload)[0], today)
+    assert "Stuck IRA — $400,186.13 (+$186.13 since 2026-07-26) (as of 2026-07-27) ⏳" in text
+    assert "1 stale" in text
+
+
+def test_unpaired_previous_balance_renders_no_day_change() -> None:
+    """P1 (2026-08-02 review): a previous_balance without its snapshot date
+    must not render a delta — it would read as a same-day change."""
+    payload: dict[str, object] = {
+        "accounts": [
+            {
+                "account_id": "d1-x",
+                "account_name": "Odd Row",
+                "broker": "vanguard",
+                "latest_snapshot_date": "2026-08-02",
+                "plaid_account_type": "investment",
+                "latest_balance": "1000.0000",
+                "previous_snapshot_date": None,
+                "previous_balance": "900.0000",
+            }
+        ]
+    }
+    lines, skipped = build_wealth_investment_lines(payload)
+    assert skipped == 0
+    assert lines[0].day_change is None
+    text = render_pulse(lines, date(2026, 8, 2))
+    assert "(+$" not in text
+
+
+def test_unparseable_previous_pair_keeps_line_without_day_change() -> None:
+    """A bad baseline drops only the delta, never the whole account line."""
+    payload: dict[str, object] = {
+        "accounts": [
+            {
+                "account_id": "d1-x",
+                "account_name": "Bad Baseline",
+                "broker": "vanguard",
+                "latest_snapshot_date": "2026-08-02",
+                "plaid_account_type": "investment",
+                "latest_balance": "1000.0000",
+                "previous_snapshot_date": "2026-08-01",
+                "previous_balance": "not-a-number",
+            }
+        ]
+    }
+    lines, skipped = build_wealth_investment_lines(payload)
+    assert skipped == 0
+    assert [ln.account_name for ln in lines] == ["Bad Baseline"]
+    assert lines[0].day_change is None
+
+
+def test_post_pulse_wealth_error_surfaces_in_delivery_block(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 (2026-08-02 review): wealth degradation must be visible in the
+    Delivery block, not hidden behind stale markers."""
+    import src.balance_alerts.digest as digest_mod
+
+    today = date(2026, 8, 2)
+    _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
+         d=date(2026, 7, 27))
+    session.commit()
+
+    monkeypatch.setattr(digest_mod, "fetch_wealth_freshness", lambda: ("error", None))
+
+    sent: dict[str, object] = {}
+
+    class _Resp:
+        status_code: int = 200
+
+    def _fake_post(
+        url: str, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> _Resp:
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setenv(wh.URL_ENV, "https://n8n.example/webhook/alert")
+    monkeypatch.setenv(wh.SECRET_ENV, "s3cret")
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    res = post_pulse(today, session, apply=True)
+    assert res.status == "sent"
+    msg = str(sent.get("message", ""))
+    assert "Joint Tenant" in msg  # degraded to local line
+    assert "wealth: unreachable — showing last local values" in msg
+
+
+def test_post_pulse_merges_wealth_lines(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.balance_alerts.digest as digest_mod
+
+    today = date(2026, 8, 2)
+    _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
+         d=date(2026, 7, 27))
+    session.commit()
+
+    monkeypatch.setattr(
+        digest_mod, "fetch_wealth_freshness", lambda: ("ok", _WEALTH_PAYLOAD)
+    )
+
+    sent: dict[str, object] = {}
+
+    class _Resp:
+        status_code: int = 200
+
+    def _fake_post(
+        url: str, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> _Resp:
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setenv(wh.URL_ENV, "https://n8n.example/webhook/alert")
+    monkeypatch.setenv(wh.SECRET_ENV, "s3cret")
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    res = post_pulse(today, session, apply=True)
+    assert res.status == "sent"
+    msg = str(sent.get("message", ""))
+    assert "E-Trade Stocks — $2,082,694.00 (+$12,694.00)" in msg
+    assert "Joint Tenant" not in msg
+
+
+def test_post_pulse_wealth_fetch_raise_degrades_to_local(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wealth-fetch crash must never lose the day's pulse — degrade to the
+    local (stale-marked) lines."""
+    import src.balance_alerts.digest as digest_mod
+
+    today = date(2026, 8, 2)
+    _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
+         d=date(2026, 7, 27))
+    session.commit()
+
+    def _boom() -> tuple[str, dict[str, object] | None]:
+        raise RuntimeError("wealth fetch exploded")
+
+    monkeypatch.setattr(digest_mod, "fetch_wealth_freshness", _boom)
+
+    sent: dict[str, object] = {}
+
+    class _Resp:
+        status_code: int = 200
+
+    def _fake_post(
+        url: str, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> _Resp:
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setenv(wh.URL_ENV, "https://n8n.example/webhook/alert")
+    monkeypatch.setenv(wh.SECRET_ENV, "s3cret")
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    res = post_pulse(today, session, apply=True)
+    assert res.status == "sent"
+    assert "Joint Tenant" in str(sent.get("message", ""))
 
 
 def test_post_pulse_pulse_compute_failure_degrades_not_crashes(

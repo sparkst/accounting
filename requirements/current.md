@@ -682,6 +682,13 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-DHL-001 | The daily pulse gains a delivery-health block: per-Plaid-item last-success age, yesterday's alert sent/failed/skipped counts, unmapped-account names, and snapshot-gap days — derived from `ingestion_log` + `alert_dispatch`. |
 | REQ-DHL-002 | Any silent-failure mode identified in the 2026-07-07 audit (missed snapshot day, failed POST, unmapped skip, dead item) is visible in this block within 24h of occurring. |
 
+## REQ-DFB-* — Feature: Daily-flash current wealth values + day change
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-DFB-001 | The daily pulse's Investment section renders current values from the wealth Worker's freshness payload (extended with `plaid_account_type`, `latest_balance`, `previous_snapshot_date`, `previous_balance` — dashboard PR #83) whenever it is reachable, superseding the local snapshot rows frozen at the 2026-07-27 Plaid consolidation; on fetch failure it degrades to the local (stale-marked) lines. |
+| REQ-DFB-002 | Every pulse line with a previous-snapshot baseline renders a signed day-change amount (`(+$1,135.00)`); a baseline older than yesterday is labeled `since <date>` so a multi-day move is never presented as a one-day change. |
+
 ## REQ-ARC-* — Feature: AR chaser (draft-for-approval)
 
 | REQ-ID | Requirement |

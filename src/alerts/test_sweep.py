@@ -244,6 +244,123 @@ def test_dry_run_writes_nothing_and_does_not_post(session: Session) -> None:
     assert row.status == "failed"  # untouched
 
 
+def test_stale_same_day_only_row_is_superseded_not_replayed(session: Session) -> None:
+    """REQ-FIX-ALR-007: a failed row of a same-day-only alert type from a
+    PRIOR day must never be re-POSTed verbatim (2026-08-02 incident: a
+    12-hour-old balance_pulse digest was re-delivered twice). It is marked
+    status='superseded' — terminal, never picked up by any later sweep."""
+    stale_date = (TODAY - timedelta(days=1)).isoformat()
+    _row(
+        session,
+        alert_key="balance:pulse:stale",
+        occurrence_date=stale_date,
+        alert_type="balance_pulse",
+    )
+    calls = {"n": 0}
+
+    def post(payload: dict[str, object]) -> WebhookResult:
+        calls["n"] += 1
+        return WebhookResult("sent", 200, None)
+
+    summary = sweep_failed_rows(
+        session, TODAY, post=post, apply=True, same_day_only_types=("balance_pulse",)
+    )
+    assert calls["n"] == 0
+    assert summary.resent == 0
+    assert summary.superseded == 1
+    row = session.query(AlertDispatch).filter_by(alert_key="balance:pulse:stale").one()
+    assert row.status == "superseded"
+    assert row.error_detail is not None and "stale" in row.error_detail
+
+
+def test_same_day_only_row_from_today_is_still_resent(session: Session) -> None:
+    """Same-day-only restricts the WINDOW, not the retry itself: a row that
+    failed earlier today is still a legitimate transient-failure retry."""
+    _row(
+        session,
+        alert_key="balance:pulse:today",
+        occurrence_date=TODAY.isoformat(),
+        alert_type="balance_pulse",
+    )
+    summary = sweep_failed_rows(
+        session,
+        TODAY,
+        post=lambda p: WebhookResult("sent", 200, None),
+        apply=True,
+        same_day_only_types=("balance_pulse",),
+    )
+    assert summary.resent == 1
+    assert summary.superseded == 0
+    row = session.query(AlertDispatch).filter_by(alert_key="balance:pulse:today").one()
+    assert row.status == "sent"
+
+
+def test_stale_row_of_unlisted_type_keeps_seven_day_window(session: Session) -> None:
+    """Durable date-keyed types (tax_bo, policy_drift, ...) keep the full
+    7-day replay window — the same-day rule applies only to listed types."""
+    stale_date = (TODAY - timedelta(days=3)).isoformat()
+    _row(
+        session,
+        alert_key="tax:sparkry:bo:stale",
+        occurrence_date=stale_date,
+        alert_type="tax_bo",
+    )
+    summary = sweep_failed_rows(
+        session,
+        TODAY,
+        post=lambda p: WebhookResult("sent", 200, None),
+        apply=True,
+        same_day_only_types=("balance_pulse",),
+    )
+    assert summary.resent == 1
+    assert summary.superseded == 0
+
+
+def test_dry_run_counts_stale_same_day_only_rows_without_writing(session: Session) -> None:
+    stale_date = (TODAY - timedelta(days=1)).isoformat()
+    _row(
+        session,
+        alert_key="balance:pulse:dry",
+        occurrence_date=stale_date,
+        alert_type="balance_pulse",
+    )
+    calls = {"n": 0}
+
+    def post(payload: dict[str, object]) -> WebhookResult:
+        calls["n"] += 1
+        return WebhookResult("sent", 200, None)
+
+    summary = sweep_failed_rows(
+        session, TODAY, post=post, apply=False, same_day_only_types=("balance_pulse",)
+    )
+    assert calls["n"] == 0
+    assert summary.superseded == 1
+    assert summary.candidates == 0
+    row = session.query(AlertDispatch).filter_by(alert_key="balance:pulse:dry").one()
+    assert row.status == "failed"  # DRY-RUN writes nothing
+
+
+def test_superseded_row_is_never_swept_again(session: Session) -> None:
+    """'superseded' is terminal — a later sweep with no same_day_only_types
+    (or a different caller) must not resurrect it."""
+    _row(
+        session,
+        alert_key="balance:pulse:done",
+        occurrence_date=TODAY.isoformat(),
+        alert_type="balance_pulse",
+        status="superseded",
+    )
+    calls = {"n": 0}
+
+    def post(payload: dict[str, object]) -> WebhookResult:
+        calls["n"] += 1
+        return WebhookResult("sent", 200, None)
+
+    summary = sweep_failed_rows(session, TODAY, post=post, apply=True)
+    assert calls["n"] == 0
+    assert summary.resent == 0
+
+
 def test_per_row_isolation_one_raising_post_does_not_halt_sweep(session: Session) -> None:
     _row(session, alert_key="bad", occurrence_date=TODAY.isoformat())
     _row(session, alert_key="good", occurrence_date=TODAY.isoformat())

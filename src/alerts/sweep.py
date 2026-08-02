@@ -17,6 +17,17 @@ target (this repo currently has two disjoint n8n webhook targets: EA's
 `N8N_ALERTS_WEBHOOK_URL` and balance's `N8N_SEVERITY_WEBHOOK_URL`).
 `resend_email`-channel rows are never swept — Resend emitters regenerate
 fresh content on their own timer rather than replaying stale copy.
+
+REQ-FIX-ALR-007 (2026-08-02 incident): replaying `payload_json` VERBATIM is
+only safe for durable, date-keyed content (tax deadlines, milestone
+crossings). Point-in-time digests (e.g. `balance_pulse`) go stale within
+hours — a replay re-delivers yesterday's balances as if current. Callers
+declare such types via `same_day_only_types`: a failed row of a listed type
+is only replayed on the SAME `occurrence_date` as the run; older rows are
+flipped to the terminal status `'superseded'` (never re-examined — the sweep
+predicate matches `status='failed'` only) instead of being re-POSTed. The
+next scheduled run of the emitter regenerates fresh content anyway, so
+nothing is lost.
 """
 
 from __future__ import annotations
@@ -44,6 +55,14 @@ class SweepSummary:
     still_failed: int = 0
     # DRY-RUN only: rows that WOULD be re-POSTed (query runs, nothing sent/written).
     candidates: int = 0
+    # REQ-FIX-ALR-007: stale same-day-only rows retired instead of replayed
+    # (apply: rows flipped to status='superseded'; DRY-RUN: rows that would be).
+    superseded: int = 0
+
+
+_SUPERSEDED_DETAIL = (
+    "stale digest — superseded, not replayed (same-day-only alert type)"
+)
 
 
 def sweep_failed_rows(
@@ -54,6 +73,7 @@ def sweep_failed_rows(
     apply: bool,
     alert_types: Sequence[str] | None = None,
     lookback_days: int = LOOKBACK_DAYS,
+    same_day_only_types: Sequence[str] = (),
 ) -> SweepSummary:
     """Re-POST failed n8n_webhook rows from the last `lookback_days` days.
 
@@ -63,9 +83,16 @@ def sweep_failed_rows(
     The explicit IS NULL arm captures pre-migration legacy rows (every
     pre-migration emitter was webhook-only) once a payload exists for them.
 
+    REQ-FIX-ALR-007: rows whose `alert_type` is in `same_day_only_types` are
+    only replayed when `occurrence_date == today` — their stored payload is a
+    point-in-time digest that goes stale within hours. Older rows are flipped
+    to the terminal status `'superseded'` (with `error_detail` explaining why)
+    so no later sweep ever replays them.
+
     DRY-RUN (`apply=False`) makes no POST and no write, but DOES run the sweep
-    query and reports the would-be-resent rows in `summary.candidates` (and a
-    log line per row), so an operator can see what a real run would replay.
+    query and reports the would-be-resent rows in `summary.candidates` and the
+    would-be-superseded rows in `summary.superseded` (and a log line per row),
+    so an operator can see what a real run would replay.
     Per-row isolation: one raising re-POST never halts the sweep.
     """
     summary = SweepSummary()
@@ -82,8 +109,22 @@ def sweep_failed_rows(
     if alert_types is not None:
         query = query.filter(AlertDispatch.alert_type.in_(alert_types))
 
+    def _is_stale_same_day_only(row: AlertDispatch) -> bool:
+        return (
+            row.alert_type in same_day_only_types
+            and row.occurrence_date != today.isoformat()
+        )
+
     if not apply:
         for row in query.all():
+            if _is_stale_same_day_only(row):
+                summary.superseded += 1
+                logger.info(
+                    "sweep DRY-RUN would supersede stale %s@%s",
+                    row.alert_key,
+                    row.occurrence_date,
+                )
+                continue
             summary.candidates += 1
             logger.info(
                 "sweep DRY-RUN would resend %s@%s", row.alert_key, row.occurrence_date
@@ -91,6 +132,18 @@ def sweep_failed_rows(
         return summary
 
     for row in query.all():
+        if _is_stale_same_day_only(row):
+            row.status = "superseded"
+            row.error_detail = _SUPERSEDED_DETAIL
+            session.commit()
+            summary.superseded += 1
+            logger.info(
+                "sweep: superseded stale %s@%s (same-day-only type %s)",
+                row.alert_key,
+                row.occurrence_date,
+                row.alert_type,
+            )
+            continue
         try:
             assert row.payload_json is not None  # guaranteed by the query filter
             payload = json.loads(row.payload_json)

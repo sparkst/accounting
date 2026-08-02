@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # must not wait a month — or forever — for a re-send).
 ALERT_TYPES = ("balance_milestone", "balance_drift", "balance_pulse", "policy_drift")
 
+# REQ-FIX-ALR-007: the daily pulse is a point-in-time digest — its stored
+# payload goes stale within hours, so the sweep must never replay one from a
+# prior day (2026-08-02: a 12-hour-old digest was re-delivered twice).
+# Milestone/drift/policy rows are durable facts and keep the 7-day window.
+SAME_DAY_ONLY_TYPES = ("balance_pulse",)
+
 
 @dataclass
 class DispatchSummary:
@@ -102,7 +108,12 @@ def dispatch_balance_alerts(
 
     if apply:
         swept = sweep_failed_rows(
-            session, today, post=_sweep_post, apply=True, alert_types=ALERT_TYPES
+            session,
+            today,
+            post=_sweep_post,
+            apply=True,
+            alert_types=ALERT_TYPES,
+            same_day_only_types=SAME_DAY_ONLY_TYPES,
         )
         # Backlog rows that failed redelivery again must reach the exit code.
         summary.failed += swept.still_failed

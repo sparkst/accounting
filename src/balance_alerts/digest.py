@@ -300,7 +300,8 @@ def _section_block(
     """A framed section. When ``summary`` is given (REQ-DFB-009 — the STOCKS
     Borrowability / LIFE INSURANCE Death Benefit+Borrowability lines), it sits
     between the header and a second rule, then the account rows."""
-    head = f"{_SECTION_SEP}\n{label} · {_fmt_money(total)}\n{_SECTION_SEP}\n"
+    header = _aligned_row(f"{label} ·", _fmt_money(total))
+    head = f"{_SECTION_SEP}\n{header}\n{_SECTION_SEP}\n"
     if summary:
         head += "\n".join(summary) + f"\n{_SECTION_SEP}\n"
     return head + "\n".join(rows)
@@ -401,7 +402,7 @@ _WEALTH_SECTION_NW_LABEL = {
     "retirement": "Retirement",
     "529": "529s",
     "loans": "Loans",
-    "life": "Life Ins Cash Value",
+    "life": "Life Ins. CV",
     "other": "Other",
 }
 
@@ -588,7 +589,7 @@ def render_wealth_pulse(
     net = sum(
         (_WEALTH_SECTION_SIGN[s] * t for s, t in section_totals.items()), Decimal(0)
     )
-    nw_header = f"💰 NET WORTH · {_fmt_money(net)}"
+    nw_header = _aligned_row("💰 NET WORTH ·", _fmt_money(net))
     baseline = _expected_baseline(today)  # REQ-DFB-008
     deltas = [
         _WEALTH_SECTION_SIGN[ln.kind] * ln.day_change

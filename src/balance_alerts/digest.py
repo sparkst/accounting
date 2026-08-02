@@ -198,14 +198,17 @@ _PULSE_KIND_LABEL = {
 # (less busy); staleness is a colored bullet: 🟡 1–5 days old, 🔴 older.
 
 _SECTION_SEP = "━━━━━━━━━━━━━━"
-#: Right-alignment column in DISPLAY CELLS (fits an iPhone-width pre block).
-#: 34 verified on-device 2026-08-02 — account rows contain no emoji (the
-#: stale marker is a plain `*`), so cell math is effectively len().
-_ROW_WIDTH = 34
+#: Right-alignment column in DISPLAY CELLS. 30 verified on-device (iPhone,
+#: Telegram <pre>) 2026-08-02 — 34 wrapped. The amount column is right-padded
+#: to exactly this many display cells, so EVERY row is this wide; keep it under
+#: the phone's monospace wrap point.
+_ROW_WIDTH = 30
 
 #: Chars rendered double-width in monospace fonts beyond east_asian_width
-#: 'W'/'F' (⚠ is EAW 'A' but renders wide with its emoji presentation).
-_EXTRA_WIDE = frozenset("⚠")
+#: 'W'/'F'. ⚠ is EAW 'A'; ▲/▼ are EAW 'A' too but iOS gives them emoji
+#: presentation and renders them 2 cells — counting them as 1 pushed delta
+#: rows past the column and wrapped on-device (2026-08-02).
+_EXTRA_WIDE = frozenset("⚠▲▼")
 #: Zero-width: variation selectors + ZWJ.
 _ZERO_WIDE = frozenset("️‍")
 
@@ -597,7 +600,9 @@ def render_wealth_pulse(
     net_delta = sum(deltas, Decimal(0))
     if deltas and abs(net_delta) >= Decimal("0.5"):
         arrow = "▲" if net_delta > 0 else "▼"
-        nw_header += f" {arrow}{abs(net_delta):,.0f}"
+        # 8-digit net worth + delta overflows the phone column — the delta
+        # rides an indented continuation line, like an account row.
+        nw_header += f"\n  {arrow}{abs(net_delta):,.0f}"
     nw_rows = [
         _aligned_row(
             f"• {_WEALTH_SECTION_NW_LABEL[s]}:",

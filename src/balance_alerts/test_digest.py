@@ -439,12 +439,12 @@ def test_dhl_full_block_golden_text(session: Session) -> None:
     expected = (
         "BUSINESS ACCOUNTS\n"
         "━━━━━━━━━━━━━━\n"
-        "💵 CHECKING · 68,334\n"
+        "💵 CHECKING ·           68,334\n"
         "━━━━━━━━━━━━━━\n"
         "• Sparkry Checking:     66,318\n"
         "• BlackLine Checking:*   2,015\n\n"
         "━━━━━━━━━━━━━━\n"
-        "💳 CREDIT · 1,913\n"
+        "💳 CREDIT ·              1,913\n"
         "━━━━━━━━━━━━━━\n"
         "• Blue Business Plus:    1,913\n"
         "━━━━━━━━━━━━━━\n"
@@ -741,12 +741,12 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
     text = render_wealth_pulse(lines, today)
     assert text.startswith("PERSONAL ACCOUNTS\n")
     assert "<pre>" not in text  # WH-Severity owns the wrap (REQ-SEV-006)
-    cash_i = text.index("💵 CASH · 12,000")
-    credit_i = text.index("💳 CREDIT · 1,500")
-    stocks_i = text.index("📈 STOCKS · 2,082,694")
-    f29_i = text.index("📈 529s · 93,185")
-    other_i = text.index("📦 OTHER · 52,000")
-    nw_i = text.index("💰 NET WORTH · 2,238,379\n  ▲13,594")
+    cash_i = text.index("💵 CASH ·               12,000")
+    credit_i = text.index("💳 CREDIT ·              1,500")
+    stocks_i = text.index("📈 STOCKS ·          2,082,694")
+    f29_i = text.index("📈 529s ·               93,185")
+    other_i = text.index("📦 OTHER ·              52,000")
+    nw_i = text.index("💰 NET WORTH ·       2,238,379\n  ▲13,594")
     assert cash_i < credit_i < stocks_i < f29_i < other_i < nw_i
     # Aligned rows; over-long delta drops to a continuation line.
     assert "• Prime Visa: ▲100      1,500" in text
@@ -777,7 +777,7 @@ def test_weekend_deltas_render_vs_friday() -> None:
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, _SUNDAY)
     assert "▲1,000" in text  # Sparks Checking vs Friday 7/31
-    assert "💰 NET WORTH · 2,238,379\n  ▲13,594" in text
+    assert "💰 NET WORTH ·       2,238,379\n  ▲13,594" in text
 
 
 def test_hidden_accounts_count_in_totals_but_render_no_row() -> None:
@@ -806,7 +806,7 @@ def test_hidden_accounts_count_in_totals_but_render_no_row() -> None:
     text = render_wealth_pulse(lines, _MONDAY)
     assert "Individual - TOD" not in text
     # Section total still includes the hidden $49.52: 2,082,694.00 + 49.52
-    assert "📈 STOCKS · 2,082,744" in text
+    assert "📈 STOCKS ·          2,082,744" in text
     assert "1 account · 0 stale" in text  # footer counts visible only
 
 
@@ -833,7 +833,7 @@ def test_flash_config_alias_and_section_applied() -> None:
     assert lines[0].account_name == "Fidelity 401k"
     assert lines[0].kind == "retirement"
     text = render_wealth_pulse(lines, _MONDAY)
-    assert "📈 RETIREMENT · 149,115" in text
+    assert "📈 RETIREMENT ·        149,115" in text
     assert "• Fidelity 401k:" in text
 
 
@@ -894,7 +894,7 @@ def test_dfb009_fields_parsed_onto_pulseline() -> None:
     assert by["E-Trade"].borrow_capacity == Decimal("500000.00")
     assert by["E-Trade"].death_benefit is None
     assert by["NA Builder"].death_benefit == Decimal("1000000.00")
-    assert by["F&G Accumulator"].borrow_capacity is None
+    assert by["F&G Annuity"].borrow_capacity is None
 
 
 def test_dfb009_stocks_borrowability_line() -> None:
@@ -910,9 +910,9 @@ def test_dfb009_life_death_benefit_and_borrow_lines() -> None:
     lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
     text = render_wealth_pulse(lines, _MONDAY)
     life = text[text.index("📦 LIFE") : text.index("💰 NET WORTH")]
-    # Death benefit = 1,000,000 (NA Builder) + 680,000 (F&G) = 1,680,000.
+    # F&G is an annuity (retirement now); LIFE death benefit = NA Builder only.
     assert "• Death Benefit:" in life
-    assert "1,680,000" in life
+    assert "1,000,000" in life
     # Borrowability = 180,000 (NA Builder policy loan); F&G annuity excluded.
     assert "• Borrowability:" in life
     assert "180,000" in life
@@ -923,7 +923,7 @@ def test_dfb009_death_benefit_excluded_from_net_worth() -> None:
     lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
     text = render_wealth_pulse(lines, _MONDAY)
     # NW = 1,000,000 stocks + (256,564.03 + 660,218.55) life cash value.
-    assert "💰 NET WORTH · 1,916,783" in text
+    assert "💰 NET WORTH ·       1,916,783" in text
 
 
 def test_dfb009_no_borrow_data_omits_summary_lines() -> None:

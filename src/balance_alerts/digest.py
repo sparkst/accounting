@@ -83,7 +83,9 @@ class PulseLine:
 
     @property
     def day_change(self) -> Decimal | None:
-        if self.previous_balance is None:
+        # Balance + date are an atomic pair: a delta without its baseline date
+        # would render as a same-day change (REQ-DFB-002 misread).
+        if self.previous_balance is None or self.previous_date is None:
             return None
         return self.balance - self.previous_balance
 
@@ -229,16 +231,26 @@ def fetch_wealth_freshness() -> tuple[str, dict[str, object] | None]:
     return fetch_d1_freshness()
 
 
-def build_wealth_investment_lines(payload: dict[str, object]) -> list[PulseLine]:
-    """PulseLines for every investment/brokerage account in the payload.
+def build_wealth_investment_lines(
+    payload: dict[str, object],
+) -> tuple[list[PulseLine], int]:
+    """(PulseLines, skipped_count) for the payload's investment accounts.
 
     Per-row isolation (house pattern): one malformed account row is skipped
-    with a log line, never blanking the whole Investment section. Rows with no
-    snapshot (null balance/date) have nothing to render and are skipped.
+    with a log line, never blanking the whole Investment section. Skipped rows
+    are COUNTED so the Delivery block can surface them — the local lines for
+    these accounts are frozen at 2026-07-27, so a quietly-dropped row would
+    otherwise vanish from the flash with no signal at all. Rows with no
+    snapshot (null balance/date) have nothing to render and skip silently.
+
+    The previous-snapshot pair is atomic: if either half is missing or
+    unparseable, both are dropped — a delta with no baseline date would render
+    as a same-day change (the exact misread REQ-DFB-002 exists to prevent).
     """
     accounts_raw = payload.get("accounts", []) if isinstance(payload, dict) else []
     accounts = accounts_raw if isinstance(accounts_raw, list) else []
     lines: list[PulseLine] = []
+    skipped = 0
     for acct in accounts:
         try:
             if not isinstance(acct, dict):
@@ -253,6 +265,20 @@ def build_wealth_investment_lines(payload: dict[str, object]) -> list[PulseLine]
             name = name[:80]  # institution-controlled — cap before display
             raw_prev_balance = acct.get("previous_balance")
             raw_prev_date = acct.get("previous_snapshot_date")
+            prev_balance: Decimal | None = None
+            prev_date: date | None = None
+            if raw_prev_balance is not None and raw_prev_date:
+                try:
+                    prev_balance = Decimal(str(raw_prev_balance))
+                    prev_date = date.fromisoformat(str(raw_prev_date))
+                except Exception:  # noqa: BLE001 — baseline is optional
+                    logger.warning(
+                        "build_wealth_investment_lines: unparseable previous "
+                        "snapshot for %r; rendering without day change",
+                        acct.get("account_id"),
+                    )
+                    prev_balance = None
+                    prev_date = None
             lines.append(
                 PulseLine(
                     name,
@@ -261,16 +287,17 @@ def build_wealth_investment_lines(payload: dict[str, object]) -> list[PulseLine]
                     False,
                     date.fromisoformat(str(raw_date)),
                     None,
-                    Decimal(str(raw_prev_balance)) if raw_prev_balance is not None else None,
-                    date.fromisoformat(str(raw_prev_date)) if raw_prev_date else None,
+                    prev_balance,
+                    prev_date,
                 )
             )
         except Exception:  # noqa: BLE001 — per-row isolation
+            skipped += 1
             logger.exception(
                 "build_wealth_investment_lines: skipping malformed row %r",
                 acct.get("account_id") if isinstance(acct, dict) else acct,
             )
-    return lines
+    return lines, skipped
 
 
 def merge_wealth_lines(
@@ -306,6 +333,10 @@ class DeliveryHealth:
     skipped: int
     unmapped: list[str]
     gaps: list[tuple[str, int]]  # (account_name, gap_days), gap_days >= 2
+    # REQ-DFB-001: non-None when the wealth-D1 source degraded this run
+    # (unreachable, or N malformed rows dropped) — a sustained wealth outage
+    # must not hide behind stale markers indefinitely.
+    wealth_note: str | None = None
 
     @property
     def healthy(self) -> bool:
@@ -314,6 +345,7 @@ class DeliveryHealth:
             and self.failed == 0
             and not self.unmapped
             and not self.gaps
+            and self.wealth_note is None
         )
 
 
@@ -321,7 +353,10 @@ _SYNC_SUCCESS_STATUSES = ("success", "partial_failure")
 
 
 def build_delivery_health(
-    today: date, session: Session, lines: list[PulseLine]
+    today: date,
+    session: Session,
+    lines: list[PulseLine],
+    wealth_note: str | None = None,
 ) -> DeliveryHealth:
     """Derive the delivery-health block (REQ-DHL-001).
 
@@ -388,7 +423,13 @@ def build_delivery_health(
     ]
 
     return DeliveryHealth(
-        syncs=syncs, sent=sent, failed=failed, skipped=skipped, unmapped=unmapped, gaps=gaps
+        syncs=syncs,
+        sent=sent,
+        failed=failed,
+        skipped=skipped,
+        unmapped=unmapped,
+        gaps=gaps,
+        wealth_note=wealth_note,
     )
 
 
@@ -407,6 +448,8 @@ def render_delivery_health(health: DeliveryHealth) -> str:
     if health.gaps:
         gap_str = " · ".join(f"{name} {days}d" for name, days in health.gaps)
         out.append(f"  gap: {gap_str}")
+    if health.wealth_note:
+        out.append(f"  wealth: {health.wealth_note}")
     return "\n".join(out)
 
 
@@ -477,22 +520,28 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
         return WebhookResult("failed", None, "digest compute error")
     # REQ-DFB-001: swap the frozen local investment lines for current wealth-D1
     # values. Any failure here degrades to the local (stale-marked) lines — the
-    # day's pulse must still send.
+    # day's pulse must still send — and the degradation surfaces in the
+    # Delivery block instead of hiding behind stale markers.
+    wealth_note: str | None = None
     try:
         wealth_status, wealth_payload = fetch_wealth_freshness()
-        wealth_lines = (
-            build_wealth_investment_lines(wealth_payload)
-            if wealth_status == "ok" and wealth_payload is not None
-            else []
-        )
+        if wealth_status == "ok" and wealth_payload is not None:
+            wealth_lines, wealth_skipped = build_wealth_investment_lines(wealth_payload)
+            if wealth_skipped:
+                wealth_note = f"{wealth_skipped} malformed row(s) skipped"
+        else:
+            wealth_lines = []
+            if wealth_status != "unconfigured":
+                wealth_note = "unreachable — showing last local values"
     except Exception:  # noqa: BLE001 — degraded pulse beats a lost pulse
         logger.exception("wealth freshness fetch failed; keeping local investment lines")
         wealth_lines = []
+        wealth_note = "fetch crashed — showing last local values"
     lines = merge_wealth_lines(lines, wealth_lines)
     # The pulse must still go out even if the delivery-health block can't be
     # computed — degrade to a pulse without the block rather than losing the day.
     try:
-        health = build_delivery_health(today, session, lines)
+        health = build_delivery_health(today, session, lines, wealth_note=wealth_note)
         health_text = "\n\n" + render_delivery_health(health)
     except Exception:
         logger.exception("delivery-health compute failed; sending degraded pulse")

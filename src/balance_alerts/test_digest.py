@@ -657,7 +657,8 @@ _WEALTH_PAYLOAD: dict[str, object] = {
 
 
 def test_wealth_lines_built_from_payload_investment_types_only() -> None:
-    lines = build_wealth_investment_lines(_WEALTH_PAYLOAD)
+    lines, skipped = build_wealth_investment_lines(_WEALTH_PAYLOAD)
+    assert skipped == 0
     assert {ln.account_name for ln in lines} == {"E-Trade Stocks", "Aiden 529"}
     etrade = next(ln for ln in lines if ln.account_name == "E-Trade Stocks")
     assert etrade.kind == "investment"
@@ -676,7 +677,8 @@ def test_wealth_line_malformed_row_isolated() -> None:
             dict(_WEALTH_PAYLOAD["accounts"][0]),  # type: ignore[index]
         ]
     }
-    lines = build_wealth_investment_lines(payload)
+    lines, skipped = build_wealth_investment_lines(payload)
+    assert skipped == 1  # surfaced in the Delivery block, never silently gone
     assert {ln.account_name for ln in lines} == {"E-Trade Stocks"}
 
 
@@ -688,7 +690,7 @@ def test_merge_replaces_frozen_local_investment_lines(session: Session) -> None:
          d=date(2026, 7, 27))
     session.commit()
     local = build_pulse(today, session)
-    merged = merge_wealth_lines(local, build_wealth_investment_lines(_WEALTH_PAYLOAD))
+    merged = merge_wealth_lines(local, build_wealth_investment_lines(_WEALTH_PAYLOAD)[0])
     names = {ln.account_name for ln in merged}
     assert "Joint Tenant" not in names  # frozen local line replaced
     assert {"Sparkry Checking", "E-Trade Stocks", "Aiden 529"} == names
@@ -722,9 +724,91 @@ def test_wealth_stale_line_renders_as_of_marker() -> None:
             }
         ]
     }
-    text = render_pulse(build_wealth_investment_lines(payload), today)
+    text = render_pulse(build_wealth_investment_lines(payload)[0], today)
     assert "Stuck IRA — $400,186.13 (+$186.13 since 2026-07-26) (as of 2026-07-27) ⏳" in text
     assert "1 stale" in text
+
+
+def test_unpaired_previous_balance_renders_no_day_change() -> None:
+    """P1 (2026-08-02 review): a previous_balance without its snapshot date
+    must not render a delta — it would read as a same-day change."""
+    payload: dict[str, object] = {
+        "accounts": [
+            {
+                "account_id": "d1-x",
+                "account_name": "Odd Row",
+                "broker": "vanguard",
+                "latest_snapshot_date": "2026-08-02",
+                "plaid_account_type": "investment",
+                "latest_balance": "1000.0000",
+                "previous_snapshot_date": None,
+                "previous_balance": "900.0000",
+            }
+        ]
+    }
+    lines, skipped = build_wealth_investment_lines(payload)
+    assert skipped == 0
+    assert lines[0].day_change is None
+    text = render_pulse(lines, date(2026, 8, 2))
+    assert "(+$" not in text
+
+
+def test_unparseable_previous_pair_keeps_line_without_day_change() -> None:
+    """A bad baseline drops only the delta, never the whole account line."""
+    payload: dict[str, object] = {
+        "accounts": [
+            {
+                "account_id": "d1-x",
+                "account_name": "Bad Baseline",
+                "broker": "vanguard",
+                "latest_snapshot_date": "2026-08-02",
+                "plaid_account_type": "investment",
+                "latest_balance": "1000.0000",
+                "previous_snapshot_date": "2026-08-01",
+                "previous_balance": "not-a-number",
+            }
+        ]
+    }
+    lines, skipped = build_wealth_investment_lines(payload)
+    assert skipped == 0
+    assert [ln.account_name for ln in lines] == ["Bad Baseline"]
+    assert lines[0].day_change is None
+
+
+def test_post_pulse_wealth_error_surfaces_in_delivery_block(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 (2026-08-02 review): wealth degradation must be visible in the
+    Delivery block, not hidden behind stale markers."""
+    import src.balance_alerts.digest as digest_mod
+
+    today = date(2026, 8, 2)
+    _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
+         d=date(2026, 7, 27))
+    session.commit()
+
+    monkeypatch.setattr(digest_mod, "fetch_wealth_freshness", lambda: ("error", None))
+
+    sent: dict[str, object] = {}
+
+    class _Resp:
+        status_code: int = 200
+
+    def _fake_post(
+        url: str, json: dict[str, object], headers: dict[str, str], timeout: float
+    ) -> _Resp:
+        sent.update(json)
+        return _Resp()
+
+    monkeypatch.setenv(wh.URL_ENV, "https://n8n.example/webhook/alert")
+    monkeypatch.setenv(wh.SECRET_ENV, "s3cret")
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    res = post_pulse(today, session, apply=True)
+    assert res.status == "sent"
+    msg = str(sent.get("message", ""))
+    assert "Joint Tenant" in msg  # degraded to local line
+    assert "wealth: unreachable — showing last local values" in msg
 
 
 def test_post_pulse_merges_wealth_lines(

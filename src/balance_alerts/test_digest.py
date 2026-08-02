@@ -105,7 +105,7 @@ def test_render_contains_balance_and_flag(session: Session) -> None:
     session.commit()
     text = render_pulse(build_pulse(date(2026, 6, 14), session), date(2026, 6, 14))
     assert "BlackLine" in text
-    assert "$800.00" in text
+    assert "$800" in text
     assert "flagged" in text
 
 
@@ -275,8 +275,8 @@ def test_stale_snapshot_renders_as_of_marker_and_stale_count(session: Session) -
     )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "Fresh Checking — $5,000.00\n" in text
-    assert "Stale Checking — $2,000.00 (as of 2026-07-03) ⏳" in text
+    assert "• Fresh Checking: $5,000\n" in text
+    assert "• Stale Checking: $2,000 ⏳Jul 3" in text
     assert "1 stale" in text
 
 
@@ -371,7 +371,7 @@ def test_stale_cached_balance_marks_stale_even_when_snapshot_date_is_today(
     )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "(as of 2026-07-02) ⏳" in text
+    assert "⏳Jul 2" in text
     assert "1 stale" in text
 
 
@@ -436,11 +436,13 @@ def test_dhl_full_block_golden_text(session: Session) -> None:
     message = render_pulse(lines, today) + "\n\n" + render_delivery_health(health)
 
     expected = (
-        "Checking\n"
-        "  Sparkry Checking — $66,318.42\n"
-        "  BlackLine Checking — $2,015.10 (as of 2026-07-03) ⏳\n\n"
-        "Credit\n"
-        "  Blue Business Plus — $1,912.55\n\n"
+        "💵 Checking · $68,334\n"
+        "• Sparkry Checking: $66,318\n"
+        "• BlackLine Checking: $2,015 ⏳Jul 3\n"
+        "━━━━━━━━━\n"
+        "💳 Credit · $1,913\n"
+        "• Blue Business Plus: $1,913\n"
+        "━━━━━━━━━\n"
         "3 accounts · 0 flagged · 1 stale\n\n"
         "Delivery\n"
         "  sync: amex ✓0d · chase ⏳3d\n"
@@ -541,7 +543,7 @@ def test_dhl_stale_sync_produces_sync_line_with_hourglass(session: Session) -> N
     assert "sync: chase ⏳5d" in text
 
 
-# ── REQ-DFB-002: day-change amounts ─────────────────────────────────────────
+# ── REQ-DFB-002/005: day-change amounts (phone format, Mon–Fri only) ────────
 
 
 def _add_snap(session: Session, acct_id: str, bal: str, d: date) -> None:
@@ -558,45 +560,55 @@ def _add_snap(session: Session, acct_id: str, bal: str, d: date) -> None:
     )
 
 
+_MONDAY = date(2026, 8, 3)
+_SUNDAY = date(2026, 8, 2)
+
+
 def test_day_change_rendered_from_previous_snapshot(session: Session) -> None:
-    today = date(2026, 8, 2)
-    _add(session, "a", "Sparkry Checking", "depository", "checking", "100135.19", d=today)
-    _add_snap(session, "a", "99000.19", today - timedelta(days=1))
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "100135.19", d=_MONDAY)
+    _add_snap(session, "a", "99000.19", _MONDAY - timedelta(days=1))
     session.commit()
-    text = render_pulse(build_pulse(today, session), today)
-    assert "Sparkry Checking — $100,135.19 (+$1,135.00)" in text
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "• Sparkry Checking: $100,135 ▲$1,135" in text
 
 
 def test_day_change_negative_with_multiday_window_labeled(session: Session) -> None:
     """A previous snapshot more than 1 day older is a multi-day move — the
     delta must carry its baseline date so it is never mis-read as one day."""
-    today = date(2026, 8, 2)
-    _add(session, "a", "Sparkry Checking", "depository", "checking", "900.00", d=today)
-    _add_snap(session, "a", "950.00", today - timedelta(days=3))
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "900.00", d=_MONDAY)
+    _add_snap(session, "a", "950.00", _MONDAY - timedelta(days=3))
     session.commit()
-    text = render_pulse(build_pulse(today, session), today)
-    assert "Sparkry Checking — $900.00 (-$50.00 since 2026-07-30)" in text
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "• Sparkry Checking: $900 ▼$50 since Jul 31" in text
 
 
 def test_no_previous_snapshot_renders_no_change_segment(session: Session) -> None:
-    today = date(2026, 8, 2)
-    _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=today)
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=_MONDAY)
     session.commit()
-    text = render_pulse(build_pulse(today, session), today)
-    assert "Sparkry Checking — $5,000.00\n" in text or text.endswith(
-        "Sparkry Checking — $5,000.00\n\n1 account · 0 flagged · 0 stale"
-    )
-    assert "(+$" not in text
-    assert "(-$" not in text
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "• Sparkry Checking: $5,000\n" in text or text.rstrip().endswith("0 stale")
+    assert "▲" not in text
+    assert "▼" not in text
 
 
-def test_zero_day_change_rendered_explicitly(session: Session) -> None:
-    today = date(2026, 8, 2)
-    _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=today)
-    _add_snap(session, "a", "5000.00", today - timedelta(days=1))
+def test_zero_day_change_omitted(session: Session) -> None:
+    """REQ-DFB-005: (+$0.00) noise is gone — sub-dollar deltas render nothing."""
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=_MONDAY)
+    _add_snap(session, "a", "5000.00", _MONDAY - timedelta(days=1))
     session.commit()
-    text = render_pulse(build_pulse(today, session), today)
-    assert "Sparkry Checking — $5,000.00 (+$0.00)" in text
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "• Sparkry Checking: $5,000" in text
+    assert "▲" not in text
+
+
+def test_weekend_renders_no_deltas(session: Session) -> None:
+    """REQ-DFB-005: deltas are Mon–Fri only."""
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "6000.00", d=_SUNDAY)
+    _add_snap(session, "a", "5000.00", _SUNDAY - timedelta(days=1))
+    session.commit()
+    text = render_pulse(build_pulse(_SUNDAY, session), _SUNDAY)
+    assert "• Sparkry Checking: $6,000" in text
+    assert "▲" not in text
 
 
 # ── REQ-DFB-001/003/004: wealth-D1-sourced flash ────────────────────────────
@@ -613,10 +625,10 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "broker": "etrade",
             "account_type": "taxable",
             "source": "plaid",
-            "latest_snapshot_date": "2026-08-02",
+            "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "brokerage",
             "latest_balance": "2082694.0000",
-            "previous_snapshot_date": "2026-08-01",
+            "previous_snapshot_date": "2026-08-02",
             "previous_balance": "2070000.0000",
         },
         {
@@ -625,7 +637,7 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "broker": "vanguard",
             "account_type": "529",
             "source": "plaid",
-            "latest_snapshot_date": "2026-08-02",
+            "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "investment",
             "latest_balance": "93185.0600",
             "previous_snapshot_date": None,
@@ -637,10 +649,10 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "broker": "chase",
             "account_type": "checking",
             "source": "plaid",
-            "latest_snapshot_date": "2026-08-02",
+            "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "depository",
             "latest_balance": "12000.0000",
-            "previous_snapshot_date": "2026-08-01",
+            "previous_snapshot_date": "2026-08-02",
             "previous_balance": "11000.0000",
         },
         {
@@ -649,10 +661,10 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "broker": "chase",
             "account_type": "credit_card",
             "source": "plaid",
-            "latest_snapshot_date": "2026-08-02",
+            "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "credit",
             "latest_balance": "1500.0000",
-            "previous_snapshot_date": "2026-08-01",
+            "previous_snapshot_date": "2026-08-02",
             "previous_balance": "1400.0000",
         },
         {
@@ -717,21 +729,33 @@ def test_wealth_line_malformed_row_isolated_and_counted() -> None:
 
 
 def test_render_wealth_pulse_sections_and_footer() -> None:
-    today = date(2026, 8, 2)
+    today = _MONDAY
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, today)
-    cash_i = text.index("Cash")
-    credit_i = text.index("Credit")
-    invest_i = text.index("Investment")
-    other_i = text.index("Other")
+    cash_i = text.index("💵 Cash · $12,000")
+    credit_i = text.index("💳 Credit · $1,500")
+    invest_i = text.index("📈 Investment · $2,175,879")
+    other_i = text.index("📦 Other · $52,000")
     assert cash_i < credit_i < invest_i < other_i
-    assert "Sparks Checking — $12,000.00 (+$1,000.00)" in text
-    assert "Prime Visa — $1,500.00 (+$100.00)" in text
-    assert "E-Trade Stocks — $2,082,694.00 (+$12,694.00)" in text
-    assert "Whole Life — $52,000.00 (+$4,000.00 since 2025-01-15) (as of 2026-01-15) ⏳" in text
+    assert text.count("━━━━━━━━━") == 4  # between sections + before NW/footer
+    assert "• Sparks Checking: $12,000 ▲$1,000" in text
+    assert "• Prime Visa: $1,500 ▲$100" in text
+    assert "• E-Trade Stocks: $2,082,694 ▲$12,694" in text
+    assert "• Whole Life: $52,000 ▲$4,000 since Jan 15 '25 ⏳Jan 15" in text
+    # NW = 12,000 − 1,500 + 2,175,879.06 + 52,000; delta sums 1-day moves only
+    # (credit sign-flipped, Whole Life's year-old baseline excluded).
+    assert "💰 Net worth: $2,238,379 ▲$13,594" in text
     assert "5 accounts · 1 stale" in text
     assert "Delivery" not in text
     assert "flagged" not in text
+
+
+def test_render_wealth_pulse_weekend_omits_all_deltas() -> None:
+    lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
+    text = render_wealth_pulse(lines, _SUNDAY)
+    assert "▲" not in text
+    assert "▼" not in text
+    assert "💰 Net worth: $2,238,379" in text
 
 
 def test_render_wealth_pulse_note_renders_warning_line() -> None:
@@ -742,7 +766,7 @@ def test_render_wealth_pulse_note_renders_warning_line() -> None:
 
 
 def test_wealth_stale_line_renders_as_of_marker() -> None:
-    today = date(2026, 8, 2)
+    today = _MONDAY
     payload: dict[str, object] = {
         "accounts": [
             {
@@ -761,7 +785,7 @@ def test_wealth_stale_line_renders_as_of_marker() -> None:
     }
     lines, _ = build_wealth_lines(payload)
     text = render_wealth_pulse(lines, today)
-    assert "Stuck IRA — $400,186.13 (+$186.13 since 2026-07-26) (as of 2026-07-27) ⏳" in text
+    assert "• Stuck IRA: $400,186 ▲$186 since Jul 26 ⏳Jul 27" in text
     assert "1 stale" in text
 
 
@@ -787,8 +811,8 @@ def test_unpaired_previous_balance_renders_no_day_change() -> None:
     lines, skipped = build_wealth_lines(payload)
     assert skipped == 0
     assert lines[0].day_change is None
-    text = render_wealth_pulse(lines, date(2026, 8, 2))
-    assert "(+$" not in text
+    text = render_wealth_pulse(lines, _MONDAY)
+    assert "▲" not in text
 
 
 def test_unparseable_previous_pair_keeps_line_without_day_change() -> None:
@@ -804,7 +828,7 @@ def test_unparseable_previous_pair_keeps_line_without_day_change() -> None:
                 "latest_snapshot_date": "2026-08-02",
                 "plaid_account_type": "investment",
                 "latest_balance": "1000.0000",
-                "previous_snapshot_date": "2026-08-01",
+                "previous_snapshot_date": "2026-08-02",
                 "previous_balance": "not-a-number",
             }
         ]
@@ -851,7 +875,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
 ) -> None:
     import src.balance_alerts.digest as digest_mod
 
-    today = date(2026, 8, 2)
+    today = _MONDAY
     _add(session, "loc-chk", "Sparkry Checking", "depository", "checking", "100135.19", d=today)
     _add(session, "loc-inv", "Joint Tenant", "investment", "brokerage", "2000000.00",
          d=date(2026, 7, 27))
@@ -869,7 +893,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     wealth = cap.by_title_prefix("📊 Wealth Snapshot")
     assert wealth is not None
     wmsg = str(wealth["message"])
-    assert "E-Trade Stocks — $2,082,694.00 (+$12,694.00)" in wmsg
+    assert "• E-Trade Stocks: $2,082,694 ▲$12,694" in wmsg
     assert "Sparks Checking" in wmsg
     assert "Joint Tenant" not in wmsg  # frozen local line replaced
     assert "Sparkry Checking" not in wmsg  # business never in the wealth flash
@@ -878,7 +902,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     business = cap.by_title_prefix("🏢 Business Accounts")
     assert business is not None
     bmsg = str(business["message"])
-    assert "Sparkry Checking — $100,135.19" in bmsg
+    assert "• Sparkry Checking: $100,135" in bmsg
     assert "Joint Tenant" not in bmsg  # frozen investment rows are dead
     assert "E-Trade Stocks" not in bmsg
     assert "Delivery" not in bmsg
@@ -915,7 +939,7 @@ def test_post_pulse_wealth_error_degrades_with_note(
     assert wealth is not None
     wmsg = str(wealth["message"])
     assert "Joint Tenant" in wmsg
-    assert "(as of 2026-07-27) ⏳" in wmsg
+    assert "⏳Jul 27" in wmsg
     assert "⚠️ wealth source: unreachable — showing last local values" in wmsg
 
 

@@ -174,27 +174,73 @@ def build_pulse(today: date, session: Session) -> list[PulseLine]:
 # (any flagged account still surfaces at the top of its group with a ⚠️).
 _PULSE_KIND_ORDER = ("checking", "savings", "credit", "investment")
 _PULSE_KIND_LABEL = {
-    "checking": "Checking",
-    "savings": "Savings",
-    "credit": "Credit",
-    "investment": "Investment",
+    "checking": "💵 Checking",
+    "savings": "🏦 Savings",
+    "credit": "💳 Credit",
+    "investment": "📈 Investment",
 }
+
+# ── Phone-first rendering (REQ-DFB-005) ─────────────────────────────────────
+# Telegram on a phone shows ~30 proportional chars per line; the 2026-08-02
+# format wrapped nearly every line at the delta. Rules: whole dollars, zero
+# deltas omitted, ▲/▼ arrows, compact ⏳ dates, names capped, heavy-rule
+# separators, section totals in headers. Deltas render Mon–Fri only —
+# weekend investment "changes" are zero-noise against Friday's close.
+
+_SECTION_SEP = "━━━━━━━━━"
+_NAME_MAX = 26
+
+
+def _fmt_money(v: Decimal) -> str:
+    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+
+
+def _short_date(d: date, today: date) -> str:
+    out = f"{d.strftime('%b')} {d.day}"
+    return out if d.year == today.year else f"{out} '{d.year % 100:02d}"
+
+
+def _short_name(name: str) -> str:
+    return name if len(name) <= _NAME_MAX else name[: _NAME_MAX - 1] + "…"
 
 
 def _render_day_change(ln: PulseLine, today: date) -> str:
-    """REQ-DFB-002: ` (+$1,135.00)` — signed vs the previous snapshot.
+    """REQ-DFB-002/005: ` ▲$1,135` vs the previous snapshot, Mon–Fri only.
 
-    A baseline that is not exactly yesterday gets ` since <date>` so a
-    multi-day (or stale-window) move is never presented as a one-day change.
+    Zero (sub-dollar) deltas are omitted. A baseline that is not exactly
+    yesterday gets ` since <date>` so a multi-day (or stale-window) move is
+    never presented as a one-day change.
     """
-    delta = ln.day_change
-    if delta is None:
+    if today.weekday() >= 5:  # Sat/Sun — no deltas (REQ-DFB-005)
         return ""
-    sign = "+" if delta >= 0 else "-"
-    out = f" ({sign}${abs(delta):,.2f}"
+    delta = ln.day_change
+    if delta is None or abs(delta) < Decimal("0.5"):
+        return ""
+    arrow = "▲" if delta > 0 else "▼"
+    out = f" {arrow}${abs(delta):,.0f}"
     if ln.previous_date is not None and ln.previous_date != today - timedelta(days=1):
-        out += f" since {ln.previous_date.isoformat()}"
-    return out + ")"
+        out += f" since {_short_date(ln.previous_date, today)}"
+    return out
+
+
+def _render_stale(ln: PulseLine, today: date) -> str:
+    if not ln.stale(today):
+        return ""
+    return f" ⏳{_short_date(ln.effective_date, today)}"
+
+
+def _render_section(
+    label: str, group: list[PulseLine], today: date, *, flags: bool
+) -> str:
+    total = sum((ln.balance for ln in group), Decimal(0))
+    rows = [f"{label} · {_fmt_money(total)}"]
+    for ln in group:
+        warn = " ⚠️" if flags and ln.breached else ""
+        rows.append(
+            f"• {_short_name(ln.account_name)}: {_fmt_money(ln.balance)}"
+            f"{_render_day_change(ln, today)}{_render_stale(ln, today)}{warn}"
+        )
+    return "\n".join(rows)
 
 
 def render_pulse(lines: list[PulseLine], today: date) -> str:
@@ -206,18 +252,12 @@ def render_pulse(lines: list[PulseLine], today: date) -> str:
         if not group:
             continue
         group.sort(key=lambda x: (not x.breached, -x.balance))
-        rows = []
-        for ln in group:
-            chg = _render_day_change(ln, today)
-            as_of = f" (as of {ln.effective_date.isoformat()}) ⏳" if ln.stale(today) else ""
-            warn = " ⚠️" if ln.breached else ""
-            rows.append(f"  {ln.account_name} — ${ln.balance:,.2f}{chg}{as_of}{warn}")
-        blocks.append(_PULSE_KIND_LABEL[kind] + "\n" + "\n".join(rows))
+        blocks.append(_render_section(_PULSE_KIND_LABEL[kind], group, today, flags=True))
     breached = sum(1 for x in lines if x.breached)
     stale = sum(1 for x in lines if x.stale(today))
     n = len(lines)
     footer = f"{n} account{'s' if n != 1 else ''} · {breached} flagged · {stale} stale"
-    return "\n\n".join(blocks) + "\n\n" + footer
+    return f"\n{_SECTION_SEP}\n".join(blocks) + f"\n{_SECTION_SEP}\n" + footer
 
 
 # ── Wealth-D1-sourced pulse lines (REQ-DFB-001/003/004) ─────────────────────
@@ -244,11 +284,20 @@ _WEALTH_KIND_BY_ACCOUNT_TYPE = {
 
 _WEALTH_KIND_ORDER = ("cash", "credit", "investment", "loan", "other")
 _WEALTH_KIND_LABEL = {
-    "cash": "Cash",
-    "credit": "Credit",
-    "investment": "Investment",
-    "loan": "Loan",
-    "other": "Other",
+    "cash": "💵 Cash",
+    "credit": "💳 Credit",
+    "investment": "📈 Investment",
+    "loan": "🏦 Loan",
+    "other": "📦 Other",
+}
+
+#: Net-worth sign per section: credit/loan balances are amounts OWED.
+_WEALTH_KIND_SIGN = {
+    "cash": 1,
+    "credit": -1,
+    "investment": 1,
+    "loan": -1,
+    "other": 1,
 }
 
 
@@ -321,7 +370,11 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
             raw_date = acct.get("latest_snapshot_date")
             if raw_balance is None or raw_date is None:
                 continue
-            name = str(acct.get("account_name") or acct.get("account_id") or "?")
+            # A nameless account must never render its raw UUID (observed
+            # live 2026-08-02 — a bare id took three phone lines).
+            name = str(
+                acct.get("account_name") or f"unnamed · {acct.get('broker', '?')}"
+            )
             name = name[:80]  # institution-controlled — cap before display
             raw_prev_balance = acct.get("previous_balance")
             raw_prev_date = acct.get("previous_snapshot_date")
@@ -363,7 +416,9 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
 def render_wealth_pulse(
     lines: list[PulseLine], today: date, note: str | None = None
 ) -> str:
-    """Wealth flash body: sections in _WEALTH_KIND_ORDER, largest first.
+    """Wealth flash body (REQ-DFB-005 phone format): sections with totals in
+    the header, heavy-rule separators, net worth (assets − credit − loans) at
+    the bottom with its own Mon–Fri day change.
 
     ``note`` (degradation signal — unreachable source, skipped rows) renders
     as a trailing ⚠️ line so a wealth-source failure is never invisible.
@@ -375,19 +430,34 @@ def render_wealth_pulse(
         )
         if not group:
             continue
-        rows = []
-        for ln in group:
-            chg = _render_day_change(ln, today)
-            as_of = f" (as of {ln.effective_date.isoformat()}) ⏳" if ln.stale(today) else ""
-            rows.append(f"  {ln.account_name} — ${ln.balance:,.2f}{chg}{as_of}")
-        blocks.append(_WEALTH_KIND_LABEL[kind] + "\n" + "\n".join(rows))
+        blocks.append(_render_section(_WEALTH_KIND_LABEL[kind], group, today, flags=False))
     if not blocks:
         body = "No wealth accounts."
     else:
+        net = sum(
+            (_WEALTH_KIND_SIGN[ln.kind] * ln.balance for ln in lines), Decimal(0)
+        )
+        nw = f"💰 Net worth: {_fmt_money(net)}"
+        if today.weekday() < 5:  # REQ-DFB-005: deltas Mon–Fri only
+            deltas = [
+                _WEALTH_KIND_SIGN[ln.kind] * ln.day_change
+                for ln in lines
+                # NW delta sums only true one-day moves — a months-old
+                # statement baseline (`since`) would swamp today's change.
+                if ln.day_change is not None
+                and ln.previous_date == today - timedelta(days=1)
+            ]
+            net_delta = sum(deltas, Decimal(0))
+            if deltas and abs(net_delta) >= Decimal("0.5"):
+                arrow = "▲" if net_delta > 0 else "▼"
+                nw += f" {arrow}${abs(net_delta):,.0f}"
         stale = sum(1 for x in lines if x.stale(today))
         n = len(lines)
         footer = f"{n} account{'s' if n != 1 else ''} · {stale} stale"
-        body = "\n\n".join(blocks) + "\n\n" + footer
+        body = (
+            f"\n{_SECTION_SEP}\n".join(blocks)
+            + f"\n{_SECTION_SEP}\n{nw}\n{footer}"
+        )
     if note:
         body += f"\n⚠️ wealth source: {note}"
     return body

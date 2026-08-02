@@ -826,6 +826,103 @@ def test_flash_config_alias_and_section_applied() -> None:
     assert "• Fidelity 401k:" in text
 
 
+# ── REQ-DFB-009: death benefit + borrowability summary sub-blocks ───────────
+
+
+_DFB009_PAYLOAD: dict[str, object] = {
+    "accounts": [
+        {
+            "account_id": "5658ff22-8f2c-4929-82d0-d819affb9d85",
+            "account_name": "E-Trade Stocks",
+            "broker": "etrade",
+            "account_type": "taxable",
+            "source": "plaid",
+            "latest_snapshot_date": "2026-08-03",
+            "plaid_account_type": "brokerage",
+            "latest_balance": "1000000.00",
+            "previous_snapshot_date": None,
+            "previous_balance": None,
+            "death_benefit": None,
+            "borrow_capacity": "500000.00",
+        },
+        {
+            "account_id": "0a5af9b7-a41f-4694-ab24-759ff8079957",
+            "account_name": "North American Builder Plus IUL4 — Travis",
+            "broker": "north_american",
+            "account_type": "other",
+            "source": "statement",
+            "latest_snapshot_date": "2026-06-24",
+            "plaid_account_type": None,
+            "latest_balance": "256564.03",
+            "previous_snapshot_date": None,
+            "previous_balance": None,
+            "death_benefit": "1000000.00",
+            "borrow_capacity": "180000.00",
+        },
+        {
+            "account_id": "6dd9fd2c-fg-2585",
+            "account_name": "F&G Accumulator Plus 10 Annuity",
+            "broker": "fg_annuity",
+            "account_type": "other",
+            "source": "statement",
+            "latest_snapshot_date": "2026-05-07",
+            "plaid_account_type": None,
+            "latest_balance": "660218.55",
+            "previous_snapshot_date": None,
+            "previous_balance": None,
+            "death_benefit": "680000.00",
+            "borrow_capacity": None,  # annuity excluded from borrow
+        },
+    ]
+}
+
+
+def test_dfb009_fields_parsed_onto_pulseline() -> None:
+    lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
+    by = {ln.account_name: ln for ln in lines}
+    assert by["E-Trade"].borrow_capacity == Decimal("500000.00")
+    assert by["E-Trade"].death_benefit is None
+    assert by["NA Builder"].death_benefit == Decimal("1000000.00")
+    assert by["F&G Accumulator"].borrow_capacity is None
+
+
+def test_dfb009_stocks_borrowability_line() -> None:
+    lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
+    text = render_wealth_pulse(lines, _MONDAY)
+    stocks = text[text.index("📈 STOCKS") : text.index("📦 LIFE")]
+    assert "• Borrowability:" in stocks
+    assert "500,000" in stocks
+    assert "Death Benefit" not in stocks  # stocks has no death benefit line
+
+
+def test_dfb009_life_death_benefit_and_borrow_lines() -> None:
+    lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
+    text = render_wealth_pulse(lines, _MONDAY)
+    life = text[text.index("📦 LIFE") : text.index("💰 NET WORTH")]
+    # Death benefit = 1,000,000 (NA Builder) + 680,000 (F&G) = 1,680,000.
+    assert "• Death Benefit:" in life
+    assert "1,680,000" in life
+    # Borrowability = 180,000 (NA Builder policy loan); F&G annuity excluded.
+    assert "• Borrowability:" in life
+    assert "180,000" in life
+
+
+def test_dfb009_death_benefit_excluded_from_net_worth() -> None:
+    """`[use cash values]` — net worth uses balances, never death benefit."""
+    lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
+    text = render_wealth_pulse(lines, _MONDAY)
+    # NW = 1,000,000 stocks + (256,564.03 + 660,218.55) life cash value.
+    assert "💰 NET WORTH · 1,916,783" in text
+
+
+def test_dfb009_no_borrow_data_omits_summary_lines() -> None:
+    """Accounts without borrow/death data render no summary sub-block."""
+    lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)  # fixture has no DFB-009 fields
+    text = render_wealth_pulse(lines, _MONDAY)
+    assert "Borrowability" not in text
+    assert "Death Benefit" not in text
+
+
 def test_render_wealth_pulse_note_renders_warning_line() -> None:
     today = date(2026, 8, 2)
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)

@@ -91,6 +91,10 @@ class PulseLine:
     previous_date: date | None = None
     # REQ-DFB-006: hidden lines still count in totals/net worth but render no row.
     hidden: bool = False
+    # REQ-DFB-009: WBR-sourced (death benefit from notes; borrow = margin or
+    # policy-loan capacity). None when the account has neither.
+    death_benefit: Decimal | None = None
+    borrow_capacity: Decimal | None = None
 
     @property
     def day_change(self) -> Decimal | None:
@@ -287,11 +291,38 @@ def _account_row(ln: PulseLine, today: date, *, flags: bool = False) -> str:
     return row
 
 
-def _section_block(label: str, total: Decimal, rows: list[str]) -> str:
-    return (
-        f"{_SECTION_SEP}\n{label} · {_fmt_money(total)}\n{_SECTION_SEP}\n"
-        + "\n".join(rows)
-    )
+def _section_block(
+    label: str, total: Decimal, rows: list[str], summary: list[str] | None = None
+) -> str:
+    """A framed section. When ``summary`` is given (REQ-DFB-009 — the STOCKS
+    Borrowability / LIFE INSURANCE Death Benefit+Borrowability lines), it sits
+    between the header and a second rule, then the account rows."""
+    head = f"{_SECTION_SEP}\n{label} · {_fmt_money(total)}\n{_SECTION_SEP}\n"
+    if summary:
+        head += "\n".join(summary) + f"\n{_SECTION_SEP}\n"
+    return head + "\n".join(rows)
+
+
+def _wealth_summary(section: str, group: list[PulseLine]) -> list[str]:
+    """REQ-DFB-009 summary sub-lines for an enriched section.
+
+    STOCKS → Borrowability (Σ margin capacity). LIFE → Death Benefit
+    (Σ death benefit) + Borrowability (Σ policy-loan capacity). Amounts come
+    straight from the freshness payload, which computes them with the WBR's own
+    constants — the flash never does the money math itself. A zero/empty
+    aggregate omits its line."""
+    out: list[str] = []
+    if section == "life":
+        db = sum((ln.death_benefit for ln in group if ln.death_benefit), Decimal(0))
+        if db > 0:
+            out.append(_aligned_row("• Death Benefit:", _fmt_money(db)))
+    if section in ("stocks", "life"):
+        borrow = sum(
+            (ln.borrow_capacity for ln in group if ln.borrow_capacity), Decimal(0)
+        )
+        if borrow > 0:
+            out.append(_aligned_row("• Borrowability:", _fmt_money(borrow)))
+    return out
 
 
 def render_pulse(lines: list[PulseLine], today: date) -> str:
@@ -494,6 +525,8 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
                     )
                     prev_balance = None
                     prev_date = None
+            db_raw = acct.get("death_benefit")
+            bc_raw = acct.get("borrow_capacity")
             lines.append(
                 PulseLine(
                     name,
@@ -505,6 +538,8 @@ def build_wealth_lines(payload: dict[str, object]) -> tuple[list[PulseLine], int
                     prev_balance,
                     prev_date,
                     hidden,
+                    Decimal(str(db_raw)) if db_raw is not None else None,
+                    Decimal(str(bc_raw)) if bc_raw is not None else None,
                 )
             )
         except Exception:  # noqa: BLE001 — per-row isolation
@@ -542,7 +577,10 @@ def render_wealth_pulse(
         total = sum((ln.balance for ln in group), Decimal(0))
         section_totals[section] = total
         rows = [_account_row(ln, today) for ln in group if not ln.hidden]
-        blocks.append(_section_block(_WEALTH_SECTION_LABEL[section], total, rows))
+        summary = _wealth_summary(section, group)
+        blocks.append(
+            _section_block(_WEALTH_SECTION_LABEL[section], total, rows, summary)
+        )
 
     net = sum(
         (_WEALTH_SECTION_SIGN[s] * t for s, t in section_totals.items()), Decimal(0)

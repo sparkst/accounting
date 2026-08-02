@@ -275,8 +275,9 @@ def test_stale_snapshot_renders_as_of_marker_and_stale_count(session: Session) -
     )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "• Fresh Checking: $5,000\n" in text
-    assert "• Stale Checking: $2,000 ⏳Jul 3" in text
+    assert "• Fresh Checking:" in text
+    assert "$5,000" in text
+    assert "• Stale Checking: ⏳7/3" in text
     assert "1 stale" in text
 
 
@@ -371,7 +372,7 @@ def test_stale_cached_balance_marks_stale_even_when_snapshot_date_is_today(
     )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "⏳Jul 2" in text
+    assert "⏳7/2" in text
     assert "1 stale" in text
 
 
@@ -436,14 +437,19 @@ def test_dhl_full_block_golden_text(session: Session) -> None:
     message = render_pulse(lines, today) + "\n\n" + render_delivery_health(health)
 
     expected = (
-        "💵 Checking · $68,334\n"
-        "• Sparkry Checking: $66,318\n"
-        "• BlackLine Checking: $2,015 ⏳Jul 3\n"
-        "━━━━━━━━━\n"
-        "💳 Credit · $1,913\n"
-        "• Blue Business Plus: $1,913\n"
-        "━━━━━━━━━\n"
-        "3 accounts · 0 flagged · 1 stale\n\n"
+        "<pre>BUSINESS ACCOUNTS\n"
+        "━━━━━━━━━━━━━━\n"
+        "💵 CHECKING · $68,334\n"
+        "━━━━━━━━━━━━━━\n"
+        "• Sparkry Checking:     $66,318\n"
+        "• BlackLine Checking:    $2,015\n"
+        "  ⏳7/3\n\n"
+        "━━━━━━━━━━━━━━\n"
+        "💳 CREDIT · $1,913\n"
+        "━━━━━━━━━━━━━━\n"
+        "• Blue Business Plus:    $1,913\n"
+        "━━━━━━━━━━━━━━\n"
+        "3 accounts · 0 flagged · 1 stale</pre>\n\n"
         "Delivery\n"
         "  sync: amex ✓0d · chase ⏳3d\n"
         "  y'day: 2 sent · 1 failed · 0 skipped\n"
@@ -569,7 +575,9 @@ def test_day_change_rendered_from_previous_snapshot(session: Session) -> None:
     _add_snap(session, "a", "99000.19", _MONDAY - timedelta(days=1))
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    assert "• Sparkry Checking: $100,135 ▲$1,135" in text
+    # Long name + delta overflows the amount column → tag drops to an
+    # indented continuation line; the amount column never moves.
+    assert "• Sparkry Checking:    $100,135\n  ▲1,135" in text
 
 
 def test_day_change_negative_with_multiday_window_labeled(session: Session) -> None:
@@ -579,14 +587,18 @@ def test_day_change_negative_with_multiday_window_labeled(session: Session) -> N
     _add_snap(session, "a", "950.00", _MONDAY - timedelta(days=3))
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    assert "• Sparkry Checking: $900 ▼$50 since Jul 31" in text
+    # REQ-DFB-006: multi-day baselines render NO delta (the ⏳ tag owns
+    # oldness) — a 3-day move must not masquerade as a day change.
+    assert "▼" not in text
+    assert "$900" in text
 
 
 def test_no_previous_snapshot_renders_no_change_segment(session: Session) -> None:
     _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=_MONDAY)
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    assert "• Sparkry Checking: $5,000\n" in text or text.rstrip().endswith("0 stale")
+    assert "• Sparkry Checking:" in text
+    assert "$5,000" in text
     assert "▲" not in text
     assert "▼" not in text
 
@@ -597,7 +609,7 @@ def test_zero_day_change_omitted(session: Session) -> None:
     _add_snap(session, "a", "5000.00", _MONDAY - timedelta(days=1))
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    assert "• Sparkry Checking: $5,000" in text
+    assert "$5,000" in text
     assert "▲" not in text
 
 
@@ -607,7 +619,7 @@ def test_weekend_renders_no_deltas(session: Session) -> None:
     _add_snap(session, "a", "5000.00", _SUNDAY - timedelta(days=1))
     session.commit()
     text = render_pulse(build_pulse(_SUNDAY, session), _SUNDAY)
-    assert "• Sparkry Checking: $6,000" in text
+    assert "$6,000" in text
     assert "▲" not in text
 
 
@@ -703,8 +715,8 @@ def test_wealth_lines_cover_every_account_type_with_section_kinds() -> None:
     assert skipped == 0
     kinds = {ln.account_name: ln.kind for ln in lines}
     assert kinds == {
-        "E-Trade Stocks": "investment",
-        "Aiden 529": "investment",
+        "E-Trade Stocks": "stocks",
+        "Aiden 529": "529",
         "Sparks Checking": "cash",
         "Prime Visa": "credit",
         "Whole Life": "other",
@@ -712,6 +724,7 @@ def test_wealth_lines_cover_every_account_type_with_section_kinds() -> None:
     etrade = next(ln for ln in lines if ln.account_name == "E-Trade Stocks")
     assert etrade.balance == Decimal("2082694.0000")
     assert etrade.day_change == Decimal("12694.0000")
+    assert not any(ln.hidden for ln in lines)
 
 
 def test_wealth_line_malformed_row_isolated_and_counted() -> None:
@@ -732,19 +745,23 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
     today = _MONDAY
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, today)
-    cash_i = text.index("💵 Cash · $12,000")
-    credit_i = text.index("💳 Credit · $1,500")
-    invest_i = text.index("📈 Investment · $2,175,879")
-    other_i = text.index("📦 Other · $52,000")
-    assert cash_i < credit_i < invest_i < other_i
-    assert text.count("━━━━━━━━━") == 4  # between sections + before NW/footer
-    assert "• Sparks Checking: $12,000 ▲$1,000" in text
-    assert "• Prime Visa: $1,500 ▲$100" in text
-    assert "• E-Trade Stocks: $2,082,694 ▲$12,694" in text
-    assert "• Whole Life: $52,000 ▲$4,000 since Jan 15 '25 ⏳Jan 15" in text
-    # NW = 12,000 − 1,500 + 2,175,879.06 + 52,000; delta sums 1-day moves only
-    # (credit sign-flipped, Whole Life's year-old baseline excluded).
-    assert "💰 Net worth: $2,238,379 ▲$13,594" in text
+    assert text.startswith("<pre>PERSONAL ACCOUNTS\n")
+    assert text.endswith("</pre>")
+    cash_i = text.index("💵 CASH · $12,000")
+    credit_i = text.index("💳 CREDIT · $1,500")
+    stocks_i = text.index("📈 STOCKS · $2,082,694")
+    f29_i = text.index("📈 529s · $93,185")
+    other_i = text.index("📦 OTHER · $52,000")
+    nw_i = text.index("💰 NET WORTH · $2,238,379 ▲13,594")
+    assert cash_i < credit_i < stocks_i < f29_i < other_i < nw_i
+    # Right-aligned amount column; over-long tag drops to a continuation line.
+    assert "• Prime Visa: ▲100       $1,500" in text
+    assert "• E-Trade Stocks:    $2,082,694\n  ▲12,694" in text
+    # Stale statement row: compact M/D tag, no multi-day delta.
+    assert "• Whole Life: ⏳1/15     $52,000" in text
+    # NW breakdown rows, credit sign-flipped.
+    assert "• Cash:" in text and "• Credit:" in text and "-$1,500" in text
+    assert "• 529s:" in text
     assert "5 accounts · 1 stale" in text
     assert "Delivery" not in text
     assert "flagged" not in text
@@ -755,14 +772,71 @@ def test_render_wealth_pulse_weekend_omits_all_deltas() -> None:
     text = render_wealth_pulse(lines, _SUNDAY)
     assert "▲" not in text
     assert "▼" not in text
-    assert "💰 Net worth: $2,238,379" in text
+    assert "💰 NET WORTH · $2,238,379" in text
+
+
+def test_hidden_accounts_count_in_totals_but_render_no_row() -> None:
+    """REQ-DFB-006: config/auto hides drop the row, keep the money."""
+    payload: dict[str, object] = {
+        "accounts": [
+            dict(_WEALTH_PAYLOAD["accounts"][0]),  # type: ignore[index]
+            {
+                # dust — auto-hidden below $100
+                "account_id": "d1-dust",
+                "account_name": "Individual - TOD",
+                "broker": "vanguard",
+                "account_type": "tod",
+                "source": "statement",
+                "latest_snapshot_date": "2026-08-03",
+                "plaid_account_type": None,
+                "latest_balance": "49.52",
+                "previous_snapshot_date": None,
+                "previous_balance": None,
+            },
+        ]
+    }
+    lines, _ = build_wealth_lines(payload)
+    dust = next(ln for ln in lines if ln.account_name == "Individual - TOD")
+    assert dust.hidden is True
+    text = render_wealth_pulse(lines, _MONDAY)
+    assert "Individual - TOD" not in text
+    # Section total still includes the hidden $49.52: 2,082,694.00 + 49.52
+    assert "📈 STOCKS · $2,082,744" in text
+    assert "1 account · 0 stale" in text  # footer counts visible only
+
+
+def test_flash_config_alias_and_section_applied() -> None:
+    """A configured account renders its alias in its configured section."""
+    payload: dict[str, object] = {
+        "accounts": [
+            {
+                # real config key: BrokerageLink → Fidelity 401k, RETIREMENT
+                "account_id": "3c12c098-30b9-4c44-85dd-e273f5b97482",
+                "account_name": "BrokerageLink",
+                "broker": "fidelity",
+                "account_type": "brokeragelink",
+                "source": "statement",
+                "latest_snapshot_date": "2026-08-03",
+                "plaid_account_type": None,
+                "latest_balance": "149114.79",
+                "previous_snapshot_date": None,
+                "previous_balance": None,
+            }
+        ]
+    }
+    lines, _ = build_wealth_lines(payload)
+    assert lines[0].account_name == "Fidelity 401k"
+    assert lines[0].kind == "retirement"
+    text = render_wealth_pulse(lines, _MONDAY)
+    assert "📈 RETIREMENT · $149,115" in text
+    assert "• Fidelity 401k:" in text
 
 
 def test_render_wealth_pulse_note_renders_warning_line() -> None:
     today = date(2026, 8, 2)
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, today, "1 malformed row(s) skipped")
-    assert text.endswith("⚠️ wealth source: 1 malformed row(s) skipped")
+    assert text.endswith("⚠️ wealth source: 1 malformed row(s) skipped</pre>")
 
 
 def test_wealth_stale_line_renders_as_of_marker() -> None:
@@ -785,7 +859,7 @@ def test_wealth_stale_line_renders_as_of_marker() -> None:
     }
     lines, _ = build_wealth_lines(payload)
     text = render_wealth_pulse(lines, today)
-    assert "• Stuck IRA: $400,186 ▲$186 since Jul 26 ⏳Jul 27" in text
+    assert "• Stuck IRA: ⏳7/27     $400,186" in text
     assert "1 stale" in text
 
 
@@ -893,7 +967,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     wealth = cap.by_title_prefix("📊 Wealth Snapshot")
     assert wealth is not None
     wmsg = str(wealth["message"])
-    assert "• E-Trade Stocks: $2,082,694 ▲$12,694" in wmsg
+    assert "• E-Trade Stocks:    $2,082,694\n  ▲12,694" in wmsg
     assert "Sparks Checking" in wmsg
     assert "Joint Tenant" not in wmsg  # frozen local line replaced
     assert "Sparkry Checking" not in wmsg  # business never in the wealth flash
@@ -902,7 +976,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     business = cap.by_title_prefix("🏢 Business Accounts")
     assert business is not None
     bmsg = str(business["message"])
-    assert "• Sparkry Checking: $100,135" in bmsg
+    assert "• Sparkry Checking:    $100,135" in bmsg
     assert "Joint Tenant" not in bmsg  # frozen investment rows are dead
     assert "E-Trade Stocks" not in bmsg
     assert "Delivery" not in bmsg
@@ -939,7 +1013,7 @@ def test_post_pulse_wealth_error_degrades_with_note(
     assert wealth is not None
     wmsg = str(wealth["message"])
     assert "Joint Tenant" in wmsg
-    assert "⏳Jul 27" in wmsg
+    assert "⏳7/27" in wmsg
     assert "⚠️ wealth source: unreachable — showing last local values" in wmsg
 
 

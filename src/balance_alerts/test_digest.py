@@ -441,12 +441,12 @@ def test_dhl_full_block_golden_text(session: Session) -> None:
         "━━━━━━━━━━━━━━\n"
         "💵 CHECKING · 68,334\n"
         "━━━━━━━━━━━━━━\n"
-        "• Sparkry Checking:         66,318\n"
-        "• BlackLine Checking:*       2,015\n\n"
+        "• Sparkry Checking:     66,318\n"
+        "• BlackLine Checking:*   2,015\n\n"
         "━━━━━━━━━━━━━━\n"
         "💳 CREDIT · 1,913\n"
         "━━━━━━━━━━━━━━\n"
-        "• Blue Business Plus:        1,913\n"
+        "• Blue Business Plus:    1,913\n"
         "━━━━━━━━━━━━━━\n"
         "3 accounts · 0 flagged · 1 stale\n\n"
         "Delivery\n"
@@ -576,7 +576,7 @@ def test_day_change_rendered_vs_friday_on_monday(session: Session) -> None:
     _add_snap(session, "a", "99000.19", _FRIDAY)
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    assert "• Sparkry Checking: ▲1,135 100,135" in text
+    assert "• Sparkry Checking:    100,135\n  ▲1,135" in text
 
 
 def test_sunday_delta_vs_friday(session: Session) -> None:
@@ -746,19 +746,30 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
     stocks_i = text.index("📈 STOCKS · 2,082,694")
     f29_i = text.index("📈 529s · 93,185")
     other_i = text.index("📦 OTHER · 52,000")
-    nw_i = text.index("💰 NET WORTH · 2,238,379 ▲13,594")
+    nw_i = text.index("💰 NET WORTH · 2,238,379\n  ▲13,594")
     assert cash_i < credit_i < stocks_i < f29_i < other_i < nw_i
     # Aligned rows; over-long delta drops to a continuation line.
-    assert "• Prime Visa: ▲100           1,500" in text
-    assert "• E-Trade Stocks:        2,082,694\n  ▲12,694" in text
+    assert "• Prime Visa: ▲100      1,500" in text
+    assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in text
     # >5-day-old statement row: star after the colon, no emoji.
-    assert "• Whole Life:*              52,000" in text
+    assert "• Whole Life:*          52,000" in text
     # NW breakdown rows, credit sign-flipped.
-    assert "• Credit:                   -1,500" in text
-    assert "• Stocks:                2,082,694" in text
+    assert "• Credit:               -1,500" in text
+    assert "• Stocks:            2,082,694" in text
     assert "5 accounts · 1 stale" in text
     assert "$" not in text
     assert "flagged" not in text
+
+
+def test_no_line_exceeds_phone_column_width() -> None:
+    """REQ-DFB-007 v3 guard: every rendered line fits the iPhone <pre> column
+    (30 display cells) — 34 wrapped on-device 2026-08-02. ▲/▼/⚠ count as 2."""
+    from src.balance_alerts.digest import _ROW_WIDTH, _dwidth
+
+    lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
+    text = render_wealth_pulse(lines, _MONDAY)
+    over = [(_dwidth(ln), ln) for ln in text.split("\n") if _dwidth(ln) > _ROW_WIDTH]
+    assert over == [], f"lines exceed {_ROW_WIDTH} cells: {over}"
 
 
 def test_weekend_deltas_render_vs_friday() -> None:
@@ -766,7 +777,7 @@ def test_weekend_deltas_render_vs_friday() -> None:
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, _SUNDAY)
     assert "▲1,000" in text  # Sparks Checking vs Friday 7/31
-    assert "💰 NET WORTH · 2,238,379 ▲13,594" in text
+    assert "💰 NET WORTH · 2,238,379\n  ▲13,594" in text
 
 
 def test_hidden_accounts_count_in_totals_but_render_no_row() -> None:
@@ -950,7 +961,7 @@ def test_wealth_stale_line_renders_as_of_marker() -> None:
     }
     lines, _ = build_wealth_lines(payload)
     text = render_wealth_pulse(lines, today)
-    assert "• Stuck IRA:*              400,186" in text
+    assert "• Stuck IRA:*          400,186" in text
     assert "1 stale" in text
 
 
@@ -1058,7 +1069,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     wealth = cap.by_title_prefix("📊 Wealth Snapshot")
     assert wealth is not None
     wmsg = str(wealth["message"])
-    assert "• E-Trade Stocks:        2,082,694\n  ▲12,694" in wmsg
+    assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in wmsg
     assert wealth.get("pre") is True
     assert "Sparks Checking" in wmsg
     assert "Joint Tenant" not in wmsg  # frozen local line replaced
@@ -1068,7 +1079,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     business = cap.by_title_prefix("🏢 Business Accounts")
     assert business is not None
     bmsg = str(business["message"])
-    assert "• Sparkry Checking:        100,135" in bmsg
+    assert "• Sparkry Checking:    100,135" in bmsg
     assert "Joint Tenant" not in bmsg  # frozen investment rows are dead
     assert "E-Trade Stocks" not in bmsg
     assert "Delivery" not in bmsg

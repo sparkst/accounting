@@ -105,7 +105,7 @@ def test_render_contains_balance_and_flag(session: Session) -> None:
     session.commit()
     text = render_pulse(build_pulse(date(2026, 6, 14), session), date(2026, 6, 14))
     assert "BlackLine" in text
-    assert "$800" in text
+    assert "800" in text
     assert "flagged" in text
 
 
@@ -276,8 +276,8 @@ def test_stale_snapshot_renders_as_of_marker_and_stale_count(session: Session) -
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
     assert "• Fresh Checking:" in text
-    assert "$5,000" in text
-    assert "• Stale Checking: ⏳7/3" in text
+    assert "5,000" in text
+    assert "🟡 Stale Checking:" in text  # 3 days old → yellow (REQ-DFB-007)
     assert "1 stale" in text
 
 
@@ -286,19 +286,31 @@ def test_fresh_snapshot_renders_bare_no_marker(session: Session) -> None:
     _add(session, "a", "Fresh Checking", "depository", "checking", "5000.00", d=today)
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "⏳" not in text
+    assert "🟡" not in text
     assert "0 stale" in text
 
 
-def test_1_day_old_snapshot_is_not_stale(session: Session) -> None:
-    """Stale is `< today - 1 day`; exactly yesterday is still current."""
+def test_1_day_old_snapshot_is_yellow(session: Session) -> None:
+    """REQ-DFB-007: 1-5 days out of date → 🟡 and counted stale."""
     today = date(2026, 7, 6)
     _add(session, "a", "Yesterday Checking", "depository", "checking", "5000.00",
          d=today - timedelta(days=1))
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "⏳" not in text
-    assert "0 stale" in text
+    assert "🟡 Yesterday Checking:" in text
+    assert "🔴" not in text
+    assert "1 stale" in text
+
+
+def test_over_5_days_old_is_red(session: Session) -> None:
+    """REQ-DFB-007: >5 days out of date → 🔴."""
+    today = date(2026, 7, 6)
+    _add(session, "a", "Old Checking", "depository", "checking", "5000.00",
+         d=today - timedelta(days=6))
+    session.commit()
+    text = render_pulse(build_pulse(today, session), today)
+    assert "🔴 Old Checking:" in text
+    assert "🟡" not in text
 
 
 def test_two_identical_consecutive_snapshots_do_not_trigger_stale_marker(
@@ -336,7 +348,7 @@ def test_two_identical_consecutive_snapshots_do_not_trigger_stale_marker(
         )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "⏳" not in text
+    assert "🟡" not in text
     assert "0 stale" in text
 
 
@@ -372,7 +384,7 @@ def test_stale_cached_balance_marks_stale_even_when_snapshot_date_is_today(
     )
     session.commit()
     text = render_pulse(build_pulse(today, session), today)
-    assert "⏳7/2" in text
+    assert "🟡 Stale Cache Checking:" in text  # cache date 7/2 → 4 days old
     assert "1 stale" in text
 
 
@@ -437,19 +449,18 @@ def test_dhl_full_block_golden_text(session: Session) -> None:
     message = render_pulse(lines, today) + "\n\n" + render_delivery_health(health)
 
     expected = (
-        "<pre>BUSINESS ACCOUNTS\n"
+        "BUSINESS ACCOUNTS\n"
         "━━━━━━━━━━━━━━\n"
-        "💵 CHECKING · $68,334\n"
+        "💵 CHECKING · 68,334\n"
         "━━━━━━━━━━━━━━\n"
-        "• Sparkry Checking:     $66,318\n"
-        "• BlackLine Checking:    $2,015\n"
-        "  ⏳7/3\n\n"
+        "• Sparkry Checking:     66,318\n"
+        "🟡 BlackLine Checking:   2,015\n\n"
         "━━━━━━━━━━━━━━\n"
-        "💳 CREDIT · $1,913\n"
+        "💳 CREDIT · 1,913\n"
         "━━━━━━━━━━━━━━\n"
-        "• Blue Business Plus:    $1,913\n"
+        "• Blue Business Plus:    1,913\n"
         "━━━━━━━━━━━━━━\n"
-        "3 accounts · 0 flagged · 1 stale</pre>\n\n"
+        "3 accounts · 0 flagged · 1 stale\n\n"
         "Delivery\n"
         "  sync: amex ✓0d · chase ⏳3d\n"
         "  y'day: 2 sent · 1 failed · 0 skipped\n"
@@ -549,7 +560,7 @@ def test_dhl_stale_sync_produces_sync_line_with_hourglass(session: Session) -> N
     assert "sync: chase ⏳5d" in text
 
 
-# ── REQ-DFB-002/005: day-change amounts (phone format, Mon–Fri only) ────────
+# ── REQ-DFB-002/005/008: day-change amounts (business-day baseline) ─────────
 
 
 def _add_snap(session: Session, acct_id: str, bal: str, d: date) -> None:
@@ -568,29 +579,37 @@ def _add_snap(session: Session, acct_id: str, bal: str, d: date) -> None:
 
 _MONDAY = date(2026, 8, 3)
 _SUNDAY = date(2026, 8, 2)
+_FRIDAY = date(2026, 7, 31)
 
 
-def test_day_change_rendered_from_previous_snapshot(session: Session) -> None:
+def test_day_change_rendered_vs_friday_on_monday(session: Session) -> None:
+    """REQ-DFB-008: Monday's baseline is Friday."""
     _add(session, "a", "Sparkry Checking", "depository", "checking", "100135.19", d=_MONDAY)
-    _add_snap(session, "a", "99000.19", _MONDAY - timedelta(days=1))
+    _add_snap(session, "a", "99000.19", _FRIDAY)
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    # Long name + delta overflows the amount column → tag drops to an
-    # indented continuation line; the amount column never moves.
-    assert "• Sparkry Checking:    $100,135\n  ▲1,135" in text
+    # Delta overflows the amount column → indented continuation line.
+    assert "• Sparkry Checking:    100,135\n  ▲1,135" in text
 
 
-def test_day_change_negative_with_multiday_window_labeled(session: Session) -> None:
-    """A previous snapshot more than 1 day older is a multi-day move — the
-    delta must carry its baseline date so it is never mis-read as one day."""
+def test_sunday_delta_vs_friday(session: Session) -> None:
+    """REQ-DFB-008: weekend flashes diff against Friday too."""
+    _add(session, "a", "Sparkry Checking", "depository", "checking", "6000.00", d=_SUNDAY)
+    _add_snap(session, "a", "5000.00", _FRIDAY)
+    session.commit()
+    text = render_pulse(build_pulse(_SUNDAY, session), _SUNDAY)
+    assert "▲1,000" in text
+
+
+def test_non_baseline_previous_renders_no_delta(session: Session) -> None:
+    """A previous snapshot that is NOT the business-day baseline renders no
+    delta — a multi-day move must not masquerade as a day change."""
     _add(session, "a", "Sparkry Checking", "depository", "checking", "900.00", d=_MONDAY)
-    _add_snap(session, "a", "950.00", _MONDAY - timedelta(days=3))
+    _add_snap(session, "a", "950.00", _MONDAY - timedelta(days=4))  # Thursday
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    # REQ-DFB-006: multi-day baselines render NO delta (the ⏳ tag owns
-    # oldness) — a 3-day move must not masquerade as a day change.
     assert "▼" not in text
-    assert "$900" in text
+    assert "900" in text
 
 
 def test_no_previous_snapshot_renders_no_change_segment(session: Session) -> None:
@@ -598,28 +617,16 @@ def test_no_previous_snapshot_renders_no_change_segment(session: Session) -> Non
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
     assert "• Sparkry Checking:" in text
-    assert "$5,000" in text
     assert "▲" not in text
     assert "▼" not in text
 
 
 def test_zero_day_change_omitted(session: Session) -> None:
-    """REQ-DFB-005: (+$0.00) noise is gone — sub-dollar deltas render nothing."""
+    """(+$0.00) noise is gone — sub-dollar deltas render nothing."""
     _add(session, "a", "Sparkry Checking", "depository", "checking", "5000.00", d=_MONDAY)
-    _add_snap(session, "a", "5000.00", _MONDAY - timedelta(days=1))
+    _add_snap(session, "a", "5000.00", _FRIDAY)
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
-    assert "$5,000" in text
-    assert "▲" not in text
-
-
-def test_weekend_renders_no_deltas(session: Session) -> None:
-    """REQ-DFB-005: deltas are Mon–Fri only."""
-    _add(session, "a", "Sparkry Checking", "depository", "checking", "6000.00", d=_SUNDAY)
-    _add_snap(session, "a", "5000.00", _SUNDAY - timedelta(days=1))
-    session.commit()
-    text = render_pulse(build_pulse(_SUNDAY, session), _SUNDAY)
-    assert "$6,000" in text
     assert "▲" not in text
 
 
@@ -640,7 +647,7 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "brokerage",
             "latest_balance": "2082694.0000",
-            "previous_snapshot_date": "2026-08-02",
+            "previous_snapshot_date": "2026-07-31",
             "previous_balance": "2070000.0000",
         },
         {
@@ -664,7 +671,7 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "depository",
             "latest_balance": "12000.0000",
-            "previous_snapshot_date": "2026-08-02",
+            "previous_snapshot_date": "2026-07-31",
             "previous_balance": "11000.0000",
         },
         {
@@ -676,7 +683,7 @@ _WEALTH_PAYLOAD: dict[str, object] = {
             "latest_snapshot_date": "2026-08-03",
             "plaid_account_type": "credit",
             "latest_balance": "1500.0000",
-            "previous_snapshot_date": "2026-08-02",
+            "previous_snapshot_date": "2026-07-31",
             "previous_balance": "1400.0000",
         },
         {
@@ -745,34 +752,34 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
     today = _MONDAY
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, today)
-    assert text.startswith("<pre>PERSONAL ACCOUNTS\n")
-    assert text.endswith("</pre>")
-    cash_i = text.index("💵 CASH · $12,000")
-    credit_i = text.index("💳 CREDIT · $1,500")
-    stocks_i = text.index("📈 STOCKS · $2,082,694")
-    f29_i = text.index("📈 529s · $93,185")
-    other_i = text.index("📦 OTHER · $52,000")
-    nw_i = text.index("💰 NET WORTH · $2,238,379 ▲13,594")
+    assert text.startswith("PERSONAL ACCOUNTS\n")
+    assert "<pre>" not in text  # WH-Severity owns the wrap (REQ-SEV-006)
+    cash_i = text.index("💵 CASH · 12,000")
+    credit_i = text.index("💳 CREDIT · 1,500")
+    stocks_i = text.index("📈 STOCKS · 2,082,694")
+    f29_i = text.index("📈 529s · 93,185")
+    other_i = text.index("📦 OTHER · 52,000")
+    nw_i = text.index("💰 NET WORTH · 2,238,379 ▲13,594")
     assert cash_i < credit_i < stocks_i < f29_i < other_i < nw_i
-    # Right-aligned amount column; over-long tag drops to a continuation line.
-    assert "• Prime Visa: ▲100       $1,500" in text
-    assert "• E-Trade Stocks:    $2,082,694\n  ▲12,694" in text
-    # Stale statement row: compact M/D tag, no multi-day delta.
-    assert "• Whole Life: ⏳1/15     $52,000" in text
+    # Aligned rows; over-long delta drops to a continuation line.
+    assert "• Prime Visa: ▲100       1,500" in text
+    assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in text
+    # >5-day-old statement row: red bullet, no date tag, no multi-day delta.
+    assert "🔴 Whole Life:          52,000" in text
     # NW breakdown rows, credit sign-flipped.
-    assert "• Cash:" in text and "• Credit:" in text and "-$1,500" in text
-    assert "• 529s:" in text
+    assert "• Credit:               -1,500" in text
+    assert "• Stocks:            2,082,694" in text
     assert "5 accounts · 1 stale" in text
-    assert "Delivery" not in text
+    assert "$" not in text
     assert "flagged" not in text
 
 
-def test_render_wealth_pulse_weekend_omits_all_deltas() -> None:
+def test_weekend_deltas_render_vs_friday() -> None:
+    """REQ-DFB-008: Sat/Sun flashes still show deltas — against Friday."""
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, _SUNDAY)
-    assert "▲" not in text
-    assert "▼" not in text
-    assert "💰 NET WORTH · $2,238,379" in text
+    assert "▲1,000" in text  # Sparks Checking vs Friday 7/31
+    assert "💰 NET WORTH · 2,238,379 ▲13,594" in text
 
 
 def test_hidden_accounts_count_in_totals_but_render_no_row() -> None:
@@ -801,7 +808,7 @@ def test_hidden_accounts_count_in_totals_but_render_no_row() -> None:
     text = render_wealth_pulse(lines, _MONDAY)
     assert "Individual - TOD" not in text
     # Section total still includes the hidden $49.52: 2,082,694.00 + 49.52
-    assert "📈 STOCKS · $2,082,744" in text
+    assert "📈 STOCKS · 2,082,744" in text
     assert "1 account · 0 stale" in text  # footer counts visible only
 
 
@@ -828,7 +835,7 @@ def test_flash_config_alias_and_section_applied() -> None:
     assert lines[0].account_name == "Fidelity 401k"
     assert lines[0].kind == "retirement"
     text = render_wealth_pulse(lines, _MONDAY)
-    assert "📈 RETIREMENT · $149,115" in text
+    assert "📈 RETIREMENT · 149,115" in text
     assert "• Fidelity 401k:" in text
 
 
@@ -836,7 +843,7 @@ def test_render_wealth_pulse_note_renders_warning_line() -> None:
     today = date(2026, 8, 2)
     lines, _ = build_wealth_lines(_WEALTH_PAYLOAD)
     text = render_wealth_pulse(lines, today, "1 malformed row(s) skipped")
-    assert text.endswith("⚠️ wealth source: 1 malformed row(s) skipped</pre>")
+    assert text.endswith("⚠️ wealth source: 1 malformed row(s) skipped")
 
 
 def test_wealth_stale_line_renders_as_of_marker() -> None:
@@ -859,7 +866,7 @@ def test_wealth_stale_line_renders_as_of_marker() -> None:
     }
     lines, _ = build_wealth_lines(payload)
     text = render_wealth_pulse(lines, today)
-    assert "• Stuck IRA: ⏳7/27     $400,186" in text
+    assert "🔴 Stuck IRA:          400,186" in text
     assert "1 stale" in text
 
 
@@ -902,7 +909,7 @@ def test_unparseable_previous_pair_keeps_line_without_day_change() -> None:
                 "latest_snapshot_date": "2026-08-02",
                 "plaid_account_type": "investment",
                 "latest_balance": "1000.0000",
-                "previous_snapshot_date": "2026-08-02",
+                "previous_snapshot_date": "2026-07-31",
                 "previous_balance": "not-a-number",
             }
         ]
@@ -956,7 +963,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     session.commit()
 
     monkeypatch.setattr(
-        digest_mod, "fetch_wealth_freshness", lambda: ("ok", _WEALTH_PAYLOAD)
+        digest_mod, "fetch_wealth_freshness", lambda today: ("ok", _WEALTH_PAYLOAD)
     )
     cap = _webhook_env(monkeypatch)
 
@@ -967,7 +974,8 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     wealth = cap.by_title_prefix("📊 Wealth Snapshot")
     assert wealth is not None
     wmsg = str(wealth["message"])
-    assert "• E-Trade Stocks:    $2,082,694\n  ▲12,694" in wmsg
+    assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in wmsg
+    assert wealth.get("pre") is True
     assert "Sparks Checking" in wmsg
     assert "Joint Tenant" not in wmsg  # frozen local line replaced
     assert "Sparkry Checking" not in wmsg  # business never in the wealth flash
@@ -976,7 +984,7 @@ def test_post_pulse_sends_wealth_and_business_as_separate_messages(
     business = cap.by_title_prefix("🏢 Business Accounts")
     assert business is not None
     bmsg = str(business["message"])
-    assert "• Sparkry Checking:    $100,135" in bmsg
+    assert "• Sparkry Checking:    100,135" in bmsg
     assert "Joint Tenant" not in bmsg  # frozen investment rows are dead
     assert "E-Trade Stocks" not in bmsg
     assert "Delivery" not in bmsg
@@ -1004,7 +1012,7 @@ def test_post_pulse_wealth_error_degrades_with_note(
          d=date(2026, 7, 27))
     session.commit()
 
-    monkeypatch.setattr(digest_mod, "fetch_wealth_freshness", lambda: ("error", None))
+    monkeypatch.setattr(digest_mod, "fetch_wealth_freshness", lambda today: ("error", None))
     cap = _webhook_env(monkeypatch)
 
     res = post_pulse(today, session, apply=True)
@@ -1013,7 +1021,7 @@ def test_post_pulse_wealth_error_degrades_with_note(
     assert wealth is not None
     wmsg = str(wealth["message"])
     assert "Joint Tenant" in wmsg
-    assert "⏳7/27" in wmsg
+    assert "🔴 Joint Tenant:" in wmsg
     assert "⚠️ wealth source: unreachable — showing last local values" in wmsg
 
 
@@ -1027,7 +1035,7 @@ def test_post_pulse_wealth_fetch_raise_degrades_to_local(
          d=date(2026, 7, 27))
     session.commit()
 
-    def _boom() -> tuple[str, dict[str, object] | None]:
+    def _boom(today: date) -> tuple[str, dict[str, object] | None]:
         raise RuntimeError("wealth fetch exploded")
 
     monkeypatch.setattr(digest_mod, "fetch_wealth_freshness", _boom)
@@ -1048,7 +1056,7 @@ def test_post_pulse_no_business_lines_sends_only_wealth(
 
     today = date(2026, 8, 2)
     monkeypatch.setattr(
-        digest_mod, "fetch_wealth_freshness", lambda: ("ok", _WEALTH_PAYLOAD)
+        digest_mod, "fetch_wealth_freshness", lambda today: ("ok", _WEALTH_PAYLOAD)
     )
     cap = _webhook_env(monkeypatch)
 

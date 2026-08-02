@@ -28,7 +28,7 @@ SECRET_ENV = "N8N_SEVERITY_WEBHOOK_SECRET"
 
 
 def post_payload(
-    payload: dict[str, str | None], *, key: str, apply: bool, timeout: float = 10.0
+    payload: dict[str, str | bool | None], *, key: str, apply: bool, timeout: float = 10.0
 ) -> WebhookResult:
     """Build-and-POST the single severity-webhook path. DRY-RUN when ``apply`` is False.
 
@@ -76,9 +76,15 @@ def build_payload_dict(
     balance: str | None = None,
     level: str | None = None,
     baseline_gap_days: str | None = None,
-) -> dict[str, str | None]:
-    """The n8n `UT-Send Alert Message` contract. `type` drives channel routing."""
-    return {
+    pre: bool = False,
+) -> dict[str, str | bool | None]:
+    """The n8n `UT-Send Alert Message` contract. `type` drives channel routing.
+
+    ``pre=True`` (REQ-SEV-006/REQ-DFB-007): WH-Severity wraps the (escaped)
+    message in a trusted ``<pre>`` so Telegram renders it monospace — the
+    caller must NOT embed HTML tags itself; they arrive entity-escaped.
+    """
+    payload: dict[str, str | bool | None] = {
         "type": severity,  # info | sev3 | sev2
         "title": title,
         "message": message,
@@ -89,9 +95,12 @@ def build_payload_dict(
         "alert_key": alert_key,
         "baseline_gap_days": baseline_gap_days,
     }
+    if pre:
+        payload["pre"] = True
+    return payload
 
 
-def build_payload(alert: BalanceAlert) -> dict[str, str | None]:
+def build_payload(alert: BalanceAlert) -> dict[str, str | bool | None]:
     """Payload for one fired BalanceAlert.
 
     REQ-FIX-PLD-003: `baseline_gap_days` always rides along in the payload

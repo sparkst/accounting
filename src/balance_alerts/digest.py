@@ -72,8 +72,9 @@ logger = logging.getLogger(__name__)
 # almost every account and make the flag meaningless.
 _CHECKING_BREACH_FLOOR = CHECKING_MILESTONES[-2]  # $1,000
 
-# REQ-FIX-ALR-005: a snapshot older than yesterday is stale.
-STALE_AFTER_DAYS = 1
+# REQ-DFB-007 (supersedes the REQ-FIX-ALR-005 window): any snapshot before
+# today is stale — 🟡 1-5 days old, 🔴 older; footer counts both.
+STALE_AFTER_DAYS = 0
 
 
 @dataclass(frozen=True)
@@ -183,74 +184,106 @@ _PULSE_KIND_LABEL = {
     "investment": "📈 INVESTMENT",
 }
 
-# ── Phone-first rendering (REQ-DFB-005/006) ─────────────────────────────────
-# Travis's 2026-08-02 template: the whole body ships inside a <pre> block
-# (the n8n Telegram formatter allows pre/code — verified in UT-Send Alert
-# Message v10), so amounts right-align in a fixed-width column. Whole
-# dollars, ▲/▼ one-day deltas Mon–Fri only, compact ⏳M/D stale tags,
-# heavy-rule framed section headers with totals, and a net-worth breakdown.
+# ── Phone-first rendering (REQ-DFB-005/006/007) ─────────────────────────────
+# Travis's 2026-08-02 template, v3: the body ships as PLAIN TEXT with
+# `pre: true` in the webhook payload — WH-Severity itself wraps the escaped
+# message in a trusted <pre> (REQ-SEV-006; caller-embedded tags arrive
+# entity-escaped and render literally, observed live 2026-08-02). Amounts
+# right-align at a fixed DISPLAY-cell column (emoji are 2 cells in a
+# monospace font — a 🟡-prefixed row must not shift the column). No `$`
+# (less busy); staleness is a colored bullet: 🟡 1–5 days old, 🔴 older.
 
 _SECTION_SEP = "━━━━━━━━━━━━━━"
-#: Right-alignment column for amounts (fits an iPhone-width <pre> block).
-_ROW_WIDTH = 31
+#: Right-alignment column in DISPLAY CELLS (fits an iPhone-width pre block).
+_ROW_WIDTH = 30
+
+#: Chars rendered double-width in monospace fonts beyond east_asian_width
+#: 'W'/'F' (⚠ is EAW 'A' but renders wide with its emoji presentation).
+_EXTRA_WIDE = frozenset("⚠")
+#: Zero-width: variation selectors + ZWJ.
+_ZERO_WIDE = frozenset("️‍")
+
+
+def _dwidth(s: str) -> int:
+    import unicodedata
+
+    w = 0
+    for ch in s:
+        if ch in _ZERO_WIDE:
+            continue
+        if ch in _EXTRA_WIDE or unicodedata.east_asian_width(ch) in ("W", "F"):
+            w += 2
+        else:
+            w += 1
+    return w
 
 
 def _fmt_money(v: Decimal) -> str:
-    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+    return f"-{abs(v):,.0f}" if v < 0 else f"{v:,.0f}"
 
 
-def _mdy(d: date, today: date) -> str:
-    out = f"{d.month}/{d.day}"
-    return out if d.year == today.year else f"{out}/{d.year % 100:02d}"
+def _row_prefix(ln: PulseLine, today: date) -> str:
+    """REQ-DFB-007: staleness as the bullet — 🟡 1–5 days old, 🔴 older."""
+    days = (today - ln.effective_date).days
+    if days <= 0:
+        return "• "
+    return "🟡 " if days <= 5 else "🔴 "
+
+
+def _expected_baseline(today: date) -> date:
+    """REQ-DFB-008: the delta baseline is the previous BUSINESS day —
+    Sat/Sun/Mon all diff against Friday, Tue–Fri against yesterday."""
+    wd = today.weekday()  # Mon=0 … Sun=6
+    if wd == 0:  # Monday → Friday
+        return today - timedelta(days=3)
+    if wd == 6:  # Sunday → Friday
+        return today - timedelta(days=2)
+    return today - timedelta(days=1)  # incl. Saturday → Friday
 
 
 def _delta_tag(ln: PulseLine, today: date) -> str:
-    """` ▲12,694` — one-day moves only, Mon–Fri only (REQ-DFB-005/006).
+    """` ▲12,694` — strictly vs the previous business day (REQ-DFB-008).
 
-    A baseline older than yesterday renders NOTHING (the ⏳ tag already says
-    the value is old) — multi-day moves never masquerade as day changes.
-    """
-    if today.weekday() >= 5:
-        return ""
+    Any other baseline renders nothing: a multi-day statement move must not
+    masquerade as a business-day change."""
     delta = ln.day_change
     if delta is None or abs(delta) < Decimal("0.5"):
         return ""
-    if ln.previous_date != today - timedelta(days=1):
+    if ln.previous_date != _expected_baseline(today):
         return ""
     arrow = "▲" if delta > 0 else "▼"
     return f" {arrow}{abs(delta):,.0f}"
 
 
-def _stale_tag(ln: PulseLine, today: date) -> str:
-    return f" ⏳{_mdy(ln.effective_date, today)}" if ln.stale(today) else ""
-
-
 def _aligned_row(left: str, amount: str) -> str:
-    """`left……amount` with the amount right-aligned at _ROW_WIDTH.
+    """`left……amount` with the amount right-aligned at _ROW_WIDTH cells.
 
     An over-long left segment is truncated with an ellipsis so the amount
     column never moves and no line soft-wraps on the phone.
     """
-    pad = _ROW_WIDTH - len(left) - len(amount)
+    pad = _ROW_WIDTH - _dwidth(left) - _dwidth(amount)
     if pad < 1:
-        left = left[: _ROW_WIDTH - len(amount) - 2] + "…"
-        pad = _ROW_WIDTH - len(left) - len(amount)
+        while left and _dwidth(left) > _ROW_WIDTH - _dwidth(amount) - 2:
+            left = left[:-1]
+        left += "…"
+        pad = _ROW_WIDTH - _dwidth(left) - _dwidth(amount)
     return f"{left}{' ' * pad}{amount}"
 
 
 def _account_row(ln: PulseLine, today: date, *, flags: bool = False) -> str:
-    """One account line; ▲/▼/⏳ tags drop to an indented continuation line
-    when they would push past the amount column — the column never moves and
+    """One account line; a ▲/▼ tag drops to an indented continuation line
+    when it would push past the amount column — the column never moves and
     nothing soft-wraps mid-number on the phone."""
     amount = _fmt_money(ln.balance)
     warn = " ⚠️" if flags and ln.breached else ""
-    tags = f"{_delta_tag(ln, today)}{_stale_tag(ln, today)}"
-    left = f"• {ln.account_name}:{warn}{tags}"
-    if len(left) + len(amount) + 1 <= _ROW_WIDTH:
+    delta = _delta_tag(ln, today)
+    prefix = _row_prefix(ln, today)
+    left = f"{prefix}{ln.account_name}:{warn}{delta}"
+    if _dwidth(left) + _dwidth(amount) + 1 <= _ROW_WIDTH:
         return _aligned_row(left, amount)
-    row = _aligned_row(f"• {ln.account_name}:{warn}", amount)
-    if tags:
-        row += f"\n {tags}"
+    row = _aligned_row(f"{prefix}{ln.account_name}:{warn}", amount)
+    if delta:
+        row += f"\n {delta}"
     return row
 
 
@@ -278,8 +311,7 @@ def render_pulse(lines: list[PulseLine], today: date) -> str:
     stale = sum(1 for x in lines if x.stale(today))
     n = len(lines)
     footer = f"{n} account{'s' if n != 1 else ''} · {breached} flagged · {stale} stale"
-    body = "BUSINESS ACCOUNTS\n" + "\n\n".join(blocks) + f"\n{_SECTION_SEP}\n{footer}"
-    return f"<pre>{body}</pre>"
+    return "BUSINESS ACCOUNTS\n" + "\n\n".join(blocks) + f"\n{_SECTION_SEP}\n{footer}"
 
 
 # ── Wealth-D1-sourced pulse lines (REQ-DFB-001/003/004) ─────────────────────
@@ -352,14 +384,16 @@ _WEALTH_SECTION_SIGN = {
 }
 
 
-def fetch_wealth_freshness() -> tuple[str, dict[str, object] | None]:
+def fetch_wealth_freshness(today: date) -> tuple[str, dict[str, object] | None]:
     """Fetch the wealth Worker's freshness payload with statement rows.
 
     Same endpoint + env gating the sentinel uses, plus ``include_statement=1``
-    (REQ-DFB-003) — digest-only; the sentinel's own call must never receive
-    statement rows. ('unconfigured', None) when WEALTH_API_BASE /
-    WEALTH_INTERNAL_KEY are absent, ('error', None) on any network/HTTP
-    failure. The key travels only in the header and is never logged.
+    (REQ-DFB-003, digest-only — the sentinel's own call must never receive
+    statement rows) and ``baseline=<previous business day>`` (REQ-DFB-008) so
+    the previous snapshot diffs Sat/Sun/Mon against Friday. ('unconfigured',
+    None) when WEALTH_API_BASE / WEALTH_INTERNAL_KEY are absent, ('error',
+    None) on any network/HTTP failure. The key travels only in the header and
+    is never logged.
     """
     import os
 
@@ -372,7 +406,10 @@ def fetch_wealth_freshness() -> tuple[str, dict[str, object] | None]:
     try:
         resp = httpx.get(
             f"{base}/wealth/api/internal/freshness",
-            params={"include_statement": "1"},
+            params={
+                "include_statement": "1",
+                "baseline": _expected_baseline(today).isoformat(),
+            },
             headers={"X-Internal-Key": key},
             timeout=15.0,
         )
@@ -511,19 +548,18 @@ def render_wealth_pulse(
         (_WEALTH_SECTION_SIGN[s] * t for s, t in section_totals.items()), Decimal(0)
     )
     nw_header = f"💰 NET WORTH · {_fmt_money(net)}"
-    if today.weekday() < 5:  # REQ-DFB-005: deltas Mon–Fri only
-        deltas = [
-            _WEALTH_SECTION_SIGN[ln.kind] * ln.day_change
-            for ln in lines
-            # NW delta sums only true one-day moves — a months-old statement
-            # baseline would swamp today's change.
-            if ln.day_change is not None
-            and ln.previous_date == today - timedelta(days=1)
-        ]
-        net_delta = sum(deltas, Decimal(0))
-        if deltas and abs(net_delta) >= Decimal("0.5"):
-            arrow = "▲" if net_delta > 0 else "▼"
-            nw_header += f" {arrow}{abs(net_delta):,.0f}"
+    baseline = _expected_baseline(today)  # REQ-DFB-008
+    deltas = [
+        _WEALTH_SECTION_SIGN[ln.kind] * ln.day_change
+        for ln in lines
+        # NW delta sums only business-day moves — a months-old statement
+        # baseline would swamp today's change.
+        if ln.day_change is not None and ln.previous_date == baseline
+    ]
+    net_delta = sum(deltas, Decimal(0))
+    if deltas and abs(net_delta) >= Decimal("0.5"):
+        arrow = "▲" if net_delta > 0 else "▼"
+        nw_header += f" {arrow}{abs(net_delta):,.0f}"
     nw_rows = [
         _aligned_row(
             f"• {_WEALTH_SECTION_NW_LABEL[s]}:",
@@ -548,7 +584,7 @@ def render_wealth_pulse(
     )
     if note:
         body += f"\n⚠️ wealth source: {note}"
-    return f"<pre>{body}</pre>"
+    return body
 
 
 # ── Delivery-health block (REQ-DHL-001/002) ─────────────────────────────────
@@ -703,7 +739,7 @@ def _record_pulse(
     key: str,
     occ: str,
     result: WebhookResult,
-    payload: dict[str, str | None],
+    payload: dict[str, str | bool | None],
     *,
     alert_type: str = "balance_pulse",
     subject: str = "Business Account Snapshot",
@@ -757,7 +793,7 @@ def _post_one_pulse(
 ) -> WebhookResult:
     """Dedup + POST + ledger-record one pulse message."""
     payload = build_payload_dict(
-        severity="info", title=title, message=message, alert_key=key
+        severity="info", title=title, message=message, alert_key=key, pre=True
     )
     if apply and _pulse_already_sent(session, key, occ):
         return WebhookResult("skipped", None, None)
@@ -789,7 +825,7 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
     wealth_note: str | None = None
     wealth_lines: list[PulseLine] = []
     try:
-        wealth_status, wealth_payload = fetch_wealth_freshness()
+        wealth_status, wealth_payload = fetch_wealth_freshness(today)
         if wealth_status == "ok" and wealth_payload is not None:
             wealth_lines, wealth_skipped = build_wealth_lines(wealth_payload)
             if wealth_skipped:

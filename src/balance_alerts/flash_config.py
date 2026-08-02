@@ -51,8 +51,6 @@ FLASH_ACCOUNTS: dict[str, FlashAccount] = {
     "011e987e-df2d-424f-9f47-8d62900589de": FlashAccount("Amy Roth IRA", "retirement"),
     "3c12c098-30b9-4c44-85dd-e273f5b97482": FlashAccount("Fidelity 401k", "retirement"),
     "458ee1fd-9154-4ba1-9da9-437943f9bdeb": FlashAccount("HSA", "retirement"),
-    # IUL used as a retirement vehicle — template places it here, not LIFE.
-    "0a5af9b7-a41f-4694-ab24-759ff8079957": FlashAccount("NA Builder", "retirement"),
     "795bd503-gsk-pen": FlashAccount("GSK Pension", "retirement"),
     # ── 529s ────────────────────────────────────────────────────────────────
     "2c2fb215-f5fa-49be-9e08-3475b41bc9b4": FlashAccount("Emerson 529", "529"),
@@ -60,6 +58,10 @@ FLASH_ACCOUNTS: dict[str, FlashAccount] = {
     # ── LOANS ───────────────────────────────────────────────────────────────
     "b7ac6407-ede9-4704-b851-f17053bfc4c3": FlashAccount("CH Mortgage", "loans"),
     # ── LIFE INSURANCE (cash values) ────────────────────────────────────────
+    # NA Builder IUL lives here (not RETIREMENT) to match the WBR — broker
+    # `north_american` classifies as insurance — so its death benefit + policy
+    # loan roll into the LIFE INSURANCE summary.
+    "0a5af9b7-a41f-4694-ab24-759ff8079957": FlashAccount("NA Builder", "life"),
     "6dd9fd2c-fg-2585": FlashAccount("F&G Accumulator", "life"),
     "f334e6e7-nwm-amy": FlashAccount("NWM Life — Amy", "life"),
     "0eda5238-nwm-9215": FlashAccount("NWM Life — Travis", "life"),

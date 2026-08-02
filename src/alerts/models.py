@@ -39,7 +39,10 @@ class AlertDispatch(Base):
     alert_type: Mapped[str] = mapped_column(String, nullable=False)
     entity: Mapped[str] = mapped_column(String, nullable=False)
     subject: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String, nullable=False)  # sent|failed|dry_run
+    # sent|failed|dry_run|superseded — 'superseded' (REQ-FIX-ALR-007) is
+    # terminal: a stale same-day-only digest row retired by the sweep instead
+    # of being replayed verbatim; no sweep ever re-examines it.
+    status: Mapped[str] = mapped_column(String, nullable=False)
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(String, nullable=False, default=_now_iso)

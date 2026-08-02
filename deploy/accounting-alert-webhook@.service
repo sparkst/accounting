@@ -1,0 +1,43 @@
+# Templated OnFailure= handler → n8n severity webhook (Telegram).
+# Alerting-consolidation (docs/superpowers/plans/2026-08-02-alerting-consolidation.md):
+# replaces accounting-alert@.service (Resend email). NOT wired to any unit
+# until deploy — cutover = editing each source unit's OnFailure= from
+# accounting-alert@%n.service to accounting-alert-webhook@%n.service.
+#
+# Anti-storm guards mirror accounting-alert@.service: StartLimit caps a
+# flapping source unit; scripts/alert_webhook.py dedups hourly per unit
+# (sentinel namespace alert-webhook-*); this unit has NO OnFailure= of its
+# own — a failing alert handler must never spawn more alert units.
+#
+# Secrets: N8N_SEVERITY_WEBHOOK_URL + N8N_SEVERITY_WEBHOOK_SECRET from
+# Doppler accounting/srv (already present — balance alerts + freshness
+# sentinel use the same pair).
+[Unit]
+Description=Accounting failure alert for %i (n8n severity webhook)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+EnvironmentFile=/etc/accounting/doppler.env
+Environment=DOPPLER_CONFIG_DIR=/home/travis/accounting/data/.doppler
+Environment=XDG_CONFIG_HOME=/home/travis/accounting/data/.xdg
+Environment=XDG_CACHE_HOME=/home/travis/accounting/data/.cache
+ExecStart=/usr/bin/doppler run -- /usr/bin/env -u DOPPLER_TOKEN /home/travis/accounting/.venv/bin/python3 -m scripts.alert_webhook "%i"
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/travis/accounting/data
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

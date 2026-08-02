@@ -1,22 +1,46 @@
-# Accounting Dashboard — Caddy reverse proxy over Tailscale
-# Single HTTPS endpoint serving both dashboard and API
-# Travis accesses: https://macbook.ancon-cliff.ts.net
+# Accounting — Caddy reverse proxy on the Hetzner box (books.sparkry.ai).
+#
+# This file is rsynced to /home/travis/accounting/Caddyfile and loaded by
+# caddy.service (ExecStart=caddy run --config /home/travis/accounting/Caddyfile,
+# User=travis). Content is the Hetzner-migration spec §Phase-3 Caddyfile
+# (docs/superpowers/specs/2026-06-01-accounting-hetzner-migration-design.md).
+#
+# INCIDENT 2026-07-29..08-02: the previous content of this file was the
+# retired MacBook config (site address `macbook.ancon-cliff.ts.net`), which
+# makes Caddy attempt auto-HTTPS and bind :80/:443 — permission denied as
+# user travis → caddy.service dead after StartLimitBurst. When the box
+# rebooted on 2026-07-29 23:07 UTC, Caddy picked this file up and never came
+# back: books.sparkry.ai served 502 and accounting-uptime-check failed every
+# 5 minutes (~270 OnFailure trips/day, ~24 alert emails/day).
+#
+# Invariants:
+#   * app listener is loopback plain-HTTP :9000 — Cloudflare terminates TLS;
+#     no ACME, no :80/:443, no public bind (REQ-HM-003).
+#   * `admin off` — Caddy's admin API (:2019) is unused here.
+#   * /reports/* relies ENTIRELY on Cloudflare Access in front of the tunnel;
+#     never add a /* CF Access bypass.
 
-macbook.ancon-cliff.ts.net {
-	# Static reports (for Jarvis to curl)
+{
+	admin off
+}
+
+http://127.0.0.1:9000 {
+	# Static reports (weekly P&L artifact)
 	handle /reports/* {
-		root * /Users/travis/SGDrive/dev/accounting
-		file_server
+		root * /home/travis/accounting
+		file_server {
+			browse off
+		}
 	}
 
-	# API requests → FastAPI (port 8000)
+	# API requests → FastAPI (uvicorn)
 	handle /api/* {
-		reverse_proxy localhost:8000
+		reverse_proxy 127.0.0.1:8000
 	}
 
-	# Everything else → SvelteKit preview (port 5173)
+	# Everything else → SvelteKit preview
 	handle {
 		header Cache-Control "no-cache, no-store, must-revalidate"
-		reverse_proxy localhost:5173
+		reverse_proxy 127.0.0.1:5173
 	}
 }

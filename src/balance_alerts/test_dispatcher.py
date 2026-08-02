@@ -251,6 +251,56 @@ def test_apply_sweeps_prior_failed_row_before_computing_today(
     assert row.status == "sent"
 
 
+def test_apply_supersedes_stale_pulse_row_instead_of_replaying(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-FIX-ALR-007 (2026-08-02 incident): a failed balance_pulse row from
+    a prior day must NOT be re-POSTed verbatim by the next --apply run — the
+    digest content is stale (yesterday's balances). The sweep marks it
+    superseded; a milestone row from the same prior day IS still replayed."""
+    session.add(
+        AlertDispatch(
+            alert_key="balance:pulse:2026-06-13",
+            occurrence_date="2026-06-13",
+            alert_type="balance_pulse",
+            entity="all",
+            subject="Daily account pulse",
+            status="failed",
+            delivery_channel="n8n_webhook",
+            payload_json='{"alert_key": "balance:pulse:2026-06-13"}',
+        )
+    )
+    session.add(
+        AlertDispatch(
+            alert_key="balance:acc:checking:5000",
+            occurrence_date="2026-06-13",
+            alert_type="balance_milestone",
+            entity="sparkry",
+            subject="Sparkry checking below $5,000.00",
+            status="failed",
+            delivery_channel="n8n_webhook",
+            payload_json='{"alert_key": "balance:acc:checking:5000"}',
+        )
+    )
+    session.commit()
+    monkeypatch.setattr(disp, "compute_balance_alerts", lambda today, s: [])
+    posted_keys: list[str] = []
+
+    def _fake_post_payload(payload, *, key, apply, timeout=10.0):  # type: ignore[no-untyped-def]
+        posted_keys.append(key)
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(disp, "post_payload", _fake_post_payload)
+    dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+
+    assert "balance:pulse:2026-06-13" not in posted_keys
+    assert "balance:acc:checking:5000" in posted_keys
+    pulse = session.query(AlertDispatch).filter_by(
+        alert_key="balance:pulse:2026-06-13"
+    ).one()
+    assert pulse.status == "superseded"
+
+
 def test_same_key_different_day_both_send(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

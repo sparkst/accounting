@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from scripts import plaid_investments_sync as cli
+from src.alerts.webhook import WebhookResult
 
 
 @pytest.fixture(autouse=True)
@@ -78,8 +79,19 @@ def test_exit_nonzero_on_error_item() -> None:
 def test_exit_zero_on_reauth_item_and_routes_sev3() -> None:
     """REQ-FIX-ALR-009: ITEM_LOGIN_REQUIRED exits 0 and routes to the
     once-per-state sev3 webhook alert instead of tripping OnFailure daily."""
+    captured = {}
+    real_route = cli.route_batch
+
+    def _spy(items, **kwargs):
+        captured["routing"] = real_route(items, **kwargs)
+        return captured["routing"]
+
     with mock.patch.object(cli, "sync_all_wealth") as sync, \
-         mock.patch.object(cli, "route_item_failures", wraps=cli.route_item_failures) as route, \
+         mock.patch.object(cli, "route_batch", side_effect=_spy), \
+         mock.patch(
+             "src.alerts.plaid_reauth.post_payload",
+             return_value=WebhookResult("sent", 200, None),
+         ), \
          mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()), \
          mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()):
         sync.return_value = _batch(
@@ -87,5 +99,6 @@ def test_exit_zero_on_reauth_item_and_routes_sev3() -> None:
             failed=1,
         )
         assert cli.main(["--apply"]) == 0
-        failures = route.call_args.args[0]
-        assert [f.error_code for f in failures] == ["ITEM_LOGIN_REQUIRED"]
+    routing = captured["routing"]
+    assert [f.error_code for f in routing.reauth] == ["ITEM_LOGIN_REQUIRED"]
+    assert routing.infra == []

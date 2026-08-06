@@ -123,9 +123,16 @@ def test_main_returns_zero_on_reauth_item_and_routes_sev3():
     """REQ-FIX-ALR-009: ITEM_LOGIN_REQUIRED is a human re-link, not an infra
     failure — the unit exits 0 and the failure routes to the once-per-state
     sev3 webhook alert instead of tripping OnFailure daily."""
+    captured = {}
+    real_route = cli.route_batch
+
+    def _spy(items, **kwargs):
+        captured["routing"] = real_route(items, **kwargs)
+        return captured["routing"]
+
     with (
         mock.patch.object(cli, "sync_all_active") as sync,
-        mock.patch.object(cli, "route_item_failures", wraps=cli.route_item_failures) as route,
+        mock.patch.object(cli, "route_batch", side_effect=_spy),
         mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()),
         mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()),
     ):
@@ -152,8 +159,9 @@ def test_main_returns_zero_on_reauth_item_and_routes_sev3():
             dry_run=False,
         )
         assert cli.main([]) == 0
-        failures = route.call_args.args[0]
-        assert [f.error_code for f in failures] == ["ITEM_LOGIN_REQUIRED"]
+    routing = captured["routing"]
+    assert [f.error_code for f in routing.reauth] == ["ITEM_LOGIN_REQUIRED"]
+    assert routing.infra == []
 
 
 def test_main_returns_nonzero_on_non_reauth_error_item():

@@ -44,18 +44,45 @@ for f in "$DEPLOY"/*.service "$DEPLOY"/*.timer; do
   fi
 done
 
+# Units with NO copy in deploy/ (the hand-installed serving stack:
+# accounting-api, accounting-dashboard, caddy, cloudflared,
+# accounting-uptime-check, backups, disk-check, …) are exactly the sev2
+# class the webhook handler was written for — sed their OnFailure= in place
+# so NOTHING keeps referencing the email template after it is retired.
+echo "== flipping OnFailure= on box-only units =="
+for f in "$SYSD"/*.service; do
+  if grep -q "OnFailure=accounting-alert@%p.service" "$f"; then
+    sed -i 's/OnFailure=accounting-alert@%p.service/OnFailure=accounting-alert-webhook@%p.service/' "$f"
+    echo "  flipped $(basename "$f")"
+  fi
+done
+
 systemctl daemon-reload
 
-echo "== smoke test: one sev3 Telegram message should arrive =="
-systemctl start accounting-alert-webhook@smoke-test.service || true
-sleep 2
-systemctl --no-pager --lines=5 status accounting-alert-webhook@smoke-test.service || true
+echo "== smoke test: one sev3 Telegram message MUST arrive =="
+# Clear the smoke unit's hourly dedup sentinel so a same-hour re-run of this
+# script still sends a real message (otherwise alert_webhook.py dedups it and
+# a successful re-run looks like a broken webhook path).
+rm -f "$REPO"/data/.alerts/alert-webhook-smoke-test-*.sent
+if ! systemctl start accounting-alert-webhook@smoke-test.service; then
+  echo "ABORT: smoke-test unit failed to start — webhook path is broken; NOT cut over cleanly" >&2
+  systemctl --no-pager --lines=15 status accounting-alert-webhook@smoke-test.service >&2 || true
+  exit 1
+fi
+result=$(systemctl show -p Result --value accounting-alert-webhook@smoke-test.service)
+if [ "$result" != "success" ]; then
+  echo "ABORT: smoke-test unit Result=$result — webhook path is broken; NOT cut over cleanly" >&2
+  systemctl --no-pager --lines=15 status accounting-alert-webhook@smoke-test.service >&2 || true
+  exit 1
+fi
+echo "  smoke-test unit succeeded — journal (confirm it says 'sent', not 'falling back to Resend email'):"
+journalctl -u accounting-alert-webhook@smoke-test.service -n 5 --no-pager -o cat 2>/dev/null | sed 's/^/    /' || true
 
 echo "== verifying no live unit still targets the email template =="
-if grep -rl "OnFailure=accounting-alert@%p.service" "$SYSD"/*.service | grep -v "alert-webhook"; then
-  echo "WARNING: units above still reference the email template (hand-installed drift) — fix manually" >&2
-else
-  echo "  clean: all OnFailure= lines target accounting-alert-webhook@"
+if grep -l "OnFailure=accounting-alert@%p.service" "$SYSD"/*.service 2>/dev/null | grep -v "alert-webhook"; then
+  echo "ABORT: units above still reference the email template" >&2
+  exit 1
 fi
+echo "  clean: all OnFailure= lines target accounting-alert-webhook@"
 
-echo "== done. Rollback = reinstall old units or sed OnFailure= back to accounting-alert@%p.service + daemon-reload =="
+echo "== done. Rollback = sed OnFailure= back to accounting-alert@%p.service + daemon-reload (email template + Resend fallback stay installed) =="

@@ -28,7 +28,7 @@ os.chdir(PROJECT_ROOT)
 
 from src.adapters.plaid_client import make_plaid_client  # noqa: E402
 from src.adapters.plaid_transactions import sync_all_active  # noqa: E402
-from src.alerts.plaid_reauth import ItemFailure, route_item_failures  # noqa: E402
+from src.alerts.plaid_reauth import route_batch  # noqa: E402
 from src.db.connection import SessionLocal, init_db  # noqa: E402
 
 logger = logging.getLogger("plaid_transactions_sync")
@@ -129,21 +129,10 @@ def main(argv: list[str] | None = None) -> int:
     # REQ-FIX-ALR-009: re-auth-class Item errors (ITEM_LOGIN_REQUIRED etc.)
     # route to a once-per-state sev3 webhook alert with the re-connect link
     # instead of hard-failing the unit daily.
-    routing = route_item_failures(
-        [
-            ItemFailure(r.item_id, r.institution_name, r.error_code)
-            for r in batch.items
-            if r.status != "ok"
-        ],
-        [r.item_id for r in batch.items if r.status == "ok"],
-        apply=args.apply,
+    routing = route_batch(
+        batch.items, apply=args.apply, source="transactions", log=logger
     )
-    if routing.reauth:
-        logger.warning(
-            "re-connect needed (sev3 webhook, not a unit failure): %s",
-            ", ".join(f"{f.institution_name}({f.error_code})" for f in routing.reauth),
-        )
-    has_failures = batch.total_failed > 0 or bool(routing.infra)
+    has_failures = batch.total_failed > 0 or routing.exit_failures
     return 1 if has_failures else 0
 
 

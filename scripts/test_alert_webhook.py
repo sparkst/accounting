@@ -76,6 +76,7 @@ def test_send_failure_returns_nonzero_and_writes_no_sentinel(
         return WebhookResult("failed", 502, "non-2xx: 502")
 
     monkeypatch.setattr(aw, "post_payload", _failing_post)
+    monkeypatch.setattr(aw, "_email_fallback", lambda unit: 1)
     monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
     monkeypatch.setattr(aw, "_build_body", lambda unit: "body")
     monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
@@ -95,12 +96,41 @@ def test_raising_post_returns_nonzero(
         raise RuntimeError("boom")
 
     monkeypatch.setattr(aw, "post_payload", _boom)
+    monkeypatch.setattr(aw, "_email_fallback", lambda unit: 1)
     monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
     monkeypatch.setattr(aw, "_build_body", lambda unit: "body")
     monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
 
     rc = aw.send_alert("accounting-api.service")
     assert rc == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_webhook_failure_falls_back_to_email(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """n8n-outage resilience: a failed webhook POST falls back to the legacy
+    Resend email path (its own dedup namespace) and exits 0 when the email
+    delivers — an n8n outage must never silence unit-failure alerting."""
+    fallback_calls: list[str] = []
+
+    def _failing_post(
+        payload: dict[str, Any], *, key: str, apply: bool, timeout: float = 10.0
+    ) -> WebhookResult:
+        return WebhookResult("failed", None, "network error")
+
+    monkeypatch.setattr(aw, "post_payload", _failing_post)
+    monkeypatch.setattr(
+        aw, "_email_fallback", lambda unit: (fallback_calls.append(unit), 0)[1]
+    )
+    monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
+    monkeypatch.setattr(aw, "_build_body", lambda unit: "body")
+    monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
+
+    rc = aw.send_alert("accounting-backup.service")
+    assert rc == 0
+    assert fallback_calls == ["accounting-backup.service"]
+    # webhook sentinel NOT written — a later webhook retry can still alert
     assert list(tmp_path.iterdir()) == []
 
 

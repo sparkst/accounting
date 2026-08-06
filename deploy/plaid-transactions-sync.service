@@ -1,6 +1,6 @@
 [Unit]
 Description=Daily Plaid transactions sync (--apply) — ingests register transactions via /transactions/sync (register-scope Items: Amex + Chase)
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 
 [Service]
 Type=oneshot
@@ -27,6 +27,8 @@ LockPersonality=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 CapabilityBoundingSet=
 SystemCallFilter=@system-service
-# Activated by plaid-transactions-sync.timer. Exits non-zero if ANY Item errors
-# (e.g. ITEM_LOGIN_REQUIRED) or a cursor is held, tripping the OnFailure alert.
+# Activated by plaid-transactions-sync.timer. Exits non-zero on infra Item
+# errors or a held cursor, tripping the OnFailure alert. REQ-FIX-ALR-009:
+# re-auth-class errors (ITEM_LOGIN_REQUIRED etc.) post a once-per-state sev3
+# webhook alert with the re-connect link and exit 0.
 # Wealth-scope Items never enter this sync (REQ-PC-B1).

@@ -2,7 +2,7 @@
 Description=Accounting Weekly Business Review scorecard — Resend email (REQ-WBR-001..003)
 After=network-online.target
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 
 [Service]
 Type=oneshot

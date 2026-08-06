@@ -589,6 +589,8 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-FIX-ALR-006 | The OnFailure alert email includes the failing unit's last ~15 journal lines and, for dispatcher units, the titles of failed alerts from the ledger. |
 | REQ-FIX-ALR-007 | `accounting-balance-alerts.service` orders `After=plaid-balance-sync.service` (ordering only) so boot catch-up evaluates the fresh snapshot. |
 | REQ-FIX-ALR-008 | The $0 floor fires on `current < 0` (strict), matching REQ-BAL-001 "<$0"; a balance of exactly $0.00 does not alert as an overdraft. |
+| REQ-FIX-ALR-009 | Plaid Items in a human-action error state (`ITEM_LOGIN_REQUIRED`, `PENDING_EXPIRATION`, `PENDING_DISCONNECT`, `ITEM_LOCKED`, `USER_SETUP_REQUIRED`, `ACCESS_NOT_GRANTED`, `ADDITIONAL_CONSENT_REQUIRED`) no longer hard-fail the daily sync units. `src/alerts/plaid_reauth.py` routes them to ONE sev3 severity-webhook alert per `(item, error_code)` state carrying the re-connect link (`https://books.sparkry.ai/admin/connections`), deduped via `data/.alerts` sentinels shared across the three sync scripts; sentinels clear on recovery so a re-break re-alerts. Infra failures (INSTITUTION_DOWN, D1-push, unexpected) still exit non-zero. The freshness sentinel (REQ-SEN-002) independently keeps reporting the stale Item daily. |
+| REQ-FIX-ALR-010 | Every deploy unit's `OnFailure=` targets `accounting-alert-webhook@%p.service` (n8n severity webhook → Telegram); no unit references the Resend email template `accounting-alert@.service` (alerting-consolidation plan §5 cutover). |
 
 ## REQ-FIX-TAX-* — Tax & B&O correctness
 

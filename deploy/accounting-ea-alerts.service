@@ -2,7 +2,7 @@
 Description=Accounting EA alert dispatch — daily WA B&O tax + invoice reminders via n8n
 After=network-online.target
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 
 [Service]
 Type=oneshot

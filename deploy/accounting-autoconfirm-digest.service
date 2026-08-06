@@ -2,7 +2,7 @@
 Description=Accounting weekly auto-confirm digest — trailing 7-day auto:rule confirms, grouped by vendor (REQ-MCA-003)
 After=network-online.target
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 
 [Service]
 Type=oneshot

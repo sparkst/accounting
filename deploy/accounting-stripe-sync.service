@@ -1,7 +1,7 @@
 # /etc/systemd/system/accounting-stripe-sync.service
 [Unit]
 Description=Daily stripe ingest sync (REQ-FIX-ING-020)
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 After=accounting-api.service
 Wants=accounting-api.service
 

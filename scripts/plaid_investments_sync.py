@@ -30,6 +30,7 @@ os.chdir(PROJECT_ROOT)
 
 from src.adapters.plaid_client import make_plaid_client  # noqa: E402
 from src.adapters.plaid_investments import sync_all_wealth  # noqa: E402
+from src.alerts.plaid_reauth import ItemFailure, route_item_failures  # noqa: E402
 from src.db.connection import SessionLocal, init_db  # noqa: E402
 
 logger = logging.getLogger("plaid_investments_sync")
@@ -80,8 +81,24 @@ def main(argv: list[str] | None = None) -> int:
     # Exit policy mirrors plaid_balance_sync: any Item not in a clean state
     # (ok / skipped_invalid_product) is a failure — including a failed D1
     # push, which would otherwise leave the wealth dashboard silently stale.
-    has_failures = batch.total_failed_items > 0
-    return 1 if has_failures else 0
+    # REQ-FIX-ALR-009: re-auth-class Item errors route to a once-per-state
+    # sev3 webhook alert (with the re-connect link) instead of hard-failing
+    # the unit daily; only infra failures exit non-zero.
+    routing = route_item_failures(
+        [
+            ItemFailure(r.item_id, r.institution_name, r.error_code)
+            for r in batch.items
+            if r.status not in ("ok", "skipped_invalid_product")
+        ],
+        [r.item_id for r in batch.items if r.status == "ok"],
+        apply=args.apply,
+    )
+    if routing.reauth:
+        logger.warning(
+            "re-connect needed (sev3 webhook, not a unit failure): %s",
+            ", ".join(f"{f.institution_name}({f.error_code})" for f in routing.reauth),
+        )
+    return 1 if routing.infra else 0
 
 
 if __name__ == "__main__":

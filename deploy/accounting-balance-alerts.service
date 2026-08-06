@@ -2,7 +2,7 @@
 Description=Accounting balance-milestone alert dispatch + daily account pulse via n8n
 After=network-online.target plaid-balance-sync.service
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 # REQ-FIX-ALR-007: ordering only (no Wants=/Requires= on plaid-balance-sync) —
 # a Persistent=true boot catch-up runs the 04:00 sync before this 14:00
 # dispatcher evaluates, and a sync failure never blocks alerting.

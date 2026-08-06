@@ -2,7 +2,7 @@
 Description=Accounting data-level freshness/invariant sentinel (REQ-SEN-001..008)
 After=network-online.target plaid-balance-sync.service plaid-transactions-sync.service accounting-stripe-sync.service accounting-shopify-sync.service
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 # Ordering only (no Wants=/Requires=) — the sentinel must still run and page
 # when a producer unit is broken or missing; that is exactly its job.
 

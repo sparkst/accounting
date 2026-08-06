@@ -1,6 +1,6 @@
 [Unit]
 Description=Daily Plaid balance sync (--apply) — writes plaid_account_balance_snapshot rows
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 
 [Service]
 Type=oneshot

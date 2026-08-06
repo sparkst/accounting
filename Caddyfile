@@ -24,7 +24,16 @@
 	admin off
 }
 
-http://127.0.0.1:9000 {
+# INCIDENT 2026-08-02..08-06: this site address was `http://127.0.0.1:9000`,
+# which in Caddy is a HOST MATCHER, not just a bind address — only requests
+# with `Host: 127.0.0.1` matched. cloudflared forwards the public Host
+# (`books.sparkry.ai`), so every real user got Caddy's no-site-matched empty
+# 200 → blank white page, while the localhost uptime probe (Host 127.0.0.1)
+# stayed green. `http://:9000` matches ANY Host; `bind 127.0.0.1` keeps the
+# listener loopback-only (REQ-HM-003). The uptime probe now sends the public
+# Host header so this class of regression trips the alert.
+http://:9000 {
+	bind 127.0.0.1
 	# Static reports (weekly P&L artifact)
 	handle /reports/* {
 		root * /home/travis/accounting

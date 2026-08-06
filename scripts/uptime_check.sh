@@ -15,14 +15,19 @@
 #
 # Optional env:
 #   UPTIME_URL              override the probe URL (default local Caddy)
+#   UPTIME_HOST_HEADER      Host header to send (default books.sparkry.ai —
+#                           the PUBLIC host, so Caddy host-matching regressions
+#                           fail the probe instead of only failing real users;
+#                           see the 2026-08-02..06 white-page incident)
 #   HEALTHCHECK_PING_URL    dead-man ping on success (no-op if unset)
 #   CURL_BIN                override the curl binary (for tests)
 set -uo pipefail
 
 URL="${UPTIME_URL:-http://127.0.0.1:9000/api/health/ping}"
+HOST_HEADER="${UPTIME_HOST_HEADER:-books.sparkry.ai}"
 CURL="${CURL_BIN:-curl}"
 
-resp="$("$CURL" -s --max-time 15 -w $'\n%{http_code}' "$URL" 2>&1)"
+resp="$("$CURL" -s --max-time 15 -H "Host: ${HOST_HEADER}" -w $'\n%{http_code}' "$URL" 2>&1)"
 
 code="$(printf '%s' "$resp" | tail -n1)"
 body="$(printf '%s' "$resp" | sed '$d')"

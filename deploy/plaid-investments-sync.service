@@ -1,6 +1,6 @@
 [Unit]
 Description=Daily Plaid investments sync (--apply) — pushes wealth-scope holdings to the wealth D1
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 # Run after the balance sync so a shared Plaid outage surfaces once, first.
 After=plaid-balance-sync.service
 
@@ -31,5 +31,7 @@ CapabilityBoundingSet=
 SystemCallFilter=@system-service
 # Activated by plaid-investments-sync.timer. REQ-PC-B3: /investments/holdings/get
 # for wealth-scope Items → POST to the wealth Worker ingest/plaid-holdings.
-# INVALID_PRODUCT Items are skipped-with-log; any other error (incl. a failed
-# D1 push) exits non-zero and fires the OnFailure alert.
+# INVALID_PRODUCT Items are skipped-with-log. REQ-FIX-ALR-009: re-auth-class
+# Item errors (ITEM_LOGIN_REQUIRED etc.) post a once-per-state sev3 webhook
+# alert and exit 0; only infra errors (incl. a failed D1 push) exit non-zero
+# and fire the OnFailure alert.

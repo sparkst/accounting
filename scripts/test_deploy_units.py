@@ -50,7 +50,7 @@ def test_plaid_transactions_sync_service_description_and_wiring() -> None:
     # The corrected Description names TRANSACTIONS (not balances) and the sync mode.
     assert "transactions sync" in desc
     assert "balance" not in desc.lower()
-    assert "OnFailure=accounting-alert@%p.service" in text
+    assert "OnFailure=accounting-alert-webhook@%p.service" in text
     assert "scripts.plaid_transactions_sync --apply" in text
     assert "env -u DOPPLER_TOKEN" in text
 
@@ -71,7 +71,7 @@ def test_plaid_investments_sync_units_exist_in_git() -> None:
 
 def test_plaid_investments_sync_service_wiring() -> None:
     text = (_DEPLOY_DIR / "plaid-investments-sync.service").read_text()
-    assert "OnFailure=accounting-alert@%p.service" in text
+    assert "OnFailure=accounting-alert-webhook@%p.service" in text
     assert "scripts.plaid_investments_sync --apply" in text
     assert "env -u DOPPLER_TOKEN" in text
     # Ordered after the balance sync, but never Wants=/Requires= on it.
@@ -98,7 +98,7 @@ def test_freshness_sentinel_units_exist_in_git() -> None:
 
 def test_freshness_sentinel_service_wiring() -> None:
     text = (_DEPLOY_DIR / "accounting-freshness-sentinel.service").read_text()
-    assert "OnFailure=accounting-alert@%p.service" in text
+    assert "OnFailure=accounting-alert-webhook@%p.service" in text
     assert "scripts.freshness_sentinel --apply" in text
     assert "env -u DOPPLER_TOKEN" in text
 
@@ -126,3 +126,21 @@ def test_freshness_sentinel_timer_daily_1345_persistent() -> None:
     text = (_DEPLOY_DIR / "accounting-freshness-sentinel.timer").read_text()
     assert "OnCalendar=*-*-* 13:45:00 UTC" in text
     assert "Persistent=true" in text
+
+
+# ── REQ-FIX-ALR-010: OnFailure cutover to the n8n severity webhook ───────────
+
+
+def test_no_unit_references_the_email_alert_template() -> None:
+    """Alerting consolidation §5: every unit's OnFailure= targets
+    accounting-alert-webhook@ (n8n severity webhook → Telegram); the Resend
+    email template must be unreferenced. The webhook template itself is
+    exempt (it documents the old template in comments and has no OnFailure=)."""
+    for unit in _DEPLOY_DIR.glob("*.service"):
+        if unit.name == "accounting-alert-webhook@.service":
+            continue
+        for line in unit.read_text().splitlines():
+            if line.startswith("OnFailure="):
+                assert line == "OnFailure=accounting-alert-webhook@%p.service", (
+                    f"{unit.name}: {line}"
+                )

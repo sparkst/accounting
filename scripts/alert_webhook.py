@@ -47,6 +47,24 @@ def _severity(unit: str) -> str:
     return "sev2" if unit in SEV2_UNITS else "sev3"
 
 
+def _email_fallback(unit: str) -> int:
+    """n8n-independent last resort: if the severity webhook cannot deliver,
+    fall back to the legacy Resend email path (scripts/alert.py, its own
+    `alert-*` hourly dedup namespace). Without this, an n8n outage would
+    silence ALL unit-failure alerting — the webhook template deliberately has
+    no OnFailure= of its own, so nothing observes our non-zero exit."""
+    try:
+        from scripts.alert import send_alert as email_send
+
+        return email_send(unit)
+    except Exception as exc:  # noqa: BLE001 — fallback must never raise
+        print(
+            f"[alert-webhook] email fallback raised for {unit}: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return 1
+
+
 def send_alert(unit: str) -> int:
     sdir = _sentinel_dir()
     sdir.mkdir(parents=True, exist_ok=True)
@@ -64,15 +82,17 @@ def send_alert(unit: str) -> int:
     )
     try:
         result = post_payload(payload, key=f"unit:{unit}", apply=True)
-    except Exception as exc:  # noqa: BLE001 — surface send failure to systemd
+    except Exception as exc:  # noqa: BLE001 — fall back, then surface to systemd
         print(f"[alert-webhook] send raised for {unit}: {type(exc).__name__}", file=sys.stderr)
-        return 1
+        return _email_fallback(unit)
     if result.status != "sent":
         # post_payload's error strings are static (never carry URL/secret).
         print(
-            f"[alert-webhook] send failed for {unit}: {result.error}", file=sys.stderr
+            f"[alert-webhook] send failed for {unit}: {result.error} — "
+            f"falling back to Resend email",
+            file=sys.stderr,
         )
-        return 1
+        return _email_fallback(unit)
     sentinel.touch()
     print(f"[alert-webhook] sent for {unit} (type={payload['type']})")
     return 0

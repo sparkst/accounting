@@ -28,6 +28,7 @@ os.chdir(PROJECT_ROOT)
 
 from src.adapters.plaid_client import make_plaid_client  # noqa: E402
 from src.adapters.plaid_transactions import sync_all_active  # noqa: E402
+from src.alerts.plaid_reauth import route_batch  # noqa: E402
 from src.db.connection import SessionLocal, init_db  # noqa: E402
 
 logger = logging.getLogger("plaid_transactions_sync")
@@ -121,15 +122,17 @@ def main(argv: list[str] | None = None) -> int:
                 r.institution_name,
                 dict(sorted(r.unrecognized_account_ids.items())),
             )
-    # Exit non-zero so launchd surfaces a failed/held-cursor sync to ops.
-    # Any per-row failure (cursor held) OR any item not in a clean state
-    # qualifies. A retryable INSTITUTION_DOWN sets status='institution_down'
-    # (not 'error') and holds the cursor, so a status=='error'-only check would
-    # exit 0 and leave ops blind to the held cursor — treat any non-ok status
-    # as a failure (REQ-PT-007).
-    has_failures = batch.total_failed > 0 or any(
-        r.status != "ok" for r in batch.items
+    # Exit non-zero so systemd surfaces a failed/held-cursor sync to ops.
+    # Any per-row failure (cursor held) OR any infra-failed item qualifies.
+    # A retryable INSTITUTION_DOWN sets status='institution_down' (not
+    # 'error') and holds the cursor — still an infra failure (REQ-PT-007).
+    # REQ-FIX-ALR-009: re-auth-class Item errors (ITEM_LOGIN_REQUIRED etc.)
+    # route to a once-per-state sev3 webhook alert with the re-connect link
+    # instead of hard-failing the unit daily.
+    routing = route_batch(
+        batch.items, apply=args.apply, source="transactions", log=logger
     )
+    has_failures = batch.total_failed > 0 or routing.exit_failures
     return 1 if has_failures else 0
 
 

@@ -28,6 +28,7 @@ from src.adapters.plaid_balance import (  # noqa: E402
     sync_all_active,
 )
 from src.adapters.plaid_client import make_plaid_client  # noqa: E402
+from src.alerts.plaid_reauth import route_batch  # noqa: E402
 from src.db.connection import SessionLocal, init_db  # noqa: E402
 
 logger = logging.getLogger("plaid_balance_sync")
@@ -99,18 +100,17 @@ def main(argv: list[str] | None = None) -> int:
         logger.info("wealth D1 push skipped (dry-run): %d row(s) would push", would_push)
 
     # REQ-FIX-PLD-002: mirror plaid_transactions_sync.py's exit policy — any
-    # accounts_failed>0 OR any Item not in a clean 'ok' state is a failure.
-    # The prior policy (only terminal, non-retryable errors) silently exited 0
-    # on a retryable INSTITUTION_DOWN or a partial per-account failure, hiding
-    # them from the OnFailure alert. Idempotent double-runs stay exit-0
-    # (IntegrityError collisions count as accounts_processed, not accounts_failed).
+    # accounts_failed>0 OR any infra-failed Item is a failure. Idempotent
+    # double-runs stay exit-0 (IntegrityError collisions count as
+    # accounts_processed, not accounts_failed).
     # REQ-PC-B2: a failed D1 push is ALSO a failure — the non-zero exit trips
     # the OnFailure alert and replaces the wealth cron's silent-failure mode.
-    has_failures = (
-        batch.total_failed > 0
-        or any(r.status != "ok" for r in batch.items)
-        or push_failed
-    )
+    # REQ-FIX-ALR-009: Items needing a human re-link (ITEM_LOGIN_REQUIRED etc.)
+    # are routed to a once-per-state sev3 webhook alert with the re-connect
+    # link instead of hard-failing the unit daily; the freshness sentinel
+    # (REQ-SEN-002) keeps tracking them until re-linked.
+    routing = route_batch(batch.items, apply=args.apply, source="balance", log=logger)
+    has_failures = batch.total_failed > 0 or routing.exit_failures or push_failed
     return 1 if has_failures else 0
 
 

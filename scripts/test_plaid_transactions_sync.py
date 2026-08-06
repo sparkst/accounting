@@ -1,8 +1,16 @@
 """Tests for scripts/plaid_transactions_sync.py (REQ-PT-014)."""
 
 import unittest.mock as mock
+from pathlib import Path
+
+import pytest
 
 from scripts import plaid_transactions_sync as cli
+
+
+@pytest.fixture(autouse=True)
+def _sentinel_tmpdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALERT_SENTINEL_DIR", str(tmp_path))
 
 
 def test_main_dry_run_default_does_not_apply():
@@ -111,8 +119,53 @@ def test_main_returns_nonzero_when_sync_reports_failures():
         assert cli.main([]) == 1
 
 
-def test_main_returns_nonzero_on_error_status_item():
-    """A terminal/retryable item error (failed counter 0) still exits non-zero."""
+def test_main_returns_zero_on_reauth_item_and_routes_sev3():
+    """REQ-FIX-ALR-009: ITEM_LOGIN_REQUIRED is a human re-link, not an infra
+    failure — the unit exits 0 and the failure routes to the once-per-state
+    sev3 webhook alert instead of tripping OnFailure daily."""
+    captured = {}
+    real_route = cli.route_batch
+
+    def _spy(items, **kwargs):
+        captured["routing"] = real_route(items, **kwargs)
+        return captured["routing"]
+
+    with (
+        mock.patch.object(cli, "sync_all_active") as sync,
+        mock.patch.object(cli, "route_batch", side_effect=_spy),
+        mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()),
+        mock.patch.object(cli, "SessionLocal", return_value=mock.MagicMock()),
+    ):
+        err_item = mock.Mock(
+            status="error",
+            institution_name="Chase",
+            item_id="item-chase",
+            added=0,
+            reactivated=0,
+            failed=0,
+            error_code="ITEM_LOGIN_REQUIRED",
+            skipped_unknown_account={},
+            unrecognized_account_ids={},
+        )
+        sync.return_value = mock.Mock(
+            items=[err_item],
+            total_added=0,
+            total_reactivated=0,
+            total_modified=0,
+            total_removed=0,
+            total_failed=0,
+            total_superseded=0,
+            total_skipped_unknown_account=0,
+            dry_run=False,
+        )
+        assert cli.main([]) == 0
+    routing = captured["routing"]
+    assert [f.error_code for f in routing.reauth] == ["ITEM_LOGIN_REQUIRED"]
+    assert routing.infra == []
+
+
+def test_main_returns_nonzero_on_non_reauth_error_item():
+    """A terminal non-reauth item error (failed counter 0) still exits non-zero."""
     with (
         mock.patch.object(cli, "sync_all_active") as sync,
         mock.patch.object(cli, "make_plaid_client", return_value=mock.Mock()),
@@ -121,10 +174,11 @@ def test_main_returns_nonzero_on_error_status_item():
         err_item = mock.Mock(
             status="error",
             institution_name="Chase",
+            item_id="item-chase",
             added=0,
             reactivated=0,
             failed=0,
-            error_code="ITEM_LOGIN_REQUIRED",
+            error_code="UNEXPECTED",
             skipped_unknown_account={},
             unrecognized_account_ids={},
         )

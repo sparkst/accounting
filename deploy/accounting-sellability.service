@@ -2,7 +2,7 @@
 Description=Accounting sellability metrics — Resend email (REQ-SEL-001..002)
 After=network-online.target
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 
 [Service]
 Type=oneshot

@@ -2,7 +2,7 @@
 Description=Accounting monthly close agent — reconciliation + anomalies + auto-confirm summary email (REQ-MCA-001/004)
 After=network-online.target plaid-transactions-sync.service
 Wants=network-online.target
-OnFailure=accounting-alert@%p.service
+OnFailure=accounting-alert-webhook@%p.service
 # Ordering only (no Wants=/Requires= on the Plaid syncs) — a Persistent=true boot
 # catch-up runs the daily syncs before this month-start job builds the report, and
 # a sync failure never blocks the close email.

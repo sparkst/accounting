@@ -208,7 +208,7 @@ src/reports/         — Weekly P&L report generator
 scripts/             — Operational scripts (backup, deduction-scan, auto-confirm, ingest-brokerage)
 scripts/plaid_balance_sync.py — Daily Plaid balance sync; box unit `plaid-balance-sync.timer` LIVE (04:00 UTC, writes `plaid_account_balance_snapshot` rows — the prior-day baseline the balance-milestone alerts cross against)
 scripts/balance_alerts_dispatch.py — Daily balance-milestone alerts + account-pulse digest (REQ-BAL-001..010); box unit `accounting-balance-alerts.timer` LIVE (14:00 UTC, `--apply --digest` → n8n severity webhook). See `src/balance_alerts/`.
-scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); box unit `plaid-transactions-sync.timer` LIVE (daily 05:00 UTC, writes real txns — Amex + Chase). Job exits non-zero if any Item errors, so a single `ITEM_LOGIN_REQUIRED` (re-auth needed) trips the daily OnFailure alert even though the other Items synced.
+scripts/plaid_transactions_sync.py — Daily Plaid transactions sync (Phase 2); box unit `plaid-transactions-sync.timer` LIVE (daily 05:00 UTC, writes real txns — Amex + Chase). Infra Item errors / held cursors exit non-zero (OnFailure webhook alert); re-auth-class errors (`ITEM_LOGIN_REQUIRED` etc.) post a once-per-state sev3 webhook alert with the re-connect link and exit 0 (REQ-FIX-ALR-009, `src/alerts/plaid_reauth.py`).
 scripts/adapter_sync.py — Scheduled Stripe/Shopify ingest (REQ-FIX-ING-020); box units `accounting-stripe-sync.timer` (05:20 UTC) + `accounting-shopify-sync.timer` (05:30 UTC), both LIVE. Wraps `POST /api/ingest/run`, which returns HTTP 200 even on adapter failure — the wrapper converts embedded `errors`/`records_failed` into a non-zero exit so `OnFailure=` actually alerts. Both adapters had silently not run since 2026-06-08 before this existed.
 scripts/uptime_check.sh — local serving-stack health probe (`accounting-uptime-check.timer`, every 5 min → alert on failure)
 scripts/freshness_sentinel.py — daily data-level freshness/invariant sentinel (REQ-SEN-001..008, `src/monitoring/sentinel.py`); asserts item sync recency, per-source ingestion_log success recency, register snapshot recency, scope anomalies (the mislink signature), register txn flow, weekly-P&L artifact freshness → one aggregated n8n severity-webhook digest/day. DRY-RUN default; exit 1 only on sentinel infra failure.
@@ -253,13 +253,13 @@ Runs on the Hetzner box `ubuntu-4gb-nbg1-2` (Ubuntu 24.04), public at **`https:/
 | `accounting-dashboard.service` | service | SvelteKit `vite preview` `127.0.0.1:5173` |
 | `caddy.service` | service | reverse proxy `127.0.0.1:9000` (cloudflared upstream) |
 | `cloudflared.service` | service | Cloudflare Tunnel `books-accounting` (token in root-600 `/etc/cloudflared/token`) |
-| `accounting-alert@.service` | template | Resend email on any unit's `OnFailure=` (hourly-deduped, sentinel in `data/.alerts`) |
+| `accounting-alert-webhook@.service` | template | n8n severity webhook (Telegram) on any unit's `OnFailure=` (hourly-deduped, sentinel in `data/.alerts`; sev2 = serving stack, sev3 = batch timers — REQ-FIX-ALR-010). The old Resend template `accounting-alert@.service` stays installed-but-unreferenced for 2 weeks post-cutover as instant rollback. |
 | `accounting-backup.timer` | timer | daily 03:17 UTC → R2 (`scripts/backup.sh`, readback-verified, 15d rolling) |
 | `accounting-backup-restore-test.timer` | timer | weekly Sun 07:00 UTC restore + row-count oracle (`scripts/backup_restore_test.py`) |
 | `accounting-disk-check.timer` | timer | every 6h; `<5 GB` free → alert |
 | `weekly-pl-report.timer` | timer | Mon 06:00 UTC → writes `reports/weekly-pl-latest.txt` (served at `/reports/*`) |
 | `accounting-uptime-check.timer` | timer | every 5 min; local Caddy `:9000` health probe → alert on failure |
-| `plaid-transactions-sync.timer` | timer | **LIVE** daily 05:00 UTC → `plaid_transactions_sync --apply` (Amex + Chase). Exits non-zero if any Item errors (e.g. `ITEM_LOGIN_REQUIRED`), tripping the OnFailure alert. |
+| `plaid-transactions-sync.timer` | timer | **LIVE** daily 05:00 UTC → `plaid_transactions_sync --apply` (Amex + Chase). Exits non-zero only on infra errors; re-auth-class Item errors route to a once-per-state sev3 webhook alert (REQ-FIX-ALR-009). |
 | `plaid-balance-sync.timer` | timer | **LIVE** daily 04:00 UTC → `plaid_balance_sync --apply`; writes `plaid_account_balance_snapshot` (the prior-day baseline for balance-milestone alerts). |
 | `accounting-stripe-sync.timer` | timer | **LIVE** daily 05:20 UTC → `adapter_sync --source stripe --apply` (POSTs `/api/ingest/run`). `Persistent=true` so a missed day catches up. |
 | `accounting-shopify-sync.timer` | timer | **LIVE** daily 05:30 UTC → `adapter_sync --source shopify --apply`. Same wrapper; the payouts-scope 403 is an allowlisted benign error (see `scripts/adapter_sync.py`). |

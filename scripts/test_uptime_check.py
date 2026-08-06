@@ -52,3 +52,26 @@ def test_200_but_body_not_ok_exits_nonzero(tmp_path):
     # 200 with an unexpected body must still fail (don't trust the code alone).
     r = _run(tmp_path, '{"ok":false}\n200')
     assert r.returncode != 0
+
+
+def test_probe_sends_public_host_header(tmp_path):
+    """2026-08-02..06 white-page incident: Caddy's site address was a
+    127.0.0.1 HOST matcher, so the localhost probe stayed green while every
+    public-Host request got an empty 200. The probe must send the public Host
+    header so that failure mode trips the alert."""
+    resp_file = tmp_path / "resp.txt"
+    resp_file.write_text('{"ok":true}\n200')
+    args_file = tmp_path / "args.txt"
+    stub = tmp_path / "curl"
+    stub.write_text('#!/bin/sh\necho "$@" >> "$ARGS_FILE"\ncat "$FAKE_RESP_FILE"\n')
+    stub.chmod(0o755)
+    env = {
+        **os.environ,
+        "CURL_BIN": str(stub),
+        "FAKE_RESP_FILE": str(resp_file),
+        "ARGS_FILE": str(args_file),
+        "HEALTHCHECK_PING_URL": "",
+    }
+    r = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "Host: books.sparkry.ai" in args_file.read_text()

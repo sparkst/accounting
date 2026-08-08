@@ -735,3 +735,62 @@ def test_additional_consent_without_history_stays_clean_skip(
     r = batch.items[0]
     assert r.status == "skipped_invalid_product"
     assert batch.total_failed_items == 0
+
+
+def test_products_not_supported_without_history_is_clean_skip(
+    session: Session,
+) -> None:
+    """Live 2026-08-08: a second BofA login answered PRODUCTS_NOT_SUPPORTED —
+    Plaid's third spelling of "this Item has no investments product". Without
+    delivered-holdings history it is the same structural clean skip as
+    INVALID_PRODUCT / ADDITIONAL_CONSENT_REQUIRED, never a unit failure."""
+    from unittest.mock import MagicMock
+
+    from src.adapters.plaid_client import TerminalPlaidError
+
+    _make_item(session, institution_name="Bank of America", item_id="plaid_inv_bofa2")
+    client = MagicMock()
+    client.investments_holdings_get.side_effect = TerminalPlaidError(
+        "PRODUCTS_NOT_SUPPORTED", "products not supported"
+    )
+
+    batch = sync_all_wealth(session, client=client, dry_run=False, post=MagicMock())
+    r = batch.items[0]
+    assert r.status == "skipped_invalid_product"
+    assert r.error_code == "PRODUCTS_NOT_SUPPORTED"
+    assert batch.total_failed_items == 0
+
+
+def test_products_not_supported_on_previously_serving_item_is_an_error(
+    session: Session,
+) -> None:
+    """History discriminator applies to PRODUCTS_NOT_SUPPORTED exactly as it
+    does to ADDITIONAL_CONSENT_REQUIRED: an item that has DELIVERED holdings
+    regressing to this code is a consent regression (user-actionable — routed
+    to the sev3 re-connect reminder by plaid_reauth), not a clean skip."""
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock
+
+    from src.adapters.plaid_client import TerminalPlaidError
+
+    _make_item(session, institution_name="Charles Schwab", item_id="plaid_inv_schwab")
+    session.add(
+        IngestionLog(
+            source="plaid_investments:Charles Schwab",
+            run_at=datetime.now(UTC).replace(tzinfo=None),
+            status="success",
+            records_processed=29,
+        )
+    )
+    session.commit()
+
+    client = MagicMock()
+    client.investments_holdings_get.side_effect = TerminalPlaidError(
+        "PRODUCTS_NOT_SUPPORTED", "products not supported"
+    )
+
+    batch = sync_all_wealth(session, client=client, dry_run=False, post=MagicMock())
+    r = batch.items[0]
+    assert r.status == "error"
+    assert r.error_code == "PRODUCTS_NOT_SUPPORTED"
+    assert batch.total_failed_items >= 1

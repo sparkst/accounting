@@ -47,6 +47,9 @@ def test_reauth_codes_extend_plaid_client_canon() -> None:
     assert pr.is_reauth("INVALID_CREDENTIALS")
     assert pr.is_reauth("ITEM_NOT_FOUND")
     assert pr.is_reauth("ADDITIONAL_CONSENT_REQUIRED")
+    # 2026-08-08 live: consent-shaped sibling — reaches routing only when an
+    # item with delivered-holdings history regressed (re-link, not infra).
+    assert pr.is_reauth("PRODUCTS_NOT_SUPPORTED")
 
 
 def test_unexpected_and_none_error_codes_are_infra() -> None:

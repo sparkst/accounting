@@ -36,7 +36,12 @@ FLASH_ACCOUNTS: dict[str, FlashAccount] = {
     "113a1462-94a3-40ed-8199-79ebbf24d814": FlashAccount("PF-Savings", "cash"),
     "e287c52d-3b1f-47a3-b748-d1595f3d56ea": FlashAccount("PF-MM", "cash"),
     # ── CREDIT ──────────────────────────────────────────────────────────────
+    # Both Alaska Airlines cards are BofA-issued and carry "Atmos Rewards"
+    # institution names since the loyalty-program rebrand; Travis wants them
+    # rendered as "Alaska …" (confirmed 2026-08-02 for Ascent, 2026-08-08 for
+    # Summit).
     "aec8a7e1-a5d4-486f-b75f-52e8f5069235": FlashAccount("Alaska Ascent", "credit"),
+    "d45cea74-ba90-44b8-814f-0ba288b168f1": FlashAccount("Alaska Summit", "credit"),
     "8e804849-8dee-45a6-9a3e-0eb6c97b0d40": FlashAccount("Costco Visa", "credit"),
     "cb0e984f-edb3-4961-8714-690224a3d9c7": FlashAccount("Prime Visa", "credit"),
     # ── STOCKS ──────────────────────────────────────────────────────────────

@@ -205,10 +205,13 @@ _SECTION_SEP = "━━━━━━━━━━━━━━"
 _ROW_WIDTH = 30
 
 #: Chars rendered double-width in monospace fonts beyond east_asian_width
-#: 'W'/'F'. ⚠ is EAW 'A'; ▲/▼ are EAW 'A' too but iOS gives them emoji
-#: presentation and renders them 2 cells — counting them as 1 pushed delta
-#: rows past the column and wrapped on-device (2026-08-02).
-_EXTRA_WIDE = frozenset("⚠▲▼")
+#: 'W'/'F'. ⚠ is EAW 'A' but ships with VS16, so it gets emoji presentation
+#: (2 cells). ▲/▼ (U+25B2/U+25BC) are plain geometric shapes with TEXT
+#: presentation — Telegram <pre> renders them 1 cell. Counting them as 2
+#: shorted every delta row's padding by one space, landing delta-line totals
+#: 1 cell left of the right margin (observed live 2026-08-08, all sections;
+#: supersedes the 2026-08-02 note that blamed a wrap on counting them as 1).
+_EXTRA_WIDE = frozenset("⚠")
 #: Zero-width: variation selectors + ZWJ.
 _ZERO_WIDE = frozenset("️‍")
 

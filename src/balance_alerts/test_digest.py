@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from src.alerts.models import AlertDispatch
 from src.balance_alerts import webhook as wh
 from src.balance_alerts.digest import (
+    PulseLine,
     build_delivery_health,
     build_pulse,
     build_wealth_lines,
@@ -749,7 +750,7 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
     nw_i = text.index("💰 NET WORTH ·       2,238,379\n  ▲13,594")
     assert cash_i < credit_i < stocks_i < f29_i < other_i < nw_i
     # Aligned rows; over-long delta drops to a continuation line.
-    assert "• Prime Visa: ▲100      1,500" in text
+    assert "• Prime Visa: ▲100       1,500" in text
     assert "• E-Trade Stocks:    2,082,694\n  ▲12,694" in text
     # >5-day-old statement row: star after the colon, no emoji.
     assert "• Whole Life:*          52,000" in text
@@ -763,13 +764,61 @@ def test_render_wealth_pulse_sections_and_footer() -> None:
 
 def test_no_line_exceeds_phone_column_width() -> None:
     """REQ-DFB-007 v3 guard: every rendered line fits the iPhone <pre> column
-    (30 display cells) — 34 wrapped on-device 2026-08-02. ▲/▼/⚠ count as 2."""
+    (30 display cells) — 34 wrapped on-device 2026-08-02. ⚠ counts as 2;
+    ▲/▼ count as 1 (text presentation — see _EXTRA_WIDE)."""
     from src.balance_alerts.digest import _ROW_WIDTH, _dwidth
 
     lines, _ = build_wealth_lines(_DFB009_PAYLOAD)
     text = render_wealth_pulse(lines, _MONDAY)
     over = [(_dwidth(ln), ln) for ln in text.split("\n") if _dwidth(ln) > _ROW_WIDTH]
     assert over == [], f"lines exceed {_ROW_WIDTH} cells: {over}"
+
+
+def test_delta_lines_share_the_no_delta_right_margin() -> None:
+    """Delta-alignment fix (2026-08-08): ▲/▼ render 1 cell in Telegram <pre>,
+    so a delta row gets one MORE pad space than the pre-fix output and its
+    total lands on the same right margin as a no-delta row. Fixture mirrors
+    the live CREDIT section that exposed the defect."""
+    fixture = [
+        ("Alaska Summit", "3664", "3496"),   # ▲168
+        ("Alaska Ascent", "2941", "10660"),  # ▼7,719
+        ("Prime Visa", "1901", None),        # no delta
+        ("Costco Visa", "313", "2127"),      # ▼1,814
+    ]
+    lines = [
+        PulseLine(
+            name,
+            "credit",
+            Decimal(bal),
+            False,
+            _MONDAY,
+            None,
+            Decimal(prev) if prev else None,
+            _FRIDAY if prev else None,
+        )
+        for name, bal, prev in fixture
+    ]
+    text = render_wealth_pulse(lines, _MONDAY)
+    assert "• Alaska Summit: ▲168    3,664" in text
+    assert "• Alaska Ascent: ▼7,719  2,941" in text
+    assert "• Prime Visa:            1,901" in text
+    assert "• Costco Visa: ▼1,814      313" in text
+    # Every account row — delta or not — is exactly 30 raw chars, so with
+    # 1-cell arrows the totals right-align at one shared margin.
+    section = text.split("💰 NET WORTH")[0]
+    rows = [ln for ln in section.split("\n") if ln.startswith("• ")]
+    assert len(rows) == 4
+    assert {len(r) for r in rows} == {30}
+
+
+def test_business_flash_inline_delta_alignment(session: Session) -> None:
+    """Same margin rule in the business flash — the fix lives in the shared
+    formatter, not per-section."""
+    _add(session, "a", "Ops Checking", "depository", "checking", "6000.00", d=_MONDAY)
+    _add_snap(session, "a", "5000.00", _FRIDAY)
+    session.commit()
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "• Ops Checking: ▲1,000   6,000" in text
 
 
 def test_weekend_deltas_render_vs_friday() -> None:

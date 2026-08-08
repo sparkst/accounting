@@ -55,10 +55,21 @@ WEALTH_HOLDINGS_INGEST_SOURCE = "plaid-holdings"
 INVALID_PRODUCT_ERROR_CODE = "INVALID_PRODUCT"
 
 #: Per-item skip set: Plaid signals "this Item has no investments product"
-#: as INVALID_PRODUCT for some institutions and ADDITIONAL_CONSENT_REQUIRED
-#: for others (observed live 2026-07-26 on Chase/PenFed/BofA/Citi).
+#: as INVALID_PRODUCT for some institutions, ADDITIONAL_CONSENT_REQUIRED for
+#: others (observed live 2026-07-26 on Chase/PenFed/BofA/Citi), and
+#: PRODUCTS_NOT_SUPPORTED for others still (observed live 2026-08-08 on a
+#: second BofA login).
 INVESTMENTS_UNAVAILABLE_ERROR_CODES = frozenset(
-    {INVALID_PRODUCT_ERROR_CODE, "ADDITIONAL_CONSENT_REQUIRED"}
+    {INVALID_PRODUCT_ERROR_CODE, "ADDITIONAL_CONSENT_REQUIRED", "PRODUCTS_NOT_SUPPORTED"}
+)
+
+#: Subset of the skip set where prior delivered holdings flip the clean skip
+#: into a user-actionable consent regression (see the history discriminator
+#: in ``_sync_one_item``). INVALID_PRODUCT stays structural-only: with
+#: history it signals a client-config regression, which must keep paging as
+#: an infra failure rather than a re-connect reminder.
+CONSENT_REGRESSION_ERROR_CODES = frozenset(
+    {"ADDITIONAL_CONSENT_REQUIRED", "PRODUCTS_NOT_SUPPORTED"}
 )
 
 
@@ -357,15 +368,16 @@ def sync_one_item(
         log_row.error_detail = exc.error_code
     except (TerminalPlaidError, PlaidErrorBase) as exc:
         if exc.error_code in INVESTMENTS_UNAVAILABLE_ERROR_CODES and not (
-            exc.error_code == "ADDITIONAL_CONSENT_REQUIRED"
+            exc.error_code in CONSENT_REGRESSION_ERROR_CODES
             and _has_served_investments(session, item)
         ):
             # Expected for wealth Items without investment accounts — Plaid
-            # answers INVALID_PRODUCT for some institutions and
+            # answers INVALID_PRODUCT for some institutions,
             # ADDITIONAL_CONSENT_REQUIRED for others (first live run
-            # 2026-07-26: Chase/PenFed/BofA/Citi). Skip-with-log, mirroring
+            # 2026-07-26: Chase/PenFed/BofA/Citi), and PRODUCTS_NOT_SUPPORTED
+            # for others still (2026-08-08: BofA). Skip-with-log, mirroring
             # the retired wealth Worker's "no investment accounts" skip.
-            # EXCEPTION (audit 2026-07-27): ADDITIONAL_CONSENT_REQUIRED on an
+            # EXCEPTION (audit 2026-07-27): a consent-shaped code on an
             # item that has previously DELIVERED holdings is an expiring
             # consent (user-actionable, must page), not a structural absence —
             # history is the discriminator, so a Schwab/E*TRADE consent lapse

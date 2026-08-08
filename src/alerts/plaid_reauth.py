@@ -69,6 +69,11 @@ REAUTH_ERROR_CODES = TERMINAL_ERROR_CODES | frozenset(
         "PENDING_DISCONNECT",
         "USER_SETUP_REQUIRED",
         "ADDITIONAL_CONSENT_REQUIRED",
+        # 2026-08-08 live (BofA, investments): a consent-shaped sibling of
+        # ADDITIONAL_CONSENT_REQUIRED. Structural absence is already skipped
+        # at the adapter layer; when it reaches routing it means an item with
+        # delivered-holdings history regressed — a human re-link, not infra.
+        "PRODUCTS_NOT_SUPPORTED",
     }
 )
 

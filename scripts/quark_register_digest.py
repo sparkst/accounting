@@ -80,11 +80,19 @@ def main() -> int:
     max_txn_date = cur.execute(
         "SELECT MAX(date) FROM transactions WHERE status!='rejected'").fetchone()[0]
 
-    # Plaid connections needing re-auth (disconnected / error) — freshness signal.
+    # Plaid connections needing re-auth — only feeds a human must actually fix.
+    # Excluded zombies: 'abandoned'/'pending_oauth' rows (never-completed Link
+    # attempts) and superseded 'disconnected' rows (no mapped accounts AND the
+    # institution has another active item covering it).
     try:
         plaid_reauth = int(scalar(
-            "SELECT COUNT(*) FROM plaid_item "
-            "WHERE status!='active' OR last_sync_status='error'"))
+            "SELECT COUNT(*) FROM plaid_item pi "
+            "WHERE (pi.status='active' AND pi.last_sync_status='error') "
+            "OR (pi.status='disconnected' AND ("
+            "  EXISTS (SELECT 1 FROM account a WHERE a.plaid_item_id=pi.id) "
+            "  OR NOT EXISTS (SELECT 1 FROM plaid_item pj "
+            "     WHERE pj.institution_id=pi.institution_id "
+            "     AND pj.status='active')))"))
     except sqlite3.Error:
         plaid_reauth = None
 

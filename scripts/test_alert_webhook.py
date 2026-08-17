@@ -32,6 +32,9 @@ def sent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[dict[str, Any]
     monkeypatch.setattr(aw, "post_payload", _fake_post_payload)
     monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
     monkeypatch.setattr(aw, "_build_body", lambda unit: f"body for {unit}")
+    # hermetic: no systemctl/journalctl on the test host
+    monkeypatch.setattr(aw, "_unit_result", lambda unit: None)
+    monkeypatch.setattr(aw, "_probe_line", lambda unit: None)
     monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
     return captured
 
@@ -63,7 +66,7 @@ def test_batch_job_unit_maps_to_sev3(sent: list[dict[str, Any]]) -> None:
 def test_body_and_alert_key_ride_the_payload(sent: list[dict[str, Any]]) -> None:
     aw.send_alert("weekly-pl-report.service")
     payload = sent[0]
-    assert payload["message"] == "body for weekly-pl-report.service"
+    assert payload["message"].endswith("body for weekly-pl-report.service")
     assert payload["alert_key"] == "unit:weekly-pl-report.service:2026080214"
 
 
@@ -147,3 +150,101 @@ def test_webhook_sentinels_use_distinct_namespace(
 
 def test_main_requires_unit_arg() -> None:
     assert aw.main([]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #53: distinguish "unit slow to start" (host starvation) from
+# "endpoint down" for accounting-uptime-check. The probe result and the
+# systemd Result= belong in the alert body; only a real probe failure pages sev2.
+# ---------------------------------------------------------------------------
+
+_UPTIME = "accounting-uptime-check.service"
+
+
+def _wire_probe(
+    monkeypatch: pytest.MonkeyPatch, *, result: str | None, probe: str | None
+) -> None:
+    monkeypatch.setattr(aw, "_unit_result", lambda unit: result)
+    monkeypatch.setattr(aw, "_probe_line", lambda unit: probe)
+
+
+def test_uptime_timeout_with_probe_ok_downgrades_to_info(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire_probe(
+        monkeypatch,
+        result="timeout",
+        probe="uptime ok: http://127.0.0.1:9000/api/health/ping -> 200",
+    )
+    assert aw.send_alert(_UPTIME) == 0
+    p = sent[0]
+    assert p["type"] == "info"
+    assert "slow to start" in p["title"]
+    assert "probe OK" in p["title"]
+    assert "Probe result: uptime ok" in p["message"]
+    assert "systemd Result: timeout" in p["message"]
+    assert "NOT a serving-stack outage" in p["message"]
+
+
+def test_uptime_timeout_without_probe_line_is_sev3(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire_probe(monkeypatch, result="timeout", probe=None)
+    aw.send_alert(_UPTIME)
+    p = sent[0]
+    assert p["type"] == "sev3"
+    assert "before the probe completed" in p["title"]
+    assert "Probe result: (none" in p["message"]
+
+
+def test_uptime_probe_fail_stays_sev2_with_probe_line(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    probe = "uptime FAIL: http://127.0.0.1:9000/api/health/ping -> code=502 body=Bad Gateway"
+    _wire_probe(monkeypatch, result="exit-code", probe=probe)
+    aw.send_alert(_UPTIME)
+    p = sent[0]
+    assert p["type"] == "sev2"
+    assert p["title"] == f"[accounting/hetzner] unit failed: {_UPTIME}"
+    assert f"Probe result: {probe}" in p["message"]
+    assert "systemd Result: exit-code" in p["message"]
+
+
+def test_uptime_timeout_but_probe_fail_line_stays_sev2(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout whose invocation still logged a FAIL line is a real outage."""
+    _wire_probe(monkeypatch, result="timeout", probe="uptime FAIL: x -> code=000 body=")
+    aw.send_alert(_UPTIME)
+    assert sent[0]["type"] == "sev2"
+
+
+def test_non_uptime_units_carry_result_but_keep_severity(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire_probe(monkeypatch, result="timeout", probe=None)
+    aw.send_alert("plaid-balance-sync.service")
+    aw.send_alert("caddy.service")
+    assert sent[0]["type"] == "sev3"
+    assert sent[1]["type"] == "sev2"
+    assert "systemd Result: timeout" in sent[0]["message"]
+    assert "Probe result" not in sent[0]["message"]
+
+
+def test_unknown_result_is_omitted_gracefully(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _wire_probe(monkeypatch, result=None, probe=None)
+    aw.send_alert("caddy.service")
+    assert sent[0]["type"] == "sev2"
+    assert "systemd Result" not in sent[0]["message"]
+
+
+def test_probe_line_picks_last_probe_line_of_journal(monkeypatch: pytest.MonkeyPatch) -> None:
+    journal = "uptime ok: a -> 200\nsome noise\nuptime FAIL: b -> code=502 body=x"
+    monkeypatch.setattr(aw, "_invocation_journal", lambda unit: journal)
+    assert aw._probe_line(_UPTIME) == "uptime FAIL: b -> code=502 body=x"
+    monkeypatch.setattr(aw, "_invocation_journal", lambda unit: "no probe line here")
+    assert aw._probe_line(_UPTIME) is None
+    monkeypatch.setattr(aw, "_invocation_journal", lambda unit: None)
+    assert aw._probe_line(_UPTIME) is None

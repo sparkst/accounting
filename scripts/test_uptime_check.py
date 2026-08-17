@@ -75,3 +75,42 @@ def test_probe_sends_public_host_header(tmp_path):
     r = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr
     assert "Host: books.sparkry.ai" in args_file.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Issue #53: the unit is versioned in deploy/ and tolerant of slow starts.
+# ---------------------------------------------------------------------------
+
+DEPLOY = Path(__file__).resolve().parents[1] / "deploy"
+
+
+def _kv(text: str, key: str) -> str:
+    for line in text.splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    raise AssertionError(f"{key}= missing")
+
+
+def test_unit_start_timeout_tolerates_starvation_but_fits_timer_period():
+    svc = (DEPLOY / "accounting-uptime-check.service").read_text()
+    tmr = (DEPLOY / "accounting-uptime-check.timer").read_text()
+    timeout = int(_kv(svc, "TimeoutStartSec"))
+    # curl --max-time 15 (probe) + 10 (dead-man ping) = 25 s of bounded network
+    # time; the rest is scheduling latency on a starved 2 vCPU box (issue #53
+    # saw >60 s). Must still finish before the next 5-min timer tick.
+    assert 120 <= timeout < 300
+    assert _kv(tmr, "OnUnitActiveSec") == "5min"
+    assert _kv(svc, "Type") == "oneshot"
+    assert _kv(svc, "OnFailure") == "accounting-alert-webhook@%p.service"
+    assert _kv(svc, "ExecStart").endswith("/scripts/uptime_check.sh")
+
+
+def test_probe_curl_bounds_are_inside_unit_timeout():
+    svc = (DEPLOY / "accounting-uptime-check.service").read_text()
+    timeout = int(_kv(svc, "TimeoutStartSec"))
+    script = SCRIPT.read_text()
+    import re
+
+    bounds = [int(m) for m in re.findall(r"--max-time (\d+)", script)]
+    assert bounds, "uptime_check.sh must bound every curl with --max-time"
+    assert sum(bounds) < timeout

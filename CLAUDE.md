@@ -258,7 +258,7 @@ Runs on the Hetzner box `ubuntu-4gb-nbg1-2` (Ubuntu 24.04), public at **`https:/
 | `accounting-backup-restore-test.timer` | timer | weekly Sun 07:00 UTC restore + row-count oracle (`scripts/backup_restore_test.py`) |
 | `accounting-disk-check.timer` | timer | every 6h; `<5 GB` free → alert |
 | `weekly-pl-report.timer` | timer | Mon 06:00 UTC → writes `reports/weekly-pl-latest.txt` (served at `/reports/*`) |
-| `accounting-uptime-check.timer` | timer | every 5 min; local Caddy `:9000` health probe → alert on failure |
+| `accounting-uptime-check.timer` | timer | every 5 min; local Caddy `:9000` health probe → alert on failure. Units versioned in `deploy/accounting-uptime-check.{service,timer}` (`TimeoutStartSec=240`, install via `deploy/install_uptime_check.sh` as root); `alert_webhook.py::classify` turns Result=timeout + `uptime ok` into info (host starvation), not sev2 (issue #53). |
 | `plaid-transactions-sync.timer` | timer | **LIVE** daily 05:00 UTC → `plaid_transactions_sync --apply` (Amex + Chase). Exits non-zero only on infra errors; re-auth-class Item errors route to a once-per-state sev3 webhook alert (REQ-FIX-ALR-009). |
 | `plaid-balance-sync.timer` | timer | **LIVE** daily 04:00 UTC → `plaid_balance_sync --apply`; writes `plaid_account_balance_snapshot` (the prior-day baseline for balance-milestone alerts). |
 | `accounting-stripe-sync.timer` | timer | **LIVE** daily 05:20 UTC → `adapter_sync --source stripe --apply` (POSTs `/api/ingest/run`). `Persistent=true` so a missed day catches up. |

@@ -1284,3 +1284,207 @@ def test_unique_snapshot_collision_still_absorbed(
     session.commit()
     assert result.accounts_failed == 0
     assert result.accounts_processed >= 1
+
+
+# ── REQ-FIX-PLD-007 — incident 2026-08-17: superseded same-institution Item ─
+#
+# Two "Bank of America" Items were active on the box (the original, plus a
+# fresh Link that minted new plaid_account_ids). After the D1 dossier was
+# relinked to the NEW ids on 2026-08-08, the OLD Item's single row went
+# wholly-unmapped and the sync paged daily for 9 days with the message
+# "Bank of America: D1 skipped ALL 1 row(s) as unmapped" — which named neither
+# Item nor account, so the operator could not tell WHICH of the two same-name
+# Items to retire. The contract (wholly-unmapped Item → page, siblings still
+# push, exit 1) is unchanged; the page must now carry the exact ids and, when
+# a healthy same-institution sibling exists, the retire command.
+
+
+def _wealth_item_result(
+    local_id: str,
+    institution_name: str,
+    rows: list[dict[str, Any]],
+    *,
+    plaid_item_id: str = "",
+    labels: dict[str, str] | None = None,
+) -> Any:
+    from src.adapters.plaid_balance import ItemSyncResult
+
+    return ItemSyncResult(
+        item_id=local_id,
+        institution_name=institution_name,
+        status="ok",
+        scope="wealth",
+        fresh_balances=rows,
+        plaid_item_id=plaid_item_id,
+        fresh_labels=labels or {},
+    )
+
+
+def _post_unmapped_only_for(unmapped_ids: set[str]) -> Any:
+    """Endpoint stub: rows whose plaid_account_id is in ``unmapped_ids`` are
+    skipped-unmapped; everything else is written."""
+
+    def _post(payload: dict[str, Any], source: str) -> dict[str, Any]:
+        rows = payload["snapshots"]
+        n_unmapped = sum(1 for r in rows if r["plaid_account_id"] in unmapped_ids)
+        n_ok = len(rows) - n_unmapped
+        return {
+            "records_processed": n_ok,
+            "records_written": n_ok,
+            "records_skipped_unmapped": n_unmapped,
+            "records_failed": 0,
+        }
+
+    return _post
+
+
+def test_push_one_wholly_unmapped_item_among_many_pages_but_pushes_the_rest(
+    session: Session,
+) -> None:
+    """One wholly-unmapped Item in a multi-Item batch: every OTHER Item still
+    pushes and resolves, the batch is flagged failed (exit 1 → OnFailure page),
+    the local delivery-health log is partial_failure, and the error names the
+    exact local Item id, Plaid item_id, and unmapped plaid_account_id(s) with
+    their name·mask·subtype labels."""
+    from src.adapters.plaid_balance import BatchResult, push_fresh_balances
+
+    batch = BatchResult(dry_run=False)
+    batch.items.append(
+        _wealth_item_result(
+            "id-boa-old",
+            "Bank of America",
+            [{"plaid_account_id": "N0qbo-old-ascent", "current_balance": "3416.18"}],
+            plaid_item_id="qna7-old",
+            labels={"N0qbo-old-ascent": "Atmos Rewards Ascent Visa Signature ·8196· credit card"},
+        )
+    )
+    batch.items.append(
+        _wealth_item_result(
+            "id-boa-new",
+            "Bank of America",
+            [
+                {"plaid_account_id": "PLxKw-new-summit", "current_balance": "4043.10"},
+                {"plaid_account_id": "1BAnK-new-ascent", "current_balance": "3416.18"},
+            ],
+            plaid_item_id="yBm4-new",
+        )
+    )
+    batch.items.append(
+        _wealth_item_result("id-vanguard", "Vanguard", [_row(1), _row(2)], plaid_item_id="ewP9")
+    )
+
+    push = push_fresh_balances(
+        batch, session=session, post=_post_unmapped_only_for({"N0qbo-old-ascent"})
+    )
+
+    # Contract: siblings unaffected, batch flagged.
+    assert push.total_pushed == 5
+    assert push.failed is True
+    by_id = {p.item_id: p for p in push.items}
+    assert by_id["id-boa-new"].error is None
+    assert by_id["id-boa-new"].records_processed == 2
+    assert by_id["id-vanguard"].error is None
+    assert by_id["id-vanguard"].records_processed == 2
+    old = by_id["id-boa-old"]
+    assert old.error is not None
+    assert "ALL 1 row(s) as unmapped" in old.error
+    # Actionable identity — never just the (ambiguous) institution name.
+    assert "id-boa-old" in old.error
+    assert "qna7-old" in old.error
+    assert "N0qbo-old-ascent" in old.error
+    assert "Atmos Rewards Ascent Visa Signature ·8196· credit card" in old.error
+    # The healthy same-institution sibling makes this the superseded-Item
+    # signature: the page carries the retire command for THIS Item's local id.
+    assert "SUPERSEDED" in old.error
+    assert "id-boa-new" in old.error
+    assert "/api/plaid/disconnect/id-boa-old" in old.error
+    # The retire hint must never point at the healthy sibling.
+    assert "/api/plaid/disconnect/id-boa-new" not in old.error
+
+    log = session.query(IngestionLog).filter_by(source="wealth_cloud:plaid_balance").one()
+    assert log.status == "partial_failure"
+    assert log.records_processed == 5
+    assert log.records_failed == 1
+    assert log.error_detail is not None
+    assert "id-boa-old" in log.error_detail
+    assert "/api/plaid/disconnect/id-boa-old" in log.error_detail
+
+
+def test_push_wholly_unmapped_item_without_healthy_sibling_has_no_superseded_hint(
+    session: Session,
+) -> None:
+    """A wholly-unmapped Item whose institution has NO other resolving Item is
+    the genuine mapping-broke case: still pages, still names ids, but must not
+    tell the operator to retire it — there is nothing superseding it."""
+    from src.adapters.plaid_balance import BatchResult, push_fresh_balances
+
+    batch = BatchResult(dry_run=False)
+    batch.items.append(
+        _wealth_item_result(
+            "id-schwab", "Charles Schwab", [_row(1)], plaid_item_id="ZgEm",
+            labels={"acct-1": "Schwab One ·1234· brokerage"},
+        )
+    )
+    batch.items.append(
+        _wealth_item_result("id-vanguard", "Vanguard", [_row(2)], plaid_item_id="ewP9")
+    )
+
+    push = push_fresh_balances(
+        batch, session=session, post=_post_unmapped_only_for({"acct-1"})
+    )
+
+    assert push.failed is True
+    schwab = next(p for p in push.items if p.item_id == "id-schwab")
+    assert schwab.error is not None
+    assert "id-schwab" in schwab.error and "ZgEm" in schwab.error
+    assert "acct-1" in schwab.error and "Schwab One ·1234· brokerage" in schwab.error
+    assert "SUPERSEDED" not in schwab.error
+    assert "/api/plaid/disconnect/" not in schwab.error
+    vanguard = next(p for p in push.items if p.item_id == "id-vanguard")
+    assert vanguard.error is None
+
+
+def test_push_superseded_hint_ignores_sibling_that_also_failed_to_resolve(
+    session: Session,
+) -> None:
+    """Two same-institution Items BOTH wholly-unmapped is not supersession —
+    neither may be told to retire in favour of the other."""
+    from src.adapters.plaid_balance import BatchResult, push_fresh_balances
+
+    batch = BatchResult(dry_run=False)
+    batch.items.append(_wealth_item_result("id-a", "Bank of America", [_row(1)]))
+    batch.items.append(_wealth_item_result("id-b", "Bank of America", [_row(2)]))
+
+    push = push_fresh_balances(
+        batch, session=session, post=_post_unmapped_only_for({"acct-1", "acct-2"})
+    )
+
+    assert push.failed is True
+    for p in push.items:
+        assert p.error is not None
+        assert "SUPERSEDED" not in p.error
+        assert "/api/plaid/disconnect/" not in p.error
+
+
+def test_wealth_scope_sync_records_plaid_item_id_and_account_labels(
+    session: Session,
+) -> None:
+    """The per-Item sync result must carry what the push needs to page
+    actionably: the Plaid item_id and a name·mask·subtype label per collected
+    plaid_account_id (register scope already had this via ``unmapped``)."""
+    item = _make_wealth_item(session, institution_name="Chase")
+    client = _mock_client_returning("accounts_balance_get_mixed")
+
+    result = sync_one_item(session, item, client=client)
+    session.commit()
+
+    assert result.plaid_item_id == item.item_id
+    assert set(result.fresh_labels) == {r["plaid_account_id"] for r in result.fresh_balances}
+    assert (
+        result.fresh_labels["plaid_acct_chase_checking_0001"]
+        == "Chase Total Checking ·0123· checking"
+    )
+    assert (
+        result.fresh_labels["plaid_acct_chase_card_0003"]
+        == "Chase Sapphire Preferred ·4567· credit card"
+    )

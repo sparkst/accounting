@@ -96,6 +96,17 @@ class ItemSyncResult:
     #: persisted locally. P0-r3a: populated for WEALTH-scope Items ONLY —
     #: always empty for register scope, whose balances are local-only.
     fresh_balances: list[dict[str, Any]] = field(default_factory=list)
+    #: Plaid's own item_id (``plaid_item.item_id``) — ``item_id`` above is the
+    #: LOCAL row uuid. Both are needed to page actionably: the local id is what
+    #: ``POST /api/plaid/disconnect/{id}`` takes, the Plaid id is what D1's
+    #: ``plaid_item`` table and the Plaid dashboard show.
+    plaid_item_id: str = ""
+    #: WEALTH scope: plaid_account_id → "name ·mask· subtype" for every
+    #: collected ``fresh_balances`` row (the register-scope ``unmapped`` list's
+    #: counterpart), so a wholly-unmapped push can name the exact account(s)
+    #: instead of just the institution — which is ambiguous the moment two
+    #: Items for the same institution are active (incident 2026-08-17).
+    fresh_labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -283,6 +294,7 @@ def sync_one_item(
         institution_name=item.institution_name,
         status="ok",
         scope=getattr(item, "scope", "register") or "register",
+        plaid_item_id=getattr(item, "item_id", "") or "",
     )
     log_row = IngestionLog(
         source=f"plaid_balance:{item.institution_name}",
@@ -469,6 +481,7 @@ def _process_plaid_account(
             # happens for this scope, and D1's conditional upsert wants the
             # freshest value on every run.
             result.fresh_balances.append(fresh_row)
+            result.fresh_labels[plaid_account_id] = _unmapped_label(plaid_account)
             result.accounts_processed += 1
         return
 
@@ -565,6 +578,17 @@ class PushItemResult:
     institution_name: str
     rows: int = 0
     pushed: int = 0
+    #: Plaid's item_id (see ``ItemSyncResult.plaid_item_id``).
+    plaid_item_id: str = ""
+    #: True when the item hit the "wholly unmapped" signature below — kept as
+    #: a flag (not just an error string) so the post-loop supersession pass
+    #: can find these items deterministically.
+    wholly_unmapped: bool = False
+    #: Local id of a healthy same-institution sibling Item whose rows DID
+    #: resolve in D1 while this Item's rows were all unmapped — the
+    #: superseded-Item signature (a fresh Link minted new plaid_account_ids
+    #: and the D1 dossier was relinked to them). None otherwise.
+    superseded_by: str | None = None
     # P1-b2r/P1-002: counts parsed from the endpoint's own response body (not
     # just the local send count) — a 200 that wrote nothing is not success.
     # P2-001: records_processed also parsed (includes idempotent no-op rows,
@@ -596,6 +620,70 @@ class PushResult:
 
 def _chunked(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
     return [rows[i : i + size] for i in range(0, len(rows), size)]
+
+
+def _unmapped_item_detail(item_result: ItemSyncResult) -> str:
+    """Render ``[item <local id> / plaid <item_id>: <pid> 'label'; ...]``.
+
+    Names the Item by BOTH ids and every pushed plaid_account_id with its
+    name·mask·subtype label (when the sync collected one), so an operator
+    reading the alert can tell two same-institution Items apart and see which
+    account D1 could not resolve — the institution name alone cannot.
+    """
+    plaid_id = getattr(item_result, "plaid_item_id", "") or "?"
+    labels = getattr(item_result, "fresh_labels", None) or {}
+    parts: list[str] = []
+    for row in item_result.fresh_balances:
+        pid = str(row.get("plaid_account_id", "?"))
+        label = labels.get(pid)
+        parts.append(f"{pid} '{label}'" if label else pid)
+    return f"[item {item_result.item_id} / plaid {plaid_id}: {'; '.join(parts)}]"
+
+
+def _annotate_superseded_items(push: PushResult) -> None:
+    """Post-loop pass: mark wholly-unmapped Items that a healthy same-
+    institution sibling supersedes, and put the retire command in the page.
+
+    Signature (incident 2026-08-17): a fresh Plaid Link for an institution
+    mints NEW plaid_account_ids; once the D1 dossier is relinked to them, the
+    OLD Item's rows are all unmapped while the NEW Item's rows resolve. The
+    contract is unchanged — the old Item still pages (exit 1) — but the page
+    now says which Item to retire and how, instead of an ambiguous
+    "<institution>: D1 skipped ALL ..." that named neither Item. Two same-
+    institution Items that BOTH failed to resolve are NOT supersession (nothing
+    proves either is the live one), so no hint is added in that case.
+    """
+    for pr in push.items:
+        if not pr.wholly_unmapped:
+            continue
+        sibling = next(
+            (
+                other
+                for other in push.items
+                if other is not pr
+                and other.institution_name == pr.institution_name
+                and other.error is None
+                and other.records_processed > 0
+            ),
+            None,
+        )
+        if sibling is None:
+            continue
+        pr.superseded_by = sibling.item_id
+        pr.error = (
+            f"{pr.error} — likely SUPERSEDED by the newer '{pr.institution_name}' "
+            f"Item {sibling.item_id} (plaid {sibling.plaid_item_id or '?'}), whose "
+            f"rows resolved in D1; retire this Item with "
+            f"POST /api/plaid/disconnect/{pr.item_id}"
+        )
+        logger.warning(
+            "plaid balance D1 push: Item %s (%s) looks superseded by Item %s — "
+            "retire it via POST /api/plaid/disconnect/%s",
+            pr.item_id,
+            pr.institution_name,
+            sibling.item_id,
+            pr.item_id,
+        )
 
 
 def push_fresh_balances(
@@ -634,6 +722,7 @@ def push_fresh_balances(
             item_id=item_result.item_id,
             institution_name=item_result.institution_name,
             rows=len(item_result.fresh_balances),
+            plaid_item_id=getattr(item_result, "plaid_item_id", "") or "",
         )
         push.items.append(pr)
         if not item_result.fresh_balances:
@@ -699,10 +788,12 @@ def push_fresh_balances(
                 # only a WHOLLY unmapped item — zero rows resolved, every row
                 # skipped-unmapped — is the "mapping broke" signature that
                 # must page.
+                pr.wholly_unmapped = True
                 pr.error = (
                     f"D1 skipped ALL {pr.records_skipped_unmapped} row(s) as "
                     f"unmapped ({pr.pushed} pushed) — the item's account "
-                    "mapping in D1 is missing or broken"
+                    "mapping in D1 is missing or broken "
+                    + _unmapped_item_detail(item_result)
                 )
             elif deliverable > 0 and pr.records_processed == 0:
                 # P2-001: records_processed (unlike records_written) already
@@ -722,6 +813,8 @@ def push_fresh_balances(
                 pr.institution_name,
                 type(exc).__name__,
             )
+
+    _annotate_superseded_items(push)
 
     # P0-r3a: with no wealth-scope Items there is no delivery to report on —
     # writing a "success, 0 records" row would misrepresent a run that never

@@ -1,0 +1,32 @@
+[Unit]
+Description=Local serving-stack health probe (Caddy :9000 → uvicorn)
+OnFailure=accounting-alert-webhook@%p.service
+
+[Service]
+Type=oneshot
+User=travis
+Group=travis
+WorkingDirectory=/home/travis/accounting
+ExecStart=/bin/bash /home/travis/accounting/scripts/uptime_check.sh
+# Issue #53: the probe itself is bounded inside the script (curl --max-time 15
+# + 10 for the dead-man ping); everything beyond that is scheduling latency on
+# a starved 2 vCPU box (2026-08-14/15: load ~35 → sandbox setup + fork took
+# >60 s while the probe still returned 200, paging 4 false sev3s). 240 s lets
+# the script's own exit code — not systemd's timeout — decide, and still fits
+# inside the 5-min timer period. When it DOES time out, alert_webhook.py reads
+# Result=timeout + the invocation's probe line and downgrades to info/sev3.
+TimeoutStartSec=240
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+# Activated by accounting-uptime-check.timer — not enabled directly (no [Install]).

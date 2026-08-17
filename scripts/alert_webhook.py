@@ -21,13 +21,19 @@ uptime-check — books.sparkry.ai is down or unprobeable) → sev2; every other
 unit (batch timers: syncs, backups, reports) → sev3. The webhook's own
 routing turns sev2/sev3 into the right Telegram channel; unknown types
 downgrade to info upstream, never dropped.
+
+Issue #53 (`classify`): every body carries the unit's systemd ``Result=``;
+accounting-uptime-check is further split by what happened — Result=timeout
+with an ``uptime ok`` probe line → info (host starvation, endpoint up),
+timeout with no probe verdict → sev3, ``uptime FAIL`` → sev2 as before.
 """
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
-from scripts.alert import _build_body, _hour, _sentinel_dir
+from scripts.alert import _build_body, _hour, _redact, _sentinel_dir
 from src.balance_alerts.webhook import build_payload_dict, post_payload
 
 #: Units whose failure means the public serving path (books.sparkry.ai) is
@@ -43,8 +49,127 @@ SEV2_UNITS = frozenset(
 )
 
 
+#: The 5-min serving-stack probe (scripts/uptime_check.sh). Issue #53: its
+#: OnFailure can fire because systemd hit TimeoutStartSec on a starved host
+#: while the probe itself returned 200 — that is host starvation, not an
+#: outage, and must not page sev2.
+PROBE_UNIT = "accounting-uptime-check.service"
+_SYSTEMCTL_TIMEOUT_SECONDS = 10
+_PROBE_PREFIXES = ("uptime ok:", "uptime FAIL:")
+
+
 def _severity(unit: str) -> str:
     return "sev2" if unit in SEV2_UNITS else "sev3"
+
+
+def _systemctl_show(unit: str, prop: str) -> str | None:
+    """Best-effort ``systemctl show -p <prop> --value <unit>`` (no privileges
+    needed for system units). None on any failure."""
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed args, unit is systemd-controlled
+            ["systemctl", "show", "-p", prop, "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=_SYSTEMCTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 — enrichment only, never blocks the alert
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _unit_result(unit: str) -> str | None:
+    """systemd's ``Result=`` for the failed unit: ``timeout`` (start timeout
+    hit), ``exit-code`` (the process itself failed), ``signal``, ..."""
+    return _systemctl_show(unit, "Result")
+
+
+def _invocation_journal(unit: str) -> str | None:
+    """Journal lines of the unit's LAST invocation only (not the previous
+    5-min runs, whose ``uptime ok`` would masquerade as this run's result)."""
+    invocation = _systemctl_show(unit, "InvocationID")
+    if not invocation:
+        return None
+    try:
+        result = subprocess.run(  # noqa: S603 — fixed args, no shell
+            [
+                "journalctl",
+                f"_SYSTEMD_INVOCATION_ID={invocation}",
+                "--no-pager",
+                "-o",
+                "cat",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_SYSTEMCTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return _redact(result.stdout.strip()) or None
+
+
+def _probe_line(unit: str) -> str | None:
+    """The last ``uptime ok:`` / ``uptime FAIL:`` line the failed invocation
+    logged, or None if the probe never got that far."""
+    journal = _invocation_journal(unit)
+    if not journal:
+        return None
+    for line in reversed(journal.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith(_PROBE_PREFIXES):
+            return stripped
+    return None
+
+
+def classify(unit: str) -> tuple[str, str, list[str]]:
+    """(severity, title, extra body lines) for the failed unit.
+
+    Every unit gets its systemd ``Result=`` in the body. The probe unit is
+    additionally classified by what actually happened:
+      * Result=timeout + probe logged ``uptime ok``  → info  (host starvation,
+        NOT an outage — the endpoint answered 200);
+      * Result=timeout + no probe line               → sev3  (the probe could
+        not run inside the start window — starvation, endpoint state unknown);
+      * probe logged ``uptime FAIL`` (any Result)     → sev2  (endpoint down).
+    """
+    severity = _severity(unit)
+    title = f"[accounting/hetzner] unit failed: {unit}"
+    result = _unit_result(unit)
+    extra: list[str] = []
+    if result:
+        extra.append(f"systemd Result: {result}")
+    if unit != PROBE_UNIT:
+        return severity, title, extra
+
+    probe = _probe_line(unit)
+    extra.append(f"Probe result: {probe or '(none — the probe never reached its verdict)'}")
+    probe_ok = probe is not None and probe.startswith("uptime ok:")
+    probe_fail = probe is not None and probe.startswith("uptime FAIL:")
+    if result == "timeout" and probe_ok:
+        severity = "info"
+        title = (
+            "[accounting/hetzner] accounting-uptime-check slow to start "
+            "(host starvation) — probe OK"
+        )
+        extra.append(
+            "systemd hit TimeoutStartSec before the unit finished, but the probe "
+            "answered 200 — this is host starvation (CPU/memory), NOT a serving-stack "
+            "outage. Check load/swap on the box; books.sparkry.ai is up."
+        )
+    elif result == "timeout" and not probe_fail:
+        severity = "sev3"
+        title = (
+            "[accounting/hetzner] accounting-uptime-check timed out before the "
+            "probe completed (host starvation?)"
+        )
+        extra.append(
+            "systemd hit TimeoutStartSec and the probe never logged a verdict — "
+            "the box was too starved to run it. Endpoint state UNKNOWN: check "
+            "load/swap, then curl -H 'Host: books.sparkry.ai' 127.0.0.1:9000/api/health/ping."
+        )
+    return severity, title, extra
 
 
 def _email_fallback(unit: str) -> int:
@@ -74,10 +199,14 @@ def send_alert(unit: str) -> int:
         print(f"[alert-webhook] already sent for {unit} this hour — skipping")
         return 0
 
+    severity, title, extra = classify(unit)
+    body = _build_body(unit)
+    if extra:
+        body = "\n".join([*extra, "", body])
     payload = build_payload_dict(
-        severity=_severity(unit),
-        title=f"[accounting/hetzner] unit failed: {unit}",
-        message=_build_body(unit),
+        severity=severity,
+        title=title,
+        message=body,
         alert_key=f"unit:{unit}:{hour}",
     )
     try:

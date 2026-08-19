@@ -1237,7 +1237,7 @@ def test_business_flash_applies_alias_and_keeps_delta_inline(
     """REQ-DFB-010: the business flash renders short per-account aliases from
     `flash_config.BUSINESS_FLASH_ALIASES` (keyed by the local `account.id`),
     so a long institution name ("Blue Business Plus Card") no longer pushes
-    its ▲/▼ tag onto a continuation line — the row reads `• SP - Amex: ▲119
+    its ▲/▼ tag onto a continuation line; the row reads `• SP - Amex: ▲119
     1,237`, aligned on the same 30-cell margin as the personal flash."""
     from src.balance_alerts import digest as dg
 

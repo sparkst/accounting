@@ -39,6 +39,10 @@ including statement-fed rows via REQ-DFB-003) and `🏢 Business Accounts`
 (local register, non-investment kinds). The delivery-health block no longer
 rides the flash; `build_delivery_health`/`render_delivery_health` stay
 exported for the alerting-consolidation workstream to re-home.
+
+REQ-DFB-010 (2026-08-19): business rows render short aliases from
+`flash_config.BUSINESS_FLASH_ALIASES` (keyed by local `account.id`) so a long
+institution name never pushes the ▲/▼ tag onto a continuation line.
 """
 
 from __future__ import annotations
@@ -55,7 +59,11 @@ from sqlalchemy.orm import Session
 
 from src.alerts.models import AlertDispatch
 from src.alerts.webhook import WebhookResult
-from src.balance_alerts.flash_config import AUTO_HIDE_BELOW, FLASH_ACCOUNTS
+from src.balance_alerts.flash_config import (
+    AUTO_HIDE_BELOW,
+    BUSINESS_FLASH_ALIASES,
+    FLASH_ACCOUNTS,
+)
 from src.balance_alerts.rules import (
     CHECKING_MILESTONES,
     CREDIT_STEP,
@@ -148,7 +156,9 @@ def build_pulse(today: date, session: Session) -> list[PulseLine]:
                 continue
             account = session.get(Account, account_id)
             name = account.account_name if account and account.account_name else account_id
-            name = name[:80]  # Plaid/institution-controlled — cap before display
+            # REQ-DFB-010: short display alias (flash_config) beats the
+            # Plaid/institution-controlled name; both capped before display.
+            name = BUSINESS_FLASH_ALIASES.get(account_id, name)[:80]
             bal = latest.current_balance  # already a Decimal (Numeric asdecimal=True)
             previous = session.scalars(
                 select(Snap)

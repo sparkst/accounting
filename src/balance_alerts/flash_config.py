@@ -19,6 +19,18 @@ from decimal import Decimal
 #: Dust threshold — anything below this auto-hides (REQ-DFB-006).
 AUTO_HIDE_BELOW = Decimal("100")
 
+#: REQ-DFB-010: short aliases for the 🏢 Business Accounts flash, keyed by the
+#: LOCAL register `account.id` (not a wealth-D1 id). An account missing here
+#: renders its `account.account_name` unchanged. Prefix = entity (SP=Sparkry,
+#: BL=BlackLine) per Travis's 2026-08-19 template; the long Plaid names pushed
+#: the ▲/▼ tag onto a continuation line.
+BUSINESS_FLASH_ALIASES: dict[str, str] = {
+    # Amex Blue Business Plus (Sparkry)
+    "2b80be8b-b46d-4c62-9aad-cfd912111e79": "SP - Amex",
+    # Chase Ink "T. SPARKS" (BlackLine card; register entity says personal)
+    "c74e4649-aa4f-4b91-b1c1-d3e350bc424f": "BL - Chase",
+}
+
 
 @dataclass(frozen=True)
 class FlashAccount:

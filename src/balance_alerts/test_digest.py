@@ -1226,3 +1226,71 @@ def test_post_pulse_pulse_compute_failure_degrades_not_crashes(
     res = post_pulse(date(2026, 7, 7), session, apply=True)
     assert res.status == "failed"
     assert "digest compute error" in (res.error or "")
+
+
+# ── REQ-DFB-010: business-flash aliases ─────────────────────────────────────
+
+
+def test_business_flash_applies_alias_and_keeps_delta_inline(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DFB-010: the business flash renders short per-account aliases from
+    `flash_config.BUSINESS_FLASH_ALIASES` (keyed by the local `account.id`),
+    so a long institution name ("Blue Business Plus Card") no longer pushes
+    its ▲/▼ tag onto a continuation line; the row reads `• SP - Amex: ▲119
+    1,237`, aligned on the same 30-cell margin as the personal flash."""
+    from src.balance_alerts import digest as dg
+
+    monkeypatch.setattr(
+        dg, "BUSINESS_FLASH_ALIASES", {"amex-1": "SP - Amex", "chase-1": "BL - Chase"}
+    )
+    session.add(
+        Account(
+            id="amex-1",
+            broker="amex",
+            account_number="n-amex-1",
+            account_name="Blue Business Plus Card",
+            account_type="credit_card",
+            entity="sparkry",
+        )
+    )
+    session.add(
+        Account(
+            id="chase-1",
+            broker="chase",
+            account_number="n-chase-1",
+            account_name="T. SPARKS",
+            account_type="credit_card",
+            entity="personal",
+        )
+    )
+    for acct, bal_fri, bal_mon in (("amex-1", "1117.67", "1236.75"), ("chase-1", "589.50", "589.50")):
+        for d, bal in ((_FRIDAY, bal_fri), (_MONDAY, bal_mon)):
+            session.add(
+                Snap(
+                    account_id=acct,
+                    snapshot_date=d,
+                    plaid_account_type="credit",
+                    plaid_account_subtype="credit card",
+                    current_balance=Decimal(bal),
+                    pulled_at=datetime.combine(d, datetime.min.time()),
+                    raw_data={},
+                )
+            )
+    session.commit()
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "Blue Business Plus" not in text
+    assert "T. SPARKS" not in text
+    assert "• SP - Amex: ▲119        1,237" in text
+    assert "• BL - Chase:              590" in text
+    rows = [ln for ln in text.split("\n") if ln.startswith("• ")]
+    assert {len(r) for r in rows} == {30}
+
+
+def test_business_flash_unaliased_account_keeps_its_name(session: Session) -> None:
+    """REQ-DFB-010: an account absent from the alias map renders its
+    `account.account_name` exactly as before (no silent rename)."""
+    _add(session, "a", "Ops Checking", "depository", "checking", "6000.00", d=_MONDAY)
+    session.commit()
+    text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
+    assert "• Ops Checking:" in text

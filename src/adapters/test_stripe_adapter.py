@@ -953,3 +953,98 @@ class TestPartialFailure:
         tx = session.query(Transaction).filter_by(source_id="ch_good").first()
         assert tx is not None
         assert result.records_failed >= 1
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-ING-021 — only settled money becomes register rows (cash basis)
+# ---------------------------------------------------------------------------
+
+
+class TestFailedChargesNotIngested:
+    """REQ-FIX-ING-021: charges whose status is not ``succeeded`` (failed,
+    pending) must NOT create income rows — cash basis means no money moved.
+
+    Regression: the Substack personal account retries failed subscription
+    invoices; each retry is a distinct failed ch_ object. 4 failed $8.00
+    charges (Jul 2026) were ingested as income, inflating B&O gross by $32.
+    """
+
+    def _run_with_charges(
+        self, adapter: StripeAdapter, session: Session, charges: list[Any]
+    ) -> Any:
+        with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
+            def by_resource(client: Any, resource: str, entity: Any, **kw: Any):
+                from src.models.enums import Entity as E
+                if entity == E.SPARKRY and resource == "charges":
+                    return charges
+                return []
+            mock_fetch.side_effect = by_resource
+            return adapter.run(session)
+
+    def test_failed_charge_not_inserted(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        failed = _fake_charge(charge_id="ch_failed1", amount=800, status="failed",
+                              balance_transaction=None)
+        result = self._run_with_charges(adapter, session, [failed])
+        assert session.query(Transaction).filter_by(source_id="ch_failed1").first() is None
+        assert result.records_skipped >= 1
+
+    def test_pending_charge_not_inserted(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        pending = _fake_charge(charge_id="ch_pending1", amount=800, status="pending")
+        self._run_with_charges(adapter, session, [pending])
+        assert session.query(Transaction).filter_by(source_id="ch_pending1").first() is None
+
+    def test_failed_charge_creates_no_fee_row(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        bt = _fake_stripe_obj(id="txn_x", fee=133)
+        failed = _fake_charge(charge_id="ch_failed2", amount=800, status="failed",
+                              balance_transaction=bt)
+        self._run_with_charges(adapter, session, [failed])
+        assert (
+            session.query(Transaction).filter_by(source_id="fee_ch_failed2").first()
+            is None
+        )
+
+    def test_multi_charge_payout_gross_matches(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        """Fixture mirrors the Jul-28 2026 Substack payout: 6 x $8.00 succeeded
+        + 1 x $375.00 succeeded + 4 x $8.00 failed retries. Register income
+        must equal the payout gross $423.00 — failed retries contribute $0."""
+        charges = [
+            _fake_charge(charge_id=f"ch_ok{i}", amount=800, status="succeeded")
+            for i in range(6)
+        ]
+        charges.append(
+            _fake_charge(charge_id="ch_annual", amount=37500, status="succeeded")
+        )
+        charges += [
+            _fake_charge(charge_id=f"ch_retry{i}", amount=800, status="failed")
+            for i in range(4)
+        ]
+        self._run_with_charges(adapter, session, charges)
+        income = (
+            session.query(Transaction)
+            .filter(Transaction.direction == Direction.INCOME.value)
+            .all()
+        )
+        assert sum(tx.amount for tx in income) == Decimal("423.00")
+        assert len(income) == 7
+
+    def test_failed_refund_not_inserted(
+        self, adapter: StripeAdapter, session: Session
+    ) -> None:
+        refund = _fake_refund(refund_id="re_failed1", amount=800)
+        refund.status = "failed"
+        with patch("src.adapters.stripe_adapter._fetch_all") as mock_fetch:
+            def by_resource(client: Any, resource: str, entity: Any, **kw: Any):
+                if resource == "refunds":
+                    return [refund]
+                return []
+            mock_fetch.side_effect = by_resource
+            adapter.run(session)
+        assert session.query(Transaction).filter_by(source_id="re_failed1").first() is None

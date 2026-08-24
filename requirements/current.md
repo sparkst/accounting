@@ -847,3 +847,16 @@ Hand-rolled per-session rsyncs deleted the box's runtime `reports/` dir on 2026-
 | REQ-DEP-002 | Clean-worktree guard: modified tracked files or untracked non-ignored files abort the deploy with the offending paths listed. Gitignored runtime files do not block. |
 | REQ-DEP-003 | `--delete` removes stale tracked files on the box, but protect filters (ordered BEFORE the gitignore merge) make `data/`, `reports/`, `.venv/`, `dashboard/node_modules/`, `dashboard/.svelte-kit/` undeletable. `--with-dashboard` lifts only the `.svelte-kit` protection to push a fresh srv-config build. |
 | REQ-DEP-004 | DRY-RUN by default (itemized); `--apply` transfers; `--restart <units…>` bounces systemd units via `ssh root@ubuntu` only after an applied transfer. Restart-noise drop-ins (`SuccessExitStatus`) are versioned under `deploy/overrides/`. |
+
+## REQ-BNO-CHK-* — Deterministic B&O pre-filing checklist
+
+`scripts/bno_preflight.py` runs before filing the monthly Sparkry (or quarterly BlackLine) WA B&O return. Strictly read-only (`file:...?immutable=1&mode=ro`), no network; one PASS/FAIL line per check + detail rows for failures; exits non-zero if ANY check fails. Reuses `src/export/basis.py` + `bno_tax.py` predicates — never forks tax logic. Built from the bs-bno-review-0824 audit findings.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-BNO-CHK-001 | Sign-vs-direction: no in-period rows for the entity with `direction='expense' AND amount>0` or `direction='income' AND amount<0`; FAIL lists ids/dates/amounts. |
+| REQ-BNO-CHK-002 | Unlinked reimbursables: open `direction='reimbursable'` rows with `reimbursement_link IS NULL` older than 30 days (vs period end), combined with any in-period deposit sharing a counterparty token in the description → FAIL listing candidate pairs. |
+| REQ-BNO-CHK-003 | Confirmed-only gate: zero in-period income-category rows with status in (`auto_classified`, `needs_review`); FAIL lists id/date/amount/category/status/confidence. |
+| REQ-BNO-CHK-004 | Refund sweep: the period's refund/chargeback outflow total (negative rows whose description matches refund/chargeback/dispute/return) is ALWAYS printed — this is the P3-302 manual returns-and-allowances deduction to apply when filing with DOR. Informational: PASS regardless of total (including $0.00). |
+| REQ-BNO-CHK-005 | Rate-tier assert: prior-calendar-year ServiceOther gross receipts (via `pretax_abs_amount`, categories mapped through `BO_CLASSIFICATION`) must be < $1,000,000; FAIL if crossed — the 1.5% rate and DOR code 40 both become wrong per the ESSB 2081 tiers. |
+| REQ-BNO-CHK-006 | Locality mapping: every in-period WA retail (`SALES_INCOME`) row's locality resolves in `WA_LOCATION_CODES` via `retail_facts` — the same predicate behind `generate_dor_upload`'s REQ-FIX-TAX-007 hard-fail, caught here before upload generation. FAIL lists unmapped localities. Entities with no in-period retail rows pass trivially. |

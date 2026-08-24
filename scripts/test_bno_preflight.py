@@ -210,6 +210,20 @@ def test_chk004_totals_refund_like_rows_and_always_passes() -> None:
     assert "65.50" in joined  # 40.00 + 25.50
 
 
+def test_chk004_matches_bare_return_and_returns() -> None:
+    p = parse_period("2026-07")
+    rows = [
+        tx(id="ret", direction="expense", tax_category="OTHER_EXPENSE",
+           amount="-10.00", description="Return for order #1043"),
+        tx(id="rets", direction="expense", tax_category="OTHER_EXPENSE",
+           amount="-5.00", description="Customer returns batch"),
+    ]
+    res = check_refund_sweep(rows, p)
+    joined = "\n".join(res.details)
+    assert "ret" in joined and "rets" in joined
+    assert "15.00" in joined  # 10.00 + 5.00
+
+
 def test_chk004_prints_zero_total_when_no_refunds() -> None:
     p = parse_period("2026-07")
     res = check_refund_sweep([tx()], p)
@@ -369,6 +383,44 @@ def test_cli_opens_db_read_only(tmp_path: Path) -> None:
 def test_cli_missing_db_errors(tmp_path: Path) -> None:
     rc = main(["--entity", "sparkry", "--period", "2026-07", "--db", str(tmp_path / "nope.db")])
     assert rc != 0
+
+
+def test_cli_reads_wal_resident_rows(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A row committed only to the WAL (not yet checkpointed) must be seen.
+
+    Regression guard: opening with ``immutable=1`` would ignore the -wal file
+    and miss this failing row, wrongly printing 'clear to file'.
+    """
+    db = tmp_path / "wal.db"
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """CREATE TABLE transactions (
+            id TEXT PRIMARY KEY, source TEXT, source_id TEXT, source_hash TEXT,
+            date TEXT, description TEXT, amount NUMERIC, entity TEXT,
+            direction TEXT, tax_category TEXT, status TEXT, confidence REAL,
+            reimbursement_link TEXT, raw_data TEXT
+        )"""
+    )
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # schema into main db
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    # A sign-vs-direction violation committed to the WAL only; writer stays open.
+    conn.execute(
+        "INSERT INTO transactions (id, source, source_hash, date, description,"
+        " amount, entity, direction, tax_category, status, confidence,"
+        " reimbursement_link, raw_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("wal-bad", "stripe", "h", "2026-07-15", "x", "50.00", "sparkry",
+         "expense", "SUPPLIES", "confirmed", 1.0, None, "{}"),
+    )
+    conn.commit()
+    try:
+        rc = main(["--entity", "sparkry", "--period", "2026-07", "--db", str(db)])
+    finally:
+        conn.close()
+    out = capsys.readouterr().out
+    assert rc != 0, out  # the WAL-resident violation must be seen
+    assert "REQ-BNO-CHK-001" in out and "FAIL" in out
 
 
 def test_period_type_is_exported() -> None:

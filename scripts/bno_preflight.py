@@ -59,7 +59,7 @@ SERVICE_TIER_THRESHOLD = Decimal("1000000")
 
 REIMBURSABLE_STALE_DAYS = 30
 
-REFUND_PATTERN = re.compile(r"refund|chargeback|dispute|returned?\b", re.IGNORECASE)
+REFUND_PATTERN = re.compile(r"refund|chargeback|dispute|\breturns?\b", re.IGNORECASE)
 
 
 @dataclass
@@ -340,8 +340,16 @@ def run_checks(txs: list[dict[str, Any]], period: Period, entity: str) -> list[C
 
 
 def load_transactions(db_path: Path, entity: str) -> list[dict[str, Any]]:
-    """Load all non-rejected rows for the entity from a READ-ONLY connection."""
-    uri = f"file:{db_path}?immutable=1&mode=ro"
+    """Load all non-rejected rows for the entity from a READ-ONLY connection.
+
+    Opened ``mode=ro`` (read-only) rather than ``immutable=1``: the live
+    register runs in WAL journal mode with concurrent sync writers, and
+    ``immutable=1`` would ignore the ``-wal`` file and silently drop every
+    transaction not yet checkpointed into the main db — exactly the recent
+    rows a pre-filing check must see. ``mode=ro`` is fully read-only and
+    respects the WAL.
+    """
+    uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:

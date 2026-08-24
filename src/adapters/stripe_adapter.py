@@ -602,6 +602,27 @@ def _ingest_entity(
             item_id = getattr(item, "id", repr(item))
             result.records_processed += 1
             try:
+                # REQ-FIX-ING-021: cash basis — only settled money becomes
+                # register rows. Failed/pending charges and failed/canceled
+                # refunds moved no money; Stripe Billing retries each emit a
+                # distinct failed ch_ object, which previously landed as
+                # phantom income and inflated B&O gross receipts.
+                item_status = getattr(item, "status", None)
+                if resource == "charges" and item_status != "succeeded":
+                    logger.info(
+                        "Skipping non-succeeded Stripe charge %s (status=%s, entity=%s)",
+                        item_id, item_status, entity_label,
+                    )
+                    result.records_skipped += 1
+                    continue
+                if resource == "refunds" and item_status in ("failed", "canceled"):
+                    logger.info(
+                        "Skipping %s Stripe refund %s (entity=%s)",
+                        item_status, item_id, entity_label,
+                    )
+                    result.records_skipped += 1
+                    continue
+
                 tx = mapper(item, entity)
                 if _insert_with_dedup(tx, f"{resource} {item_id}"):
                     pending += 1

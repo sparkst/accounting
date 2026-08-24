@@ -850,7 +850,7 @@ Hand-rolled per-session rsyncs deleted the box's runtime `reports/` dir on 2026-
 
 ## REQ-BNO-CHK-* — Deterministic B&O pre-filing checklist
 
-`scripts/bno_preflight.py` runs before filing the monthly Sparkry (or quarterly BlackLine) WA B&O return. Strictly read-only (`file:...?immutable=1&mode=ro`), no network; one PASS/FAIL line per check + detail rows for failures; exits non-zero if ANY check fails. Reuses `src/export/basis.py` + `bno_tax.py` predicates — never forks tax logic. Built from the bs-bno-review-0824 audit findings.
+`scripts/bno_preflight.py` runs before filing the monthly Sparkry (or quarterly BlackLine) WA B&O return. Strictly read-only (`file:...?mode=ro` — `immutable=1` is deliberately omitted: it is WAL-blind and drops uncheckpointed rows on a live DB), no network; one PASS/FAIL line per check + detail rows for failures; exits non-zero if ANY check fails. Reuses `src/export/basis.py` + `bno_tax.py` predicates — never forks tax logic. Built from the bs-bno-review-0824 audit findings.
 
 | REQ-ID | Requirement |
 |--------|-------------|

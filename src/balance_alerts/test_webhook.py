@@ -39,6 +39,28 @@ def test_payload_shape_and_severity_passthrough() -> None:
     assert p["alert_key"] == "balance:acc:checking:1000"
 
 
+def test_balance_alert_payload_has_no_bot_field() -> None:
+    """REQ-DGQ-001: non-digest alerts carry no `bot` override — they stay on
+    the info bot chosen by the downstream severity map."""
+    p = wh.build_payload(_alert())
+    assert "bot" not in p
+
+
+def test_build_payload_dict_omits_bot_when_none() -> None:
+    """REQ-DGQ-001: bot=None (the default) leaves the payload byte-identical —
+    no `bot` key at all (backward compat)."""
+    p = wh.build_payload_dict(severity="info", title="t", message="m", alert_key="k")
+    assert "bot" not in p
+
+
+def test_build_payload_dict_includes_bot_when_set() -> None:
+    """REQ-DGQ-001: an explicit bot rides in the payload for allowlisted routing."""
+    p = wh.build_payload_dict(
+        severity="info", title="t", message="m", alert_key="k", bot="quark"
+    )
+    assert p["bot"] == "quark"
+
+
 def test_dry_run_makes_no_network_call(monkeypatch: pytest.MonkeyPatch) -> None:
     def _boom(*a: object, **k: object) -> None:  # pragma: no cover
         raise AssertionError("network in dry-run")

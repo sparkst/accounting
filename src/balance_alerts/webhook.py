@@ -77,12 +77,17 @@ def build_payload_dict(
     level: str | None = None,
     baseline_gap_days: str | None = None,
     pre: bool = False,
+    bot: str | None = None,
 ) -> dict[str, str | bool | None]:
     """The n8n `UT-Send Alert Message` contract. `type` drives channel routing.
 
     ``pre=True`` (REQ-SEV-006/REQ-DFB-007): WH-Severity wraps the (escaped)
     message in a trusted ``<pre>`` so Telegram renders it monospace — the
     caller must NOT embed HTML tags itself; they arrive entity-escaped.
+
+    ``bot`` (REQ-DGQ-001): an allowlisted n8n bot-registry key (e.g. ``quark``)
+    that overrides the severity map's default bot. Included ONLY when set, so
+    every existing payload stays byte-identical (absent = downstream picks info).
     """
     payload: dict[str, str | bool | None] = {
         "type": severity,  # info | sev3 | sev2
@@ -97,6 +102,8 @@ def build_payload_dict(
     }
     if pre:
         payload["pre"] = True
+    if bot is not None:
+        payload["bot"] = bot
     return payload
 
 

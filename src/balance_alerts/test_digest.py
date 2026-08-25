@@ -232,6 +232,51 @@ def test_post_pulse_apply_sends_dedupes_and_never_logs_secret(
     assert calls["n"] == 1
 
 
+def test_both_pulse_payloads_route_to_quark_bot(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DGQ-001: both daily digests (📊 Wealth Snapshot / 🏢 Business
+    Accounts) carry `bot == "quark"` in their webhook payloads; non-digest
+    balance alerts do not (covered in test_webhook.py)."""
+    import src.balance_alerts.digest as dg
+    from src.alerts.webhook import WebhookResult
+
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(
+        dg,
+        "fetch_wealth_freshness",
+        lambda today: (
+            "ok",
+            {
+                "accounts": [
+                    {
+                        "account_id": "w1",
+                        "account_name": "Roth",
+                        "account_type": "roth_ira",
+                        "latest_balance": "50000",
+                        "latest_snapshot_date": "2026-06-14",
+                    }
+                ]
+            },
+        ),
+    )
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def _cap(payload: dict[str, object], *, key: str, apply: bool, timeout: float = 10.0) -> WebhookResult:
+        captured.append((key, dict(payload)))
+        return WebhookResult("dry_run", None, None)
+
+    monkeypatch.setattr(dg, "post_payload", _cap)
+    post_pulse(date(2026, 6, 14), session, apply=False)
+
+    keys = {k for k, _ in captured}
+    assert any(k.startswith("wealth:pulse:") for k in keys)
+    assert any(k.startswith("balance:pulse:") for k in keys)
+    for _, p in captured:
+        assert p["bot"] == "quark"
+
+
 def test_post_pulse_failed_then_retry_updates_same_audit_row(
     session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:

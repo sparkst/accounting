@@ -701,6 +701,12 @@ prompt) · tax forecaster is full-household MFJ with a one-time config file.
 | REQ-DFB-004 | The daily flash is two messages (2026-08-02): `📊 Wealth Snapshot` — every /wealth-page account (cash, credit, investment, loan, statement-fed) from the wealth D1 with day changes — and `🏢 Business Accounts` — local register, non-investment kinds. No delivery-health block on either; independent dedup keys `wealth:pulse:<date>` / `balance:pulse:<date>`. |
 | REQ-DFB-010 | The 🏢 Business Accounts flash renders short per-account aliases from `flash_config.BUSINESS_FLASH_ALIASES` (keyed by the local register `account.id`; 2026-08-19 template: `SP - Amex`, `BL - Chase`), so long institution names no longer push the ▲/▼ tag onto a continuation line; an account absent from the map renders its `account_name` unchanged. Balances/deltas/staleness are untouched (the 08-19 "missing delta" was Chase posting an outbound transfer 1-3 days after it left `available_balance`; the flash renders `current_balance` by design). |
 
+## REQ-DGQ-* — Feature: route daily digests to the quark Telegram bot
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-DGQ-001 | The two daily account digests (`📊 Wealth Snapshot` key `wealth:pulse:<date>` / `🏢 Business Accounts` key `balance:pulse:<date>`) carry an explicit `bot: "quark"` field in their n8n webhook payloads so the severity map routes them to the quark bot; every other alert (balance milestones, stale-account warnings, sentinel, EA alerts) omits the field and stays on the default info bot. `build_payload_dict` includes `bot` only when set, so all non-digest payloads stay byte-identical (absent = downstream chooses info). |
+
 ## REQ-ARC-* — Feature: AR chaser (draft-for-approval)
 
 | REQ-ID | Requirement |

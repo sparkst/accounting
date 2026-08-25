@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import Decimal
@@ -72,8 +73,25 @@ from src.balance_alerts.rules import (
     classify,
 )
 from src.balance_alerts.webhook import build_payload_dict, post_payload
+from src.reports.report_email import (
+    SendResult,
+    _validate_email,
+    dispatch_report,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Env carrying the digest email recipients (REQ-DIG-EML-003). Comma-separated,
+#: whitespace-tolerant; no recipient string literals live in source.
+DIGEST_EMAIL_RECIPIENTS_ENV = "DIGEST_EMAIL_RECIPIENTS"
+
+# Worst-of ranking for folding the email SendResult into post_pulse's return
+# (REQ-DIG-EML-004): failed > sent > dry_run > skipped.
+_STATUS_RANK = {"failed": 0, "sent": 1, "dry_run": 2, "skipped": 3}
+
+
+def _worse(a: str, b: str) -> str:
+    return a if _STATUS_RANK.get(a, 3) <= _STATUS_RANK.get(b, 3) else b
 
 # A checking account is "breached" in the pulse when it has dropped into sev3
 # territory (≤ $1k) — not merely below the top $10k milestone, which would flag
@@ -837,6 +855,68 @@ def _record_pulse(
         session.rollback()
 
 
+def resolve_digest_recipients() -> list[str]:
+    """Parse + format-validate the digest email recipients (REQ-DIG-EML-003).
+
+    Reads ``DIGEST_EMAIL_RECIPIENTS`` (comma-separated, whitespace-tolerant).
+    Unset/empty ⇒ ``[]`` (the email leg is a silent no-op). A malformed address
+    raises ``ValueError`` — the caller turns that into a clean email-leg
+    failure, never a crashed pulse.
+    """
+    raw = os.environ.get(DIGEST_EMAIL_RECIPIENTS_ENV, "").strip()
+    if not raw:
+        return []
+    recipients = [part.strip() for part in raw.split(",") if part.strip()]
+    for candidate in recipients:
+        _validate_email(candidate)
+    return recipients
+
+
+def _send_digest_email(
+    session: Session,
+    *,
+    key: str,
+    occ: str,
+    digest_name: str,
+    alert_type: str,
+    message: str,
+    apply: bool,
+) -> SendResult | None:
+    """Email leg for one digest (REQ-DIG-EML-001..004).
+
+    Rides the shared Resend mailer via ``dispatch_report`` with its own dedup
+    row (``<prefix>:email:<date>``, ``resend_email`` channel, NULL payload).
+    Returns None when the leg is a no-op (recipients unconfigured) so it
+    contributes nothing to the worst-of aggregation. Body is byte-identical to
+    the Telegram ``message`` string; subject is ``<DIGEST NAME> - <date>``.
+    """
+    try:
+        recipients = resolve_digest_recipients()
+    except ValueError as exc:
+        # A malformed env entry: fail the email leg cleanly with detail —
+        # never crash the pulse, never touch the network.
+        logger.warning("digest email: invalid %s; skipping send", DIGEST_EMAIL_RECIPIENTS_ENV)
+        if not apply:
+            return SendResult("dry_run")
+        return SendResult("failed", str(exc))
+    if not recipients:
+        logger.info("digest email: %s unset — email leg no-op", DIGEST_EMAIL_RECIPIENTS_ENV)
+        return None
+    # Insert "email" before the date: wealth:pulse:<date> → wealth:pulse:email:<date>.
+    email_key = f"{key.rsplit(':', 1)[0]}:email:{occ}"
+    return dispatch_report(
+        session,
+        alert_key=email_key,
+        occurrence_date=occ,
+        alert_type=f"{alert_type}_email",
+        entity="all",
+        subject=f"{digest_name} - {occ}",
+        body=message,
+        apply=apply,
+        to_emails=recipients,
+    )
+
+
 def _post_one_pulse(
     session: Session,
     *,
@@ -848,22 +928,45 @@ def _post_one_pulse(
     subject: str,
     apply: bool,
     bot: str | None = None,
+    digest_name: str | None = None,
 ) -> WebhookResult:
-    """Dedup + POST + ledger-record one pulse message.
+    """Dedup + POST + ledger-record one pulse message, then (REQ-DIG-EML) the
+    optional email leg.
 
     ``bot`` (REQ-DGQ-001) rides through to the webhook payload so the daily
     digests can route to the quark bot; None keeps the info-bot default.
+
+    ``digest_name`` (REQ-DIG-EML-001) enables the email leg for a digest and
+    names it for the subject line. The webhook POST always happens FIRST; the
+    email leg has its own dedup row and its failure only surfaces in the
+    worst-of return — it never blocks or reorders the Telegram send.
     """
     payload = build_payload_dict(
         severity="info", title=title, message=message, alert_key=key, pre=True, bot=bot
     )
     if apply and _pulse_already_sent(session, key, occ):
-        return WebhookResult("skipped", None, None)
-    result = post_payload(payload, key=key, apply=apply, timeout=10.0)
-    if apply:
-        _record_pulse(
-            session, key, occ, result, payload, alert_type=alert_type, subject=subject
+        result = WebhookResult("skipped", None, None)
+    else:
+        result = post_payload(payload, key=key, apply=apply, timeout=10.0)
+        if apply:
+            _record_pulse(
+                session, key, occ, result, payload, alert_type=alert_type, subject=subject
+            )
+
+    if digest_name is not None:
+        email_result = _send_digest_email(
+            session,
+            key=key,
+            occ=occ,
+            digest_name=digest_name,
+            alert_type=alert_type,
+            message=message,
+            apply=apply,
         )
+        if email_result is not None:
+            combined = _worse(result.status, email_result.status)
+            if combined != result.status:
+                return WebhookResult(combined, result.http_status, result.error)
     return result
 
 
@@ -932,6 +1035,7 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
             subject="Wealth Snapshot",
             apply=apply,
             bot="quark",  # REQ-DGQ-001: daily digest routes to the quark bot
+            digest_name="PERSONAL ACCOUNTS",  # REQ-DIG-EML-002 email subject
         )
 
     # ── Business flash (register accounts, non-investment) ─────────────────
@@ -948,6 +1052,7 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
             subject="Business Accounts",
             apply=apply,
             bot="quark",  # REQ-DGQ-001: daily digest routes to the quark bot
+            digest_name="BUSINESS ACCOUNTS",  # REQ-DIG-EML-002 email subject
         )
 
     results = [r for r in (wealth_result, business_result) if r is not None]

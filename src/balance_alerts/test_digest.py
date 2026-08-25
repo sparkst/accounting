@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import logging
+import re as _re
 from collections.abc import Generator
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import httpx
 import pytest
+import resend as _resend
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import src.balance_alerts.digest as _dg
 from src.alerts.models import AlertDispatch
 from src.balance_alerts import webhook as wh
 from src.balance_alerts.digest import (
@@ -1339,3 +1342,248 @@ def test_business_flash_unaliased_account_keeps_its_name(session: Session) -> No
     session.commit()
     text = render_pulse(build_pulse(_MONDAY, session), _MONDAY)
     assert "• Ops Checking:" in text
+
+
+# ── REQ-DIG-EML-001..005: email leg for the two daily digests ───────────────
+
+
+def _wealth_freshness_stub(today: date) -> tuple[str, dict[str, object]]:
+    return (
+        "ok",
+        {
+            "accounts": [
+                {
+                    "account_id": "w1",
+                    "account_name": "Roth",
+                    "account_type": "roth_ira",
+                    "latest_balance": "50000",
+                    "latest_snapshot_date": today.isoformat(),
+                }
+            ]
+        },
+    )
+
+
+def _arm_webhook(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+    """Make the telegram webhook 'send' and capture each posted message body."""
+    captured: dict[str, list[str]] = {"messages": []}
+
+    from src.alerts.webhook import WebhookResult
+
+    def _cap(payload: dict[str, object], *, key: str, apply: bool, timeout: float = 10.0) -> WebhookResult:
+        captured["messages"].append(str(payload["message"]))
+        return WebhookResult("sent", 200, None)
+
+    monkeypatch.setattr(_dg, "post_payload", _cap)
+    return captured
+
+
+def test_both_digests_send_email_to_all_recipients(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-001/002: 2 sends, each to BOTH recipients; body byte-identical
+    to the telegram message; subject '<NAME> - <ISO date>'."""
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(_dg, "fetch_wealth_freshness", _wealth_freshness_stub)
+    tg = _arm_webhook(monkeypatch)
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    monkeypatch.setenv("DIGEST_EMAIL_RECIPIENTS", " a@example.com, b@example.com ")
+
+    emails: list[dict[str, object]] = []
+
+    def _fake_send(params: dict[str, object]) -> dict[str, str]:
+        emails.append(params)
+        return {"id": f"id-{len(emails)}"}
+
+    monkeypatch.setattr(_resend.Emails, "send", _fake_send)
+
+    today = date(2026, 6, 14)
+    res = post_pulse(today, session, apply=True)
+    assert res.status == "sent"
+
+    assert len(emails) == 2  # one per digest
+    subjects = sorted(str(e["subject"]) for e in emails)
+    assert subjects == ["BUSINESS ACCOUNTS - 2026-06-14", "PERSONAL ACCOUNTS - 2026-06-14"]
+    for e in emails:
+        assert e["to"] == ["a@example.com", "b@example.com"]
+        assert _re.match(r"^(PERSONAL|BUSINESS) ACCOUNTS - \d{4}-\d{2}-\d{2}$", str(e["subject"]))
+    # Body byte-identical to the telegram message text.
+    email_bodies = sorted(str(e["text"]) for e in emails)
+    assert email_bodies == sorted(tg["messages"])
+    # Each digest has its own email ledger row.
+    email_rows = (
+        session.query(AlertDispatch)
+        .filter(AlertDispatch.delivery_channel == "resend_email")
+        .all()
+    )
+    keys = sorted(r.alert_key for r in email_rows)
+    assert keys == [f"balance:pulse:email:{today}", f"wealth:pulse:email:{today}"]
+    assert all(r.payload_json is None for r in email_rows)
+
+
+def test_env_unset_no_email_no_ledger_row_telegram_unchanged(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-003: unset DIGEST_EMAIL_RECIPIENTS ⇒ email leg is a no-op."""
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(_dg, "fetch_wealth_freshness", _wealth_freshness_stub)
+    _arm_webhook(monkeypatch)
+    monkeypatch.delenv("DIGEST_EMAIL_RECIPIENTS", raising=False)
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+
+    def _boom(params: object) -> dict[str, str]:
+        raise AssertionError("email leg must be a no-op when env unset")
+
+    monkeypatch.setattr(_resend.Emails, "send", _boom)
+
+    res = post_pulse(date(2026, 6, 14), session, apply=True)
+    assert res.status == "sent"
+    assert (
+        session.query(AlertDispatch)
+        .filter(AlertDispatch.delivery_channel == "resend_email")
+        .count()
+        == 0
+    )
+
+
+def test_email_failure_surfaces_in_worst_of_but_telegram_still_sent(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-004: email failure ⇒ post_pulse returns failed, telegram rows
+    still recorded sent."""
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(_dg, "fetch_wealth_freshness", _wealth_freshness_stub)
+    _arm_webhook(monkeypatch)
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    monkeypatch.setenv("DIGEST_EMAIL_RECIPIENTS", "a@example.com")
+
+    def _raise(params: object) -> dict[str, str]:
+        raise RuntimeError("resend down")
+
+    monkeypatch.setattr(_resend.Emails, "send", _raise)
+
+    res = post_pulse(date(2026, 6, 14), session, apply=True)
+    assert res.status == "failed"
+    # Telegram pulse rows still recorded sent.
+    tg_rows = (
+        session.query(AlertDispatch)
+        .filter(AlertDispatch.delivery_channel == "n8n_webhook")
+        .all()
+    )
+    assert tg_rows and all(r.status == "sent" for r in tg_rows)
+
+
+def test_same_day_rerun_does_not_double_email(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-004: email dedup row ⇒ a same-day re-run never re-sends."""
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(_dg, "fetch_wealth_freshness", _wealth_freshness_stub)
+    _arm_webhook(monkeypatch)
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    monkeypatch.setenv("DIGEST_EMAIL_RECIPIENTS", "a@example.com")
+
+    sends = {"n": 0}
+
+    def _fake_send(params: object) -> dict[str, str]:
+        sends["n"] += 1
+        return {"id": "x"}
+
+    monkeypatch.setattr(_resend.Emails, "send", _fake_send)
+
+    today = date(2026, 6, 14)
+    post_pulse(today, session, apply=True)
+    assert sends["n"] == 2  # 2 digests, first run
+    post_pulse(today, session, apply=True)
+    assert sends["n"] == 2  # no second email
+
+
+def test_invalid_recipient_fails_cleanly_telegram_unaffected(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-003/004: a malformed address in the env fails the email leg
+    with error detail, never crashing the pulse; telegram unaffected."""
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(_dg, "fetch_wealth_freshness", _wealth_freshness_stub)
+    _arm_webhook(monkeypatch)
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    monkeypatch.setenv("DIGEST_EMAIL_RECIPIENTS", "ok@example.com, not-an-email")
+
+    def _boom(params: object) -> dict[str, str]:
+        raise AssertionError("must not send with an invalid recipient set")
+
+    monkeypatch.setattr(_resend.Emails, "send", _boom)
+
+    res = post_pulse(date(2026, 6, 14), session, apply=True)
+    assert res.status == "failed"
+    tg_rows = (
+        session.query(AlertDispatch)
+        .filter(AlertDispatch.delivery_channel == "n8n_webhook")
+        .all()
+    )
+    assert tg_rows and all(r.status == "sent" for r in tg_rows)
+
+
+def test_dry_run_email_leg_no_network_no_ledger(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-004: apply=False ⇒ email leg is dry-run — no send, no row."""
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04")
+    session.commit()
+    monkeypatch.setattr(_dg, "fetch_wealth_freshness", _wealth_freshness_stub)
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    monkeypatch.setenv("DIGEST_EMAIL_RECIPIENTS", "a@example.com")
+
+    def _boom(params: object) -> dict[str, str]:
+        raise AssertionError("dry-run must never send")
+
+    monkeypatch.setattr(_resend.Emails, "send", _boom)
+
+    res = post_pulse(date(2026, 6, 14), session, apply=False)
+    assert res.status == "dry_run"
+    assert (
+        session.query(AlertDispatch)
+        .filter(AlertDispatch.delivery_channel == "resend_email")
+        .count()
+        == 0
+    )
+
+
+def test_milestone_dispatcher_never_emails(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DIG-EML-005: the balance-milestone dispatcher path never emails,
+    even with DIGEST_EMAIL_RECIPIENTS configured."""
+    from src.balance_alerts.dispatcher import dispatch_balance_alerts
+
+    # A monitored account; details don't matter — the pin is that NO email is
+    # ever sent from the dispatcher path.
+    _add(session, "a", "Sparkry checking", "depository", "checking", "66318.04", d=date(2026, 6, 14))
+    session.commit()
+    monkeypatch.setenv(wh.URL_ENV, "https://n8n.example/webhook/alert")
+    monkeypatch.setenv(wh.SECRET_ENV, "s")
+    monkeypatch.setenv("RESEND_API_KEY", "test-key")
+    monkeypatch.setenv("DIGEST_EMAIL_RECIPIENTS", "a@example.com")
+
+    class _Resp:
+        status_code = 200
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+
+    def _boom(params: object) -> dict[str, str]:
+        raise AssertionError("REQ-DIG-EML-005: dispatcher path must never email")
+
+    monkeypatch.setattr(_resend.Emails, "send", _boom)
+
+    dispatch_balance_alerts(date(2026, 6, 14), session, apply=True)
+    assert (
+        session.query(AlertDispatch)
+        .filter(AlertDispatch.delivery_channel == "resend_email")
+        .count()
+        == 0
+    )

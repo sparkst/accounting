@@ -81,6 +81,9 @@ def resolve_to_email() -> str:
 class SendResult:
     status: str  # "sent" | "failed" | "dry_run" | "skipped"
     error: str | None = None
+    # Resend's returned message id — a deploy receipt for the digest email leg
+    # (REQ-DIG-EML-004); None for dry-run/failed/skipped and for legacy callers.
+    message_id: str | None = None
 
 
 def build_html_body(plain_text: str) -> str:
@@ -93,9 +96,21 @@ def build_html_body(plain_text: str) -> str:
     )
 
 
-def send_report_email(subject: str, plain_text: str, *, apply: bool) -> SendResult:
+def send_report_email(
+    subject: str,
+    plain_text: str,
+    *,
+    apply: bool,
+    to_emails: list[str] | None = None,
+) -> SendResult:
     """Send *plain_text* via Resend when apply=True; dry-run never touches
-    the network."""
+    the network.
+
+    ``to_emails`` (REQ-DIG-EML-001): an explicit recipient list — a single
+    Resend send carrying the full to-list, each address format-validated. When
+    None (the default, and every existing WBR/TXF/SEL caller), the historical
+    single-recipient ``resolve_to_email()`` behavior is byte-identical.
+    """
     if not apply:
         return SendResult("dry_run")
 
@@ -104,20 +119,29 @@ def send_report_email(subject: str, plain_text: str, *, apply: bool) -> SendResu
         return SendResult("failed", "RESEND_API_KEY is not configured")
 
     try:
-        to_email = resolve_to_email()
+        if to_emails is None:
+            recipients = [resolve_to_email()]
+        else:
+            recipients = [e for e in to_emails]
+            for candidate in recipients:
+                _validate_email(candidate)
     except ValueError as exc:
         return SendResult("failed", str(exc))
+    if not recipients:
+        return SendResult("failed", "no recipients")
 
     params: resend.Emails.SendParams = {
         "from": FROM_ADDRESS,
-        "to": [to_email],
+        "to": recipients,
         "subject": subject,
         "html": build_html_body(plain_text),
         "text": plain_text,
     }
     try:
-        resend.Emails.send(params)
-        return SendResult("sent")
+        resp = resend.Emails.send(params)
+        message_id = resp.get("id") if isinstance(resp, dict) else None
+        logger.info("digest email sent id=%s", message_id)
+        return SendResult("sent", message_id=message_id)
     except Exception as exc:  # noqa: BLE001 — a send failure must never crash the run
         logger.exception("report email send failed (subject=%r)", subject)
         return SendResult("failed", str(exc))
@@ -188,8 +212,13 @@ def dispatch_report(
     subject: str,
     body: str,
     apply: bool,
+    to_emails: list[str] | None = None,
 ) -> SendResult:
     """Full send+ledger pattern for one report run.
+
+    ``to_emails`` (REQ-DIG-EML-001) rides through to ``send_report_email`` for
+    the multi-recipient digest email leg; None keeps the single-recipient
+    ``resolve_to_email()`` behavior for existing report callers.
 
     Dry-run: never checks the ledger, never writes it, just returns
     ``dry_run`` (caller prints the rendered report to stdout).
@@ -201,7 +230,7 @@ def dispatch_report(
         return SendResult("dry_run")
     if already_sent(session, alert_key, occurrence_date):
         return SendResult("skipped")
-    result = send_report_email(subject, body, apply=True)
+    result = send_report_email(subject, body, apply=True, to_emails=to_emails)
     record_dispatch(
         session,
         alert_key=alert_key,

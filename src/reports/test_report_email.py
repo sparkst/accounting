@@ -438,3 +438,75 @@ class TestBuildHtmlBody:
         assert "<script>" not in html
         assert "&lt;script&gt;" in html
         assert "&amp; co" in html
+
+
+# ── REQ-DIG-EML-001/002: multi-recipient to_emails + message_id ────────────
+
+
+class TestToEmailsMultiRecipient:
+    def test_to_emails_sends_to_full_list_and_captures_message_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RESEND_API_KEY", "test-key")
+        captured: list[dict[str, object]] = []
+
+        def _fake_send(params: dict[str, object]) -> dict[str, str]:
+            captured.append(params)
+            return {"id": "resend-xyz"}
+
+        monkeypatch.setattr(_resend.Emails, "send", _fake_send)
+        result = report_email.send_report_email(
+            "PERSONAL ACCOUNTS - 2026-08-26",
+            "body text",
+            apply=True,
+            to_emails=["a@example.com", "b@example.com"],
+        )
+        assert result.status == "sent"
+        assert result.message_id == "resend-xyz"
+        assert len(captured) == 1
+        assert captured[0]["to"] == ["a@example.com", "b@example.com"]
+        assert captured[0]["subject"] == "PERSONAL ACCOUNTS - 2026-08-26"
+        assert captured[0]["text"] == "body text"
+
+    def test_to_emails_none_is_byte_identical_single_recipient(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: existing WBR/TXF/SEL callers pass no to_emails and must
+        # keep the resolve_to_email() single-recipient behavior unchanged.
+        monkeypatch.setenv("RESEND_API_KEY", "test-key")
+        monkeypatch.setenv("REPORT_TO_EMAIL", "single@example.com")
+        captured: list[dict[str, object]] = []
+
+        def _fake_send(params: dict[str, object]) -> dict[str, str]:
+            captured.append(params)
+            return {"id": "one"}
+
+        monkeypatch.setattr(_resend.Emails, "send", _fake_send)
+        result = report_email.send_report_email("subj", "body", apply=True)
+        assert result.status == "sent"
+        assert captured[0]["to"] == ["single@example.com"]
+
+    def test_invalid_address_in_to_emails_returns_failed_without_sending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("RESEND_API_KEY", "test-key")
+
+        def _boom(params: object) -> dict[str, str]:
+            raise AssertionError("must not send with an invalid recipient")
+
+        monkeypatch.setattr(_resend.Emails, "send", _boom)
+        result = report_email.send_report_email(
+            "subj", "body", apply=True, to_emails=["ok@example.com", "not-an-email"]
+        )
+        assert result.status == "failed"
+        assert result.error is not None
+
+    def test_dry_run_with_to_emails_never_sends(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def _boom(params: object) -> dict[str, str]:
+            raise AssertionError("dry-run must never call resend.Emails.send")
+
+        monkeypatch.setattr(_resend.Emails, "send", _boom)
+        result = report_email.send_report_email(
+            "subj", "body", apply=False, to_emails=["a@example.com"]
+        )
+        assert result.status == "dry_run"

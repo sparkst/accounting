@@ -847,10 +847,15 @@ def _post_one_pulse(
     alert_type: str,
     subject: str,
     apply: bool,
+    bot: str | None = None,
 ) -> WebhookResult:
-    """Dedup + POST + ledger-record one pulse message."""
+    """Dedup + POST + ledger-record one pulse message.
+
+    ``bot`` (REQ-DGQ-001) rides through to the webhook payload so the daily
+    digests can route to the quark bot; None keeps the info-bot default.
+    """
     payload = build_payload_dict(
-        severity="info", title=title, message=message, alert_key=key, pre=True
+        severity="info", title=title, message=message, alert_key=key, pre=True, bot=bot
     )
     if apply and _pulse_already_sent(session, key, occ):
         return WebhookResult("skipped", None, None)
@@ -926,6 +931,7 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
             alert_type="wealth_pulse",
             subject="Wealth Snapshot",
             apply=apply,
+            bot="quark",  # REQ-DGQ-001: daily digest routes to the quark bot
         )
 
     # ── Business flash (register accounts, non-investment) ─────────────────
@@ -941,6 +947,7 @@ def post_pulse(today: date, session: Session, *, apply: bool) -> WebhookResult:
             alert_type="balance_pulse",
             subject="Business Accounts",
             apply=apply,
+            bot="quark",  # REQ-DGQ-001: daily digest routes to the quark bot
         )
 
     results = [r for r in (wealth_result, business_result) if r is not None]

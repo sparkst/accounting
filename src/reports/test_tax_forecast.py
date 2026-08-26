@@ -490,6 +490,49 @@ class TestComputeTXF:
         assert data["sparkry"]["gross_receipts_ytd"] == baseline_gross
         assert data["sparkry"]["expenses_ytd"] == baseline_expenses
 
+    def test_one_reimbursement_linked_to_many_expenses_excludes_all_legs(
+        self, session: Session, config_dir: Path
+    ) -> None:
+        """Issue #62: link_reimbursement has no 1:1 enforcement — one
+        reimbursement income row can be linked to several expense legs (one
+        deposit covering multiple trip expenses). ``_exclude_reimbursement_pairs``
+        must exclude EVERY linked expense leg, not just the last one linked
+        (whose id happens to land in the income row's single-valued
+        back-pointer)."""
+        _seed_year(session)
+        baseline = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        baseline_gross = baseline["sparkry"]["gross_receipts_ytd"]
+        baseline_expenses = baseline["sparkry"]["expenses_ytd"]
+
+        income_tx = _tx(
+            session, amount="1446.18", direction=Direction.INCOME.value, entity=Entity.SPARKRY.value,
+            date="2026-06-20", tax_category=TaxCategory.CONSULTING_INCOME.value,
+            description="Cardinal Health trip reimbursement",
+        )
+        expense_a = _tx(
+            session, amount="-900.00", direction=Direction.REIMBURSABLE.value, entity=Entity.SPARKRY.value,
+            date="2026-06-18", tax_category=TaxCategory.SUPPLIES.value,
+            description="Flight", reimbursement_link=income_tx.id,
+        )
+        expense_b = _tx(
+            session, amount="-546.18", direction=Direction.REIMBURSABLE.value, entity=Entity.SPARKRY.value,
+            date="2026-06-19", tax_category=TaxCategory.SUPPLIES.value,
+            description="Hotel", reimbursement_link=income_tx.id,
+        )
+        # The income row's back-pointer is single-valued, so the second
+        # link_reimbursement call overwrites it — it can only ever
+        # remember the last-linked expense.
+        income_tx.reimbursement_link = expense_a.id
+        session.add(income_tx)
+        session.commit()
+        income_tx.reimbursement_link = expense_b.id
+        session.add(income_tx)
+        session.commit()
+
+        data = txf.compute_txf(session, TODAY, config_dir=config_dir)
+        assert data["sparkry"]["gross_receipts_ytd"] == baseline_gross
+        assert data["sparkry"]["expenses_ytd"] == baseline_expenses
+
     def test_bno_rows_use_bno_tax_rates(self, session: Session, config_dir: Path) -> None:
         from src.export.bno_tax import BO_RATE
 

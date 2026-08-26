@@ -15,17 +15,21 @@ Semantics:
   exclusion semantics) — a split parent's children carry the actual amounts.
 - Reimbursable netting (per CLAUDE.md — reimbursable pairs net to zero on
   P&L): the expense side sums ``direction=expense`` rows but excludes any
-  such row that is itself the expense leg of a linked reimbursement pair
-  (``link_reimbursement`` permits the expense leg to be direction=expense,
-  not just direction=reimbursable, and sets the link bidirectionally); rows
-  with ``direction=reimbursable`` are never summed as expenses in the first
-  place. The revenue side additionally excludes income rows that are
-  reimbursement receipts. Both exclusions key off the same
-  ``reimbursement_target_ids`` set (any transaction id targeted by another
-  row's ``reimbursement_link``), so a linked pair — regardless of whether
-  the expense leg is direction=expense or direction=reimbursable — nets to
-  exactly zero on both sides. An unlinked reimbursable expense stays
-  invisible to both sides — correct, it is not yet P&L.
+  such row whose own ``reimbursement_link`` is set (``link_reimbursement``
+  permits the expense leg to be direction=expense, not just
+  direction=reimbursable, and always sets the expense leg's own link when
+  linking); rows with ``direction=reimbursable`` are never summed as
+  expenses in the first place. The revenue side excludes income rows that
+  are reimbursement receipts via ``reimbursement_target_ids`` (any
+  transaction id targeted by another row's ``reimbursement_link``).
+  ``link_reimbursement`` has no 1:1 enforcement, so one reimbursement
+  income row may be the target of many expense legs' links (REQ-FIX-ING/
+  issue #62, e.g. one deposit covering several trip expenses) — the
+  expense-side check keys off each row's own link (always set per linked
+  expense leg) rather than the income row's single-valued back-pointer
+  (which only ever remembers the last-linked expense), so it correctly
+  excludes every linked expense leg, not just one. An unlinked reimbursable
+  expense stays invisible to both sides — correct, it is not yet P&L.
 - All amounts are ``abs()``'d by direction and computed in Decimal
   end-to-end (``Decimal(str(x))`` at the boundary, per CLAUDE.md) — never a
   SQL-side float aggregate.
@@ -125,13 +129,17 @@ def compute_entity_pl(
                 continue  # reimbursement receipt — already netted, not revenue
             revenue += amt
         elif tx.direction == Direction.EXPENSE.value:
-            # REQ-FIX-API-003: link_reimbursement permits the expense leg to
-            # be direction=expense (not just reimbursable) and sets the link
-            # bidirectionally, so reimbursement_target_ids also contains the
-            # expense-side id for such a pair. Skip it here too — it is
-            # already netted via the income-side exclusion above, so summing
-            # it as an expense would double-count the reimbursed amount.
-            if tx.id in reimbursement_target_ids:
+            # Issue #62: link_reimbursement has no 1:1 enforcement — one
+            # reimbursement income row can be the target of many expense
+            # legs' reimbursement_link (e.g. one deposit covering several
+            # trip expenses). The income row's own reimbursement_link is
+            # single-valued and only ever remembers the LAST-linked expense,
+            # so checking reimbursement_target_ids (built from that single
+            # back-pointer) only excludes one of the N linked expenses.
+            # Each expense leg always carries its own reimbursement_link
+            # pointing at the income row when linked — check that directly
+            # instead of relying on the income row's back-pointer.
+            if tx.reimbursement_link is not None or tx.id in reimbursement_target_ids:
                 continue
             expenses += amt
         # transfer / reimbursable-direction rows are never P&L on either side

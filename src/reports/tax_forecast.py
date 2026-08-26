@@ -262,19 +262,25 @@ def _exclude_reimbursement_pairs(session: Session, transactions: list[Transactio
     (plausible if the classifier tags a Stripe/bank deposit as
     CONSULTING_INCOME before it is manually linked) must not inflate
     Schedule-C gross receipts, and the linked reimbursable/expense leg must
-    not double as a deductible expense. ``reimbursement_link`` is set
-    bidirectionally by ``link_reimbursement`` (transactions.py), so any row
-    whose id is targeted by another row's ``reimbursement_link`` — on
-    EITHER side of the pair — is excluded here."""
+    not double as a deductible expense.
+
+    ``link_reimbursement`` has no 1:1 enforcement (issue #62): one
+    reimbursement income row may be the target of many expense legs' links
+    (e.g. one deposit covering several trip expenses). Each expense leg's
+    own ``reimbursement_link`` is always set when linked, so a row is
+    excluded either because its OWN link is set (an expense leg) or because
+    its id is targeted by some other row's link (the income leg — targeted
+    by every expense linked to it, regardless of how many there are)."""
     reimbursement_target_ids = {
         row[0]
         for row in session.query(Transaction.reimbursement_link)
         .filter(Transaction.reimbursement_link.is_not(None))
         .all()
     }
-    if not reimbursement_target_ids:
-        return transactions
-    return [tx for tx in transactions if tx.id not in reimbursement_target_ids]
+    return [
+        tx for tx in transactions
+        if tx.reimbursement_link is None and tx.id not in reimbursement_target_ids
+    ]
 
 
 def _month_totals(transactions: list[Any], categories: set[str], *, income: bool) -> dict[int, Decimal]:

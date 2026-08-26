@@ -181,6 +181,44 @@ class TestComputeEntityPL:
         assert pl.expenses == Decimal("0")
         assert pl.net == Decimal("0")
 
+    def test_one_reimbursement_linked_to_many_expenses_nets_all_to_zero(
+        self, session: Session
+    ) -> None:
+        """Issue #62: a single deposit can reimburse several expenses at
+        once (e.g. one Cardinal Health trip reimbursement covering multiple
+        June expenses). link_reimbursement has no 1:1 enforcement — nothing
+        stops calling it N times against the same income row, once per
+        expense leg. Every linked expense leg must net to zero, not just
+        the last one linked (whose id happens to land in the income row's
+        single-valued back-pointer)."""
+        income_tx = _make_tx(
+            session, amount="1446.18", direction=Direction.INCOME.value,
+            description="Cardinal Health trip reimbursement",
+        )
+        expense_a = _make_tx(
+            session, amount="-900.00", direction=Direction.EXPENSE.value,
+            description="Flight", reimbursement_link=income_tx.id,
+        )
+        expense_b = _make_tx(
+            session, amount="-546.18", direction=Direction.EXPENSE.value,
+            description="Hotel", reimbursement_link=income_tx.id,
+        )
+        # Mirror link_reimbursement's bidirectional back-pointer: it is
+        # single-valued, so the SECOND call to overwrite it clobbers the
+        # first expense's back-reference — the income row can only ever
+        # remember the last-linked expense.
+        income_tx.reimbursement_link = expense_a.id
+        session.add(income_tx)
+        session.commit()
+        income_tx.reimbursement_link = expense_b.id
+        session.add(income_tx)
+        session.commit()
+
+        pl = compute_entity_pl(session, "2026-06-01", "2026-06-15")
+        assert pl.revenue == Decimal("0")
+        assert pl.expenses == Decimal("0")
+        assert pl.net == Decimal("0")
+
     def test_unlinked_reimbursable_invisible_to_both_sides(self, session: Session) -> None:
         """An unlinked reimbursable expense (not yet reimbursed) is not P&L
         on either side — correct, it's still pending."""

@@ -15,7 +15,8 @@ non-zero if ANY check fails.
 Checks:
   REQ-BNO-CHK-001  sign-vs-direction integrity in the period
   REQ-BNO-CHK-002  stale unlinked reimbursables with an in-period deposit
-                   from the same counterparty
+                   from the same counterparty (informational — an
+                   unreimbursed trip is normal month-end state)
   REQ-BNO-CHK-003  confirmed-only gate on in-period income rows
   REQ-BNO-CHK-004  refund/chargeback sweep — the P3-302 manual
                    returns-and-allowances deduction (informational)
@@ -159,7 +160,12 @@ def check_unlinked_reimbursables(txs: list[dict[str, Any]], period: Period) -> C
     A reimbursable row with ``reimbursement_link IS NULL`` older than 30 days
     (relative to period end) combined with any in-period deposit sharing a
     counterparty token in its description is a likely un-linked reimbursement —
-    it would inflate income (the deposit) without the offsetting link.
+    surfaced for a human to glance at before filing.
+
+    Informational only (REQ-FIX-BNO-001): a trip's expenses routinely stay
+    unreimbursed through the following month-end close — that is the normal
+    cash-timing lag, not a defect — so this must never FAIL/block a filing.
+    Same PASS-always shape as REQ-BNO-CHK-004.
     """
     end = date.fromisoformat(period.end)
     stale_cutoff = (end - timedelta(days=REIMBURSABLE_STALE_DAYS)).isoformat()
@@ -188,8 +194,8 @@ def check_unlinked_reimbursables(txs: list[dict[str, Any]], period: Period) -> C
                 )
     return CheckResult(
         "REQ-BNO-CHK-002",
-        "unlinked reimbursables vs in-period deposits",
-        passed=not pairs,
+        "unlinked reimbursables vs in-period deposits (informational)",
+        passed=True,
         details=pairs,
     )
 

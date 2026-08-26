@@ -97,7 +97,13 @@ def test_chk001_passes_clean() -> None:
 # ── REQ-BNO-CHK-002 unlinked reimbursables ─────────────────────────────────
 
 
-def test_chk002_flags_stale_reimbursable_with_matching_deposit() -> None:
+def test_chk002_reports_but_never_blocks_stale_reimbursable_with_matching_deposit() -> None:
+    """Regression guard for #64: an unreimbursed trip is expected month-end
+    state, not a filing blocker. The check stays informational — it must
+    surface the pairing (so a human can still glance at it) but never fail
+    the checklist, or every filing that follows a not-yet-reimbursed trip
+    gets held hostage.
+    """
     p = parse_period("2026-07")
     rows = [
         tx(
@@ -118,7 +124,7 @@ def test_chk002_flags_stale_reimbursable_with_matching_deposit() -> None:
     ]
     res = check_unlinked_reimbursables(rows, p)
     assert res.req_id == "REQ-BNO-CHK-002"
-    assert not res.passed
+    assert res.passed  # informational only — must never block a B&O filing
     joined = "\n".join(res.details)
     assert "reimb" in joined and "deposit" in joined
 

@@ -140,7 +140,9 @@ def send_report_email(
     try:
         resp = resend.Emails.send(params)
         message_id = resp.get("id") if isinstance(resp, dict) else None
-        logger.info("digest email sent id=%s", message_id)
+        # WARNING, not info: the accounting-balance-alerts unit's journal
+        # filter is WARNING+ (REQ-FIX-ISSUE-67) — info never reaches it.
+        logger.warning("digest email sent id=%s", message_id)
         return SendResult("sent", message_id=message_id)
     except Exception as exc:  # noqa: BLE001 — a send failure must never crash the run
         logger.exception("report email send failed (subject=%r)", subject)
@@ -169,6 +171,15 @@ def record_dispatch(
     """Idempotent upsert into ``alert_dispatch``. ``delivery_channel`` is
     always ``resend_email``; ``payload_json`` is always NULL (design spec
     §7 channel discriminator — never the n8n_webhook replay path)."""
+    # REQ-FIX-ISSUE-67: the Resend message_id is the only deploy receipt for
+    # a digest send; it previously reached only a logger.info line, invisible
+    # on units whose journal filter is WARNING+. error_detail is otherwise
+    # unused on a "sent" result, so it doubles as the persisted receipt.
+    error_detail = (
+        f"message_id={result.message_id}"
+        if result.status == "sent" and result.message_id
+        else result.error
+    )
     existing = (
         session.query(AlertDispatch)
         .filter_by(alert_key=alert_key, occurrence_date=occurrence_date)
@@ -176,7 +187,7 @@ def record_dispatch(
     )
     if existing is not None:
         existing.status = result.status
-        existing.error_detail = result.error
+        existing.error_detail = error_detail
         existing.delivery_channel = "resend_email"
         existing.payload_json = None
         session.commit()
@@ -189,7 +200,7 @@ def record_dispatch(
         subject=subject,
         status=result.status,
         http_status=None,
-        error_detail=result.error,
+        error_detail=error_detail,
         delivery_channel="resend_email",
         payload_json=None,
     )

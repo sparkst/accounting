@@ -189,6 +189,30 @@ class TestRecordDispatch:
         assert row is None
         assert state["calls"] >= 1
 
+    def test_sent_result_message_id_is_persisted_to_error_detail(
+        self, session: Session
+    ) -> None:
+        """REQ-FIX-ISSUE-67: the Resend message_id is the deploy receipt for
+        a digest send. Before this fix it only ever reached a logger.info
+        line — invisible on units whose journal filter is WARNING+ (e.g.
+        accounting-balance-alerts) — and was never persisted anywhere, so a
+        pulled deploy receipt required hitting the Resend API directly."""
+        report_email.record_dispatch(
+            session,
+            alert_key="digest:2026-08-25",
+            occurrence_date="2026-08-25",
+            alert_type="balance_digest",
+            entity="all",
+            subject="subj",
+            result=report_email.SendResult("sent", message_id="resend-abc123"),
+        )
+        row = (
+            session.query(AlertDispatch)
+            .filter_by(alert_key="digest:2026-08-25", occurrence_date="2026-08-25")
+            .one()
+        )
+        assert row.error_detail == "message_id=resend-abc123"
+
     def test_existing_row_is_updated_in_place(self, session: Session) -> None:
         report_email.record_dispatch(
             session,

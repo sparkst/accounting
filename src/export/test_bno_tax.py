@@ -406,6 +406,34 @@ class TestDorUploadHardFailOnUnmappedLocation:
         )
         assert any(line.startswith("TAX,45,1739,") for line in content.splitlines())
 
+    def test_bellingham_is_mapped_to_dor_location_3701(self) -> None:
+        """Issue #57: Bellingham was missing from WA_LOCATION_CODES, hard-
+        blocking the Q3 2026 BlackLine DOR upload. WA DOR Q3 2026 local sales
+        & use tax rate table lists Bellingham as location code 3701."""
+        content, _ = generate_dor_upload(
+            [
+                {
+                    "date": "2026-07-10",
+                    "amount": "100.00",
+                    "tax_category": "SALES_INCOME",
+                    "source": "shopify",
+                    "raw_data": {
+                        "total_price": "100.00",
+                        "total_tax": "9.30",
+                        "shipping_address": {"province_code": "WA", "city": "Bellingham"},
+                        "tax_lines": [
+                            {"title": "Washington State Tax"},
+                            {"title": "Bellingham City Tax"},
+                        ],
+                    },
+                }
+            ],
+            "blackline",
+            2026,
+            quarter=3,
+        )
+        assert any(line.startswith("TAX,45,3701,") for line in content.splitlines())
+
 
 class TestDorUploadLineCodes:
     """Line codes must match the WA Combined Excise Tax Return 'Code' column."""

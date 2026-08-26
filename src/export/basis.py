@@ -29,6 +29,7 @@ WA_LOCATION_CODES: dict[str, tuple[str, str]] = {
     "maple valley": ("1720", "Maple Valley"),
     "sammamish": ("1739", "Sammamish"),
     "king county unincorp.": ("1700", "King County Unincorp."),
+    "bellingham": ("3701", "Bellingham"),
 }
 # Fallback when a WA sale's locality can't be mapped to a known city code.
 UNKNOWN_WA_LOCATION = ("____", "WA — unmapped locality")

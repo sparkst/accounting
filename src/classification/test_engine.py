@@ -78,11 +78,12 @@ def _make_transaction(
     amount: Decimal = Decimal("-50.00"),
     date: str = "2026-03-01",
     raw_data: dict[str, Any] | None = None,
+    source_id: str = "test-001",
 ) -> Transaction:
     """Factory for minimal Transaction instances (not persisted to DB)."""
     return Transaction(
         source=source,
-        source_id="test-001",
+        source_id=source_id,
         source_hash="abc123",
         date=date,
         description=description,
@@ -325,6 +326,26 @@ class TestTier2Patterns:
 
         assert result is not None
         assert result.entity == Entity.BLACKLINE
+        assert result.direction == Direction.EXPENSE
+
+    def test_shopify_refund_is_other_expense_not_supplies(self) -> None:
+        """REQ-FIX-TAX-003 (issue #58): a Shopify refund is contra-revenue,
+        not a purchased-supplies expense. Rule 1 must not lump refunds in
+        with real negative-amount Shopify fees — refunds keep OTHER_EXPENSE
+        so a later reclassify pass can't clobber the adapter's category
+        back to SUPPLIES.
+        """
+        txn = _make_transaction(
+            description="Shopify Refund for #1024",
+            source=Source.SHOPIFY.value,
+            amount=Decimal("-32.76"),
+            source_id="refund_999",
+        )
+        result = match_structural_pattern(txn)
+
+        assert result is not None
+        assert result.entity == Entity.BLACKLINE
+        assert result.tax_category == TaxCategory.OTHER_EXPENSE
         assert result.direction == Direction.EXPENSE
 
     def test_stripe_substack_subscription_income(self) -> None:

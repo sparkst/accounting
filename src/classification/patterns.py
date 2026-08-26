@@ -56,6 +56,23 @@ def match_structural_pattern(
     if source == "shopify":
         # Shopify fees are negative amounts — still BlackLine but expense.
         if _is_expense(transaction):
+            # REQ-FIX-TAX-003 (issue #58): refunds are contra-revenue, not a
+            # purchased-supplies expense. _parse_refund already stamps
+            # OTHER_EXPENSE and leaves status=needs_review as a human-review
+            # flag; a later ingest run's reclassify pass (which reclassifies
+            # every needs_review row, not just new ones) was clobbering that
+            # back to SUPPLIES because this rule couldn't tell a refund from
+            # a real fee. Match the adapter's own "refund_" source_id marker.
+            source_id = (transaction.source_id or "").lower()
+            if source_id.startswith("refund_"):
+                return ClassificationResult(
+                    entity=Entity.BLACKLINE,
+                    tax_category=TaxCategory.OTHER_EXPENSE,
+                    direction=Direction.EXPENSE,
+                    confidence=_TIER2_CONFIDENCE,
+                    tier_used=2,
+                    reasoning="Source=shopify refund → BlackLine contra-revenue (OTHER_EXPENSE)",
+                )
             return ClassificationResult(
                 entity=Entity.BLACKLINE,
                 tax_category=TaxCategory.SUPPLIES,

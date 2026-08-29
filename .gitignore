@@ -43,5 +43,9 @@ src/api/test_error_handlers*\(*\).py
 # .example alongside it (config/tax_profile.example.yaml IS tracked).
 /config/tax_profile.yaml
 
+# WA use-tax parameters (a filing position) — never checked in; ship the
+# .example alongside it (config/use_tax.example.yaml IS tracked). (#59)
+/config/use_tax.yaml
+
 # Editor/sed-style backup files — never intended to be committed
 *.bak

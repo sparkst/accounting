@@ -1,0 +1,19 @@
+# WA use-tax parameters for the comped ($0) BlackLine order estimate
+# (REQ-UTX-003, sparkst/accounting#59; WAC 458-20-178). Copy this file to
+# config/use_tax.yaml (gitignored — never commit a filing position) and fill in
+# real numbers. Until that file exists (or either value <= 0), the monthly-close
+# report still shows the comped-order + unit counts but prints
+# "estimate UNAVAILABLE" instead of a dollar figure — it never invents a filing
+# position on your behalf.
+#
+# This is a REPORT-ONLY estimate: nothing is written to the register and no
+# WA DOR return is auto-committed. The register tracks no per-SKU COGS, so the
+# estimate is unit_count × avg_unit_cost × use_tax_rate, not exact COGS.
+
+# Assumed average per-unit cost of goods given away, in dollars.
+# Sizing audit (2026-08-24): ~$20–40/unit for BlackLine apparel.
+avg_unit_cost: 0.00
+
+# Combined local use-tax rate, as a decimal (NOT a percent).
+# Sizing audit: ~0.090–0.103 (9.0%–10.3%). Sammamish is ~0.103.
+use_tax_rate: 0.00

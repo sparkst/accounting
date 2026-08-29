@@ -157,6 +157,15 @@ def render_html(report: CloseReport, *, narrative: str | None = None) -> str:
             f"{_esc(report.sellability_text)}</td></tr>"
         )
 
+    # WA use tax — comped orders (REQ-UTX-005, #59: report-only estimate)
+    if report.use_tax_text:
+        parts.append(_section("WA use tax (comped orders)"))
+        parts.append(
+            f'<tr><td colspan="2" style="padding:4px 12px;font-family:ui-monospace,'
+            f'SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;">'
+            f"{_esc(report.use_tax_text)}</td></tr>"
+        )
+
     body = "".join(parts)
     return (
         '<body style="margin:0;padding:0;background-color:#f5f5f7;">'

@@ -153,6 +153,19 @@ def test_module_constants() -> None:
     assert email_mod.DELIVERY_CHANNEL == "resend_email"
 
 
+def test_render_html_embeds_use_tax_section() -> None:
+    """REQ-UTX-005 (#59): the WA use-tax section ships WITH the close email."""
+    report = _report()
+    report.use_tax_text = "WA use tax — comped orders (WAC 458-20-178) · Q2 2026\n  estimated use tax: $21.63"
+    html = email_mod.render_html(report)
+    assert "WA use tax (comped orders)" in html
+    assert "WAC 458-20-178" in html
+    assert "$21.63" in html
+    # Absent text renders no empty section header.
+    report.use_tax_text = None
+    assert "WA use tax (comped orders)" not in email_mod.render_html(report)
+
+
 def test_render_html_embeds_sellability_section() -> None:
     """REQ-SEL-001: the sellability section ships WITH the close email."""
     report = _report()

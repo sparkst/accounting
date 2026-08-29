@@ -1,6 +1,6 @@
 """Tests for scripts/bno_preflight.py — deterministic B&O pre-filing checklist.
 
-REQ-IDs: REQ-BNO-CHK-001..006. Each check is a pure function over transaction
+REQ-IDs: REQ-BNO-CHK-001..007. Each check is a pure function over transaction
 dicts so it is testable without a database; one end-to-end test builds a real
 SQLite file and asserts the CLI opens it read-only and exits non-zero on any
 failing check.
@@ -16,12 +16,15 @@ import pytest
 
 from scripts.bno_preflight import (
     Period,
+    build_account_entity_map,
     check_confirmed_only,
+    check_entity_account_commingling,
     check_locality_mapping,
     check_rate_tier,
     check_refund_sweep,
     check_sign_vs_direction,
     check_unlinked_reimbursables,
+    load_all_transactions,
     main,
     parse_period,
     run_checks,
@@ -305,15 +308,140 @@ def test_chk006_passes_for_mapped_localities_and_service_entity() -> None:
     assert check_locality_mapping([tx()], parse_period("2026-07"), entity="sparkry").passed
 
 
+# ── REQ-BNO-CHK-007 entity-vs-account commingling ──────────────────────────
+#
+# Ownership of a receiving account is looked up from an account-label → owning-
+# entity map (built from the `account` table). A receipt whose owning `entity`
+# disagrees with the account it lands in is commingling; an unmapped label is
+# surfaced ("cannot verify"), never silently passed. The concrete bug (#76/#61):
+# Sparkry LLC Substack revenue paying out into Travis's personal Chase.
+
+# Chase ****3894 = personal; Chase ****0001 = Sparkry business (test fixtures).
+ACCT_MAP = {"Chase ****3894": "personal", "Chase ****0001": "sparkry"}
+
+
+def test_chk007_flags_business_income_into_personal_account() -> None:
+    """Substack payout: entity=sparkry landing in the personal Chase → FLAG."""
+    p = parse_period("2026-07")
+    rows = [
+        tx(
+            id="substack-payout",
+            entity="sparkry",
+            direction="transfer",
+            amount="343.00",
+            payment_method="Chase ****3894",
+            description="Substack payout",
+        )
+    ]
+    res = check_entity_account_commingling(rows, p, ACCT_MAP)
+    assert res.req_id == "REQ-BNO-CHK-007"
+    assert not res.passed
+    joined = "\n".join(res.details)
+    assert "substack-payout" in joined
+    assert "sparkry" in joined and "personal" in joined
+
+
+def test_chk007_passes_business_income_into_matching_business_account() -> None:
+    """The same revenue on the Sparkry business Chase → PASS (no flag)."""
+    p = parse_period("2026-07")
+    rows = [
+        tx(
+            id="ok-payout",
+            entity="sparkry",
+            direction="transfer",
+            amount="343.00",
+            payment_method="Chase ****0001",
+            description="Substack payout",
+        )
+    ]
+    res = check_entity_account_commingling(rows, p, ACCT_MAP)
+    assert res.passed
+    assert res.details == []
+
+
+def test_chk007_flags_personal_income_into_business_account() -> None:
+    """Inverse direction: entity=personal landing in a business account → FLAG."""
+    p = parse_period("2026-07")
+    rows = [
+        tx(
+            id="personal-in-biz",
+            entity="personal",
+            direction="income",
+            amount="200.00",
+            payment_method="Chase ****0001",
+            description="Personal side income",
+        )
+    ]
+    res = check_entity_account_commingling(rows, p, ACCT_MAP)
+    assert not res.passed
+    joined = "\n".join(res.details)
+    assert "personal-in-biz" in joined
+
+
+def test_chk007_reports_unmapped_payment_method_never_silently_passes() -> None:
+    """A payment_method not in the map is surfaced, not silently passed."""
+    p = parse_period("2026-07")
+    rows = [
+        tx(
+            id="mystery",
+            entity="sparkry",
+            direction="income",
+            amount="100.00",
+            payment_method="Wells Fargo ****9999",
+        )
+    ]
+    res = check_entity_account_commingling(rows, p, ACCT_MAP)
+    assert not res.passed
+    joined = "\n".join(res.details).lower()
+    assert "mystery" in "\n".join(res.details)
+    assert "unmapped" in joined and "cannot verify" in joined
+
+
+def test_chk007_skips_rows_without_a_payment_method_label() -> None:
+    """Stripe charge rows carry no account label (the payout row does) → skip."""
+    p = parse_period("2026-07")
+    rows = [tx(id="charge", entity="sparkry", amount="500.00", payment_method=None)]
+    assert check_entity_account_commingling(rows, p, ACCT_MAP).passed
+
+
+def test_chk007_ignores_out_of_period_and_expense_outflows() -> None:
+    """Only in-period receipts (amount > 0) are receiving-account events."""
+    p = parse_period("2026-07")
+    rows = [
+        # expense outflow from the personal Chase — not a receipt "into" it
+        tx(
+            id="expense",
+            entity="sparkry",
+            direction="expense",
+            amount="-50.00",
+            payment_method="Chase ****3894",
+        ),
+        # commingled receipt but out of the filing period
+        tx(
+            id="oop",
+            entity="sparkry",
+            direction="income",
+            amount="50.00",
+            date="2026-06-01",
+            payment_method="Chase ****3894",
+        ),
+    ]
+    assert check_entity_account_commingling(rows, p, ACCT_MAP).passed
+
+
 # ── run_checks + CLI end-to-end ────────────────────────────────────────────
 
 
-def test_run_checks_returns_all_six_in_order() -> None:
+def test_run_checks_returns_all_seven_in_order() -> None:
     res = run_checks([tx()], parse_period("2026-07"), entity="sparkry")
-    assert [r.req_id for r in res] == [f"REQ-BNO-CHK-00{i}" for i in range(1, 7)]
+    assert [r.req_id for r in res] == [f"REQ-BNO-CHK-00{i}" for i in range(1, 8)]
 
 
-def _make_db(path: Path, rows: list[dict[str, Any]]) -> None:
+def _make_db(
+    path: Path,
+    rows: list[dict[str, Any]],
+    accounts: list[tuple[str, str]] | None = None,
+) -> None:
     import json
 
     conn = sqlite3.connect(path)
@@ -322,15 +450,15 @@ def _make_db(path: Path, rows: list[dict[str, Any]]) -> None:
             id TEXT PRIMARY KEY, source TEXT, source_id TEXT, source_hash TEXT,
             date TEXT, description TEXT, amount NUMERIC, entity TEXT,
             direction TEXT, tax_category TEXT, status TEXT, confidence REAL,
-            reimbursement_link TEXT, raw_data TEXT
+            reimbursement_link TEXT, payment_method TEXT, raw_data TEXT
         )"""
     )
     for i, r in enumerate(rows):
         conn.execute(
             "INSERT INTO transactions (id, source, source_hash, date, description,"
             " amount, entity, direction, tax_category, status, confidence,"
-            " reimbursement_link, raw_data)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " reimbursement_link, payment_method, raw_data)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 r["id"],
                 r["source"],
@@ -344,9 +472,19 @@ def _make_db(path: Path, rows: list[dict[str, Any]]) -> None:
                 r["status"],
                 r["confidence"],
                 r["reimbursement_link"],
+                r.get("payment_method"),
                 json.dumps(r["raw_data"]),
             ),
         )
+    if accounts is not None:
+        conn.execute(
+            "CREATE TABLE account (id TEXT PRIMARY KEY, payment_method TEXT, entity TEXT)"
+        )
+        for j, (pm, ent) in enumerate(accounts):
+            conn.execute(
+                "INSERT INTO account (id, payment_method, entity) VALUES (?,?,?)",
+                (f"acct-{j}", pm, ent),
+            )
     conn.commit()
     conn.close()
 
@@ -357,7 +495,85 @@ def test_cli_exits_zero_on_clean_db(tmp_path: Path, capsys: pytest.CaptureFixtur
     rc = main(["--entity", "sparkry", "--period", "2026-07", "--db", str(db)])
     out = capsys.readouterr().out
     assert rc == 0
-    assert out.count("PASS") == 6
+    assert out.count("PASS") == 7
+
+
+def test_cli_flags_commingled_payout_across_entities(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end: a Sparkry payout into the personal Chase must block the
+    filing via REQ-BNO-CHK-007 — even when filing the ``sparkry`` entity, the
+    check reads every non-rejected receipt so both commingling directions are
+    caught (REQ-BNO-007)."""
+    db = tmp_path / "commingled.db"
+    _make_db(
+        db,
+        [
+            tx(
+                id="substack-payout",
+                entity="sparkry",
+                direction="transfer",
+                amount="343.00",
+                tax_category="SUBSCRIPTION_INCOME",
+                payment_method="Chase ****3894",
+                description="Substack payout",
+            )
+        ],
+        accounts=[("Chase ****3894", "personal"), ("Chase ****0001", "sparkry")],
+    )
+    rc = main(["--entity", "sparkry", "--period", "2026-07", "--db", str(db)])
+    out = capsys.readouterr().out
+    assert rc != 0
+    assert "FAIL" in out and "REQ-BNO-CHK-007" in out
+    assert "substack-payout" in out
+
+
+def test_cli_commingling_passes_when_account_matches(tmp_path: Path) -> None:
+    """Same revenue on the Sparkry business account → no commingling flag."""
+    db = tmp_path / "clean-acct.db"
+    _make_db(
+        db,
+        [
+            tx(
+                id="ok-payout",
+                entity="sparkry",
+                direction="transfer",
+                amount="343.00",
+                tax_category="SUBSCRIPTION_INCOME",
+                payment_method="Chase ****0001",
+                description="Substack payout",
+            )
+        ],
+        accounts=[("Chase ****3894", "personal"), ("Chase ****0001", "sparkry")],
+    )
+    assert main(["--entity", "sparkry", "--period", "2026-07", "--db", str(db)]) == 0
+
+
+def test_build_account_entity_map_and_load_all_transactions(tmp_path: Path) -> None:
+    """DB-boundary helpers: the account map is built from the account table and
+    the all-entity loader returns every non-rejected row (both entities)."""
+    db = tmp_path / "map.db"
+    _make_db(
+        db,
+        [
+            tx(id="s", entity="sparkry", payment_method="Chase ****0001"),
+            tx(id="p", entity="personal", payment_method="Chase ****3894"),
+            tx(id="gone", entity="sparkry", status="rejected", payment_method="Chase ****0001"),
+        ],
+        accounts=[("Chase ****3894", "personal"), ("Chase ****0001", "sparkry"), (None, "sparkry")],
+    )
+    amap = build_account_entity_map(db)
+    assert amap == {"Chase ****3894": "personal", "Chase ****0001": "sparkry"}
+    all_rows = load_all_transactions(db)
+    ids = {r["id"] for r in all_rows}
+    assert ids == {"s", "p"}  # rejected excluded; both entities present
+
+
+def test_build_account_entity_map_missing_table_is_empty(tmp_path: Path) -> None:
+    """A DB with no account table yields an empty map (no crash)."""
+    db = tmp_path / "no-acct.db"
+    _make_db(db, [tx()])  # no accounts arg → no account table
+    assert build_account_entity_map(db) == {}
 
 
 def test_cli_exits_nonzero_on_failing_check(

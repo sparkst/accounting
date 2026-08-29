@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic B&O pre-filing checklist (REQ-BNO-CHK-001..006).
+"""Deterministic B&O pre-filing checklist (REQ-BNO-CHK-001..007).
 
 Run BEFORE filing the monthly Sparkry (or quarterly BlackLine) WA B&O return.
 Strictly read-only: the SQLite register is opened with
@@ -25,6 +25,12 @@ Checks:
   REQ-BNO-CHK-006  every in-period WA retail row's locality resolves in
                    WA_LOCATION_CODES (catches the REQ-FIX-TAX-007 hard-fail
                    before upload generation)
+  REQ-BNO-CHK-007  entity-vs-account commingling — a receipt whose owning
+                   entity disagrees with the entity that owns the account it
+                   landed in (e.g. Sparkry LLC Substack revenue paying out to
+                   Travis's personal Chase; REQ-BNO-007 / issues #76, #61).
+                   Account ownership is read from the `account` table; an
+                   unmapped account label is surfaced, never silently passed.
 """
 
 from __future__ import annotations
@@ -331,10 +337,89 @@ def check_locality_mapping(
     )
 
 
+# ── REQ-BNO-CHK-007 ────────────────────────────────────────────────────────
+
+
+def check_entity_account_commingling(
+    txs: list[dict[str, Any]],
+    period: Period,
+    account_entity: dict[str, str],
+) -> CheckResult:
+    """Flag in-period receipts landing in an account owned by a different entity.
+
+    Commingling smell (REQ-BNO-007 / issues #76, #61): business-entity revenue
+    (Sparkry / BlackLine) received into a personal-labeled account — or the
+    inverse, personal income into a business account — with nothing in the
+    system catching it. The concrete case: Sparkry LLC Substack subscription
+    revenue paying out via Stripe into Travis's personal Chase.
+
+    The register has no account foreign key, so the receiving account is keyed
+    off the ``payment_method`` label. ``account_entity`` maps each known label
+    to its owning entity (built from the ``account`` table). For every in-period
+    receipt (``amount > 0`` — money received into an account):
+
+      * label maps to an entity that DISAGREES with the row's ``entity`` → FLAG
+        (commingling; blocks the filing),
+      * label is set but not in the map → surfaced as "unmapped, cannot verify"
+        and also blocks (mirrors REQ-BNO-CHK-006's unmapped-locality gate) —
+        never silently passed,
+      * no label (e.g. a Stripe charge row; the payout row carries the label)
+        → skipped.
+
+    Rejected rows are excluded upstream by the loaders.
+    """
+    mismatches: list[str] = []
+    unmapped: list[str] = []
+    for tx in txs:
+        if not period.contains(tx.get("date", "")):
+            continue
+        if _dec(tx.get("amount")) <= 0:
+            continue  # only receipts are "received into" an account
+        label = tx.get("payment_method")
+        if not label:
+            continue  # no receiving-account label on this row
+        row_entity = str(tx.get("entity") or "")
+        owner = account_entity.get(str(label))
+        if owner is None:
+            unmapped.append(
+                f"  id={tx.get('id')} date={tx.get('date')}"
+                f" amount={_dec(tx.get('amount'))} entity={row_entity!r}"
+                f" payment_method={str(label)!r} — unmapped, cannot verify"
+                " account ownership (add the account to the `account` table)"
+            )
+            continue
+        if owner != row_entity:
+            mismatches.append(
+                f"  id={tx.get('id')} date={tx.get('date')}"
+                f" amount={_dec(tx.get('amount'))} entity={row_entity!r}"
+                f" received into account payment_method={str(label)!r}"
+                f" owned by entity={owner!r} — entity/account commingling"
+                f" desc={str(tx.get('description'))[:40]!r}"
+            )
+    return CheckResult(
+        "REQ-BNO-CHK-007",
+        "entity-vs-account commingling",
+        passed=not mismatches and not unmapped,
+        details=[*mismatches, *unmapped],
+    )
+
+
 # ── orchestration ──────────────────────────────────────────────────────────
 
 
-def run_checks(txs: list[dict[str, Any]], period: Period, entity: str) -> list[CheckResult]:
+def run_checks(
+    txs: list[dict[str, Any]],
+    period: Period,
+    entity: str,
+    *,
+    account_entity: dict[str, str] | None = None,
+    all_txs: list[dict[str, Any]] | None = None,
+) -> list[CheckResult]:
+    """Run every check. Checks 001..006 are scoped to the filing ``entity``'s
+    rows (``txs``); the commingling check (007) is cross-entity by nature, so it
+    scans ``all_txs`` (every non-rejected receipt, all entities) when provided,
+    falling back to ``txs`` otherwise."""
+    commingle_rows = all_txs if all_txs is not None else txs
     return [
         check_sign_vs_direction(txs, period),
         check_unlinked_reimbursables(txs, period),
@@ -342,6 +427,7 @@ def run_checks(txs: list[dict[str, Any]], period: Period, entity: str) -> list[C
         check_refund_sweep(txs, period),
         check_rate_tier(txs, period),
         check_locality_mapping(txs, period, entity),
+        check_entity_account_commingling(commingle_rows, period, account_entity or {}),
     ]
 
 
@@ -380,6 +466,58 @@ def load_transactions(db_path: Path, entity: str) -> list[dict[str, Any]]:
         conn.close()
 
 
+def _ro_connect(db_path: Path) -> sqlite3.Connection:
+    """Open the register strictly read-only, honouring the WAL (see
+    ``load_transactions`` for why ``mode=ro`` and not ``immutable=1``)."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_all_transactions(db_path: Path) -> list[dict[str, Any]]:
+    """Load every non-rejected row across ALL entities (read-only).
+
+    Feeds the commingling check (REQ-BNO-CHK-007), which is cross-entity: filing
+    one entity must still surface a receipt from another entity that landed in
+    this entity's account (and vice versa). Includes ``payment_method`` — the
+    join key to the account's owning entity.
+    """
+    conn = _ro_connect(db_path)
+    try:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)")}
+        pm = "payment_method" if "payment_method" in cols else "NULL AS payment_method"
+        cur = conn.execute(
+            "SELECT id, source, date, description, amount, entity, direction,"
+            f" tax_category, status, confidence, {pm}"
+            " FROM transactions WHERE status != 'rejected'"
+        )
+        return [dict(row) for row in cur]
+    finally:
+        conn.close()
+
+
+def build_account_entity_map(db_path: Path) -> dict[str, str]:
+    """Map each account's ``payment_method`` label to its owning ``entity``.
+
+    The ``account`` table (src/models/brokerage.py) is the authoritative,
+    self-maintaining ownership source: every Plaid/CSV account carries both its
+    ``payment_method`` join label and its ``entity``. A register missing the
+    table (e.g. a minimal fixture) yields an empty map, and every labelled
+    receipt is then reported as "unmapped, cannot verify" rather than passed.
+    """
+    conn = _ro_connect(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT payment_method, entity FROM account"
+            " WHERE payment_method IS NOT NULL AND payment_method != ''"
+        )
+        return {str(row["payment_method"]): str(row["entity"]) for row in cur}
+    except sqlite3.OperationalError:
+        return {}  # no account table in this register
+    finally:
+        conn.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deterministic B&O pre-filing checklist.")
     parser.add_argument("--entity", required=True, choices=["sparkry", "blackline"])
@@ -400,6 +538,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         txs = load_transactions(db_path, args.entity)
+        all_txs = load_all_transactions(db_path)
+        account_entity = build_account_entity_map(db_path)
     except sqlite3.Error as exc:
         print(f"ERROR: cannot read {db_path}: {exc}")
         return 2
@@ -407,8 +547,11 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"B&O pre-filing checklist — entity={args.entity} period={period.label}"
         f" ({period.start}..{period.end}) rows={len(txs)}"
+        f" (all-entity rows={len(all_txs)}, mapped accounts={len(account_entity)})"
     )
-    results = run_checks(txs, period, args.entity)
+    results = run_checks(
+        txs, period, args.entity, account_entity=account_entity, all_txs=all_txs
+    )
     any_fail = False
     for r in results:
         status = "PASS" if r.passed else "FAIL"

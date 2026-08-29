@@ -87,6 +87,8 @@ class CloseReport:
     data_hygiene: list[str] = field(default_factory=lambda: list(DATA_HYGIENE_CALLOUTS))
     # REQ-SEL-001: the sellability section ships WITH the close email.
     sellability_text: str | None = None
+    # REQ-UTX-005 (#59): quarter-to-date WA use-tax estimate on comped orders.
+    use_tax_text: str | None = None
 
 
 def _month_bounds(month: str) -> tuple[str, str]:
@@ -171,6 +173,21 @@ def build_close_report(
         logger.exception("sellability section failed; close report degrades")
         sellability_text = "Sellability section unavailable (compute error — check logs)"
 
+    # REQ-UTX-005 (#59): quarter-to-date WA use-tax estimate on comped ($0)
+    # BlackLine orders. Report-only; a compute error degrades to a note.
+    try:
+        from src.export.use_tax_estimate import (
+            build_use_tax_summary,
+            render_use_tax_section,
+        )
+
+        use_tax_text: str | None = render_use_tax_section(
+            build_use_tax_summary(session, month)
+        )
+    except Exception:  # noqa: BLE001 — close must ship even if UTX breaks
+        logger.exception("use-tax section failed; close report degrades")
+        use_tax_text = "Use-tax section unavailable (compute error — check logs)"
+
     return CloseReport(
         month=month,
         generated_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
@@ -180,4 +197,5 @@ def build_close_report(
         anomalies=scan_anomalies(session, month),
         autoconfirm=_autoconfirm_summary(session, first, last),
         sellability_text=sellability_text,
+        use_tax_text=use_tax_text,
     )

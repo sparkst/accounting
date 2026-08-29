@@ -878,3 +878,21 @@ Hand-rolled per-session rsyncs deleted the box's runtime `reports/` dir on 2026-
 | REQ-DIG-EML-003 | Recipients come ONLY from env `DIGEST_EMAIL_RECIPIENTS` (comma-separated, whitespace-tolerant, each address format-validated like `report_email._validate_email`). No recipient string literals in production source (REQ-FIX-API-004 grep-gate stays green). Env unset/empty ⇒ the email leg is a silent no-op (one log line, no ledger row, no effect on the pulse result). |
 | REQ-DIG-EML-004 | Each digest email has its own `alert_dispatch` dedup row — keys `wealth:pulse:email:<date>` / `balance:pulse:email:<date>`, `delivery_channel="resend_email"`, `payload_json` NULL (the `dispatch_report` pattern). A same-day re-run never double-emails. An email failure surfaces in `post_pulse`'s worst-of return (so the timer exit reflects it) but NEVER blocks or reorders the Telegram send — the webhook POST happens first and email exceptions are contained. |
 | REQ-DIG-EML-005 | Non-digest alerts (balance milestones via `src/balance_alerts/dispatcher.py`, and every other severity-webhook caller) never email. Pinned with a behavior test. |
+
+## REQ-UTX-* — Feature: WA use-tax estimate on comped ($0) BlackLine orders (#59, WAC 458-20-178)
+
+Report-only quarterly estimate (Option A, decided-by: travis 2026-08-28). Comped
+($0) BlackLine Shopify orders give apparel away; WA use tax is owed on the COST of
+the goods since no retail sales tax was collected. The register correctly books $0
+revenue (right for B&O) but the use-tax liability was surfaced nowhere. This
+feature surfaces a quarter-to-date number in the monthly-close report Travis
+already reads. Nothing is written to the register; no filing position is
+auto-committed. `src/export/use_tax_estimate.py`.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-UTX-001 | `find_comped_orders(txs)` selects only $0-amount BlackLine (`entity`) Shopify (`source`) rows carrying `line_items` (excludes payouts/refunds which share the source but have none). `estimate_use_tax_accrual(orders, unit_cost, rate)` = Σ line-item quantities × assumed avg per-unit COGS × rate, each money leg `Decimal.quantize` half-up to cents; empty → $0.00. |
+| REQ-UTX-002 | Only `status='confirmed'` comped orders feed the number. Shopify orders ingest at `needs_review` (`shopify_adapter.py:_parse_order`); needs_review and rejected rows are excluded so the filing number reflects human-verified comps only (the substantive fix over the closed PR #68 primitive, which counted needs_review). |
+| REQ-UTX-003 | The two tax parameters (assumed avg per-unit COGS + local use-tax rate) are Travis's WA DOR filing position, read from gitignored `config/use_tax.yaml` (tracked `config/use_tax.example.yaml`). Missing file or either value `<= 0` → `load_use_tax_config` returns None → UNAVAILABLE, mirroring `config/tax_profile.yaml`; the estimate is never invented. |
+| REQ-UTX-004 | `build_use_tax_summary(session, month)` reports the confirmed comped-order and unit counts for the QUARTER containing `month` (BlackLine files B&O/CETR quarterly), plus the dollar estimate when config is set. Counts always render (liability visible pre-config); the dollar figure only when both parameters are supplied. |
+| REQ-UTX-005 | The monthly-close report/email carries a "WA use tax (comped orders)" section (`CloseReport.use_tax_text`) with the quarter label, counts, the estimate or an UNAVAILABLE note, and a report-only/not-booked disclaimer citing WAC 458-20-178. A compute error degrades to a note; it never kills the close email (the REQ-SEL-001 degrade pattern). |

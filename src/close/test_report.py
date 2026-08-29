@@ -97,3 +97,27 @@ def test_data_hygiene_callouts_present(session: Session) -> None:
     assert "Vanguard $0 stub (named 2026-07-08) — confirm archive" in report.data_hygiene
     assert "$50 Fidelity TOD — human closure decision" in report.data_hygiene
     assert report.data_hygiene == list(DATA_HYGIENE_CALLOUTS)
+
+
+def test_build_close_report_includes_use_tax_section(session: Session) -> None:
+    """REQ-UTX-005 (#59): the close report carries the comped-order use-tax section.
+
+    A confirmed $0 BlackLine Shopify comp in-quarter surfaces in the section for
+    the quarter containing the close month. No config/use_tax.yaml exists in the
+    test tree, so the estimate degrades to UNAVAILABLE while the counts render.
+    """
+    _tx(
+        session,
+        description="Comp #1017",
+        source="shopify",
+        entity=Entity.BLACKLINE.value,
+        amount=Decimal("0.00"),
+        status=TransactionStatus.CONFIRMED.value,
+        raw_data={"id": 1017, "line_items": [{"quantity": 2}]},
+    )
+    report = build_close_report(session, "2026-06", today=_TODAY)
+    assert report.use_tax_text is not None
+    assert "WAC 458-20-178" in report.use_tax_text
+    assert "Q2 2026" in report.use_tax_text
+    assert "1" in report.use_tax_text  # one confirmed comp order
+    assert "UNAVAILABLE" in report.use_tax_text  # no config in the test tree

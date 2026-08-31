@@ -123,11 +123,29 @@ def _probe_line(unit: str) -> str | None:
     return None
 
 
-def classify(unit: str) -> tuple[str, str, list[str]]:
-    """(severity, title, extra body lines) for the failed unit.
+def _is_genuine_failure(result: str | None) -> bool:
+    """Whether an OnFailure= trigger reflects a real failure the wrapper should
+    page on, given the unit's systemd ``Result=`` at handler-run time.
 
-    Every unit gets its systemd ``Result=`` in the body. The probe unit is
-    additionally classified by what actually happened:
+    Issue #79 (08-27, journal ids 17223, 17227): the OnFailure handler ran, but
+    by the time it queried state the 5-min timer had already re-activated the
+    probe to a successful run, so ``Result`` read ``success`` — the failing
+    invocation had recovered. The handler paged "unit failed" anyway because the
+    page/no-page decision never consulted Result. Page only when Result names a
+    real failure (``exit-code``/``timeout``/``signal``/``core-dump``/…). A
+    positive ``success`` is the one shape that is suppressed; ``None`` (state
+    unreadable — no privileges) fails OPEN and still pages, so a genuine outage
+    is never silenced by an inability to read Result."""
+    return result != "success"
+
+
+def classify(unit: str, result: str | None) -> tuple[str, str, list[str]]:
+    """(severity, title, extra body lines) for the failed unit, given its
+    systemd ``Result=`` (fetched once by the caller so the page/no-page guard
+    and the body see the same value — Issue #79).
+
+    Every unit gets its ``Result=`` in the body. The probe unit is additionally
+    classified by what actually happened:
       * Result=timeout + probe logged ``uptime ok``  → info  (host starvation,
         NOT an outage — the endpoint answered 200);
       * Result=timeout + no probe line               → sev3  (the probe could
@@ -136,7 +154,6 @@ def classify(unit: str) -> tuple[str, str, list[str]]:
     """
     severity = _severity(unit)
     title = f"[accounting/hetzner] unit failed: {unit}"
-    result = _unit_result(unit)
     extra: list[str] = []
     if result:
         extra.append(f"systemd Result: {result}")
@@ -191,6 +208,19 @@ def _email_fallback(unit: str) -> int:
 
 
 def send_alert(unit: str) -> int:
+    # Issue #79: derive the page/no-page decision from the unit's ACTUAL
+    # failure state, not from the mere fact that OnFailure= fired. If the
+    # failing invocation has already recovered (Result=success — the 08-27
+    # false-fire shape), there is nothing to page. Read Result once and thread
+    # it into classify() so the guard and the body agree.
+    unit_result = _unit_result(unit)
+    if not _is_genuine_failure(unit_result):
+        print(
+            f"[alert-webhook] {unit}: systemd Result={unit_result} — OnFailure fired "
+            "but the unit is not in a failure state (stale/re-run trigger); no page"
+        )
+        return 0
+
     sdir = _sentinel_dir()
     sdir.mkdir(parents=True, exist_ok=True)
     hour = _hour()
@@ -199,7 +229,7 @@ def send_alert(unit: str) -> int:
         print(f"[alert-webhook] already sent for {unit} this hour — skipping")
         return 0
 
-    severity, title, extra = classify(unit)
+    severity, title, extra = classify(unit, unit_result)
     body = _build_body(unit)
     if extra:
         body = "\n".join([*extra, "", body])

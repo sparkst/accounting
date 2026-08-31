@@ -896,3 +896,18 @@ auto-committed. `src/export/use_tax_estimate.py`.
 | REQ-UTX-003 | The two tax parameters (assumed avg per-unit COGS + local use-tax rate) are Travis's WA DOR filing position, read from gitignored `config/use_tax.yaml` (tracked `config/use_tax.example.yaml`). Missing file or either value `<= 0` → `load_use_tax_config` returns None → UNAVAILABLE, mirroring `config/tax_profile.yaml`; the estimate is never invented. |
 | REQ-UTX-004 | `build_use_tax_summary(session, month)` reports the confirmed comped-order and unit counts for the QUARTER containing `month` (BlackLine files B&O/CETR quarterly), plus the dollar estimate when config is set. Counts always render (liability visible pre-config); the dollar figure only when both parameters are supplied. |
 | REQ-UTX-005 | The monthly-close report/email carries a "WA use tax (comped orders)" section (`CloseReport.use_tax_text`) with the quarter label, counts, the estimate or an UNAVAILABLE note, and a report-only/not-booked disclaimer citing WAC 458-20-178. A compute error degrades to a note; it never kills the close email (the REQ-SEL-001 degrade pattern). |
+
+## REQ-HYG-1026-*: Data hygiene, BlackLine test order #1026 exclusion (#73)
+
+Split out of #58. Order #1026 (buyer "Travis Sparks", $32.76) and its matching
+refund were auto-tagged `PERSONAL_NON_DEDUCTIBLE` inside the BlackLine entity,
+wrong on both axes. Travis ruling 2026-08-31 (Option C): these were **test
+orders, not real transactions** so exclude both from the books entirely, no P&L
+impact on either entity. Exclusion is a status flip to `rejected` (never a
+DELETE), with a `review_reason` and an `AuditEvent` per field change.
+
+| REQ-ID | Requirement |
+|--------|-------------|
+| REQ-HYG-1026-001 | One-off correction `scripts/exclude_test_order_1026.py` rejects the #1026 order (BlackLine Shopify row, `raw_data.name == "#1026"`) and its matching refund. The refund is linked by `raw_data.order_id` (Shopify nests refunds inside the order) with the `"Shopify Refund for #1026"` description as a fallback tie; `find_order_ids` is status-agnostic so a refund still links after its order was excluded on a prior run. DRY-RUN by default, `--apply` commits. Rows are never deleted. |
+| REQ-HYG-1026-002 | Go-forward prevention (`shopify_adapter.py`): an order Shopify itself flags as a test order (`order.test is True`, Bogus Gateway / test mode) is ingested as `status=rejected` with `review_reason=TEST_ORDER_REVIEW_REASON` by `_parse_order`; its refunds inherit the same via `_parse_refund` (which receives the parent order). A rejected row never books to P&L/B&O and never reaches the classifier reclassify pass, so a test purchase can no longer land as `PERSONAL_NON_DEDUCTIBLE`. Buyer name and refund/`financial_status` are deliberately NOT triggers: a real self-purchase Travis keeps is genuine BlackLine revenue, and a legitimately refunded real order is contra-revenue that stays on the books (order income + refund expense net to zero). `_insert_if_new` copies the adapter-stamped `review_reason` onto the row. |
+| REQ-HYG-1026-003 | The correction script uses per-row savepoints (one bad row never halts the batch), skips split parents/children (a half-rejection would break the split-sum invariant), writes an `AuditEvent` per field change (`status` + `review_reason`), is idempotent (an already-rejected row is skipped; a second run reports zero changes), and forces a real transaction before the first savepoint so a DRY-RUN `rollback()` actually reverts (the pysqlite SAVEPOINT-autocommit landmine, mirroring `remediate_plaid_mirrors.py`). A behavior test asserts the rejected rows drop out of `compute_entity_pl` for BlackLine. |

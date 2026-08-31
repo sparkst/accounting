@@ -25,10 +25,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.shopify_adapter import (
+    TEST_ORDER_REVIEW_REASON,
     ShopifyAdapter,
     ShopifyAuthError,
     _parse_order,
     _parse_payout,
+    _parse_refund,
 )
 from src.models.base import Base
 from src.models.enums import (
@@ -567,3 +569,104 @@ def test_resolve_token_grant_failure_raises():
 def test_init_requires_some_credential():
     with pytest.raises(ValueError):
         ShopifyAdapter(store_url="x.myshopify.com")
+
+
+# ---------------------------------------------------------------------------
+# Shopify test-order exclusion (REQ-HYG-1026-002, issue #73)
+# ---------------------------------------------------------------------------
+
+SAMPLE_TEST_ORDER: dict = {
+    "id": 5009999999999,
+    "name": "#9001",
+    "created_at": "2026-02-01T12:00:00-08:00",
+    "processed_at": "2026-02-01T12:00:00-08:00",
+    "financial_status": "refunded",
+    "total_price": "32.76",
+    "currency": "USD",
+    "test": True,  # Shopify's own flag for orders placed in test mode
+    "customer": {"first_name": "Travis", "last_name": "Sparks"},
+    "line_items": [{"title": "BlackLine Jersey", "quantity": 1, "price": "32.76"}],
+    "refunds": [
+        {
+            "id": 9009,
+            "order_id": 5009999999999,
+            "created_at": "2026-02-02T09:00:00-08:00",
+            "transactions": [
+                {
+                    "id": 9009001,
+                    "kind": "refund",
+                    "status": "success",
+                    "amount": "32.76",
+                    "currency": "USD",
+                }
+            ],
+        }
+    ],
+}
+
+
+class TestTestOrderExclusion:
+    """A Shopify test order (order.test is True) must never book; it is
+    rejected at ingest so it contributes nothing to P&L/B&O and is never
+    auto-classified (issue #73, Travis ruling 2026-08-31 Option C)."""
+
+    def test_test_order_is_rejected_at_parse(self) -> None:
+        tx = _parse_order(SAMPLE_TEST_ORDER)
+        assert tx["status"] == TransactionStatus.REJECTED.value
+        assert tx["review_reason"] == TEST_ORDER_REVIEW_REASON
+        # Entity/category still stamped correctly for the audit trail.
+        assert tx["entity"] == Entity.BLACKLINE.value
+
+    def test_non_test_order_is_needs_review(self) -> None:
+        tx = _parse_order(SAMPLE_ORDER)
+        assert tx["status"] == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.get("review_reason") is None
+
+    def test_test_false_is_not_rejected(self) -> None:
+        order = dict(SAMPLE_ORDER, test=False)
+        tx = _parse_order(order)
+        assert tx["status"] == TransactionStatus.NEEDS_REVIEW.value
+
+    def test_refund_of_test_order_is_rejected(self) -> None:
+        refund = SAMPLE_TEST_ORDER["refunds"][0]
+        tx = _parse_refund(refund, SAMPLE_TEST_ORDER)
+        assert tx["status"] == TransactionStatus.REJECTED.value
+        assert tx["review_reason"] == TEST_ORDER_REVIEW_REASON
+
+    def test_refund_of_real_order_is_needs_review(self) -> None:
+        refund = SAMPLE_ORDER_WITH_REFUND["refunds"][0]
+        tx = _parse_refund(refund, SAMPLE_ORDER_WITH_REFUND)
+        assert tx["status"] == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.get("review_reason") is None
+
+    def test_self_purchase_buyer_alone_is_not_a_trigger(self) -> None:
+        """A real order Travis places on his own store and KEEPS is genuine
+        BlackLine revenue: buyer name (and a 'refunded' financial_status) must
+        NOT reject it. Only Shopify's own test flag does."""
+        order = {
+            **SAMPLE_ORDER,
+            "id": 5001099,
+            "financial_status": "refunded",
+            "customer": {"first_name": "Travis", "last_name": "Sparks"},
+        }
+        tx = _parse_order(order)
+        assert tx["status"] == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.get("review_reason") is None
+
+    def test_test_order_persists_as_rejected_with_reason(
+        self, session: Session, adapter: ShopifyAdapter
+    ) -> None:
+        """End-to-end through _insert_if_new: review_reason survives to the row
+        (the insert path picks fields explicitly, so it must copy review_reason)."""
+        from src.adapters.base import AdapterResult
+
+        res = AdapterResult(source=Source.SHOPIFY.value)
+        adapter._insert_if_new(_parse_order(SAMPLE_TEST_ORDER), session, res, [0])
+        session.commit()
+        row = (
+            session.query(Transaction)
+            .filter(Transaction.source_id == "order_5009999999999")
+            .one()
+        )
+        assert row.status == TransactionStatus.REJECTED.value
+        assert row.review_reason == TEST_ORDER_REVIEW_REASON

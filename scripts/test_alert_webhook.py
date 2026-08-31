@@ -82,6 +82,7 @@ def test_send_failure_returns_nonzero_and_writes_no_sentinel(
     monkeypatch.setattr(aw, "_email_fallback", lambda unit: 1)
     monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
     monkeypatch.setattr(aw, "_build_body", lambda unit: "body")
+    monkeypatch.setattr(aw, "_unit_result", lambda unit: "exit-code")  # genuine failure
     monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
 
     rc = aw.send_alert("accounting-api.service")
@@ -102,6 +103,7 @@ def test_raising_post_returns_nonzero(
     monkeypatch.setattr(aw, "_email_fallback", lambda unit: 1)
     monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
     monkeypatch.setattr(aw, "_build_body", lambda unit: "body")
+    monkeypatch.setattr(aw, "_unit_result", lambda unit: "exit-code")  # genuine failure
     monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
 
     rc = aw.send_alert("accounting-api.service")
@@ -128,6 +130,7 @@ def test_webhook_failure_falls_back_to_email(
     )
     monkeypatch.setattr(aw, "_sentinel_dir", lambda: tmp_path)
     monkeypatch.setattr(aw, "_build_body", lambda unit: "body")
+    monkeypatch.setattr(aw, "_unit_result", lambda unit: "exit-code")  # genuine failure
     monkeypatch.setenv("ALERT_HOUR_OVERRIDE", "2026080214")
 
     rc = aw.send_alert("accounting-backup.service")
@@ -238,6 +241,64 @@ def test_unknown_result_is_omitted_gracefully(
     aw.send_alert("caddy.service")
     assert sent[0]["type"] == "sev2"
     assert "systemd Result" not in sent[0]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #79: the OnFailure handler must page only on a genuine failure state.
+# 08-27 (journal ids 17223, 17227) paged "unit failed" twice while the alert
+# body itself reported `systemd Result: success` — the handler queried Result
+# after the 5-min timer had already re-run the probe to success, yet paged
+# anyway because the page/no-page decision never consulted Result. The failure
+# predicate is now derived from the unit's actual Result: `success` → no page.
+# ---------------------------------------------------------------------------
+
+
+def test_uptime_result_success_does_not_page(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exact 08-27 false-fire shape: OnFailure fired but by handler time
+    the probe had re-run and systemd reports Result=success. No page."""
+    _wire_probe(
+        monkeypatch,
+        result="success",
+        probe="uptime ok: http://127.0.0.1:9000/api/health/ping -> 200",
+    )
+    assert aw.send_alert(_UPTIME) == 0
+    assert sent == []
+
+
+def test_result_success_any_unit_does_not_page(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The success guard is not probe-specific: any unit whose Result reads
+    success at handler time is a stale/re-run trigger, not a failure."""
+    _wire_probe(monkeypatch, result="success", probe=None)
+    assert aw.send_alert("caddy.service") == 0
+    assert sent == []
+
+
+def test_result_success_writes_no_sentinel(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-failure must not consume the hourly dedup budget — a genuine
+    failure later in the same hour must still be free to page."""
+    _wire_probe(monkeypatch, result="success", probe=None)
+    aw.send_alert(_UPTIME)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_genuine_failure_still_pages_exactly_once(
+    sent: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-UPCHK-02 + acceptance: an induced unit failure (Result=exit-code)
+    yields exactly one alert — carrying the unit name and Result — and dedups
+    on the second OnFailure within the hour."""
+    _wire_probe(monkeypatch, result="exit-code", probe=None)
+    assert aw.send_alert("caddy.service") == 0
+    assert aw.send_alert("caddy.service") == 0  # same unit+hour → dedup
+    assert len(sent) == 1
+    assert "caddy.service" in sent[0]["title"]
+    assert "systemd Result: exit-code" in sent[0]["message"]
 
 
 def test_probe_line_picks_last_probe_line_of_journal(monkeypatch: pytest.MonkeyPatch) -> None:

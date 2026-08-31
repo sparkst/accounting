@@ -80,6 +80,26 @@ BATCH_SIZE = 100              # DB commit frequency — reduces per-record fsync
 # Link header pattern: <url>; rel="next"
 _LINK_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
+# REQ-HYG-1026-002 (issue #73): review_reason stamped on any Shopify order (and
+# its refunds) that Shopify itself flags as a test order (``order.test is True``,
+# i.e. placed via the Bogus Gateway / test mode). Such rows are ingested as
+# ``rejected`` so they never book to P&L/B&O and never reach the classifier (a
+# rejected row is excluded from the reclassify pass), which is why an earlier
+# test purchase could land as PERSONAL_NON_DEDUCTIBLE. We key ONLY off Shopify's
+# own ``test`` flag: buyer name and refund/financial_status are deliberately NOT
+# triggers: a real self-purchase Travis keeps is genuine BlackLine revenue, and
+# a legitimately refunded real order is contra-revenue that must stay on the
+# books (order income + refund expense netting to zero).
+TEST_ORDER_REVIEW_REASON = (
+    "Shopify test order (order.test=true), excluded from the books; not a real "
+    "transaction (issue #73)."
+)
+
+
+def _is_test_order(order: dict[str, Any]) -> bool:
+    """True only when Shopify's own ``test`` flag on the order is boolean True."""
+    return order.get("test") is True
+
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -158,6 +178,8 @@ def _parse_order(order: dict[str, Any]) -> dict[str, Any]:
 
     currency = (order.get("currency") or "USD").upper()
 
+    is_test = _is_test_order(order)
+
     return {
         "source": Source.SHOPIFY.value,
         "source_id": source_id,
@@ -169,7 +191,14 @@ def _parse_order(order: dict[str, Any]) -> dict[str, Any]:
         "entity": Entity.BLACKLINE.value,
         "direction": Direction.INCOME.value,
         "tax_category": TaxCategory.SALES_INCOME.value,
-        "status": TransactionStatus.NEEDS_REVIEW.value,
+        # A Shopify-flagged test order never books: reject it up front so it is
+        # excluded from P&L/B&O and never reaches the classifier (REQ-HYG-1026-002).
+        "status": (
+            TransactionStatus.REJECTED.value
+            if is_test
+            else TransactionStatus.NEEDS_REVIEW.value
+        ),
+        "review_reason": TEST_ORDER_REVIEW_REASON if is_test else None,
         "confidence": 0.8,
         "raw_data": order,
     }
@@ -207,6 +236,9 @@ def _parse_refund(refund: dict[str, Any], order: dict[str, Any]) -> dict[str, An
 
     currency = (order.get("currency") or "USD").upper()
 
+    # A refund of a Shopify test order is itself test data (REQ-HYG-1026-002).
+    is_test = _is_test_order(order)
+
     return {
         "source": Source.SHOPIFY.value,
         "source_id": source_id,
@@ -223,7 +255,12 @@ def _parse_refund(refund: dict[str, Any], order: dict[str, Any]) -> dict[str, An
         # B&O gross instead of reducing net. OTHER_EXPENSE keeps gross = actual
         # sales and books the refund as an outflow (consistent with direction).
         "tax_category": TaxCategory.OTHER_EXPENSE.value,
-        "status": TransactionStatus.NEEDS_REVIEW.value,
+        "status": (
+            TransactionStatus.REJECTED.value
+            if is_test
+            else TransactionStatus.NEEDS_REVIEW.value
+        ),
+        "review_reason": TEST_ORDER_REVIEW_REASON if is_test else None,
         "confidence": 0.8,
         "raw_data": refund,
     }
@@ -548,6 +585,9 @@ class ShopifyAdapter(BaseAdapter):
             direction=fields["direction"],
             tax_category=fields["tax_category"],
             status=fields["status"],
+            # REQ-HYG-1026-002: preserve an adapter-stamped review_reason (e.g. a
+            # rejected Shopify test order); absent for orders/payouts that don't set it.
+            review_reason=fields.get("review_reason"),
             confidence=fields["confidence"],
             raw_data=fields["raw_data"],
         )

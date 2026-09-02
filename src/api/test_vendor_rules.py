@@ -437,3 +437,75 @@ def test_patch_new_pattern_validated_against_existing_is_regex(client: TestClien
         f"/api/vendor-rules/{rule_id}", json={"vendor_pattern": "amazon(unclosed"}
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# REQ-FIX-ING-022 — the PATCH edit path must enforce the same guard as POST.
+# qreview P0-a1b / P0-a1b-2: the dashboard rule editor is PATCH-based, so an
+# unguarded PATCH leaves the whole incident reachable through the primary
+# human edit surface.
+# ---------------------------------------------------------------------------
+
+_POISONED = "cardinal.*health|fascinate.*os"
+
+
+def test_patch_cannot_turn_a_literal_rule_into_a_dead_regex(
+    client: TestClient,
+) -> None:
+    """Setting a regex pattern while is_regex stays False must 422, not 200."""
+    with _TestSession() as session:
+        rule_id = _make_rule(session, pattern="Cardinal Health East Cafe").id
+
+    resp = client.patch(
+        f"/api/vendor-rules/{rule_id}", json={"vendor_pattern": _POISONED}
+    )
+    assert resp.status_code == 422, resp.text
+
+    with _TestSession() as session:
+        rule = session.query(VendorRule).filter(VendorRule.id == rule_id).one()
+        assert rule.vendor_pattern == "Cardinal Health East Cafe"
+
+
+def test_patch_cannot_clear_is_regex_on_a_regex_rule(client: TestClient) -> None:
+    """Flipping is_regex to false on a rule that already holds a regex is the
+    same poisoning, arrived at from the other direction."""
+    with _TestSession() as session:
+        rule = _make_rule(session, pattern=_POISONED)
+        rule.is_regex = True
+        session.commit()
+        rule_id = rule.id
+
+    resp = client.patch(f"/api/vendor-rules/{rule_id}", json={"is_regex": False})
+    assert resp.status_code == 422, resp.text
+
+    with _TestSession() as session:
+        assert (
+            session.query(VendorRule).filter(VendorRule.id == rule_id).one().is_regex
+            is True
+        )
+
+
+def test_patch_accepts_a_regex_pattern_when_flagged_regex(
+    client: TestClient,
+) -> None:
+    with _TestSession() as session:
+        rule_id = _make_rule(session, pattern="Anthropic Headquarters").id
+
+    resp = client.patch(
+        f"/api/vendor-rules/{rule_id}",
+        json={"vendor_pattern": _POISONED, "is_regex": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["is_regex"] is True
+
+
+def test_patch_still_accepts_a_punctuated_literal(client: TestClient) -> None:
+    """No false positives: real descriptors keep working through PATCH."""
+    with _TestSession() as session:
+        rule_id = _make_rule(session, pattern="Old Name").id
+
+    resp = client.patch(
+        f"/api/vendor-rules/{rule_id}", json={"vendor_pattern": "SQ *COFFEE SHOP"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["vendor_pattern"] == "SQ *COFFEE SHOP"

@@ -292,6 +292,19 @@ class TestNormalizeLearnedPattern:
         noisy = "TRACE#:091000019854840 EED:260831 TRN: 2439854840TC"
         assert normalize_learned_pattern(noisy).strip() != ""
 
+    def test_desc_date_field_included_in_normalized_head_when_populated(
+        self,
+    ) -> None:
+        """REQ-FIX-ING-024 / P2-b8c: DESC DATE is not in the marker set, so if
+        an originator populates it (e.g., DESC DATE:20260829), the normalized
+        head includes the date value. This fixture pins the behavior for future
+        review — whether DESC DATE should be treated as a per-payment marker
+        depends on whether its value is stable per originator or varies per txn.
+        """
+        # The normalized head includes DESC DATE when populated
+        normalized = normalize_learned_pattern(CARDINAL_WITH_POPULATED_DESC_DATE)
+        assert "20260829" in normalized or "DESC DATE:20260829" in normalized
+
 
 # ---------------------------------------------------------------------------
 # qreview round 1 findings — dedup round-trip and seed-file defense
@@ -338,3 +351,40 @@ class TestSeedRulesObeyTheGuard:
             except PatternFlagError as exc:
                 bad.append(f"{defn.vendor_pattern!r}: {exc}")
         assert not bad, "seed rules violating REQ-FIX-ING-022:\n" + "\n".join(bad)
+
+
+class TestNormalizeNeverEmitsBoilerplate:
+    """qreview P1-f6a: truncating at the first ACH marker can leave nothing but
+    the network's own boilerplate. A rule on that header would match EVERY ACH
+    payment and misclassify the lot. When no distinctive originator token
+    survives, degrade to the raw description — one-shot matching is the old
+    behavior and is strictly safer than over-matching.
+    """
+
+    BOILERPLATE_ONLY = (
+        "ORIG CO NAME: ORIG ID: DESC DATE: CO ENTRY DESCR:EFTPAYMENTSEC:CCD "
+        "TRACE#:091000019854840 EED:260831"
+    )
+
+    def test_boilerplate_only_header_falls_back_to_the_raw_description(
+        self,
+    ) -> None:
+        assert normalize_learned_pattern(self.BOILERPLATE_ONLY) == self.BOILERPLATE_ONLY
+
+    def test_boilerplate_header_never_matches_an_unrelated_ach_payment(
+        self, session: Session
+    ) -> None:
+        other = (
+            "ORIG CO NAME:ACME WIDGETS, ORIG ID:9999999999 DESC DATE: CO ENTRY "
+            "DESCR:EFTPAYMENTSEC:CCD TRACE#:000000000000001 EED:260901"
+        )
+        _rule(session, normalize_learned_pattern(self.BOILERPLATE_ONLY))
+        assert lookup_vendor_rule(other, session) is None
+
+    def test_a_named_originator_still_generalizes(self) -> None:
+        """The Cardinal case must keep working — the guard only rejects heads
+        with no distinctive token left after boilerplate is removed."""
+        assert normalize_learned_pattern(CARDINAL_JUL) != CARDINAL_JUL
+        assert normalize_learned_pattern(CARDINAL_JUL) == normalize_learned_pattern(
+            CARDINAL_AUG
+        )

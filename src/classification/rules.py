@@ -248,6 +248,35 @@ _ACH_PAYMENT_MARKERS = re.compile(r"TRACE\s*#|TRN\s*:|EED\s*:|RMR\*", re.IGNOREC
 #: A truncated head shorter than this is not distinctive enough to be a rule.
 _MIN_LEARNED_PATTERN_LEN = 12
 
+#: ACH/wire network boilerplate. These words appear in EVERY ACH description,
+#: so a truncated head made only of them would match every ACH payment in the
+#: register and misclassify the lot. Stripping them leaves the originator's
+#: own name, which is the only part worth learning.
+_ACH_BOILERPLATE = re.compile(
+    r"""
+      ORIG \s* CO \s* NAME | ORIG \s* ID | DESC \s* DATE | CO \s* ENTRY
+    | DESCR | EFT\s*PAYMENT | DIRECT \s* DEPOSIT | IND \s* ID | IND \s* NAME
+    | SEC \s* : | \bCCD\b | \bPPD\b | \bCTX\b | \bWEB\b | \bTEL\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+#: Distinctive residue required after boilerplate, punctuation and digits are
+#: removed, before a truncated head may be used as a rule pattern.
+_MIN_DISTINCTIVE_RESIDUE_LEN = 4
+
+
+def _distinctive_residue(head: str) -> str:
+    """What is left of *head* once ACH boilerplate, digits and punctuation go.
+
+    For a real payment this is the originator's name (``CARDINAL HEALTH``).
+    For a header the bank filled with nothing but network fields it is empty,
+    which is the signal that the head must not become a rule.
+    """
+    residue = _ACH_BOILERPLATE.sub(" ", head)
+    residue = re.sub(r"[^A-Za-z]+", " ", residue)
+    return " ".join(residue.split())
+
 
 class PatternFlagError(ValueError):
     """A ``vendor_pattern`` / ``is_regex`` combination that must never be stored.
@@ -384,5 +413,17 @@ def normalize_learned_pattern(description: str) -> str:
 
     head = description[: marker.start()].strip().rstrip(",;:-").strip()
     if len(head) < _MIN_LEARNED_PATTERN_LEN:
+        return description
+
+    # A head carrying no originator name is pure network boilerplate. Learning
+    # it would produce a rule that matches every ACH payment in the register,
+    # which is far worse than the one-shot rule this function exists to
+    # replace — so degrade to the raw description instead.
+    if len(_distinctive_residue(head)) < _MIN_DISTINCTIVE_RESIDUE_LEN:
+        logger.debug(
+            "Learned pattern head %r is ACH boilerplate only — keeping the raw "
+            "description rather than a rule that would match every payment",
+            head,
+        )
         return description
     return head

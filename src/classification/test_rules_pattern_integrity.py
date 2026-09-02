@@ -342,10 +342,10 @@ class TestSeedRulesObeyTheGuard:
     """
 
     def test_every_seed_rule_pattern_flag_pair_is_valid(self) -> None:
-        from src.classification.seed_rules import _SEED_RULES
+        from src.classification.seed_rules import SEED_RULES
 
         bad: list[str] = []
-        for defn in _SEED_RULES:
+        for defn in SEED_RULES:
             try:
                 validate_pattern_flag(defn.vendor_pattern, is_regex=defn.is_regex)
             except PatternFlagError as exc:

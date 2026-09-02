@@ -1412,7 +1412,11 @@ def bulk_confirm_transactions(
         confirmed += 1
 
         # Learning loop: create vendor rule for unique vendors
-        vendor_pattern = tx.description
+        # REQ-FIX-ING-024: normalize ONCE and dedup on the same value we
+        # store. Filtering on the raw description while writing the normalized
+        # head would never find the existing rule, so every ACH payment would
+        # add another one — the rule spam normalization exists to stop.
+        vendor_pattern = normalize_learned_pattern(tx.description or "")
         rule_entity = body.entity or tx.entity
         rule_category = body.tax_category or tx.tax_category
         if vendor_pattern and tx.direction and rule_entity:
@@ -1426,7 +1430,7 @@ def bulk_confirm_transactions(
             )
             if existing_rule is None:
                 rule = VendorRule(
-                    vendor_pattern=normalize_learned_pattern(vendor_pattern),
+                    vendor_pattern=vendor_pattern,
                     entity=rule_entity,
                     tax_category=rule_category,
                     direction=tx.direction,

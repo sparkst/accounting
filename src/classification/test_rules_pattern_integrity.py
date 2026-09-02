@@ -56,6 +56,17 @@ CARDINAL_JUL = (
     "NAME:SPARKRY LLC RMR*OI*CH20260331**33000.00*33000.00*0.00\\ DIRECT "
     "DEPOSIT TRN: 1872243053TC"
 )
+# REQ-FIX-ING-024 test case: originator with DESC DATE populated before TRACE#.
+# If DESC DATE is per-payment (P2-b8c), the learned rule must generalize across
+# different DESC DATE values. Currently the head includes DESC DATE, so the
+# pattern is stable across payments if DESC DATE is always empty; adding this
+# fixture pins the behavior when DESC DATE has a value.
+CARDINAL_WITH_POPULATED_DESC_DATE = (
+    "ORIG CO NAME:CARDINAL HEALTH, ORIG ID:1310958666 DESC DATE:20260829 "
+    "CO ENTRY DESCR:EFTPAYMENTSEC:CCD TRACE#:091000019854840 EED:260831 "
+    "IND ID: IND NAME:SPARKRY LLC RMR*OI*CH20260430**31000.00*31000.00*0.00\\ "
+    "DIRECT DEPOSIT TRN: 2439854840TC"
+)
 
 
 @pytest.fixture(scope="function")
@@ -280,3 +291,50 @@ class TestNormalizeLearnedPattern:
     def test_never_returns_empty_for_a_noise_only_string(self) -> None:
         noisy = "TRACE#:091000019854840 EED:260831 TRN: 2439854840TC"
         assert normalize_learned_pattern(noisy).strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# qreview round 1 findings — dedup round-trip and seed-file defense
+# ---------------------------------------------------------------------------
+
+
+class TestLearnedRuleDedup:
+    """REQ-FIX-ING-024: normalizing on write is only half the job. Every
+    learning-loop entry point must ALSO normalize the pattern it dedups on,
+    or each ACH payment creates a second rule instead of incrementing the
+    first — the rule-spam the normalization exists to stop.
+    """
+
+    def test_normalize_is_idempotent(self) -> None:
+        once = normalize_learned_pattern(CARDINAL_AUG)
+        assert normalize_learned_pattern(once) == once
+
+    def test_exact_literal_lookup_finds_rule_stored_as_normalized_head(
+        self, session: Session
+    ) -> None:
+        from src.classification.rules import find_exact_literal_rule
+
+        _rule(session, normalize_learned_pattern(CARDINAL_JUL), is_regex=False)
+        found = find_exact_literal_rule(session, CARDINAL_AUG, Entity.SPARKRY.value)
+        assert found is not None, (
+            "the August payment must dedup onto the rule learned in July"
+        )
+
+
+class TestSeedRulesObeyTheGuard:
+    """REQ-FIX-ING-022 defense in depth: the seed file is the other place a
+    human writes patterns by hand, and it is where the poisoned rules came
+    from. A new seed regex without is_regex=True must fail here, not in
+    production six weeks later.
+    """
+
+    def test_every_seed_rule_pattern_flag_pair_is_valid(self) -> None:
+        from src.classification.seed_rules import _SEED_RULES
+
+        bad: list[str] = []
+        for defn in _SEED_RULES:
+            try:
+                validate_pattern_flag(defn.vendor_pattern, is_regex=defn.is_regex)
+            except PatternFlagError as exc:
+                bad.append(f"{defn.vendor_pattern!r}: {exc}")
+        assert not bad, "seed rules violating REQ-FIX-ING-022:\n" + "\n".join(bad)

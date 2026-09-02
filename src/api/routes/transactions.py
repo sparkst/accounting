@@ -303,7 +303,11 @@ def _upsert_vendor_rule(
         )
         return
 
-    from src.classification.rules import find_best_matching_rule, find_exact_literal_rule
+    from src.classification.rules import (
+        find_best_matching_rule,
+        find_exact_literal_rule,
+        normalize_learned_pattern,
+    )
 
     now = datetime.now(UTC).replace(tzinfo=None)
     matched_rule = find_best_matching_rule(session, tx.description, tx.entity)
@@ -314,7 +318,7 @@ def _upsert_vendor_rule(
         # — a literal match is the most precise starting point; the human
         # can widen it later via the dashboard.
         rule = VendorRule(
-            vendor_pattern=tx.description,
+            vendor_pattern=normalize_learned_pattern(tx.description),
             is_regex=False,
             entity=tx.entity,
             tax_category=tx.tax_category,
@@ -390,7 +394,7 @@ def _upsert_vendor_rule(
         return
 
     new_rule = VendorRule(
-        vendor_pattern=tx.description,
+        vendor_pattern=normalize_learned_pattern(tx.description),
         is_regex=False,
         entity=tx.entity,
         tax_category=tx.tax_category,

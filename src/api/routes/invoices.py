@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
+from src.classification.rules import normalize_learned_pattern
 from src.invoicing.email_sender import _validate_email, send_invoice_email
 from src.invoicing.generator import generate_calendar_invoice as _gen_calendar
 from src.invoicing.generator import generate_flat_invoice as _gen_flat
@@ -1425,7 +1426,7 @@ def bulk_confirm_transactions(
             )
             if existing_rule is None:
                 rule = VendorRule(
-                    vendor_pattern=vendor_pattern,
+                    vendor_pattern=normalize_learned_pattern(vendor_pattern),
                     entity=rule_entity,
                     tax_category=rule_category,
                     direction=tx.direction,

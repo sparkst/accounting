@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -124,7 +125,9 @@ def find_exact_literal_rule(
     """
     if not description:
         return None
-    needle = description.strip().lower()
+    # REQ-FIX-ING-024: learned rules store the normalized originator head,
+    # so the exact-literal comparison must normalize the needle too.
+    needle = normalize_learned_pattern(description).strip().lower()
     candidates: list[VendorRule] = (
         session.query(VendorRule)
         .filter(VendorRule.entity == entity, VendorRule.is_regex.is_(False))
@@ -205,3 +208,181 @@ def lookup_vendor_rule(
         deductible_pct=best_rule.deductible_pct,
         rule_id=best_rule.id,  # REQ-MCA-002: auto-confirm keys on the winning rule
     )
+
+
+# ---------------------------------------------------------------------------
+# Pattern integrity — REQ-FIX-ING-022/023/024
+#
+# Incident 2026-09-02: REQ-FIX-ING-005 made ``is_regex=False`` mean
+# ``re.escape``-ed literal matching and defaulted every pre-migration row to
+# False. The human-authored regex rules (``cardinal.*health|fascinate.*os``,
+# ``\bshopify\b``, ``amazon.*aws|aws\.amazon``) were silently converted to
+# literals that can never match a bank description, so 34 of 76 rules went
+# dead and Tier 1 stopped answering for half the vendor book.
+# ---------------------------------------------------------------------------
+
+#: Constructs that only make sense as a regex. Deliberately NOT "any
+#: metacharacter": real card descriptors carry ``*`` (``SQ *COFFEE SHOP``,
+#: ``PAYPAL *VENDOR``) and real vendor names carry parentheses and dots
+#: (``A.B Corp (West)``), and every one of those is a legitimate literal.
+#: What no literal descriptor contains is a dot-quantifier, a backslash
+#: escape class, an alternation, or a character class — which is exactly
+#: what all 34 poisoned production rules contained.
+_REGEX_CONSTRUCTS = re.compile(
+    r"""
+      \.[*+?]              # dot-quantifier:  cardinal.*health
+    | \\[bBdDsSwWAZ]       # escape class:    \bshopify\b , \s+
+    | \\[.^$*+?()\[\]{}|]  # escaped meta:    aws\.amazon
+    | \|                   # alternation:     stickermule|sticker mule
+    | \[[^\]]+\]           # character class: [0-9]
+    """,
+    re.VERBOSE,
+)
+
+#: Per-payment tokens in an ACH/wire description. Everything from the first of
+#: these onward is unique to a single payment (trace number, settlement date,
+#: remittance invoice, amount), so a rule learned from it can never match
+#: another payment. The text before them is the stable originator header.
+_ACH_PAYMENT_MARKERS = re.compile(r"TRACE\s*#|TRN\s*:|EED\s*:|RMR\*", re.IGNORECASE)
+
+#: A truncated head shorter than this is not distinctive enough to be a rule.
+_MIN_LEARNED_PATTERN_LEN = 12
+
+
+class PatternFlagError(ValueError):
+    """A ``vendor_pattern`` / ``is_regex`` combination that must never be stored.
+
+    Raised when a pattern carrying hard regex metacharacters would be saved as
+    a literal (the ING-005 dead-rule trap), when a pattern flagged as a regex
+    does not compile, or when the pattern is empty.
+    """
+
+
+def looks_like_regex(pattern: str) -> bool:
+    """True when *pattern* contains a construct only a regex author would write.
+
+    False for legitimate literals that merely contain punctuation, such as
+    ``SQ *COFFEE SHOP`` or ``A.B Corp (West)`` — those still match themselves
+    when escaped, so flagging them would be a false positive.
+    """
+    return bool(_REGEX_CONSTRUCTS.search(pattern))
+
+
+def validate_pattern_flag(pattern: str, *, is_regex: bool) -> None:
+    """Guard a (pattern, is_regex) pair before it reaches the database.
+
+    REQ-FIX-ING-022. Call at every rule-creation and rule-edit site.
+
+    Raises:
+        PatternFlagError: pattern is empty; or it carries regex constructs
+            while ``is_regex`` is False (it would be escaped and never match);
+            or ``is_regex`` is True and the pattern does not compile.
+    """
+    if not pattern or not pattern.strip():
+        raise PatternFlagError("vendor_pattern must not be empty")
+
+    if is_regex:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise PatternFlagError(
+                f"vendor_pattern {pattern!r} is flagged is_regex=True but does "
+                f"not compile: {exc}"
+            ) from exc
+        return
+
+    if looks_like_regex(pattern):
+        raise PatternFlagError(
+            f"vendor_pattern {pattern!r} carries regex constructs but "
+            f"is_regex=False, so it would be escaped and could never match a "
+            f"description. Set is_regex=True, or write a plain literal."
+        )
+
+
+@dataclass
+class PatternRepairResult:
+    """Outcome of :func:`repair_literal_regex_rules`."""
+
+    repaired: int = 0
+    skipped: int = 0
+    dry_run: bool = True
+    repaired_ids: list[str] = field(default_factory=list)
+    skipped_ids: list[str] = field(default_factory=list)
+
+
+def repair_literal_regex_rules(
+    session: Session, *, dry_run: bool = True
+) -> PatternRepairResult:
+    """Flip ``is_regex`` to True on rules whose literal pattern is really a regex.
+
+    REQ-FIX-ING-023. Repairs the rows the ING-005 migration poisoned: an
+    ``is_regex=False`` rule whose pattern carries regex constructs and compiles
+    cleanly was authored as a regex and is currently dead.
+
+    A pattern that does not compile is left alone and counted in ``skipped`` —
+    flipping it would only trade a silent miss for a logged one, and a human
+    has to decide what it was meant to say.
+
+    DRY-RUN default: the caller must pass ``dry_run=False`` to write. The
+    caller owns the commit.
+    """
+    result = PatternRepairResult(dry_run=dry_run)
+
+    candidates: list[VendorRule] = (
+        session.query(VendorRule).filter(VendorRule.is_regex.is_(False)).all()
+    )
+    for rule in candidates:
+        if not looks_like_regex(rule.vendor_pattern):
+            continue
+        try:
+            re.compile(rule.vendor_pattern)
+        except re.error:
+            logger.warning(
+                "Vendor rule %s pattern=%r is neither a valid literal nor a "
+                "valid regex — left for a human",
+                rule.id,
+                rule.vendor_pattern,
+            )
+            result.skipped += 1
+            result.skipped_ids.append(rule.id)
+            continue
+
+        result.repaired += 1
+        result.repaired_ids.append(rule.id)
+        if not dry_run:
+            rule.is_regex = True
+
+    if not dry_run and result.repaired:
+        session.flush()
+    return result
+
+
+def normalize_learned_pattern(description: str) -> str:
+    """Reduce an ACH/wire description to the part that repeats across payments.
+
+    REQ-FIX-ING-024. The learning loop stored raw descriptions verbatim, so a
+    rule learned from a Cardinal Health payment carried that payment's unique
+    ``TRACE#``, ``EED``, remittance invoice and amount, and could only ever
+    match the one transaction it came from. Nine such write-only rules existed
+    in production.
+
+    Truncating at the first per-payment marker keeps the stable originator
+    header (``ORIG CO NAME:CARDINAL HEALTH, ORIG ID:1310958666 ...``), which is
+    still a contiguous substring of every future payment, so the result stays a
+    valid literal pattern and needs no regex.
+
+    Card and vendor descriptions carry no such markers and pass through
+    unchanged. A description that is *only* payment noise has no stable head,
+    so the original is returned rather than an empty or useless pattern.
+    """
+    if not description:
+        return description
+
+    marker = _ACH_PAYMENT_MARKERS.search(description)
+    if marker is None:
+        return description
+
+    head = description[: marker.start()].strip().rstrip(",;:-").strip()
+    if len(head) < _MIN_LEARNED_PATTERN_LEN:
+        return description
+    return head

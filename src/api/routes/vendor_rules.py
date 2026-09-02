@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.classification.rules import PatternFlagError, validate_pattern_flag
 from src.db.connection import SessionLocal
 from src.models.enums import Direction, Entity, TaxCategory, TaxSubcategory, VendorRuleSource
 from src.models.transaction import Transaction
@@ -290,6 +291,13 @@ def create_vendor_rule(
         try:
             body.validate_enums()
         except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        # REQ-FIX-ING-022: a metacharacter pattern saved as a literal is a
+        # dead rule (the 2026-09-02 incident). Reject it at the door.
+        try:
+            validate_pattern_flag(body.vendor_pattern, is_regex=body.is_regex)
+        except PatternFlagError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         rule = VendorRule(

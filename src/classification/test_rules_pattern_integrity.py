@@ -292,18 +292,26 @@ class TestNormalizeLearnedPattern:
         noisy = "TRACE#:091000019854840 EED:260831 TRN: 2439854840TC"
         assert normalize_learned_pattern(noisy).strip() != ""
 
-    def test_desc_date_field_included_in_normalized_head_when_populated(
-        self,
-    ) -> None:
-        """REQ-FIX-ING-024 / P2-b8c: DESC DATE is not in the marker set, so if
-        an originator populates it (e.g., DESC DATE:20260829), the normalized
-        head includes the date value. This fixture pins the behavior for future
-        review — whether DESC DATE should be treated as a per-payment marker
-        depends on whether its value is stable per originator or varies per txn.
-        """
-        # The normalized head includes DESC DATE when populated
+    def test_populated_desc_date_never_leaks_into_the_pattern(self) -> None:
+        """REQ-FIX-ING-024 / qreview P2-b8c: when an originator populates
+        DESC DATE the value is that payment's own date. A pattern carrying it
+        would match exactly one transaction, which is the defect this function
+        exists to remove, so DESC DATE is a per-payment marker too."""
         normalized = normalize_learned_pattern(CARDINAL_WITH_POPULATED_DESC_DATE)
-        assert "20260829" in normalized or "DESC DATE:20260829" in normalized
+        assert "20260829" not in normalized
+        assert "DESC DATE" not in normalized.upper()
+        assert "CARDINAL HEALTH" in normalized.upper()
+
+    def test_all_three_cardinal_payments_normalize_identically(self) -> None:
+        """Empty DESC DATE, populated DESC DATE, different trace numbers and
+        different amounts must all collapse to the same originator header."""
+        heads = {
+            normalize_learned_pattern(CARDINAL_JUL),
+            normalize_learned_pattern(CARDINAL_AUG),
+            normalize_learned_pattern(CARDINAL_WITH_POPULATED_DESC_DATE),
+        }
+        assert len(heads) == 1, heads
+        assert "ORIG ID:1310958666" in heads.pop()
 
 
 # ---------------------------------------------------------------------------

@@ -243,7 +243,15 @@ _REGEX_CONSTRUCTS = re.compile(
 #: these onward is unique to a single payment (trace number, settlement date,
 #: remittance invoice, amount), so a rule learned from it can never match
 #: another payment. The text before them is the stable originator header.
-_ACH_PAYMENT_MARKERS = re.compile(r"TRACE\s*#|TRN\s*:|EED\s*:|RMR\*", re.IGNORECASE)
+#:
+#: ``DESC DATE`` is in the set even though it is often empty: when an
+#: originator DOES populate it the value is the payment's own date, and a
+#: pattern carrying it would again match exactly one transaction. Truncating
+#: there still leaves ``ORIG CO NAME:<originator>, ORIG ID:<stable id>``,
+#: which is the part worth learning.
+_ACH_PAYMENT_MARKERS = re.compile(
+    r"TRACE\s*#|TRN\s*:|EED\s*:|RMR\*|DESC\s*DATE", re.IGNORECASE
+)
 
 #: A truncated head shorter than this is not distinctive enough to be a rule.
 _MIN_LEARNED_PATTERN_LEN = 12

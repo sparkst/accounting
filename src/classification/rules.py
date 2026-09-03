@@ -357,7 +357,7 @@ def repair_literal_regex_rules(
     session: Session,
     *,
     dry_run: bool = True,
-    changed_by: str = "cron:repair_vendor_rule_patterns",
+    changed_by: str = "human:operator",
 ) -> PatternRepairResult:
     """Flip ``is_regex`` to True on rules whose literal pattern is really a regex.
 

@@ -470,6 +470,38 @@ class TestMakeLearnedVendorRule:
         )
         assert rule.vendor_pattern == "Anthropic, PBC"
 
+    def test_omitted_deductible_pct_coalesces_to_the_column_default(self) -> None:
+        """The invoices learn-site omitted deductible_pct and took the 1.0
+        NOT-NULL default; an explicit None would defeat that default and fail
+        the flush, so the factory coalesces None -> 1.0."""
+        rule = make_learned_vendor_rule(
+            description="Anthropic, PBC",
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.SUPPLIES.value,
+            direction=Direction.EXPENSE.value,
+        )
+        assert rule.deductible_pct == 1.0
+
+    def test_explicit_deductible_pct_passes_through(self) -> None:
+        """The transactions learn-sites passed tx.deductible_pct; a real value,
+        including 0.0 (non-deductible), must survive — only None coalesces."""
+        rule = make_learned_vendor_rule(
+            description="Anthropic, PBC",
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.SUPPLIES.value,
+            direction=Direction.EXPENSE.value,
+            deductible_pct=0.5,
+        )
+        assert rule.deductible_pct == 0.5
+        zero = make_learned_vendor_rule(
+            description="Anthropic, PBC",
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.SUPPLIES.value,
+            direction=Direction.EXPENSE.value,
+            deductible_pct=0.0,
+        )
+        assert zero.deductible_pct == 0.0
+
 
 class TestRepairWritesAuditTrail:
     """qreview P2-d1e: ``repair_literal_regex_rules`` flips ``is_regex`` on up

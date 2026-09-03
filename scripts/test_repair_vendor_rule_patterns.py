@@ -15,6 +15,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from scripts.repair_vendor_rule_patterns import repair
+from src.classification.rules import ENTITY_TYPE_VENDOR_RULE
+from src.models.audit_event import AuditEvent
 from src.models.base import Base
 from src.models.enums import Direction, Entity, TaxCategory
 from src.models.vendor_rule import VendorRule
@@ -91,3 +93,44 @@ def test_uncompilable_pattern_is_reported_not_flipped(session: Session) -> None:
     assert result.skipped == 1
     session.expire_all()
     assert session.query(VendorRule).one().is_regex is False
+
+
+# ── Audit trail (qreview P2-d1e / P2-002) ────────────────────────────────────
+# The library function is unit-tested for the audit write in
+# test_rules_pattern_integrity.py; these assert the actual production
+# entrypoint (the committed CLI wrapper) persists the audit rows and honors
+# --changed-by, since that is what will run against the real 34 dead rules.
+
+
+def test_apply_via_cli_wrapper_persists_an_audit_row(session: Session) -> None:
+    rule = _rule(session, POISONED)
+    repair(session, dry_run=False, changed_by="human:travis@blacklinemtb.com")
+    session.expire_all()
+    audits = session.query(AuditEvent).all()
+    assert len(audits) == 1
+    a = audits[0]
+    assert a.entity_id == rule.id
+    assert a.entity_type == ENTITY_TYPE_VENDOR_RULE
+    assert a.field_changed == "is_regex"
+    assert (a.old_value, a.new_value) == ("False", "True")
+    assert a.changed_by == "human:travis@blacklinemtb.com"
+
+
+def test_default_changed_by_names_a_human_not_a_fictional_cron(
+    session: Session,
+) -> None:
+    """P2-001: no cron/timer runs this script, so the default actor must not
+    claim one — an audit row that lies about who ran it defeats the purpose."""
+    _rule(session, POISONED)
+    repair(session, dry_run=False)
+    session.expire_all()
+    changed_by = session.query(AuditEvent).one().changed_by
+    assert not changed_by.startswith("cron:")
+    assert changed_by == "human:operator"
+
+
+def test_dry_run_via_cli_wrapper_writes_no_audit_row(session: Session) -> None:
+    _rule(session, POISONED)
+    repair(session, dry_run=True)
+    session.expire_all()
+    assert session.query(AuditEvent).count() == 0

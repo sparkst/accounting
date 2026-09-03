@@ -47,9 +47,21 @@ from src.models.vendor_rule import VendorRule  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
-def repair(session: Session, *, dry_run: bool = True) -> PatternRepairResult:
-    """Run the repair and own the commit. DRY-RUN default (REQ-FIX-ING-023)."""
-    result = repair_literal_regex_rules(session, dry_run=dry_run)
+def repair(
+    session: Session,
+    *,
+    dry_run: bool = True,
+    changed_by: str = "human:operator",
+) -> PatternRepairResult:
+    """Run the repair and own the commit. DRY-RUN default (REQ-FIX-ING-023).
+
+    ``changed_by`` is stamped on the AuditEvent for each flipped rule. This is
+    a manually-run CLI (no cron/timer references it), so the default names a
+    human operator; pass ``--changed-by`` to record who actually ran it.
+    """
+    result = repair_literal_regex_rules(
+        session, dry_run=dry_run, changed_by=changed_by
+    )
     if not dry_run and result.repaired:
         session.commit()
     return result
@@ -109,6 +121,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--apply", action="store_true", help="Commit (default: dry-run).")
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
+    p.add_argument(
+        "--changed-by",
+        default="human:operator",
+        help="Actor recorded on each rule's AuditEvent (default: human:operator).",
+    )
     args = p.parse_args(list(argv) if argv is not None else None)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -120,7 +137,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         repaired_detail = _rule_labels(session, preview.repaired_ids)
         skipped_detail = _rule_labels(session, preview.skipped_ids)
 
-        result = repair(session, dry_run=not args.apply)
+        result = repair(session, dry_run=not args.apply, changed_by=args.changed_by)
 
         if args.json:
             print(

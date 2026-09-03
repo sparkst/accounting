@@ -32,14 +32,17 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.classification.rules import (
+    ENTITY_TYPE_VENDOR_RULE,
     PatternFlagError,
     lookup_vendor_rule,
+    make_learned_vendor_rule,
     normalize_learned_pattern,
     repair_literal_regex_rules,
     validate_pattern_flag,
 )
+from src.models.audit_event import AuditEvent
 from src.models.base import Base
-from src.models.enums import Direction, Entity, TaxCategory
+from src.models.enums import Direction, Entity, TaxCategory, VendorRuleSource
 from src.models.vendor_rule import VendorRule
 
 # The exact production strings from the incident.
@@ -396,3 +399,126 @@ class TestNormalizeNeverEmitsBoilerplate:
         assert normalize_learned_pattern(CARDINAL_JUL) == normalize_learned_pattern(
             CARDINAL_AUG
         )
+
+
+class TestMakeLearnedVendorRule:
+    """qreview P1-d4e: the "every learned rule's pattern is normalized"
+    invariant was enforced by convention at three separate construction sites.
+    A fourth learn-site that forgets ``normalize_learned_pattern`` reopens the
+    one-shot-rule bug REQ-FIX-ING-024 closed. ``make_learned_vendor_rule`` is
+    the single chokepoint every learn-site must route through, so the invariant
+    is structural, not per-site discipline.
+    """
+
+    def test_pattern_is_normalized_at_the_chokepoint(self) -> None:
+        rule = make_learned_vendor_rule(
+            description=CARDINAL_AUG,
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.CONTRACT_LABOR.value,
+            direction=Direction.INCOME.value,
+        )
+        assert rule.vendor_pattern == normalize_learned_pattern(CARDINAL_AUG)
+        assert rule.vendor_pattern != CARDINAL_AUG  # actually truncated the head
+
+    def test_two_payments_from_one_originator_produce_the_same_pattern(
+        self,
+    ) -> None:
+        a = make_learned_vendor_rule(
+            description=CARDINAL_AUG,
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.CONTRACT_LABOR.value,
+            direction=Direction.INCOME.value,
+        )
+        b = make_learned_vendor_rule(
+            description=CARDINAL_JUL,
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.CONTRACT_LABOR.value,
+            direction=Direction.INCOME.value,
+        )
+        assert a.vendor_pattern == b.vendor_pattern
+
+    def test_learned_rule_is_always_a_literal(self) -> None:
+        """Learned rules are literals — a normalized head is matched via
+        ``re.escape`` so any residual metacharacter is matched verbatim."""
+        rule = make_learned_vendor_rule(
+            description="A.B Corp (West) | East",
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.SUPPLIES.value,
+            direction=Direction.EXPENSE.value,
+        )
+        assert rule.is_regex is False
+
+    def test_defaults_match_the_learn_sites(self) -> None:
+        """The factory must reproduce the field values the three inlined
+        construction sites used, or replacing them changes behavior."""
+        rule = make_learned_vendor_rule(
+            description="Anthropic, PBC",
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.SUPPLIES.value,
+            direction=Direction.EXPENSE.value,
+        )
+        assert rule.confidence == 0.80
+        assert rule.source == VendorRuleSource.LEARNED.value
+        assert rule.examples == 1
+
+    def test_plain_vendor_description_passes_through(self) -> None:
+        rule = make_learned_vendor_rule(
+            description="Anthropic, PBC",
+            entity=Entity.SPARKRY.value,
+            tax_category=TaxCategory.SUPPLIES.value,
+            direction=Direction.EXPENSE.value,
+        )
+        assert rule.vendor_pattern == "Anthropic, PBC"
+
+
+class TestRepairWritesAuditTrail:
+    """qreview P2-d1e: ``repair_literal_regex_rules`` flips ``is_regex`` on up
+    to 34 rules — a field-level change to classification behavior. The system's
+    critical rule is a full audit trail for every field-level change, so each
+    flip must leave an entity-mode ``AuditEvent``. Without it, 34 rules change
+    how money is categorized with no record of who, when, or what.
+    """
+
+    def _dead_regex_rule(self, session: Session, pattern: str) -> VendorRule:
+        """A rule the ING-005 migration poisoned: a real regex stored literal."""
+        return _rule(session, pattern, is_regex=False)
+
+    def test_apply_writes_one_audit_row_per_repaired_rule(
+        self, session: Session
+    ) -> None:
+        r1 = self._dead_regex_rule(session, CARDINAL_RULE)
+        r2 = self._dead_regex_rule(session, r"\bshopify\b")
+        self._rule_real_literal = _rule(session, "Anthropic Headquarters")
+
+        result = repair_literal_regex_rules(
+            session, dry_run=False, changed_by="cron:test_repair"
+        )
+        session.commit()
+
+        audits = session.query(AuditEvent).all()
+        assert result.repaired == 2
+        assert len(audits) == 2
+        by_entity = {a.entity_id: a for a in audits}
+        assert set(by_entity) == {r1.id, r2.id}
+        for a in audits:
+            assert a.entity_type == ENTITY_TYPE_VENDOR_RULE
+            assert a.field_changed == "is_regex"
+            assert a.old_value == "False"
+            assert a.new_value == "True"
+            assert a.changed_by == "cron:test_repair"
+            assert a.transaction_id is None  # entity mode, not transaction mode
+
+    def test_dry_run_writes_no_audit_rows(self, session: Session) -> None:
+        self._dead_regex_rule(session, CARDINAL_RULE)
+        repair_literal_regex_rules(session, dry_run=True)
+        assert session.query(AuditEvent).count() == 0
+
+    def test_uncompilable_rule_is_not_audited(self, session: Session) -> None:
+        """A skipped (non-compiling) rule is not mutated, so it earns no audit
+        row — an audit trail records changes, not non-changes."""
+        self._dead_regex_rule(session, r"cardinal.*health(")  # unbalanced paren
+        result = repair_literal_regex_rules(session, dry_run=False)
+        session.commit()
+        assert result.repaired == 0
+        assert result.skipped == 1
+        assert session.query(AuditEvent).count() == 0

@@ -16,10 +16,16 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from src.classification.engine import ClassificationResult
-from src.models.enums import Direction, Entity, TaxCategory
+from src.models.audit_event import AuditEvent
+from src.models.enums import Direction, Entity, TaxCategory, VendorRuleSource
 from src.models.vendor_rule import VendorRule
 
 logger = logging.getLogger(__name__)
+
+#: entity_type discriminator for entity-mode AuditEvents recording a
+#: vendor-rule field change (REQ-FIX-ING-023 / qreview P2-d1e). The repair
+#: mutates rules, not transactions, so it uses the AuditEvent entity mode.
+ENTITY_TYPE_VENDOR_RULE = "vendor_rule"
 
 
 def _match_candidates(
@@ -348,7 +354,10 @@ class PatternRepairResult:
 
 
 def repair_literal_regex_rules(
-    session: Session, *, dry_run: bool = True
+    session: Session,
+    *,
+    dry_run: bool = True,
+    changed_by: str = "cron:repair_vendor_rule_patterns",
 ) -> PatternRepairResult:
     """Flip ``is_regex`` to True on rules whose literal pattern is really a regex.
 
@@ -359,6 +368,12 @@ def repair_literal_regex_rules(
     A pattern that does not compile is left alone and counted in ``skipped`` —
     flipping it would only trade a silent miss for a logged one, and a human
     has to decide what it was meant to say.
+
+    Every applied flip writes an entity-mode ``AuditEvent`` (qreview P2-d1e):
+    the flip changes how a rule classifies money, and the system's audit-trail
+    invariant covers every field-level change. ``changed_by`` records the actor
+    (default: the repair cron). No audit row is written for skipped rules or in
+    dry-run — an audit trail records changes, not non-changes.
 
     DRY-RUN default: the caller must pass ``dry_run=False`` to write. The
     caller owns the commit.
@@ -388,6 +403,16 @@ def repair_literal_regex_rules(
         result.repaired_ids.append(rule.id)
         if not dry_run:
             rule.is_regex = True
+            session.add(
+                AuditEvent(
+                    entity_id=rule.id,
+                    entity_type=ENTITY_TYPE_VENDOR_RULE,
+                    field_changed="is_regex",
+                    old_value="False",
+                    new_value="True",
+                    changed_by=changed_by,
+                )
+            )
 
     if not dry_run and result.repaired:
         session.flush()
@@ -435,3 +460,48 @@ def normalize_learned_pattern(description: str) -> str:
         )
         return description
     return head
+
+
+def make_learned_vendor_rule(
+    *,
+    description: str,
+    entity: str,
+    tax_category: str,
+    direction: str,
+    tax_subcategory: str | None = None,
+    deductible_pct: float | None = None,
+    confidence: float = 0.80,
+    examples: int = 1,
+    last_matched: datetime | None = None,
+) -> VendorRule:
+    """Build a LEARNED VendorRule — the single construction chokepoint.
+
+    qreview P1-d4e. The "every learned rule's pattern is normalized"
+    invariant (REQ-FIX-ING-024) used to live as convention at three separate
+    ``VendorRule(...)`` call sites; a fourth learn-site that forgot
+    :func:`normalize_learned_pattern` would silently reopen the one-shot-rule
+    bug. Every learn-site now routes through here, so the invariant is
+    structural: the pattern is normalized exactly once, in one place, and a
+    learned rule is always a literal (``is_regex=False`` — the normalized head
+    is matched via ``re.escape``, so any residual metacharacter is verbatim).
+
+    Returns an un-added, un-committed ``VendorRule``; the caller owns
+    ``session.add`` and the commit (and any dedup lookup, keyed off the
+    returned ``vendor_pattern`` so the dedup value is the stored value).
+    """
+    return VendorRule(
+        vendor_pattern=normalize_learned_pattern(description),
+        is_regex=False,
+        entity=entity,
+        tax_category=tax_category,
+        tax_subcategory=tax_subcategory,
+        direction=direction,
+        # deductible_pct is NOT NULL with a 1.0 default; an explicit None would
+        # override that default and fail the flush, so coalesce (matches the
+        # invoices learn-site, which omitted the field and took the 1.0 default).
+        deductible_pct=deductible_pct if deductible_pct is not None else 1.0,
+        confidence=confidence,
+        source=VendorRuleSource.LEARNED.value,
+        examples=examples,
+        last_matched=last_matched,
+    )

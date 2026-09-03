@@ -571,3 +571,8 @@ def seed_vendor_rules(session: Session, *, force: bool = False) -> int:
         session.commit()
 
     return inserted
+
+
+# REQ-FIX-ING-022 defense in depth: export the seed rules so they can be
+# validated by the test without import gymnastics. See test_rules_pattern_integrity.py.
+SEED_RULES = _SEED_RULES

@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
+from src.classification.rules import make_learned_vendor_rule
 from src.invoicing.email_sender import _validate_email, send_invoice_email
 from src.invoicing.generator import generate_calendar_invoice as _gen_calendar
 from src.invoicing.generator import generate_flat_invoice as _gen_flat
@@ -45,7 +46,6 @@ from src.models.enums import (
     BillingModel,
     ConfirmedBy,
     InvoiceStatus,
-    VendorRuleSource,
 )
 from src.models.invoice import Customer, Invoice, InvoiceLineItem
 from src.models.transaction import Transaction
@@ -1411,34 +1411,40 @@ def bulk_confirm_transactions(
         confirmed += 1
 
         # Learning loop: create vendor rule for unique vendors
-        vendor_pattern = tx.description
+        # REQ-FIX-ING-024: normalize ONCE and dedup on the same value we
+        # store. Filtering on the raw description while writing the normalized
+        # head would never find the existing rule, so every ACH payment would
+        # add another one — the rule spam normalization exists to stop.
         rule_entity = body.entity or tx.entity
         rule_category = body.tax_category or tx.tax_category
-        if vendor_pattern and tx.direction and rule_entity:
-            existing_rule = (
-                session.query(VendorRule)
-                .filter(
-                    VendorRule.vendor_pattern == vendor_pattern,
-                    VendorRule.entity == rule_entity,
-                )
-                .first()
+        # A learned rule needs an entity, a category and a direction; without
+        # any of them there is nothing to store (and the NOT-NULL columns would
+        # reject it). Build through the single learned-rule chokepoint (P1-d4e),
+        # then dedup on its normalized pattern — the value we would store — so
+        # the filter and the stored pattern can never diverge (REQ-FIX-ING-024).
+        if rule_entity and rule_category and tx.direction:
+            candidate = make_learned_vendor_rule(
+                description=tx.description or "",
+                entity=rule_entity,
+                tax_category=rule_category,
+                direction=tx.direction,
+                last_matched=now,
             )
-            if existing_rule is None:
-                rule = VendorRule(
-                    vendor_pattern=vendor_pattern,
-                    entity=rule_entity,
-                    tax_category=rule_category,
-                    direction=tx.direction,
-                    confidence=0.80,
-                    source=VendorRuleSource.LEARNED.value,
-                    examples=1,
-                    last_matched=now,
+            if candidate.vendor_pattern:
+                existing_rule = (
+                    session.query(VendorRule)
+                    .filter(
+                        VendorRule.vendor_pattern == candidate.vendor_pattern,
+                        VendorRule.entity == rule_entity,
+                    )
+                    .first()
                 )
-                session.add(rule)
-                rules_created += 1
-            else:
-                existing_rule.examples += 1
-                existing_rule.last_matched = now
+                if existing_rule is None:
+                    session.add(candidate)
+                    rules_created += 1
+                else:
+                    existing_rule.examples += 1
+                    existing_rule.last_matched = now
 
     session.commit()
     return BulkConfirmResponse(confirmed=confirmed, rules_created=rules_created)

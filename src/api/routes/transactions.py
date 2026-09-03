@@ -303,7 +303,11 @@ def _upsert_vendor_rule(
         )
         return
 
-    from src.classification.rules import find_best_matching_rule, find_exact_literal_rule
+    from src.classification.rules import (
+        find_best_matching_rule,
+        find_exact_literal_rule,
+        make_learned_vendor_rule,
+    )
 
     now = datetime.now(UTC).replace(tzinfo=None)
     matched_rule = find_best_matching_rule(session, tx.description, tx.entity)
@@ -313,17 +317,13 @@ def _upsert_vendor_rule(
         # from real receipts are vendor names like "Anthropic, PBC" or "AWS"
         # — a literal match is the most precise starting point; the human
         # can widen it later via the dashboard.
-        rule = VendorRule(
-            vendor_pattern=tx.description,
-            is_regex=False,
+        rule = make_learned_vendor_rule(
+            description=tx.description,
             entity=tx.entity,
             tax_category=tx.tax_category,
             tax_subcategory=tx.tax_subcategory,
             direction=tx.direction,
             deductible_pct=tx.deductible_pct,
-            confidence=0.80,
-            source=VendorRuleSource.LEARNED.value,
-            examples=1,
             last_matched=now,
         )
         session.add(rule)
@@ -389,17 +389,13 @@ def _upsert_vendor_rule(
         )
         return
 
-    new_rule = VendorRule(
-        vendor_pattern=tx.description,
-        is_regex=False,
+    new_rule = make_learned_vendor_rule(
+        description=tx.description,
         entity=tx.entity,
         tax_category=tx.tax_category,
         tax_subcategory=tx.tax_subcategory,
         direction=tx.direction,
         deductible_pct=tx.deductible_pct,
-        confidence=0.80,
-        source=VendorRuleSource.LEARNED.value,
-        examples=1,
         last_matched=now,
     )
     session.add(new_rule)

@@ -10,7 +10,6 @@ DELETE /api/vendor-rules/{id}      — Delete rule.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
@@ -20,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from src.classification.rules import PatternFlagError, validate_pattern_flag
 from src.db.connection import SessionLocal
 from src.models.enums import Direction, Entity, TaxCategory, TaxSubcategory, VendorRuleSource
 from src.models.transaction import Transaction
@@ -85,22 +85,6 @@ class VendorRuleListResponse(BaseModel):
     offset: int
 
 
-def _validate_pattern(pattern: str, is_regex: bool) -> None:
-    """REQ-FIX-ING-005: is_regex=true patterns must compile at write time.
-
-    Raises:
-        ValueError: When ``is_regex`` is True and ``pattern`` is not a valid
-            regex. Literal (``is_regex=False``) patterns never fail here —
-            any string is a valid literal.
-    """
-    if not is_regex:
-        return
-    try:
-        re.compile(pattern)
-    except re.error as exc:
-        raise ValueError(f"Invalid regex vendor_pattern {pattern!r}: {exc}") from exc
-
-
 class VendorRuleCreate(BaseModel):
     """Fields required to create a new vendor rule."""
 
@@ -125,7 +109,9 @@ class VendorRuleCreate(BaseModel):
             TaxSubcategory(self.tax_subcategory)
         Direction(self.direction)
         VendorRuleSource(self.source)
-        _validate_pattern(self.vendor_pattern, self.is_regex)
+        # REQ-FIX-ING-022: one guard, raised as ValueError here so the
+        # caller's existing validate_enums 422 handler covers it too.
+        validate_pattern_flag(self.vendor_pattern, is_regex=self.is_regex)
 
 
 class VendorRulePatch(BaseModel):
@@ -292,6 +278,13 @@ def create_vendor_rule(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+        # REQ-FIX-ING-022: a metacharacter pattern saved as a literal is a
+        # dead rule (the 2026-09-02 incident). Reject it at the door.
+        try:
+            validate_pattern_flag(body.vendor_pattern, is_regex=body.is_regex)
+        except PatternFlagError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
         rule = VendorRule(
             vendor_pattern=body.vendor_pattern,
             is_regex=body.is_regex,
@@ -341,15 +334,17 @@ def patch_vendor_rule(
 
         patch_data = body.model_dump(exclude_none=True)
 
-        # REQ-FIX-ING-005: validate the PATCH's resulting (pattern, is_regex)
-        # combination — a PATCH may set is_regex=true without touching
-        # vendor_pattern (validate the existing pattern), or set a new pattern
-        # on a rule that is already is_regex=true (validate the new pattern).
+        # REQ-FIX-ING-005 + REQ-FIX-ING-022: validate the PATCH's RESULTING
+        # (pattern, is_regex) combination through the same single guard POST
+        # uses. A PATCH may set is_regex=true without touching vendor_pattern,
+        # set a new pattern on a rule that is already is_regex=true, or — the
+        # 2026-09-02 incident arriving through the edit surface — put a regex
+        # into a literal rule or clear is_regex on a rule that holds one.
         final_pattern = patch_data.get("vendor_pattern", rule.vendor_pattern)
         final_is_regex = patch_data.get("is_regex", rule.is_regex)
         try:
-            _validate_pattern(final_pattern, final_is_regex)
-        except ValueError as exc:
+            validate_pattern_flag(final_pattern, is_regex=final_is_regex)
+        except PatternFlagError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         for field in _PATCHABLE:

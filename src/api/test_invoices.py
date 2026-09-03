@@ -871,6 +871,35 @@ class TestBulkConfirm:
         assert len(rules) == 1
         assert rules[0].examples == 2
 
+    def test_bulk_confirm_no_category_confirms_but_skips_rule(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        """qreview P3-002: with no category on the body AND none on the txn,
+        rule_category is None. The learn-loop guard must suppress rule creation
+        (a NOT-NULL tax_category rule would otherwise crash the whole commit),
+        while the transaction itself still confirms. No 500."""
+        tx = _make_transaction(db_session, description="NoCategoryVendor")
+        assert tx.tax_category is None
+
+        r = client.post("/api/transactions/bulk-confirm", json={
+            "ids": [tx.id],
+            "entity": "sparkry",
+            # tax_category deliberately omitted
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["confirmed"] == 1
+        assert data["rules_created"] == 0
+
+        db_session.expire_all()
+        assert db_session.get(Transaction, tx.id).status == "confirmed"
+        assert (
+            db_session.query(VendorRule)
+            .filter(VendorRule.vendor_pattern == "NoCategoryVendor")
+            .count()
+            == 0
+        )
+
 
 # ---------------------------------------------------------------------------
 # iCal upload

@@ -1112,6 +1112,35 @@ class TestGmailIncomeVetoEdges:
         assert txn.review_reason == first_reason
         assert (txn.review_reason or "").count("Corrupted upstream payload") == 1
 
+    def test_corrupted_marker_does_not_revert_a_confirmed_row(
+        self, seeded_session: Session
+    ) -> None:
+        """review round 3 (P3): nothing on the confirm path clears
+        review_reason, so a later re-classify of a human-confirmed corrupted
+        row must not silently revert it back to needs_review."""
+        txn = _make_transaction(
+            description="elevenlabs.io",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        txn.review_reason = (
+            "Corrupted upstream payload: the sender header contained the "
+            "literal '[object Object]'."
+        )
+        txn.status = TransactionStatus.CONFIRMED.value
+        result = ClassificationResult(
+            entity=Entity.SPARKRY,
+            tax_category=TaxCategory.OFFICE_EXPENSE,
+            direction=Direction.EXPENSE,
+            confidence=0.95,
+            tier_used=3,
+            status=TransactionStatus.AUTO_CLASSIFIED,
+            reasoning="office expense",
+        )
+        apply_result(txn, result)
+
+        assert txn.status == TransactionStatus.AUTO_CLASSIFIED.value
+
 
 # ---------------------------------------------------------------------------
 # Seed rules

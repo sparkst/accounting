@@ -311,6 +311,7 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
     ):
         transaction.entity = result.entity.value
     prior_reason = transaction.review_reason or ""
+    prior_status = transaction.status
     transaction.tax_category = result.tax_category.value
     transaction.direction = result.direction.value
     transaction.confidence = result.confidence
@@ -322,8 +323,14 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
 
     # accounting#85: a corrupted-payload flag set at ingest must survive
     # classification — otherwise a confident tier-3 expense result silently
-    # auto-classifies the row and the marker is lost.
-    if _CORRUPTED_MARKER in prior_reason:
+    # auto-classifies the row and the marker is lost. Skip once a human has
+    # confirmed the row: nothing on the confirm path clears review_reason,
+    # so without this guard a later re-classify would silently revert a
+    # confirmed row back to needs_review (review round 3).
+    if (
+        _CORRUPTED_MARKER in prior_reason
+        and prior_status != TransactionStatus.CONFIRMED.value
+    ):
         transaction.status = TransactionStatus.NEEDS_REVIEW.value
         new_reason = transaction.review_reason or ""
         # review round 2: skip the append when prior_reason is already folded

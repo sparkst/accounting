@@ -683,9 +683,9 @@ class GmailN8nAdapter(BaseAdapter):
             ) from exc
 
         # str() guard: some upstream n8n payloads send `from`/`body_text`/
-        # `subject` as a JSON object rather than a string; without this,
-        # downstream .strip()/re.search calls raise TypeError/AttributeError
-        # on a dict (accounting#85 review round 2).
+        # `subject`/`body_html` as a JSON object rather than a string;
+        # without this, downstream .strip()/re.search calls raise
+        # TypeError/AttributeError on a dict (accounting#85 review round 2/3).
         from_field: str = str(record.get("from", "") or "")
         body_text: str = str(record.get("body_text", "") or "")
         subject: str = str(record.get("subject", "") or "")
@@ -710,7 +710,7 @@ class GmailN8nAdapter(BaseAdapter):
 
         amount = extract_amount(body_text, subject)
         # Fallback: try HTML body for amounts if body_text had nothing
-        body_html: str = record.get("body_html", "")
+        body_html: str = str(record.get("body_html", "") or "")
         if amount is None and body_html:
             amount = extract_amount(body_html, subject)
         payment_method = extract_payment_method(body_text) or extract_payment_method(body_html)

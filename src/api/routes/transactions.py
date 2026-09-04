@@ -303,11 +303,8 @@ def _upsert_vendor_rule(
         )
         return
 
-    from src.classification.rules import (
-        find_best_matching_rule,
-        find_exact_literal_rule,
-        make_learned_vendor_rule,
-    )
+    from src.classification.learned_patterns import make_learned_vendor_rule
+    from src.classification.rules import find_best_matching_rule, find_exact_literal_rule
 
     now = datetime.now(UTC).replace(tzinfo=None)
     matched_rule = find_best_matching_rule(session, tx.description, tx.entity)

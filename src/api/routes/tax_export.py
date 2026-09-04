@@ -171,7 +171,21 @@ def _bno_pretax_amount(tx_dict: dict[str, Any]) -> Decimal | None:
     ``line_items``/``gross_income`` figures (Schedule C / 1065 gross receipts
     include out-of-state sales) — those stay on the gross-incl-OOS basis via
     ``pretax_abs_amount`` directly.
+
+    REQ-GMOBJ-04 (accounting#85, review round 2): a row still awaiting human
+    review is not a gross receipt, so it returns ``None`` here too. The filter
+    lives in this shared helper — not in each caller's loop — because it is
+    the single B&O-basis function every B&O-purposed surface routes through
+    (``/api/tax-summary``'s bno_monthly/bno_quarterly and the YoY
+    comparison's), which is what keeps them reconciled with
+    ``bno_tax._aggregate_income_by_month`` and the filed B&O CSV/DOR figure.
+    The income-tax surfaces (``line_items``/``gross_income``, the
+    ``/tax-summary/monthly`` drill-down and its ``income_unconfirmed``
+    counter) call ``pretax_abs_amount`` directly and are unaffected — they
+    must still see the unconfirmed rows they report on.
     """
+    if tx_dict.get("status") == TransactionStatus.NEEDS_REVIEW.value:
+        return None
     cat = tx_dict.get("tax_category")
     if cat in RETAIL_CATEGORIES:
         facts = retail_facts(tx_dict)
@@ -851,7 +865,14 @@ def get_retail_detail(
             detail="Provide exactly one of month or quarter.",
         )
 
-    transactions = _fetch_transactions(session, entity, year)
+    # REQ-GMOBJ-04 (accounting#85, review round 2): this endpoint is a filing
+    # surface — its gross_retailing/wa_taxable feed the same DOR figure as the
+    # B&O CSV — so it is fed the needs_review-free set, exactly like
+    # GET /api/export/bno. compute_retail_detail is a pure function with no
+    # status concept, so the exclusion has to happen here.
+    transactions = _fetch_transactions(
+        session, entity, year, exclude_needs_review=True
+    )
     tx_dicts = [_tx_to_dict(tx) for tx in transactions]
     d = compute_retail_detail(tx_dicts, year, month=month, quarter=quarter)
 

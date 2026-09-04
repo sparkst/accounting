@@ -1208,7 +1208,14 @@ class TestPerFileRollback:
             adapter = GmailN8nAdapter(source_dirs=[str(tmp_path)])
             result = adapter.run(session)
         finally:
-            gmail_mod.GmailN8nAdapter._record_ingested_file = monkey_target  # type: ignore[method-assign]
+            # Restore as a staticmethod: attribute access unwraps the
+            # descriptor to a plain function, so assigning `monkey_target`
+            # back bare would rebind it as an *instance* method and every
+            # later call in this module would raise "takes 5 positional
+            # arguments but 6 were given".
+            gmail_mod.GmailN8nAdapter._record_ingested_file = staticmethod(  # type: ignore[method-assign]
+                monkey_target
+            )
 
         assert result.records_created == 2
         assert result.records_failed == 1

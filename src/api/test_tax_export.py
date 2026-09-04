@@ -963,9 +963,9 @@ class TestAllBnoSurfacesExcludeNeedsReviewIncome:
             params={"entity": "sparkry", "year": 2025, "compare_year": 2024},
         )
         assert resp.status_code == 200
-        prior = resp.json()["comparison"]["prior"]
-        jan = next(m for m in prior["bno_monthly"] if m["month"] == "2024-01")
-        assert jan["income"] == 10000.00
+        deltas = resp.json()["comparison"]["bno_monthly_deltas"]
+        jan = next(m for m in deltas if m["month"] == "2025-01")
+        assert jan["prior"] == 10000.00
 
     def test_retail_detail_excludes_needs_review_sales(
         self, client: TestClient

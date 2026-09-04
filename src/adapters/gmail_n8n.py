@@ -384,6 +384,20 @@ def _has_object_object(text: str) -> bool:
     return bool(_OBJECT_OBJECT_RE.search(text or ""))
 
 
+def _is_object_shaped(value: object) -> bool:
+    """True when an n8n field arrived as a JSON object/array, not a string.
+
+    accounting#85 review round 2: this is the SAME upstream corruption as the
+    ``[object Object]`` literal — the payload's node serialised an object into
+    a string field — but Python's ``str()`` renders it as a dict/list repr
+    (``"{'name': 'x'}"``), which no ``[object Object]`` guard can match. Left
+    undetected, the repr is stored as the description and the row passes with
+    only the generic "classification pending" reason, so neither the engine's
+    sticky corrupted-marker re-assert nor the narrow gmail-income veto fires.
+    """
+    return value is not None and not isinstance(value, str | int | float | bool)
+
+
 #: Public alias — the classification engine's narrow gmail-income veto
 #: (accounting#85 REQ-GMOBJ-02 v2) needs this predicate, and must use the
 #: adapter's single regex rather than re-declaring one that can drift.
@@ -692,6 +706,11 @@ class GmailN8nAdapter(BaseAdapter):
         # `subject`/`body_html` as a JSON object rather than a string;
         # without this, downstream .strip()/re.search calls raise
         # TypeError/AttributeError on a dict (accounting#85 review round 2/3).
+        object_shaped_fields = [
+            name
+            for name in ("from", "subject", "body_text", "body_html")
+            if _is_object_shaped(record.get(name))
+        ]
         from_field: str = str(record.get("from", "") or "")
         body_text: str = str(record.get("body_text", "") or "")
         subject: str = str(record.get("subject", "") or "")
@@ -713,6 +732,17 @@ class GmailN8nAdapter(BaseAdapter):
             return
 
         vendor = extract_vendor(from_field, body_text)
+        if _is_object_shaped(record.get("from")):
+            # The `from` repr must never become the description (REQ-GMOBJ-01):
+            # it can never match a VendorRule and can never be learned. Recover
+            # the vendor from the forwarded header in the body if there is one,
+            # else store the explicit UNKNOWN_VENDOR constant.
+            recovered = extract_vendor("", body_text)
+            vendor = (
+                recovered
+                if recovered and not _has_object_object(recovered)
+                else UNKNOWN_VENDOR
+            )
 
         amount = extract_amount(body_text, subject)
         # Fallback: try HTML body for amounts if body_text had nothing
@@ -789,12 +819,23 @@ class GmailN8nAdapter(BaseAdapter):
             _has_object_object(from_field)
             or _has_object_object(subject)
             or _has_object_object(_extract_vendor_raw(from_field, body_text))
+            or object_shaped_fields
         ):
             status = TransactionStatus.NEEDS_REVIEW.value
+            if object_shaped_fields:
+                detail = (
+                    "arrived as a JSON object rather than a string in "
+                    f"{', '.join(object_shaped_fields)}"
+                )
+            else:
+                detail = (
+                    "contained the literal '[object Object]' in the sender "
+                    "header or subject"
+                )
             reason = (
-                f"{CORRUPTED_PAYLOAD_MARKER}: the sender header or subject "
-                "contained the literal '[object Object]'; vendor was derived "
-                "from the sender domain and must be confirmed manually."
+                f"{CORRUPTED_PAYLOAD_MARKER}: the upstream payload {detail}; "
+                "vendor was derived from the sender domain and must be "
+                "confirmed manually."
             )
             review_reason = f"{review_reason} {reason}" if review_reason else reason
 

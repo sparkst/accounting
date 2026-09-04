@@ -74,11 +74,10 @@ _ENTITY_AUTHORITATIVE_SOURCES = frozenset({Source.STRIPE.value, Source.SHOPIFY.v
 # instead vetoed on the tax category by _veto_gmail_income() (accounting#85).
 _AUTHORITATIVE_SIGN_SOURCES = frozenset({Source.PLAID.value, Source.BANK_CSV.value})
 
-# accounting#85: phrase the gmail adapter writes into review_reason when the
-# upstream payload was corrupted. It must survive classification, so
-# apply_result() re-asserts NEEDS_REVIEW whenever it is already present.
-# Imported (not re-declared, review round 2) so the two can never drift.
-
+# Tax categories treated as income for the gmail source/direction veto
+# (accounting#85 _veto_gmail_income): any of these on a gmail row is routed
+# to NEEDS_REVIEW regardless of direction, since gmail receipts are always
+# expenses by the adapter's signed_amount = -abs(amount) contract.
 _INCOME_TAX_CATEGORIES = frozenset({
     TaxCategory.CONSULTING_INCOME,
     TaxCategory.SUBSCRIPTION_INCOME,

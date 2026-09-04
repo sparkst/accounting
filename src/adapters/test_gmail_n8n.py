@@ -264,6 +264,30 @@ NON_STRING_FROM_RECEIPT: dict[str, object] = {
     "body_html": "<html></html>",
 }
 
+NON_STRING_BODY_SUBJECT_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 4: `body_text`/`subject` as JSON objects
+    # (not strings) must not raise TypeError from re.search calls downstream.
+    "id": "nonstringbodysubj0001",
+    "filename": "2026-08-20_nonstring_body_subject_0001",
+    "date": "2026-08-20T00:00:00.000Z",
+    "from": "Acme <billing@acme.example>",
+    "subject": {"text": "Your receipt"},
+    "body_text": {"text": "Receipt Amount paid $10.00"},
+    "body_html": "<html></html>",
+}
+
+OBJECT_OBJECT_SUBJECT_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 4: the corrupted-payload literal can land in
+    # `subject` with a well-formed `from`, and must still route to review.
+    "id": "objectobjectsubject0001",
+    "filename": "2026-08-20_object_object_subject_0001",
+    "date": "2026-08-20T00:00:00.000Z",
+    "from": "Acme <billing@acme.example>",
+    "subject": "[object Object]",
+    "body_text": "Receipt Amount paid $10.00\n",
+    "body_html": "<html></html>",
+}
+
 FORWARDED_APPLE_RECEIPT: dict[str, object] = {
     "id": "196dff7d8e138b25",
     "filename": "2025-05-17_Travis_Sparks_196dff7d8e138b25",
@@ -830,6 +854,32 @@ class TestObjectObjectPayload:
         tx = session.query(Transaction).one()
         assert tx.description is not None
 
+    def test_non_string_body_and_subject_does_not_crash(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 4: `body_text`/`subject` as JSON
+        objects (not strings) must not raise TypeError from the re.search
+        calls that scan them — ingest should still complete."""
+        write_fixture(tmp_path, NON_STRING_BODY_SUBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description is not None
+
+    def test_object_object_subject_routes_to_needs_review(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 4: a corrupted `subject` (well-formed
+        `from`) must also route to NEEDS_REVIEW with the corrupted-payload
+        marker, not pass through silently."""
+        write_fixture(tmp_path, OBJECT_OBJECT_SUBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.review_reason is not None
+        assert "object object" in tx.review_reason.lower()
+
 
 class TestObjectObjectVendorShapes:
     """REQ-GMOBJ-01: no gmail row ever stores the literal, whatever the shape."""
@@ -886,6 +936,36 @@ class TestObjectObjectOCRPreservesMarker:
         tx = session.query(Transaction).one()
         assert gmail_n8n_mod.CORRUPTED_PAYLOAD_MARKER in (tx.review_reason or "")
         assert "Auto-extracted from attachment" in (tx.review_reason or "")
+
+    def test_ocr_vendor_object_object_literal_not_stored_as_description(
+        self, tmp_path: Path, session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """accounting#85 review round 4 (P3): if OCR itself returns the
+        `[object Object]` literal as the vendor, it must not be stored as
+        tx.description — the pre-OCR fallback description is kept instead."""
+        import src.adapters.gmail_n8n as gmail_n8n_mod
+        from src.utils.receipt_ocr import OCRResult
+
+        record = dict(ANTHROPIC_RECEIPT)
+        record["id"] = "ocrobjectobject0001"
+        record["filename"] = "2026-08-20_ocr_object_object_0001"
+        record["from"] = "Travis Sparks <sparkst@gmail.com>"
+        record["body_text"] = ""
+        write_fixture(tmp_path, record)
+        (tmp_path / f"{record['id']}_receipt.png").write_bytes(b"fake")
+
+        monkeypatch.setattr(
+            gmail_n8n_mod,
+            "extract_receipt",
+            lambda _path: OCRResult(
+                vendor="[object Object]", amount=decimal.Decimal("24.27"), success=True
+            ),
+        )
+
+        GmailN8nAdapter(source_dirs=[str(tmp_path)]).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description != "[object Object]"
 
 
 class TestObjectObjectSelfForwardIngest:

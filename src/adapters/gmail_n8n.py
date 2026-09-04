@@ -682,12 +682,13 @@ class GmailN8nAdapter(BaseAdapter):
                 f"{json_path.name}: invalid date {raw_date!r}: {exc}"
             ) from exc
 
-        # str() guard: some upstream n8n payloads send `from` as a JSON object
-        # rather than a string; without this, _extract_vendor_raw's .strip()
-        # raises AttributeError on a dict (accounting#85 review).
+        # str() guard: some upstream n8n payloads send `from`/`body_text`/
+        # `subject` as a JSON object rather than a string; without this,
+        # downstream .strip()/re.search calls raise TypeError/AttributeError
+        # on a dict (accounting#85 review round 2).
         from_field: str = str(record.get("from", "") or "")
-        body_text: str = record.get("body_text", "")
-        subject: str = record.get("subject", "")
+        body_text: str = str(record.get("body_text", "") or "")
+        subject: str = str(record.get("subject", "") or "")
 
         # Skip Shopify order notification emails — sales data comes from
         # the Shopify API integration, not email notifications.
@@ -778,14 +779,16 @@ class GmailN8nAdapter(BaseAdapter):
         # accounting#85: a `[object Object]`-literal sender means the upstream
         # payload was corrupted; force review with an explicit reason rather
         # than letting the record pass through silently.
-        if _has_object_object(from_field) or _has_object_object(
-            _extract_vendor_raw(from_field, body_text)
+        if (
+            _has_object_object(from_field)
+            or _has_object_object(subject)
+            or _has_object_object(_extract_vendor_raw(from_field, body_text))
         ):
             status = TransactionStatus.NEEDS_REVIEW.value
             reason = (
-                f"{CORRUPTED_PAYLOAD_MARKER}: the sender header contained the "
-                "literal '[object Object]'; vendor was derived from the sender "
-                "domain and must be confirmed manually."
+                f"{CORRUPTED_PAYLOAD_MARKER}: the sender header or subject "
+                "contained the literal '[object Object]'; vendor was derived "
+                "from the sender domain and must be confirmed manually."
             )
             review_reason = f"{review_reason} {reason}" if review_reason else reason
 
@@ -831,7 +834,11 @@ class GmailN8nAdapter(BaseAdapter):
                 try:
                     ocr: OCRResult = extract_receipt(image_attachments[0])
                     if ocr.success:
-                        if ocr.vendor and vendor in ("Travis Sparks", ""):
+                        if (
+                            ocr.vendor
+                            and not _has_object_object(ocr.vendor)
+                            and vendor in ("Travis Sparks", "")
+                        ):
                             tx.description = ocr.vendor
                         if ocr.amount is not None and tx.amount is None:
                             tx.amount = -abs(ocr.amount)

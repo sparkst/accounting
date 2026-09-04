@@ -1016,3 +1016,147 @@ class TestAllBnoSurfacesExcludeNeedsReviewIncome:
         ).json()
         jan = next(m for m in body["months"] if m["month"] == "2025-01")
         assert jan["income_unconfirmed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# accounting#85 review round 3: the needs_review exclusion is a GROSS-RECEIPTS
+# exclusion. WA retail sales tax collected is trust-fund money already taken
+# from the customer, and dropping unreviewed income from the filed B&O figure
+# must be disclosed in the export itself.
+# ---------------------------------------------------------------------------
+
+
+class TestNeedsReviewExclusionIsGrossOnly:
+    def _make_sammamish_sale(self, session: Session, *, status: str) -> Transaction:
+        tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-10",
+            description="Shopify Order — Sammamish",
+            amount=Decimal("100.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=status,
+            confidence=0.95,
+            raw_data={
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA", "city": "Sammamish"},
+                "tax_lines": [
+                    {"title": "Washington State Tax"},
+                    {"title": "Sammamish City Tax"},
+                ],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add(tx)
+        session.commit()
+        return tx
+
+    def test_retail_detail_still_reports_needs_review_sales_tax(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            self._make_sammamish_sale(s, status=TransactionStatus.CONFIRMED.value)
+            self._make_sammamish_sale(s, status=TransactionStatus.NEEDS_REVIEW.value)
+
+        resp = client.get(
+            "/api/bno/retail-detail",
+            params={"entity": "blackline", "year": 2026, "month": 1},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # B&O gross measure: confirmed only.
+        assert body["gross_retailing"] == 90.70
+        assert body["wa_taxable"] == 90.70
+        # Trust-fund tax measure: everything collected.
+        assert body["sales_tax_collected"] == 18.60
+        assert len(body["by_location"]) == 1
+        assert body["by_location"][0]["tax_collected"] == 18.60
+        assert body["by_location"][0]["taxable_amount"] == 181.40
+
+    def test_dor_upload_reports_all_collected_retail_sales_tax(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            self._make_sammamish_sale(s, status=TransactionStatus.CONFIRMED.value)
+            self._make_sammamish_sale(s, status=TransactionStatus.NEEDS_REVIEW.value)
+
+        resp = client.get(
+            "/api/export/bno",
+            params={
+                "entity": "blackline",
+                "year": 2026,
+                "month": 1,
+                "format": "dor",
+            },
+        )
+        assert resp.status_code == 200
+        lines = resp.text.strip().splitlines()
+        # Retailing B&O (code 2) on the confirmed-only basis ...
+        assert "TAX,2,0,90.70" in lines
+        # ... but the state (code 1) and local (code 45) SALES tax lines carry
+        # every dollar of tax actually collected from customers.
+        assert "TAX,1,0,181.40" in lines
+        assert "TAX,45,1739,181.40" in lines
+
+    def test_bno_csv_discloses_excluded_needs_review_income(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2026-01-15")
+            vetoed = _make_tx(s, amount=Decimal("2500.00"), date="2026-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        resp = client.get(
+            "/api/export/bno", params={"entity": "sparkry", "year": 2026}
+        )
+        assert resp.status_code == 200
+        disclosure = [
+            ln for ln in resp.text.splitlines() if ln.startswith("# EXCLUDED")
+        ]
+        assert len(disclosure) == 1
+        assert "1 needs_review income" in disclosure[0]
+        assert "2500.00" in disclosure[0]
+        assert resp.headers["X-Excluded-Needs-Review-Income"] == "1"
+        assert resp.headers["X-Excluded-Needs-Review-Amount"] == "2500.00"
+
+    def test_dor_upload_discloses_excluded_needs_review_income_in_headers(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2026-01-15")
+            vetoed = _make_tx(s, amount=Decimal("2500.00"), date="2026-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        resp = client.get(
+            "/api/export/bno",
+            params={
+                "entity": "sparkry",
+                "year": 2026,
+                "month": 1,
+                "format": "dor",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.headers["X-Excluded-Needs-Review-Income"] == "1"
+        assert resp.headers["X-Excluded-Needs-Review-Amount"] == "2500.00"
+
+    def test_no_disclosure_when_nothing_was_excluded(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2026-01-15")
+
+        resp = client.get(
+            "/api/export/bno", params={"entity": "sparkry", "year": 2026}
+        )
+        assert resp.status_code == 200
+        assert "# EXCLUDED" not in resp.text
+        assert resp.headers["X-Excluded-Needs-Review-Income"] == "0"

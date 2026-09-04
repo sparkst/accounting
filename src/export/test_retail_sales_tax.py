@@ -156,3 +156,49 @@ class TestComputeRetailDetail:
             compute_retail_detail([], 2026)
         with pytest.raises(ValueError):
             compute_retail_detail([], 2026, month=1, quarter=1)
+
+
+# ---------------------------------------------------------------------------
+# accounting#85 review round 3: needs_review is a GROSS-RECEIPTS exclusion only.
+# WA retail sales tax is trust-fund money already collected from the customer —
+# excluding an unreviewed order from it under-remits tax that was collected.
+# ---------------------------------------------------------------------------
+
+
+class TestNeedsReviewIsGrossOnlyExclusion:
+    def _pair(self) -> list[dict]:
+        confirmed = _shopify_order(
+            date="2026-01-10", total_price="100.00", total_tax="9.30",
+            ship_state="WA", city_tax_title="Sammamish City Tax",
+        )
+        confirmed["status"] = "confirmed"
+        pending = _shopify_order(
+            date="2026-01-11", total_price="100.00", total_tax="9.30",
+            ship_state="WA", city_tax_title="Sammamish City Tax",
+        )
+        pending["status"] = "needs_review"
+        return [confirmed, pending]
+
+    def test_needs_review_drops_out_of_gross_retailing(self) -> None:
+        d = compute_retail_detail(self._pair(), 2026, month=1)
+        assert d.gross_retailing == Decimal("90.70")
+        assert d.wa_taxable == Decimal("90.70")
+
+    def test_needs_review_sales_tax_is_still_reported(self) -> None:
+        d = compute_retail_detail(self._pair(), 2026, month=1)
+        # Both orders collected 9.30 of WA retail sales tax from the customer.
+        assert d.sales_tax_collected == Decimal("18.60")
+        assert len(d.by_location) == 1
+        line = d.by_location[0]
+        assert line.location_code == WA_LOCATION_CODES["sammamish"][0]
+        assert line.tax_collected == Decimal("18.60")
+        # Line 45's taxable measure is the sales-tax measure, not B&O gross.
+        assert line.taxable_amount == Decimal("181.40")
+
+    def test_status_less_dicts_are_unaffected(self) -> None:
+        txns = [t.copy() for t in self._pair()]
+        for t in txns:
+            t.pop("status")
+        d = compute_retail_detail(txns, 2026, month=1)
+        assert d.gross_retailing == Decimal("181.40")
+        assert d.sales_tax_collected == Decimal("18.60")

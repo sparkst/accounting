@@ -994,6 +994,85 @@ class TestGmailIncomeVeto:
         assert result.tax_category == TaxCategory.OFFICE_EXPENSE
 
 
+class TestGmailIncomeVetoEdges:
+    """Round-1 review fixes for accounting#85."""
+
+    def test_reimbursable_direction_is_not_exempt(
+        self, seeded_session: Session
+    ) -> None:
+        """An income tax_category must be vetoed even when direction is
+        REIMBURSABLE — gross receipts aggregate on tax_category alone."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.CONSULTING_INCOME,
+                direction=Direction.REIMBURSABLE,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="reimbursable guess",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+
+    def test_low_confidence_reason_is_preserved(
+        self, seeded_session: Session
+    ) -> None:
+        """The veto appends to, never replaces, the tier's own explanation."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.10,
+                tier_used=3,
+                reasoning="unsure",
+            )
+            result = classify(txn, seeded_session)
+
+        reason = result.review_reason or ""
+        assert "Low confidence" in reason
+        assert "gmail" in reason.lower()
+
+    def test_corrupted_payload_marker_survives_classification(
+        self, seeded_session: Session
+    ) -> None:
+        """A corrupted-payload flag set at ingest must not be erased by a
+        confident expense classification."""
+        txn = _make_transaction(
+            description="elevenlabs.io",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        txn.review_reason = (
+            "Corrupted upstream payload: the sender header contained the "
+            "literal '[object Object]'."
+        )
+        result = ClassificationResult(
+            entity=Entity.SPARKRY,
+            tax_category=TaxCategory.OFFICE_EXPENSE,
+            direction=Direction.EXPENSE,
+            confidence=0.95,
+            tier_used=3,
+            status=TransactionStatus.AUTO_CLASSIFIED,
+            reasoning="office expense",
+        )
+        apply_result(txn, result)
+
+        assert txn.status == TransactionStatus.NEEDS_REVIEW.value
+        assert "Corrupted upstream payload" in (txn.review_reason or "")
+
+
 # ---------------------------------------------------------------------------
 # Seed rules
 # ---------------------------------------------------------------------------

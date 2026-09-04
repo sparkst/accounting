@@ -806,6 +806,51 @@ class TestObjectObjectPayload:
         assert tx.status == TransactionStatus.NEEDS_REVIEW.value  # classification pending, as today
 
 
+class TestObjectObjectVendorShapes:
+    """REQ-GMOBJ-01: no gmail row ever stores the literal, whatever the shape."""
+
+    def test_bare_literal_from_field(self) -> None:
+        assert "[object Object]" not in extract_vendor("[object Object]")
+
+    def test_literal_inside_angle_brackets(self) -> None:
+        assert "[object Object]" not in extract_vendor("Acme <[object Object]>")
+
+    def test_literal_in_forwarded_from_line(self) -> None:
+        body = (
+            "---------- Forwarded message ---------\n"
+            "From: [object Object] <billing@mail.elevenlabs.io>\n"
+        )
+        vendor = extract_vendor("Travis Sparks <sparkst@gmail.com>", body)
+        assert "[object Object]" not in vendor
+
+    def test_display_name_literal_falls_back_to_domain(self) -> None:
+        assert extract_vendor(
+            "[object Object] <billing@mail.elevenlabs.io>"
+        ) == "elevenlabs.io"
+
+
+class TestObjectObjectSelfForwardIngest:
+    def test_self_forwarded_literal_flags_needs_review(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """A self-forward whose body From: carries the literal must still be
+        flagged, and must not store the literal as the description."""
+        record = dict(OBJECT_OBJECT_RECEIPT)
+        record["from"] = "Travis Sparks <sparkst@gmail.com>"
+        record["body_text"] = (
+            "---------- Forwarded message ---------\n"
+            "From: [object Object] <billing@mail.elevenlabs.io>\n"
+            "Total: $24.27\n"
+        )
+        write_fixture(tmp_path, record)
+        GmailN8nAdapter(source_dirs=[str(tmp_path)]).run(session)
+
+        tx = session.query(Transaction).one()
+        assert "[object Object]" not in (tx.description or "")
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert "object object" in (tx.review_reason or "").lower()
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: forwarded vendor extraction helpers
 # ---------------------------------------------------------------------------

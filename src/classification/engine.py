@@ -69,8 +69,14 @@ _ENTITY_AUTHORITATIVE_SOURCES = frozenset({Source.STRIPE.value, Source.SHOPIFY.v
 # amount is internally contradictory and must be vetoed. NOTE: gmail_n8n is
 # deliberately excluded — it stores income as -abs(amount) *before* the
 # classifier assigns direction=income (see CLAUDE.md "Adapter behavior"), so a
-# negative Gmail amount tagged income is correct, not a mismatch.
+# negative Gmail amount tagged income is not a *sign* mismatch. Gmail income is
+# instead vetoed on the tax category by _veto_gmail_income() (accounting#85).
 _AUTHORITATIVE_SIGN_SOURCES = frozenset({Source.PLAID.value, Source.BANK_CSV.value})
+
+# accounting#85: phrase the gmail adapter writes into review_reason when the
+# upstream payload was corrupted. It must survive classification, so
+# apply_result() re-asserts NEEDS_REVIEW whenever it is already present.
+_CORRUPTED_MARKER = "Corrupted upstream payload"
 
 _INCOME_TAX_CATEGORIES = frozenset({
     TaxCategory.CONSULTING_INCOME,
@@ -188,23 +194,27 @@ def _veto_gmail_income(
     """
     if transaction.source != Source.GMAIL_N8N.value:
         return result
-    is_income = result.direction not in (
-        Direction.TRANSFER,
-        Direction.REIMBURSABLE,
-    ) and (
+    # REQ-GMOBJ-02: ANY income tax_category counts, whatever the direction —
+    # gross receipts are aggregated on tax_category alone, so a
+    # TRANSFER/REIMBURSABLE direction is no exemption.
+    is_income = (
         result.direction == Direction.INCOME
         or result.tax_category in _INCOME_TAX_CATEGORIES
     )
     if not is_income:
         return result
+    reason = (
+        f"Source/direction mismatch: gmail receipts are always expenses, "
+        f"but tier {result.tier_used} classified this row as income "
+        f"({result.tax_category.value}). Routed to review."
+    )
+    if result.review_reason:
+        # Keep the tier's own explanation (e.g. the low-confidence note).
+        reason = f"{result.review_reason} {reason}"
     return replace(
         result,
         status=TransactionStatus.NEEDS_REVIEW,
-        review_reason=(
-            f"Source/direction mismatch: gmail receipts are always expenses, "
-            f"but tier {result.tier_used} classified this row as income "
-            f"({result.tax_category.value}). Routed to review."
-        ),
+        review_reason=reason,
     )
 
 
@@ -297,6 +307,7 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
         or transaction.entity is None
     ):
         transaction.entity = result.entity.value
+    prior_reason = transaction.review_reason or ""
     transaction.tax_category = result.tax_category.value
     transaction.direction = result.direction.value
     transaction.confidence = result.confidence
@@ -305,6 +316,17 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
     if result.tax_subcategory:
         transaction.tax_subcategory = result.tax_subcategory
     transaction.deductible_pct = result.deductible_pct
+
+    # accounting#85: a corrupted-payload flag set at ingest must survive
+    # classification — otherwise a confident tier-3 expense result silently
+    # auto-classifies the row and the marker is lost.
+    if _CORRUPTED_MARKER in prior_reason:
+        transaction.status = TransactionStatus.NEEDS_REVIEW.value
+        transaction.review_reason = (
+            f"{transaction.review_reason} {prior_reason}".strip()
+            if transaction.review_reason
+            else prior_reason
+        )
 
     # Missing amounts always need review regardless of classification confidence
     if transaction.amount is None and transaction.status != TransactionStatus.NEEDS_REVIEW.value:

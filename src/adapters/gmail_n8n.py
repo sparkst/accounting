@@ -384,7 +384,7 @@ def _has_object_object(text: str) -> bool:
     return bool(_OBJECT_OBJECT_RE.search(text or ""))
 
 
-def extract_vendor(from_field: str, body_text: str = "") -> str:
+def _extract_vendor_raw(from_field: str, body_text: str = "") -> str:
     """Extract the human-readable vendor name from a RFC 5322 ``From`` header.
 
     For self-forwarded emails (from Travis Sparks's own addresses) the real
@@ -431,6 +431,32 @@ def extract_vendor(from_field: str, body_text: str = "") -> str:
             # names the real vendor ("mail.elevenlabs.io" -> "elevenlabs.io").
             return _vendor_from_domain(from_field)
     return from_field
+
+
+# accounting#85: marker phrase the classifier looks for so a corrupted-payload
+# row can never be silently auto-classified later (see engine._CORRUPTED_MARKER).
+CORRUPTED_PAYLOAD_MARKER = "Corrupted upstream payload"
+
+# Description stored when no usable vendor can be recovered from a corrupted
+# payload. Never the "[object Object]" literal (REQ-GMOBJ-01).
+UNKNOWN_VENDOR = "Unknown vendor"
+
+
+def extract_vendor(from_field: str, body_text: str = "") -> str:
+    """Vendor name for a ``From`` header, never the ``[object Object]`` literal.
+
+    REQ-GMOBJ-01: whatever shape the corrupted payload takes (bare literal,
+    display name, angle-bracket address, or a literal inside a forwarded
+    ``From:`` line), the returned vendor is sanitised — the sender domain when
+    one can be recovered, else ``"Unknown vendor"``.
+    """
+    vendor = _extract_vendor_raw(from_field, body_text)
+    if not _has_object_object(vendor):
+        return vendor
+    fallback = _vendor_from_domain(from_field)
+    if fallback and not _has_object_object(fallback):
+        return fallback
+    return UNKNOWN_VENDOR
 
 
 # ---------------------------------------------------------------------------
@@ -736,10 +762,12 @@ class GmailN8nAdapter(BaseAdapter):
         # accounting#85: a `[object Object]`-literal sender means the upstream
         # payload was corrupted; force review with an explicit reason rather
         # than letting the record pass through silently.
-        if _has_object_object(from_field):
+        if _has_object_object(from_field) or _has_object_object(
+            _extract_vendor_raw(from_field, body_text)
+        ):
             status = TransactionStatus.NEEDS_REVIEW.value
             reason = (
-                "Corrupted upstream payload: the sender header contained the "
+                f"{CORRUPTED_PAYLOAD_MARKER}: the sender header contained the "
                 "literal '[object Object]'; vendor was derived from the sender "
                 "domain and must be confirmed manually."
             )

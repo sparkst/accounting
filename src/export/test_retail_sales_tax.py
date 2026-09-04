@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import Any
 
 from src.export.retail_sales_tax import (
     WA_LOCATION_CODES,
@@ -166,7 +167,7 @@ class TestComputeRetailDetail:
 
 
 class TestNeedsReviewIsGrossOnlyExclusion:
-    def _pair(self) -> list[dict]:
+    def _pair(self) -> list[dict[str, Any]]:
         confirmed = _shopify_order(
             date="2026-01-10", total_price="100.00", total_tax="9.30",
             ship_state="WA", city_tax_title="Sammamish City Tax",

@@ -135,6 +135,47 @@ def _aggregate_income_by_month(
     return result
 
 
+def needs_review_income_summary(
+    transactions: list[dict[str, Any]],
+    year: int,
+) -> tuple[int, Decimal]:
+    """Return (count, total) of income rows dropped from the B&O gross measure.
+
+    accounting#85 (review round 3): ``_aggregate_income_by_month`` silently
+    skips ``needs_review`` income, so a filed B&O/DOR figure can be materially
+    below the books with nothing in the output saying so. The >20% unconfirmed
+    banner is a *different* measure (it counts all unconfirmed rows, income or
+    not, and only fires above a threshold), so it is not a disclosure of this
+    exclusion. Callers use this to state the exclusion in the export itself.
+
+    The total is on the same basis as the aggregation it mirrors: pre-tax, and
+    confirmed out-of-state retail rows are omitted the same way.
+    """
+    count = 0
+    total = Decimal("0")
+    for tx in transactions:
+        cat = tx.get("tax_category", "")
+        if cat not in INCOME_CATEGORIES:
+            continue
+        if tx.get("status") != _NEEDS_REVIEW:
+            continue
+        date_str = tx.get("date", "")
+        if not date_str.startswith(str(year)):
+            continue
+        if _month_from_date(date_str) is None:
+            continue
+        if cat in RETAIL_CATEGORIES:
+            facts = retail_facts(tx)
+            if facts.is_confirmed_oos:
+                continue
+            amt = facts.pretax
+        else:
+            amt = pretax_abs_amount(tx)
+        count += 1
+        total += amt
+    return count, total.quantize(Decimal("0.01"))
+
+
 def build_sparkry_bno_csv(
     transactions: list[dict[str, Any]],
     year: int,

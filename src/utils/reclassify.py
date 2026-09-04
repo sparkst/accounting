@@ -27,7 +27,11 @@ from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session
 
-from src.adapters.gmail_n8n import _extract_forwarded_vendor, _is_self_forwarded
+from src.adapters.gmail_n8n import (
+    _extract_forwarded_vendor,
+    _has_object_object,
+    _is_self_forwarded,
+)
 from src.classification.engine import apply_result, classify
 from src.classification.seed_rules import seed_vendor_rules
 from src.db.connection import SessionLocal
@@ -66,6 +70,22 @@ def _update_forwarded_vendor(tx: Transaction) -> bool:
         return False
 
     forwarded_vendor = _extract_forwarded_vendor(body_text)
+
+    # accounting#85 (REQ-GMOBJ-01, review round 3): _extract_forwarded_vendor
+    # returns the RAW forwarded display name, unlike the adapter's
+    # extract_vendor(), which sanitises it. Writing it back here re-introduced
+    # the literal "[object Object]" as a description on every reclassify_all
+    # run — over the already-sanitised value, and on ALL gmail rows, not just
+    # needs_review ones. A corrupted name is never an improvement on what
+    # ingest already stored, so keep the stored description.
+    if forwarded_vendor and _has_object_object(forwarded_vendor):
+        logger.warning(
+            "Ignoring corrupted forwarded vendor for tx=%s (kept %r)",
+            tx.id[:8],
+            tx.description,
+        )
+        return False
+
     if forwarded_vendor and forwarded_vendor != tx.description:
         logger.info(
             "Re-extracted vendor for tx=%s: %r -> %r",

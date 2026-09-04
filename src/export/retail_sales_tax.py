@@ -43,8 +43,13 @@ from src.export.basis import (
 from src.export.basis import (
     retail_facts as retail_facts,
 )
+from src.models.enums import TransactionStatus
 
 RETAILING_BO_RATE = Decimal("0.00471")
+
+# accounting#85 (REQ-GMOBJ-04): rows in this status are excluded from the B&O
+# gross measure but NOT from the retail sales tax already collected.
+_NEEDS_REVIEW = TransactionStatus.NEEDS_REVIEW.value
 
 
 def _q2(value: Decimal) -> Decimal:
@@ -84,7 +89,21 @@ def compute_retail_detail(
     month: int | None = None,
     quarter: int | None = None,
 ) -> RetailDetail:
-    """Aggregate retail (SALES_INCOME) rows for the period into a RetailDetail."""
+    """Aggregate retail (SALES_INCOME) rows for the period into a RetailDetail.
+
+    accounting#85 (REQ-GMOBJ-04, review round 3): ``NEEDS_REVIEW`` rows are
+    excluded from the GROSS-RECEIPTS measures only — ``gross_retailing``,
+    ``interstate_deduction``, ``wa_taxable`` and ``retailing_bo``. They are
+    still counted in ``sales_tax_collected`` and in every ``by_location``
+    line, because WA retail sales tax is trust-fund money already collected
+    from the customer: it is owed to DOR whether or not the order has been
+    reviewed, and DOR line 45's ``taxable_amount`` is that tax's measure, not
+    a B&O gross-receipts measure. Dropping unreviewed orders from the sales
+    tax lines would under-remit tax that was actually collected — and since
+    every non-test Shopify order is ingested at ``needs_review``, that would
+    be nearly the whole retail book. Status-less dicts (pure-function
+    callers) count toward everything.
+    """
     months = _period_months(month, quarter)
 
     gross = Decimal("0")
@@ -106,10 +125,13 @@ def compute_retail_detail(
             continue
 
         f = retail_facts(tx)
-        gross += f.pretax
+        in_gross = tx.get("status") != _NEEDS_REVIEW
+        if in_gross:
+            gross += f.pretax
         sales_tax += f.sales_tax
         if f.is_confirmed_oos:
-            interstate += f.pretax
+            if in_gross:
+                interstate += f.pretax
         elif f.is_wa and f.location_code:
             line = locations.setdefault(
                 f.location_code, LocationLine(f.location_code, f.location_name)

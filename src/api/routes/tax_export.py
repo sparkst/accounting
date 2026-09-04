@@ -23,7 +23,11 @@ from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.export.basis import RETAIL_CATEGORIES, pretax_abs_amount, retail_facts
-from src.export.bno_tax import generate_bno_export, generate_dor_upload
+from src.export.bno_tax import (
+    generate_bno_export,
+    generate_dor_upload,
+    needs_review_income_summary,
+)
 from src.export.freetaxusa import generate_freetaxusa_export
 from src.export.retail_sales_tax import compute_retail_detail
 from src.export.taxact import generate_taxact_export
@@ -865,14 +869,15 @@ def get_retail_detail(
             detail="Provide exactly one of month or quarter.",
         )
 
-    # REQ-GMOBJ-04 (accounting#85, review round 2): this endpoint is a filing
-    # surface — its gross_retailing/wa_taxable feed the same DOR figure as the
-    # B&O CSV — so it is fed the needs_review-free set, exactly like
-    # GET /api/export/bno. compute_retail_detail is a pure function with no
-    # status concept, so the exclusion has to happen here.
-    transactions = _fetch_transactions(
-        session, entity, year, exclude_needs_review=True
-    )
+    # REQ-GMOBJ-04 (accounting#85, review round 3): this endpoint is a filing
+    # surface, but only HALF of it is a gross-receipts measure. The full set is
+    # passed and compute_retail_detail applies the needs_review exclusion to
+    # gross_retailing/interstate_deduction/wa_taxable/retailing_bo only — the
+    # sales-tax-collected figures must keep every dollar actually collected
+    # from customers (see compute_retail_detail's docstring). Excluding here
+    # instead would zero the WA retail sales tax lines, since every non-test
+    # Shopify order is ingested at needs_review.
+    transactions = _fetch_transactions(session, entity, year)
     tx_dicts = [_tx_to_dict(tx) for tx in transactions]
     d = compute_retail_detail(tx_dicts, year, month=month, quarter=quarter)
 
@@ -1198,17 +1203,27 @@ def export_bno(
         )
 
     # The warning is computed over the UNFILTERED set so the >20% unconfirmed
-    # banner still fires; the export itself is fed the needs_review-free set
+    # banner still fires; the B&O CSV itself is fed the needs_review-free set
     # (REQ-GMOBJ-04).
     transactions = _fetch_transactions(session, entity, year)
     warn = _check_unconfirmed_threshold(transactions, hard_block=False)
 
+    all_dicts = [_tx_to_dict(tx) for tx in transactions]
     tx_dicts = [
         _tx_to_dict(tx)
         for tx in _fetch_transactions(
             session, entity, year, exclude_needs_review=True
         )
     ]
+
+    # accounting#85 (review round 3): state the exclusion in the output. A
+    # filed figure that is materially below the books must say so on its face
+    # — the >20% unconfirmed banner is a different, threshold-gated measure.
+    excluded_count, excluded_total = needs_review_income_summary(all_dicts, year)
+    disclosure_headers = {
+        "X-Excluded-Needs-Review-Income": str(excluded_count),
+        "X-Excluded-Needs-Review-Amount": f"{excluded_total:.2f}",
+    }
 
     # DOR upload format (single filing period — month OR quarter)
     if format.lower() == "dor":
@@ -1218,8 +1233,11 @@ def export_bno(
                 detail="DOR upload requires exactly one of month or quarter.",
             )
         try:
+            # The FULL set: generate_dor_upload's B&O aggregation drops
+            # needs_review income itself, while its retail sales tax lines
+            # (codes 1 and 45) must report every dollar collected.
             content, filename = generate_dor_upload(
-                tx_dicts, entity, year, month=month, quarter=quarter
+                all_dicts, entity, year, month=month, quarter=quarter
             )
         except ValueError as exc:
             # REQ-FIX-TAX-007: unmapped WA locality is an actionable filing
@@ -1228,11 +1246,21 @@ def export_bno(
         return Response(
             content=content,
             media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                **disclosure_headers,
+            },
         )
 
     # Standard summary format
     content, filename = generate_bno_export(tx_dicts, entity, year)
+
+    if excluded_count:
+        content = (
+            f"# EXCLUDED: {excluded_count} needs_review income row(s) totalling "
+            f"${excluded_total:.2f} are NOT in these gross figures. Review and "
+            f"confirm them, then re-export before filing.\n"
+        ) + content
 
     if warn:
         warning_row = f"# WARNING: {warn['warning']}\n"
@@ -1241,5 +1269,8 @@ def export_bno(
     return Response(
         content=content,
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            **disclosure_headers,
+        },
     )

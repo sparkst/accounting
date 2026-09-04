@@ -23,11 +23,7 @@ from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
 from src.export.basis import RETAIL_CATEGORIES, pretax_abs_amount, retail_facts
-from src.export.bno_tax import (
-    generate_bno_export,
-    generate_dor_upload,
-    needs_review_income_summary,
-)
+from src.export.bno_tax import generate_bno_export, generate_dor_upload
 from src.export.freetaxusa import generate_freetaxusa_export
 from src.export.retail_sales_tax import compute_retail_detail
 from src.export.taxact import generate_taxact_export
@@ -114,35 +110,23 @@ def _fetch_transactions(
     session: Session,
     entity: str,
     year: int,
-    *,
-    exclude_needs_review: bool = False,
 ) -> list[Transaction]:
     """Return non-rejected, non-split-parent transactions for the given entity + year.
 
     Split-parent transactions are excluded because their children carry
     the actual amounts — including both would double-count.
-
-    REQ-GMOBJ-04 (accounting#85): with *exclude_needs_review* the query also
-    excludes NEEDS_REVIEW rows. The B&O export passes it so a phantom income
-    row vetoed to needs_review (which keeps its income tax_category) is not
-    filed as WA gross receipts. It is opt-in rather than unconditional
-    because the >20% unconfirmed warning, the readiness stats and the B&O
-    wizard's per-month ``income_unconfirmed`` counter all have to *see* the
-    needs_review rows to report them — filtering them out of every caller
-    would silently zero those warnings.
     """
     year_prefix = str(year)
-    query = session.query(Transaction).filter(
-        Transaction.entity == entity,
-        Transaction.date.like(f"{year_prefix}-%"),
-        Transaction.status != TransactionStatus.REJECTED.value,
-        Transaction.status != TransactionStatus.SPLIT_PARENT.value,
-    )
-    if exclude_needs_review:
-        query = query.filter(
-            Transaction.status != TransactionStatus.NEEDS_REVIEW.value
+    return (
+        session.query(Transaction)
+        .filter(
+            Transaction.entity == entity,
+            Transaction.date.like(f"{year_prefix}-%"),
+            Transaction.status != TransactionStatus.REJECTED.value,
+            Transaction.status != TransactionStatus.SPLIT_PARENT.value,
         )
-    return query.all()
+        .all()
+    )
 
 
 def _tx_to_dict(tx: Transaction) -> dict[str, Any]:
@@ -175,21 +159,7 @@ def _bno_pretax_amount(tx_dict: dict[str, Any]) -> Decimal | None:
     ``line_items``/``gross_income`` figures (Schedule C / 1065 gross receipts
     include out-of-state sales) — those stay on the gross-incl-OOS basis via
     ``pretax_abs_amount`` directly.
-
-    REQ-GMOBJ-04 (accounting#85, review round 2): a row still awaiting human
-    review is not a gross receipt, so it returns ``None`` here too. The filter
-    lives in this shared helper — not in each caller's loop — because it is
-    the single B&O-basis function every B&O-purposed surface routes through
-    (``/api/tax-summary``'s bno_monthly/bno_quarterly and the YoY
-    comparison's), which is what keeps them reconciled with
-    ``bno_tax._aggregate_income_by_month`` and the filed B&O CSV/DOR figure.
-    The income-tax surfaces (``line_items``/``gross_income``, the
-    ``/tax-summary/monthly`` drill-down and its ``income_unconfirmed``
-    counter) call ``pretax_abs_amount`` directly and are unaffected — they
-    must still see the unconfirmed rows they report on.
     """
-    if tx_dict.get("status") == TransactionStatus.NEEDS_REVIEW.value:
-        return None
     cat = tx_dict.get("tax_category")
     if cat in RETAIL_CATEGORIES:
         facts = retail_facts(tx_dict)
@@ -869,14 +839,6 @@ def get_retail_detail(
             detail="Provide exactly one of month or quarter.",
         )
 
-    # REQ-GMOBJ-04 (accounting#85, review round 3): this endpoint is a filing
-    # surface, but only HALF of it is a gross-receipts measure. The full set is
-    # passed and compute_retail_detail applies the needs_review exclusion to
-    # gross_retailing/interstate_deduction/wa_taxable/retailing_bo only — the
-    # sales-tax-collected figures must keep every dollar actually collected
-    # from customers (see compute_retail_detail's docstring). Excluding here
-    # instead would zero the WA retail sales tax lines, since every non-test
-    # Shopify order is ingested at needs_review.
     transactions = _fetch_transactions(session, entity, year)
     tx_dicts = [_tx_to_dict(tx) for tx in transactions]
     d = compute_retail_detail(tx_dicts, year, month=month, quarter=quarter)
@@ -1202,28 +1164,10 @@ def export_bno(
             detail="B&O tax reports are only available for sparkry and blackline entities.",
         )
 
-    # The warning is computed over the UNFILTERED set so the >20% unconfirmed
-    # banner still fires; the B&O CSV itself is fed the needs_review-free set
-    # (REQ-GMOBJ-04).
     transactions = _fetch_transactions(session, entity, year)
     warn = _check_unconfirmed_threshold(transactions, hard_block=False)
 
-    all_dicts = [_tx_to_dict(tx) for tx in transactions]
-    tx_dicts = [
-        _tx_to_dict(tx)
-        for tx in _fetch_transactions(
-            session, entity, year, exclude_needs_review=True
-        )
-    ]
-
-    # accounting#85 (review round 3): state the exclusion in the output. A
-    # filed figure that is materially below the books must say so on its face
-    # — the >20% unconfirmed banner is a different, threshold-gated measure.
-    excluded_count, excluded_total = needs_review_income_summary(all_dicts, year)
-    disclosure_headers = {
-        "X-Excluded-Needs-Review-Income": str(excluded_count),
-        "X-Excluded-Needs-Review-Amount": f"{excluded_total:.2f}",
-    }
+    tx_dicts = [_tx_to_dict(tx) for tx in transactions]
 
     # DOR upload format (single filing period — month OR quarter)
     if format.lower() == "dor":
@@ -1233,11 +1177,8 @@ def export_bno(
                 detail="DOR upload requires exactly one of month or quarter.",
             )
         try:
-            # The FULL set: generate_dor_upload's B&O aggregation drops
-            # needs_review income itself, while its retail sales tax lines
-            # (codes 1 and 45) must report every dollar collected.
             content, filename = generate_dor_upload(
-                all_dicts, entity, year, month=month, quarter=quarter
+                tx_dicts, entity, year, month=month, quarter=quarter
             )
         except ValueError as exc:
             # REQ-FIX-TAX-007: unmapped WA locality is an actionable filing
@@ -1246,21 +1187,11 @@ def export_bno(
         return Response(
             content=content,
             media_type="text/csv; charset=utf-8",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                **disclosure_headers,
-            },
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     # Standard summary format
     content, filename = generate_bno_export(tx_dicts, entity, year)
-
-    if excluded_count:
-        content = (
-            f"# EXCLUDED: {excluded_count} needs_review income row(s) totalling "
-            f"${excluded_total:.2f} are NOT in these gross figures. Review and "
-            f"confirm them, then re-export before filing.\n"
-        ) + content
 
     if warn:
         warning_row = f"# WARNING: {warn['warning']}\n"
@@ -1269,8 +1200,5 @@ def export_bno(
     return Response(
         content=content,
         media_type="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-            **disclosure_headers,
-        },
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

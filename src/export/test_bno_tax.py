@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import io
 from decimal import Decimal
-from typing import Any
 
 import pytest
 
@@ -533,52 +532,3 @@ class TestDorUploadRetailSalesTax:
         assert ["TAX", "1", "0", "90.70"] in tax_lines
         # Local sales tax (code 45) at the Sammamish location code.
         assert ["TAX", "45", "1739", "90.70"] in tax_lines
-
-
-# ---------------------------------------------------------------------------
-# REQ-GMOBJ-04: needs_review income rows are not gross receipts
-# ---------------------------------------------------------------------------
-
-
-class TestNeedsReviewIncomeExcludedFromGross:
-    """Issue #85 review round v2: the gmail income veto flips status to
-    needs_review but leaves the income tax_category in place. B&O gross
-    aggregation had no status filter, so a vetoed phantom income row was still
-    counted as WA gross receipts (and taxed). Rows awaiting human review must
-    not enter the B&O measure until they are resolved."""
-
-    def _sparkry_gross(
-        self, transactions: list[dict[str, Any]], year: int = 2025
-    ) -> Decimal:
-        csv_text = build_sparkry_bno_csv(transactions, year)
-        rows = list(csv.reader(io.StringIO(csv_text)))
-        total = Decimal("0")
-        for r in rows[1:]:
-            if len(r) > 3 and r[0] and "TOTAL" not in r[0].upper():
-                total += Decimal(r[3])
-        return total
-
-    def test_needs_review_income_row_is_not_counted_in_gross(self) -> None:
-        confirmed = _income_tx("CONSULTING_INCOME", "10000.00", "2025-01-15")
-        confirmed["status"] = "confirmed"
-        needs_review = _income_tx("CONSULTING_INCOME", "10000.00", "2025-01-20")
-        needs_review["status"] = "needs_review"
-
-        assert self._sparkry_gross([confirmed, needs_review]) == Decimal("10000.00")
-
-    def test_rows_without_a_status_key_are_still_counted(self) -> None:
-        """Pure-function callers that pass status-less dicts must be unaffected."""
-        assert self._sparkry_gross(
-            [_income_tx("CONSULTING_INCOME", "10000.00", "2025-01-15")]
-        ) == Decimal("10000.00")
-
-    def test_blackline_quarterly_gross_also_skips_needs_review(self) -> None:
-        confirmed = _income_tx("SALES_INCOME", "5000.00", "2025-01-20")
-        confirmed["status"] = "confirmed"
-        needs_review = _income_tx("SALES_INCOME", "5000.00", "2025-02-20")
-        needs_review["status"] = "needs_review"
-
-        csv_text = build_blackline_bno_csv([confirmed, needs_review], 2025)
-        rows = list(csv.reader(io.StringIO(csv_text)))
-        q1 = [r for r in rows[1:] if r and "Q1" in r[0]]
-        assert sum(Decimal(r[3]) for r in q1) == Decimal("5000.00")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -546,7 +547,9 @@ class TestNeedsReviewIncomeExcludedFromGross:
     counted as WA gross receipts (and taxed). Rows awaiting human review must
     not enter the B&O measure until they are resolved."""
 
-    def _sparkry_gross(self, transactions: list[dict], year: int = 2025) -> Decimal:
+    def _sparkry_gross(
+        self, transactions: list[dict[str, Any]], year: int = 2025
+    ) -> Decimal:
         csv_text = build_sparkry_bno_csv(transactions, year)
         rows = list(csv.reader(io.StringIO(csv_text)))
         total = Decimal("0")

@@ -110,23 +110,35 @@ def _fetch_transactions(
     session: Session,
     entity: str,
     year: int,
+    *,
+    exclude_needs_review: bool = False,
 ) -> list[Transaction]:
     """Return non-rejected, non-split-parent transactions for the given entity + year.
 
     Split-parent transactions are excluded because their children carry
     the actual amounts — including both would double-count.
+
+    REQ-GMOBJ-04 (accounting#85): with *exclude_needs_review* the query also
+    excludes NEEDS_REVIEW rows. The B&O export passes it so a phantom income
+    row vetoed to needs_review (which keeps its income tax_category) is not
+    filed as WA gross receipts. It is opt-in rather than unconditional
+    because the >20% unconfirmed warning, the readiness stats and the B&O
+    wizard's per-month ``income_unconfirmed`` counter all have to *see* the
+    needs_review rows to report them — filtering them out of every caller
+    would silently zero those warnings.
     """
     year_prefix = str(year)
-    return (
-        session.query(Transaction)
-        .filter(
-            Transaction.entity == entity,
-            Transaction.date.like(f"{year_prefix}-%"),
-            Transaction.status != TransactionStatus.REJECTED.value,
-            Transaction.status != TransactionStatus.SPLIT_PARENT.value,
-        )
-        .all()
+    query = session.query(Transaction).filter(
+        Transaction.entity == entity,
+        Transaction.date.like(f"{year_prefix}-%"),
+        Transaction.status != TransactionStatus.REJECTED.value,
+        Transaction.status != TransactionStatus.SPLIT_PARENT.value,
     )
+    if exclude_needs_review:
+        query = query.filter(
+            Transaction.status != TransactionStatus.NEEDS_REVIEW.value
+        )
+    return query.all()
 
 
 def _tx_to_dict(tx: Transaction) -> dict[str, Any]:
@@ -1164,10 +1176,18 @@ def export_bno(
             detail="B&O tax reports are only available for sparkry and blackline entities.",
         )
 
+    # The warning is computed over the UNFILTERED set so the >20% unconfirmed
+    # banner still fires; the export itself is fed the needs_review-free set
+    # (REQ-GMOBJ-04).
     transactions = _fetch_transactions(session, entity, year)
     warn = _check_unconfirmed_threshold(transactions, hard_block=False)
 
-    tx_dicts = [_tx_to_dict(tx) for tx in transactions]
+    tx_dicts = [
+        _tx_to_dict(tx)
+        for tx in _fetch_transactions(
+            session, entity, year, exclude_needs_review=True
+        )
+    ]
 
     # DOR upload format (single filing period — month OR quarter)
     if format.lower() == "dor":

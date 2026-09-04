@@ -384,6 +384,12 @@ def _has_object_object(text: str) -> bool:
     return bool(_OBJECT_OBJECT_RE.search(text or ""))
 
 
+#: Public alias — the classification engine's narrow gmail-income veto
+#: (accounting#85 REQ-GMOBJ-02 v2) needs this predicate, and must use the
+#: adapter's single regex rather than re-declaring one that can drift.
+has_object_object = _has_object_object
+
+
 def _extract_vendor_raw(from_field: str, body_text: str = "") -> str:
     """Extract the human-readable vendor name from a RFC 5322 ``From`` header.
 

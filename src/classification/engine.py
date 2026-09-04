@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.orm import Session
 
 from src.adapters.gmail_n8n import CORRUPTED_PAYLOAD_MARKER as _CORRUPTED_MARKER
+from src.adapters.gmail_n8n import has_object_object as _has_object_object
 from src.models.enums import Direction, Entity, Source, TaxCategory, TransactionStatus
 
 if TYPE_CHECKING:
@@ -190,10 +191,22 @@ def _veto_gmail_income(
 
     Category/direction are preserved (mirroring the inflow-on-expense veto):
     only the status and review_reason change, so the human sees the tier's
-    suggestion. NOTE: this does NOT itself remove the row from B&O gross
-    aggregation — that keys on tax_category regardless of status — so the
-    row remains counted until a human resolves the review (accounting#85
-    review round 3).
+    suggestion. The needs_review status now also drops the row out of B&O
+    gross receipts (``bno_tax._aggregate_income_by_month``, REQ-GMOBJ-04), so
+    a vetoed phantom no longer inflates the filing while it waits for a human.
+
+    REQ-GMOBJ-02 v2 — the veto is NARROW. Sparkry really does receive gmail
+    income notifications, and two rules yield an income category for a gmail
+    row *deliberately*: the Tier-1 ``cardinal.*health`` seed and the Tier-2
+    SAP/Ariba pattern. Vetoing every gmail income result silently disabled
+    both. The downgrade therefore fires only when the classification is not
+    trustworthy:
+
+    (a) the row carries the corrupted ``[object Object]`` payload marker — in
+        the description, or in the review_reason the adapter wrote when it
+        scrubbed the literal out of the description; or
+    (b) the income label came from the Tier-3 fallback/LLM path, i.e. no
+        deterministic tier-1/tier-2 rule produced it.
     """
     if transaction.source != Source.GMAIL_N8N.value:
         return result
@@ -205,6 +218,14 @@ def _veto_gmail_income(
         or result.tax_category in _INCOME_TAX_CATEGORIES
     )
     if not is_income:
+        return result
+    corrupted = _has_object_object(transaction.description or "") or (
+        _CORRUPTED_MARKER in (transaction.review_reason or "")
+    )
+    from_fallback = result.tier_used == 3
+    if not (corrupted or from_fallback):
+        # A deterministic tier-1/tier-2 rule deliberately classified this
+        # gmail row as income (SAP/Ariba, cardinal.*health) — keep it.
         return result
     reason = (
         f"Source/direction mismatch: gmail receipts are always expenses, "
@@ -311,7 +332,6 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
     ):
         transaction.entity = result.entity.value
     prior_reason = transaction.review_reason or ""
-    prior_status = transaction.status
     transaction.tax_category = result.tax_category.value
     transaction.direction = result.direction.value
     transaction.confidence = result.confidence
@@ -323,14 +343,12 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
 
     # accounting#85: a corrupted-payload flag set at ingest must survive
     # classification — otherwise a confident tier-3 expense result silently
-    # auto-classifies the row and the marker is lost. Skip once a human has
-    # confirmed the row: nothing on the confirm path clears review_reason,
-    # so without this guard a later re-classify would silently revert a
-    # confirmed row back to needs_review (review round 3).
-    if (
-        _CORRUPTED_MARKER in prior_reason
-        and prior_status != TransactionStatus.CONFIRMED.value
-    ):
+    # auto-classifies the row and the marker is lost. REQ-GMOBJ-05: the
+    # round-3 "skip when the row was already CONFIRMED" guard was inert —
+    # reclassify.py only ever queries NEEDS_REVIEW rows and ingest.py applies
+    # to freshly created needs_review rows, so no caller can reach here with a
+    # confirmed row — and has been deleted.
+    if _CORRUPTED_MARKER in prior_reason:
         transaction.status = TransactionStatus.NEEDS_REVIEW.value
         new_reason = transaction.review_reason or ""
         # review round 2: skip the append when prior_reason is already folded

@@ -21,6 +21,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from src.export.basis import RETAIL_CATEGORIES, pretax_abs_amount, retail_facts
+from src.models.enums import TransactionStatus
 from src.utils.constants import SPARKRY_CONTACT_EMAIL
 
 # ---------------------------------------------------------------------------
@@ -51,6 +52,9 @@ BO_RATE: dict[str, Decimal] = {
 }
 
 INCOME_CATEGORIES = set(BO_CLASSIFICATION.keys())
+
+# REQ-GMOBJ-04: rows in this status are excluded from the B&O gross measure.
+_NEEDS_REVIEW = TransactionStatus.NEEDS_REVIEW.value
 
 MONTH_NAMES = [
     "January", "February", "March", "April", "May", "June",
@@ -104,6 +108,14 @@ def _aggregate_income_by_month(
     for tx in transactions:
         cat = tx.get("tax_category", "")
         if cat not in INCOME_CATEGORIES:
+            continue
+        # REQ-GMOBJ-04 (accounting#85): a row still awaiting human review is
+        # not a gross receipt. The gmail income veto downgrades a phantom
+        # income row to needs_review but leaves its income tax_category in
+        # place, so without this filter the phantom is still filed — and
+        # taxed — as WA gross receipts. Status-less dicts (pure-function
+        # callers) are unaffected.
+        if tx.get("status") == _NEEDS_REVIEW:
             continue
         date_str = tx.get("date", "")
         if not date_str.startswith(str(year)):

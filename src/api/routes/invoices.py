@@ -34,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 
 from src.api.deps import get_db
-from src.classification.learned_patterns import make_learned_vendor_rule
+from src.classification.rules import make_learned_vendor_rule
 from src.invoicing.email_sender import _validate_email, send_invoice_email
 from src.invoicing.generator import generate_calendar_invoice as _gen_calendar
 from src.invoicing.generator import generate_flat_invoice as _gen_flat

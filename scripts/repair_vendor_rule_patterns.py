@@ -37,7 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sqlalchemy.orm import Session  # noqa: E402
 
-from src.classification.pattern_integrity import (  # noqa: E402
+from src.classification.rules import (  # noqa: E402
     PatternRepairResult,
     repair_literal_regex_rules,
 )

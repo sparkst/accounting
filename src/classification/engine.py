@@ -169,6 +169,52 @@ def _reconcile_sign(
     return result
 
 
+def _veto_gmail_income(
+    transaction: Transaction, result: ClassificationResult
+) -> ClassificationResult:
+    """Route gmail-sourced rows classified as income to needs_review.
+
+    accounting#85: ``gmail_n8n``'s adapter contract is
+    ``signed_amount = -abs(amount)`` — every gmail receipt is an expense by
+    construction, so gmail is deliberately excluded from
+    ``_AUTHORITATIVE_SIGN_SOURCES`` and ``_reconcile_sign()`` never fires on
+    it. That left a hole: a corrupted description (e.g. the ``[object
+    Object]`` literal) defeats tiers 1-2, and a tier-3 mis-guess of an income
+    category was silently AUTO_CLASSIFIED, inflating Sparkry B&O gross.
+
+    Category/direction are preserved (mirroring the inflow-on-expense veto):
+    only the status and review_reason change, so the human sees the tier's
+    suggestion while the row stays out of the automated income totals.
+    """
+    if transaction.source != Source.GMAIL_N8N.value:
+        return result
+    is_income = result.direction not in (
+        Direction.TRANSFER,
+        Direction.REIMBURSABLE,
+    ) and (
+        result.direction == Direction.INCOME
+        or result.tax_category in _INCOME_TAX_CATEGORIES
+    )
+    if not is_income:
+        return result
+    return replace(
+        result,
+        status=TransactionStatus.NEEDS_REVIEW,
+        review_reason=(
+            f"Source/direction mismatch: gmail receipts are always expenses, "
+            f"but tier {result.tier_used} classified this row as income "
+            f"({result.tax_category.value}). Routed to review."
+        ),
+    )
+
+
+def _finalise(
+    transaction: Transaction, result: ClassificationResult
+) -> ClassificationResult:
+    """Apply the sign and gmail-income vetoes to a tier's result."""
+    return _veto_gmail_income(transaction, _reconcile_sign(transaction, result))
+
+
 def classify(
     transaction: Transaction,
     session: Session,
@@ -211,21 +257,21 @@ def classify(
     if tier1 is not None and tier1.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier1.tier_used = 1
         tier1.status = TransactionStatus.AUTO_CLASSIFIED
-        return _reconcile_sign(transaction, tier1)
+        return _finalise(transaction, tier1)
 
     # ── Tier 2: Structural patterns ─────────────────────────────────────────
     tier2 = _pat_mod.match_structural_pattern(transaction)
     if tier2 is not None and tier2.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier2.tier_used = 2
         tier2.status = TransactionStatus.AUTO_CLASSIFIED
-        return _reconcile_sign(transaction, tier2)
+        return _finalise(transaction, tier2)
 
     # ── Tier 3: LLM classification ──────────────────────────────────────────
     tier3 = _llm_mod.llm_classify(transaction, api_key=llm_api_key, _session=session)
     if tier3.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier3.tier_used = 3
         tier3.status = TransactionStatus.AUTO_CLASSIFIED
-        return _reconcile_sign(transaction, tier3)
+        return _finalise(transaction, tier3)
 
     # ── Needs review ────────────────────────────────────────────────────────
     # Best partial result is kept so the reviewer has a pre-filled suggestion.
@@ -235,7 +281,7 @@ def classify(
         f"Low confidence ({tier3.confidence:.2f}) from Tier 3 LLM: "
         f"{tier3.reasoning}"
     )
-    return _reconcile_sign(transaction, tier3)
+    return _finalise(transaction, tier3)
 
 
 def apply_result(transaction: Transaction, result: ClassificationResult) -> None:

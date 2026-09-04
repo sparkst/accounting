@@ -85,7 +85,7 @@
     "deductible_pct": 1.0,
     "confidence": 0.95,
     "tier_used": 1,
-    "status": "auto_classified"
+    "status": "needs_review"
   },
   {
     "description": "STICKERMULE decals order",
@@ -129,7 +129,7 @@
     "deductible_pct": 1.0,
     "confidence": 0.97,
     "tier_used": 1,
-    "status": "auto_classified"
+    "status": "needs_review"
   },
   {
     "description": "STRIPE INC processing fee",

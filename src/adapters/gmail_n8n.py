@@ -370,6 +370,20 @@ def _extract_forwarded_subject(body_text: str) -> str | None:
     return None
 
 
+_OBJECT_OBJECT_RE = re.compile(r"\[object\s+object\]", re.IGNORECASE)
+
+
+def _has_object_object(text: str) -> bool:
+    """True when *text* carries the JS ``[object Object]`` stringification.
+
+    accounting#85: an upstream n8n node serialises an object into the ``from``
+    header, so the display name arrives as the literal ``[object Object]``.
+    That literal can never match a VendorRule and can never be learned, so it
+    must never be stored as a description nor auto-classified.
+    """
+    return bool(_OBJECT_OBJECT_RE.search(text or ""))
+
+
 def extract_vendor(from_field: str, body_text: str = "") -> str:
     """Extract the human-readable vendor name from a RFC 5322 ``From`` header.
 
@@ -409,8 +423,13 @@ def extract_vendor(from_field: str, body_text: str = "") -> str:
     m = re.match(r"^(.*?)\s*<[^>]+>\s*$", from_field)
     if m:
         name = m.group(1).strip()
-        if name:
+        if name and not _has_object_object(name):
             return name
+        if name:
+            # accounting#85: never surface the "[object Object]" literal as a
+            # description — fall back to the sender's domain, which at least
+            # names the real vendor ("mail.elevenlabs.io" -> "elevenlabs.io").
+            return _vendor_from_domain(from_field)
     return from_field
 
 
@@ -713,6 +732,18 @@ class GmailN8nAdapter(BaseAdapter):
             # The amount extracted from body_text is always positive (it's what was
             # charged); store it as negative per the sign convention.
             signed_amount = -abs(amount)
+
+        # accounting#85: a `[object Object]`-literal sender means the upstream
+        # payload was corrupted; force review with an explicit reason rather
+        # than letting the record pass through silently.
+        if _has_object_object(from_field):
+            status = TransactionStatus.NEEDS_REVIEW.value
+            reason = (
+                "Corrupted upstream payload: the sender header contained the "
+                "literal '[object Object]'; vendor was derived from the sender "
+                "domain and must be confirmed manually."
+            )
+            review_reason = f"{review_reason} {reason}" if review_reason else reason
 
         # Discover co-located attachments.
         attachments = find_attachments(json_path.parent, source_id)

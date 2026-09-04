@@ -907,6 +907,94 @@ class TestClassificationEngine:
 
 
 # ---------------------------------------------------------------------------
+# REQ-GMOBJ-02: gmail rows never auto-book as income
+# ---------------------------------------------------------------------------
+
+
+class TestGmailIncomeVeto:
+    """Issue #85: gmail_n8n's adapter contract is signed_amount = -abs()
+    (always an expense). A tier that mis-guesses an income tax_category for a
+    gmail-sourced row (e.g. a broken `[object Object]` description defeating
+    vendor/pattern rules) must be downgraded to NEEDS_REVIEW rather than
+    silently AUTO_CLASSIFIED, mirroring the existing _reconcile_sign() outflow
+    veto but keyed on source == GMAIL_N8N rather than on amount sign (gmail is
+    deliberately excluded from _AUTHORITATIVE_SIGN_SOURCES)."""
+
+    def test_gmail_income_veto_downgrades_subscription_income_to_needs_review(
+        self, seeded_session: Session
+    ) -> None:
+        """Regression for accounting#85: the ElevenLabs charge
+        (4ed8f5dd-f936-4357-8a58-7e47b9f3af8f, 2026-08-18, +$24.27) was
+        mis-booked SUBSCRIPTION_INCOME, inflating Sparkry B&O gross."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+        assert "gmail" in (result.review_reason or "").lower()
+
+    def test_gmail_income_veto_ignores_non_gmail_sources(
+        self, seeded_session: Session
+    ) -> None:
+        """The gmail-keyed veto must not fire for a non-gmail source."""
+        txn = _make_transaction(
+            description="Some subscription income vendor",
+            source=Source.STRIPE.value,
+            amount=Decimal("24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+        assert result.tax_category == TaxCategory.SUBSCRIPTION_INCOME
+
+    def test_gmail_income_veto_leaves_expense_classification_alone(
+        self, seeded_session: Session
+    ) -> None:
+        """A correctly-classified gmail expense row (e.g.
+        517ecbb1-a4cd-45b2-9f66-87c875f6884a, OFFICE_EXPENSE -$27.58) must
+        not be touched by the income veto."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-27.58"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.OFFICE_EXPENSE,
+                direction=Direction.EXPENSE,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="office supplies keyword matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+        assert result.tax_category == TaxCategory.OFFICE_EXPENSE
+
+
+# ---------------------------------------------------------------------------
 # Seed rules
 # ---------------------------------------------------------------------------
 

@@ -236,6 +236,22 @@ FORWARDED_WIFI_ONBOARD: dict[str, object] = {
     "body_html": "<html></html>",
 }
 
+OBJECT_OBJECT_RECEIPT: dict[str, object] = {
+    # accounting#85: a JS object serialized before it reaches gmail_n8n.py,
+    # producing a `from` header whose display name is the literal string
+    # "[object Object]" — extract_vendor() then stores that literal as the
+    # description, defeating vendor/pattern matching and (per the ElevenLabs
+    # regression, 4ed8f5dd-f936-4357-8a58-7e47b9f3af8f) letting tier-3
+    # mis-guess income and inflate B&O gross.
+    "id": "4ed8f5dd1936",
+    "filename": "2026-08-18_object_object_4ed8f5dd1936",
+    "date": "2026-08-18T00:00:00.000Z",
+    "from": "[object Object] <billing@mail.elevenlabs.io>",
+    "subject": "Your receipt",
+    "body_text": "Receipt Amount paid $24.27\n",
+    "body_html": "<html></html>",
+}
+
 FORWARDED_APPLE_RECEIPT: dict[str, object] = {
     "id": "196dff7d8e138b25",
     "filename": "2025-05-17_Travis_Sparks_196dff7d8e138b25",
@@ -740,6 +756,54 @@ class TestGmailN8nAdapterRun:
         self._make_adapter(tmp_path).run(session)
         tx = session.query(Transaction).one()
         assert tx.source == Source.GMAIL_N8N.value
+
+
+# ---------------------------------------------------------------------------
+# REQ-GMOBJ-01: reject `[object Object]` description at ingest
+# ---------------------------------------------------------------------------
+
+
+class TestObjectObjectPayload:
+    def _make_adapter(self, *dirs: Path) -> GmailN8nAdapter:
+        return GmailN8nAdapter(source_dirs=[str(d) for d in dirs])
+
+    def test_object_object_payload_routes_to_needs_review(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85: a `[object Object]`-literal vendor must route the
+        record to NEEDS_REVIEW with a review reason, not pass through
+        silently."""
+        write_fixture(tmp_path, OBJECT_OBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.review_reason is not None
+        assert "object object" in tx.review_reason.lower()
+
+    def test_object_object_literal_never_stored_as_description(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """The literal string "[object Object]" must never be stored as the
+        plain description — it can never match a VendorRule and can never be
+        learned."""
+        write_fixture(tmp_path, OBJECT_OBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description != "[object Object]"
+
+    def test_well_formed_record_unaffected_by_object_object_guard(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """The guard must be narrowly scoped: a normal, well-formed vendor
+        description is stored and ingested exactly as before."""
+        write_fixture(tmp_path, ANTHROPIC_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description == "Anthropic, PBC"
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value  # classification pending, as today
 
 
 # ---------------------------------------------------------------------------

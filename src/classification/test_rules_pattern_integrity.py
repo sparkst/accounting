@@ -554,3 +554,38 @@ class TestRepairWritesAuditTrail:
         assert result.repaired == 0
         assert result.skipped == 1
         assert session.query(AuditEvent).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# accounting#82 (P2-c9d): force_literal escape hatch for a legitimate
+# pipe/bracket literal, per REQ-VRESC-01..03.
+# ---------------------------------------------------------------------------
+
+
+class TestForceLiteralEscapeHatch:
+    def test_force_literal_bypasses_looks_like_regex(self) -> None:
+        """REQ-VRESC-01: force_literal=True skips looks_like_regex entirely
+        for the is_regex=False path, so a real '|'-bearing descriptor can be
+        stored as a literal without raising PatternFlagError."""
+        validate_pattern_flag(
+            "FOO|BAR LLC", is_regex=False, force_literal=True
+        )  # must not raise
+
+    def test_force_literal_matches_own_description(self, session: Session) -> None:
+        """REQ-VRESC-02: a literal stored with force_literal=True matches its
+        own description via re.escape, per the issue's acceptance line."""
+        validate_pattern_flag(
+            "FOO|BAR LLC", is_regex=False, force_literal=True
+        )  # must not raise before the rule is even stored
+        rule = _rule(session, "FOO|BAR LLC", is_regex=False)
+        hit = lookup_vendor_rule("FOO|BAR LLC", session)
+        assert hit is not None, "force_literal rule must match its own description"
+        assert hit.id == rule.id
+
+    def test_default_still_rejects_pipe_and_bracket_literal(self) -> None:
+        """REQ-VRESC-03: the default (force_literal=False, today's call
+        shape) still rejects '|'/'[...]' literals exactly as before."""
+        with pytest.raises(PatternFlagError):
+            validate_pattern_flag("FOO|BAR LLC", is_regex=False)
+        with pytest.raises(PatternFlagError):
+            validate_pattern_flag("ACME [WEST]", is_regex=False)

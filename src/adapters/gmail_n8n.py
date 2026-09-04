@@ -453,6 +453,19 @@ def extract_vendor(from_field: str, body_text: str = "") -> str:
     vendor = _extract_vendor_raw(from_field, body_text)
     if not _has_object_object(vendor):
         return vendor
+    # review round 2: for a self-forward whose forwarded From: display name is
+    # the corrupted literal, fall back to the *forwarded* sender's own domain
+    # (from the body) rather than the outer self-forward envelope's domain —
+    # otherwise every self-forwarded corrupted payload mis-attributes to
+    # "gmail.com" instead of the real vendor.
+    if _is_self_forwarded(from_field):
+        m = re.search(
+            r"^From:\s+.*?<([^>]+)>", body_text, re.IGNORECASE | re.MULTILINE
+        )
+        if m:
+            forwarded_fallback = _vendor_from_domain(m.group(1).strip())
+            if forwarded_fallback and not _has_object_object(forwarded_fallback):
+                return forwarded_fallback
     fallback = _vendor_from_domain(from_field)
     if fallback and not _has_object_object(fallback):
         return fallback
@@ -823,10 +836,17 @@ class GmailN8nAdapter(BaseAdapter):
                             tx.date = ocr.date
                         if ocr.entity_hint:
                             tx.entity = ocr.entity_hint
-                        # Mark as OCR-extracted, still needs human review
-                        tx.review_reason = (
+                        # Mark as OCR-extracted, still needs human review. Append
+                        # rather than overwrite so an existing corrupted-payload
+                        # marker (accounting#85) survives (P2 review round 2).
+                        ocr_note = (
                             "Auto-extracted from attachment via Claude CLI. "
                             "Please verify vendor, amount, and entity."
+                        )
+                        tx.review_reason = (
+                            f"{tx.review_reason} {ocr_note}"
+                            if tx.review_reason
+                            else ocr_note
                         )
                         import json as _json
                         tx.notes = (

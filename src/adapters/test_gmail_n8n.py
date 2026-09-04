@@ -822,11 +822,45 @@ class TestObjectObjectVendorShapes:
         )
         vendor = extract_vendor("Travis Sparks <sparkst@gmail.com>", body)
         assert "[object Object]" not in vendor
+        # review round 2: the fallback must use the *forwarded* sender's
+        # domain, not the outer self-forward envelope (sparkst@gmail.com).
+        assert vendor == "elevenlabs.io"
 
     def test_display_name_literal_falls_back_to_domain(self) -> None:
         assert extract_vendor(
             "[object Object] <billing@mail.elevenlabs.io>"
         ) == "elevenlabs.io"
+
+
+class TestObjectObjectOCRPreservesMarker:
+    def test_ocr_branch_appends_not_overwrites_corrupted_marker(
+        self, tmp_path: Path, session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """review round 2 (P2): a corrupted-payload row whose body is empty but
+        whose attachment OCR succeeds must keep the CORRUPTED_PAYLOAD_MARKER in
+        review_reason, not have it clobbered by the OCR note."""
+        import src.adapters.gmail_n8n as gmail_n8n_mod
+        from src.utils.receipt_ocr import OCRResult
+
+        record = dict(OBJECT_OBJECT_RECEIPT)
+        record["body_text"] = ""  # forces the body_is_empty OCR branch
+        write_fixture(tmp_path, record)
+        # Co-locate a fake receipt image so find_extractable_attachments finds one.
+        (tmp_path / f"{record['id']}_receipt.png").write_bytes(b"fake")
+
+        monkeypatch.setattr(
+            gmail_n8n_mod,
+            "extract_receipt",
+            lambda _path: OCRResult(
+                vendor="Elevenlabs", amount=decimal.Decimal("24.27"), success=True
+            ),
+        )
+
+        GmailN8nAdapter(source_dirs=[str(tmp_path)]).run(session)
+
+        tx = session.query(Transaction).one()
+        assert gmail_n8n_mod.CORRUPTED_PAYLOAD_MARKER in (tx.review_reason or "")
+        assert "Auto-extracted from attachment" in (tx.review_reason or "")
 
 
 class TestObjectObjectSelfForwardIngest:

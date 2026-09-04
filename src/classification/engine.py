@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
+from src.adapters.gmail_n8n import CORRUPTED_PAYLOAD_MARKER as _CORRUPTED_MARKER
 from src.models.enums import Direction, Entity, Source, TaxCategory, TransactionStatus
 
 if TYPE_CHECKING:
@@ -76,7 +77,7 @@ _AUTHORITATIVE_SIGN_SOURCES = frozenset({Source.PLAID.value, Source.BANK_CSV.val
 # accounting#85: phrase the gmail adapter writes into review_reason when the
 # upstream payload was corrupted. It must survive classification, so
 # apply_result() re-asserts NEEDS_REVIEW whenever it is already present.
-_CORRUPTED_MARKER = "Corrupted upstream payload"
+# Imported (not re-declared, review round 2) so the two can never drift.
 
 _INCOME_TAX_CATEGORIES = frozenset({
     TaxCategory.CONSULTING_INCOME,
@@ -322,11 +323,15 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
     # auto-classifies the row and the marker is lost.
     if _CORRUPTED_MARKER in prior_reason:
         transaction.status = TransactionStatus.NEEDS_REVIEW.value
-        transaction.review_reason = (
-            f"{transaction.review_reason} {prior_reason}".strip()
-            if transaction.review_reason
-            else prior_reason
-        )
+        new_reason = transaction.review_reason or ""
+        # review round 2: skip the append when prior_reason is already folded
+        # in (e.g. a re-classify run) so the text doesn't grow/duplicate.
+        if prior_reason in new_reason:
+            transaction.review_reason = new_reason or prior_reason
+        else:
+            transaction.review_reason = (
+                f"{new_reason} {prior_reason}".strip() if new_reason else prior_reason
+            )
 
     # Missing amounts always need review regardless of classification confidence
     if transaction.amount is None and transaction.status != TransactionStatus.NEEDS_REVIEW.value:

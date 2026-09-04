@@ -1072,6 +1072,46 @@ class TestGmailIncomeVetoEdges:
         assert txn.status == TransactionStatus.NEEDS_REVIEW.value
         assert "Corrupted upstream payload" in (txn.review_reason or "")
 
+    def test_corrupted_marker_imported_from_adapter_not_duplicated(self) -> None:
+        """review round 2: engine's marker must be the adapter's constant, not
+        an independent literal that can silently drift out of sync."""
+        import src.classification.engine as engine_mod
+        from src.adapters.gmail_n8n import CORRUPTED_PAYLOAD_MARKER
+
+        assert getattr(engine_mod, "_CORRUPTED_MARKER") is CORRUPTED_PAYLOAD_MARKER  # noqa: B009
+
+    def test_corrupted_payload_marker_not_duplicated_on_reclassify(
+        self, seeded_session: Session
+    ) -> None:
+        """review round 2 (P3): re-running apply_result on an already-flagged
+        row must not keep re-appending prior_reason, growing the text."""
+        txn = _make_transaction(
+            description="elevenlabs.io",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        txn.review_reason = (
+            "Corrupted upstream payload: the sender header contained the "
+            "literal '[object Object]'."
+        )
+        result = ClassificationResult(
+            entity=Entity.SPARKRY,
+            tax_category=TaxCategory.OFFICE_EXPENSE,
+            direction=Direction.EXPENSE,
+            confidence=0.95,
+            tier_used=3,
+            status=TransactionStatus.AUTO_CLASSIFIED,
+            reasoning="office expense",
+        )
+        apply_result(txn, result)
+        first_reason = txn.review_reason
+
+        # Simulate a second classification run against the now-persisted row.
+        apply_result(txn, result)
+
+        assert txn.review_reason == first_reason
+        assert (txn.review_reason or "").count("Corrupted upstream payload") == 1
+
 
 # ---------------------------------------------------------------------------
 # Seed rules

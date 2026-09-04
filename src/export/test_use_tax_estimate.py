@@ -106,31 +106,31 @@ SHOPIFY_PAYOUT = {
 }
 
 
-def test_find_comped_orders_selects_zero_amount_confirmed_blackline_shopify():
+def test_find_comped_orders_selects_zero_amount_confirmed_blackline_shopify() -> None:
     txs = [COMP_ORDER, COMP_ORDER_MULTI_UNIT, PAID_ORDER]
     assert find_comped_orders(txs) == [COMP_ORDER, COMP_ORDER_MULTI_UNIT]
 
 
-def test_find_comped_orders_requires_confirmed_excludes_needs_review():
+def test_find_comped_orders_requires_confirmed_excludes_needs_review() -> None:
     # REQ-UTX-002 / the ingest-status fix: Shopify orders land at needs_review;
     # only human-CONFIRMED comps feed the filing number (PR #68 wrongly counted
     # needs_review rows). This is the substantive correction over the primitive.
     assert find_comped_orders([NEEDS_REVIEW_COMP_ORDER]) == []
 
 
-def test_find_comped_orders_excludes_rejected_status():
+def test_find_comped_orders_excludes_rejected_status() -> None:
     assert find_comped_orders([REJECTED_COMP_ORDER]) == []
 
 
-def test_find_comped_orders_excludes_other_entities():
+def test_find_comped_orders_excludes_other_entities() -> None:
     assert find_comped_orders([SPARKRY_ZERO_ORDER]) == []
 
 
-def test_find_comped_orders_excludes_non_order_shopify_rows():
+def test_find_comped_orders_excludes_non_order_shopify_rows() -> None:
     assert find_comped_orders([SHOPIFY_PAYOUT]) == []
 
 
-def test_estimate_use_tax_accrual_sums_units_and_applies_rate():
+def test_estimate_use_tax_accrual_sums_units_and_applies_rate() -> None:
     result = estimate_use_tax_accrual(
         [COMP_ORDER, COMP_ORDER_MULTI_UNIT],
         unit_cost=Decimal("30.00"),
@@ -146,7 +146,7 @@ def test_estimate_use_tax_accrual_sums_units_and_applies_rate():
     )
 
 
-def test_estimate_use_tax_accrual_empty_orders_is_zero():
+def test_estimate_use_tax_accrual_empty_orders_is_zero() -> None:
     result = estimate_use_tax_accrual([], unit_cost=Decimal("30.00"), rate=Decimal("0.103"))
     assert result.unit_count == 0
     assert result.estimated_tax == Decimal("0.00")
@@ -155,11 +155,11 @@ def test_estimate_use_tax_accrual_empty_orders_is_zero():
 # ── config loader (REQ-UTX-003) ─────────────────────────────────────────────
 
 
-def test_load_use_tax_config_missing_file_returns_none(tmp_path: Path):
+def test_load_use_tax_config_missing_file_returns_none(tmp_path: Path) -> None:
     assert load_use_tax_config(tmp_path / "nope.yaml") is None
 
 
-def test_load_use_tax_config_zero_values_returns_none(tmp_path: Path):
+def test_load_use_tax_config_zero_values_returns_none(tmp_path: Path) -> None:
     p = tmp_path / "use_tax.yaml"
     p.write_text("avg_unit_cost: 0.00\nuse_tax_rate: 0.00\n")
     # Report-only + Travis-supplied: an unfilled config must NOT invent a
@@ -167,14 +167,14 @@ def test_load_use_tax_config_zero_values_returns_none(tmp_path: Path):
     assert load_use_tax_config(p) is None
 
 
-def test_load_use_tax_config_valid_returns_decimals(tmp_path: Path):
+def test_load_use_tax_config_valid_returns_decimals(tmp_path: Path) -> None:
     p = tmp_path / "use_tax.yaml"
     p.write_text("avg_unit_cost: 30.00\nuse_tax_rate: 0.103\n")
     cfg = load_use_tax_config(p)
     assert cfg == UseTaxConfig(unit_cost=Decimal("30.00"), rate=Decimal("0.103"))
 
 
-def test_quarter_of_month():
+def test_quarter_of_month() -> None:
     assert quarter_of_month("2026-01") == 1
     assert quarter_of_month("2026-03") == 1
     assert quarter_of_month("2026-07") == 3
@@ -218,7 +218,7 @@ def _comp(session: Session, *, dt: str, units: int, status: str, **over: object)
     return tx
 
 
-def test_build_use_tax_summary_counts_confirmed_comps_in_quarter(session: Session, tmp_path: Path):
+def test_build_use_tax_summary_counts_confirmed_comps_in_quarter(session: Session, tmp_path: Path) -> None:
     # Q3 2026 = Jul/Aug/Sep. Two confirmed comps in-quarter (1 + 2 units),
     # plus noise that must be excluded.
     _comp(session, dt="2026-07-05", units=1, status=TransactionStatus.CONFIRMED.value)
@@ -243,7 +243,7 @@ def test_build_use_tax_summary_counts_confirmed_comps_in_quarter(session: Sessio
     assert summary.unavailable_reason is None
 
 
-def test_build_use_tax_summary_unavailable_without_config(session: Session, tmp_path: Path):
+def test_build_use_tax_summary_unavailable_without_config(session: Session, tmp_path: Path) -> None:
     _comp(session, dt="2026-07-05", units=2, status=TransactionStatus.CONFIRMED.value)
     session.flush()
     summary = build_use_tax_summary(session, "2026-08", config_path=tmp_path / "absent.yaml")
@@ -273,7 +273,7 @@ def _summary(**over: object) -> UseTaxQuarterSummary:
     return UseTaxQuarterSummary(**base)  # type: ignore[arg-type]
 
 
-def test_render_use_tax_section_has_estimate_and_disclaimer():
+def test_render_use_tax_section_has_estimate_and_disclaimer() -> None:
     text = render_use_tax_section(_summary())
     assert "WAC 458-20-178" in text
     assert "Q3 2026" in text
@@ -281,7 +281,7 @@ def test_render_use_tax_section_has_estimate_and_disclaimer():
     assert "report-only" in text.lower()
 
 
-def test_render_use_tax_section_unavailable_names_config():
+def test_render_use_tax_section_unavailable_names_config() -> None:
     text = render_use_tax_section(
         _summary(estimate=None, unavailable_reason="config/use_tax.yaml not set")
     )
@@ -290,6 +290,6 @@ def test_render_use_tax_section_unavailable_names_config():
     assert "$" not in text.split("UNAVAILABLE")[1]  # no dollar figure once unavailable
 
 
-def test_render_use_tax_section_zero_orders():
+def test_render_use_tax_section_zero_orders() -> None:
     text = render_use_tax_section(_summary(order_count=0, unit_count=0, estimate=None))
     assert "No confirmed comped" in text

@@ -252,6 +252,18 @@ OBJECT_OBJECT_RECEIPT: dict[str, object] = {
     "body_html": "<html></html>",
 }
 
+NON_STRING_FROM_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 3: some upstream n8n payloads send `from`
+    # as an actual JSON object rather than a string. Ingest must not crash.
+    "id": "nonstringfrom0001",
+    "filename": "2026-08-19_nonstring_from_0001",
+    "date": "2026-08-19T00:00:00.000Z",
+    "from": {"name": "Acme", "address": "billing@acme.example"},
+    "subject": "Your receipt",
+    "body_text": "Receipt Amount paid $10.00\n",
+    "body_html": "<html></html>",
+}
+
 FORWARDED_APPLE_RECEIPT: dict[str, object] = {
     "id": "196dff7d8e138b25",
     "filename": "2025-05-17_Travis_Sparks_196dff7d8e138b25",
@@ -804,6 +816,19 @@ class TestObjectObjectPayload:
         tx = session.query(Transaction).one()
         assert tx.description == "Anthropic, PBC"
         assert tx.status == TransactionStatus.NEEDS_REVIEW.value  # classification pending, as today
+
+
+    def test_non_string_from_field_does_not_crash(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 3: a `from` value that is a JSON
+        object (not a string) must not raise AttributeError from
+        extract_vendor's .strip() call — ingest should still complete."""
+        write_fixture(tmp_path, NON_STRING_FROM_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description is not None
 
 
 class TestObjectObjectVendorShapes:

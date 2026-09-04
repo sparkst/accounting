@@ -682,7 +682,10 @@ class GmailN8nAdapter(BaseAdapter):
                 f"{json_path.name}: invalid date {raw_date!r}: {exc}"
             ) from exc
 
-        from_field: str = record.get("from", "")
+        # str() guard: some upstream n8n payloads send `from` as a JSON object
+        # rather than a string; without this, _extract_vendor_raw's .strip()
+        # raises AttributeError on a dict (accounting#85 review).
+        from_field: str = str(record.get("from", "") or "")
         body_text: str = record.get("body_text", "")
         subject: str = record.get("subject", "")
 

@@ -191,7 +191,10 @@ def _veto_gmail_income(
 
     Category/direction are preserved (mirroring the inflow-on-expense veto):
     only the status and review_reason change, so the human sees the tier's
-    suggestion while the row stays out of the automated income totals.
+    suggestion. NOTE: this does NOT itself remove the row from B&O gross
+    aggregation — that keys on tax_category regardless of status — so the
+    row remains counted until a human resolves the review (accounting#85
+    review round 3).
     """
     if transaction.source != Source.GMAIL_N8N.value:
         return result

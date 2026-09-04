@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
+from src.adapters.gmail_n8n import CORRUPTED_PAYLOAD_MARKER as _CORRUPTED_MARKER
+from src.adapters.gmail_n8n import has_object_object as _has_object_object
 from src.models.enums import Direction, Entity, Source, TaxCategory, TransactionStatus
 
 if TYPE_CHECKING:
@@ -69,9 +71,14 @@ _ENTITY_AUTHORITATIVE_SOURCES = frozenset({Source.STRIPE.value, Source.SHOPIFY.v
 # amount is internally contradictory and must be vetoed. NOTE: gmail_n8n is
 # deliberately excluded — it stores income as -abs(amount) *before* the
 # classifier assigns direction=income (see CLAUDE.md "Adapter behavior"), so a
-# negative Gmail amount tagged income is correct, not a mismatch.
+# negative Gmail amount tagged income is not a *sign* mismatch. Gmail income is
+# instead vetoed on the tax category by _veto_gmail_income() (accounting#85).
 _AUTHORITATIVE_SIGN_SOURCES = frozenset({Source.PLAID.value, Source.BANK_CSV.value})
 
+# Tax categories treated as income for the gmail source/direction veto
+# (accounting#85 _veto_gmail_income): any of these on a gmail row is routed
+# to NEEDS_REVIEW regardless of direction, since gmail receipts are always
+# expenses by the adapter's signed_amount = -abs(amount) contract.
 _INCOME_TAX_CATEGORIES = frozenset({
     TaxCategory.CONSULTING_INCOME,
     TaxCategory.SUBSCRIPTION_INCOME,
@@ -169,6 +176,79 @@ def _reconcile_sign(
     return result
 
 
+def _veto_gmail_income(
+    transaction: Transaction, result: ClassificationResult
+) -> ClassificationResult:
+    """Route gmail-sourced rows classified as income to needs_review.
+
+    accounting#85: ``gmail_n8n``'s adapter contract is
+    ``signed_amount = -abs(amount)`` — every gmail receipt is an expense by
+    construction, so gmail is deliberately excluded from
+    ``_AUTHORITATIVE_SIGN_SOURCES`` and ``_reconcile_sign()`` never fires on
+    it. That left a hole: a corrupted description (e.g. the ``[object
+    Object]`` literal) defeats tiers 1-2, and a tier-3 mis-guess of an income
+    category was silently AUTO_CLASSIFIED, inflating Sparkry B&O gross.
+
+    Category/direction are preserved (mirroring the inflow-on-expense veto):
+    only the status and review_reason change, so the human sees the tier's
+    suggestion. The needs_review status now also drops the row out of B&O
+    gross receipts (``bno_tax._aggregate_income_by_month``, REQ-GMOBJ-04), so
+    a vetoed phantom no longer inflates the filing while it waits for a human.
+
+    REQ-GMOBJ-02 v2 — the veto is NARROW. Sparkry really does receive gmail
+    income notifications, and two rules yield an income category for a gmail
+    row *deliberately*: the Tier-1 ``cardinal.*health`` seed and the Tier-2
+    SAP/Ariba pattern. Vetoing every gmail income result silently disabled
+    both. The downgrade therefore fires only when the classification is not
+    trustworthy:
+
+    (a) the row carries the corrupted ``[object Object]`` payload marker — in
+        the description, or in the review_reason the adapter wrote when it
+        scrubbed the literal out of the description; or
+    (b) the income label came from the Tier-3 fallback/LLM path, i.e. no
+        deterministic tier-1/tier-2 rule produced it.
+    """
+    if transaction.source != Source.GMAIL_N8N.value:
+        return result
+    # REQ-GMOBJ-02: ANY income tax_category counts, whatever the direction —
+    # gross receipts are aggregated on tax_category alone, so a
+    # TRANSFER/REIMBURSABLE direction is no exemption.
+    is_income = (
+        result.direction == Direction.INCOME
+        or result.tax_category in _INCOME_TAX_CATEGORIES
+    )
+    if not is_income:
+        return result
+    corrupted = _has_object_object(transaction.description or "") or (
+        _CORRUPTED_MARKER in (transaction.review_reason or "")
+    )
+    from_fallback = result.tier_used == 3
+    if not (corrupted or from_fallback):
+        # A deterministic tier-1/tier-2 rule deliberately classified this
+        # gmail row as income (SAP/Ariba, cardinal.*health) — keep it.
+        return result
+    reason = (
+        f"Source/direction mismatch: gmail receipts are always expenses, "
+        f"but tier {result.tier_used} classified this row as income "
+        f"({result.tax_category.value}). Routed to review."
+    )
+    if result.review_reason:
+        # Keep the tier's own explanation (e.g. the low-confidence note).
+        reason = f"{result.review_reason} {reason}"
+    return replace(
+        result,
+        status=TransactionStatus.NEEDS_REVIEW,
+        review_reason=reason,
+    )
+
+
+def _finalise(
+    transaction: Transaction, result: ClassificationResult
+) -> ClassificationResult:
+    """Apply the sign and gmail-income vetoes to a tier's result."""
+    return _veto_gmail_income(transaction, _reconcile_sign(transaction, result))
+
+
 def classify(
     transaction: Transaction,
     session: Session,
@@ -211,21 +291,21 @@ def classify(
     if tier1 is not None and tier1.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier1.tier_used = 1
         tier1.status = TransactionStatus.AUTO_CLASSIFIED
-        return _reconcile_sign(transaction, tier1)
+        return _finalise(transaction, tier1)
 
     # ── Tier 2: Structural patterns ─────────────────────────────────────────
     tier2 = _pat_mod.match_structural_pattern(transaction)
     if tier2 is not None and tier2.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier2.tier_used = 2
         tier2.status = TransactionStatus.AUTO_CLASSIFIED
-        return _reconcile_sign(transaction, tier2)
+        return _finalise(transaction, tier2)
 
     # ── Tier 3: LLM classification ──────────────────────────────────────────
     tier3 = _llm_mod.llm_classify(transaction, api_key=llm_api_key, _session=session)
     if tier3.confidence >= _AUTO_CLASSIFY_THRESHOLD:
         tier3.tier_used = 3
         tier3.status = TransactionStatus.AUTO_CLASSIFIED
-        return _reconcile_sign(transaction, tier3)
+        return _finalise(transaction, tier3)
 
     # ── Needs review ────────────────────────────────────────────────────────
     # Best partial result is kept so the reviewer has a pre-filled suggestion.
@@ -235,7 +315,7 @@ def classify(
         f"Low confidence ({tier3.confidence:.2f}) from Tier 3 LLM: "
         f"{tier3.reasoning}"
     )
-    return _reconcile_sign(transaction, tier3)
+    return _finalise(transaction, tier3)
 
 
 def apply_result(transaction: Transaction, result: ClassificationResult) -> None:
@@ -251,6 +331,7 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
         or transaction.entity is None
     ):
         transaction.entity = result.entity.value
+    prior_reason = transaction.review_reason or ""
     transaction.tax_category = result.tax_category.value
     transaction.direction = result.direction.value
     transaction.confidence = result.confidence
@@ -259,6 +340,25 @@ def apply_result(transaction: Transaction, result: ClassificationResult) -> None
     if result.tax_subcategory:
         transaction.tax_subcategory = result.tax_subcategory
     transaction.deductible_pct = result.deductible_pct
+
+    # accounting#85: a corrupted-payload flag set at ingest must survive
+    # classification — otherwise a confident tier-3 expense result silently
+    # auto-classifies the row and the marker is lost. REQ-GMOBJ-05: the
+    # round-3 "skip when the row was already CONFIRMED" guard was inert —
+    # reclassify.py only ever queries NEEDS_REVIEW rows and ingest.py applies
+    # to freshly created needs_review rows, so no caller can reach here with a
+    # confirmed row — and has been deleted.
+    if _CORRUPTED_MARKER in prior_reason:
+        transaction.status = TransactionStatus.NEEDS_REVIEW.value
+        new_reason = transaction.review_reason or ""
+        # review round 2: skip the append when prior_reason is already folded
+        # in (e.g. a re-classify run) so the text doesn't grow/duplicate.
+        if prior_reason in new_reason:
+            transaction.review_reason = new_reason or prior_reason
+        else:
+            transaction.review_reason = (
+                f"{new_reason} {prior_reason}".strip() if new_reason else prior_reason
+            )
 
     # Missing amounts always need review regardless of classification confidence
     if transaction.amount is None and transaction.status != TransactionStatus.NEEDS_REVIEW.value:

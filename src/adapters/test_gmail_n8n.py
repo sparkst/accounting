@@ -23,6 +23,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.gmail_n8n import (
+    CORRUPTED_PAYLOAD_MARKER,
     GmailN8nAdapter,
     _extract_forwarded_vendor,
     _is_self_forwarded,
@@ -234,6 +235,70 @@ FORWARDED_WIFI_ONBOARD: dict[str, object] = {
         " $ 8.00 \n"
     ),
     "body_html": "<html></html>",
+}
+
+OBJECT_OBJECT_RECEIPT: dict[str, object] = {
+    # accounting#85: a JS object serialized before it reaches gmail_n8n.py,
+    # producing a `from` header whose display name is the literal string
+    # "[object Object]" — extract_vendor() then stores that literal as the
+    # description, defeating vendor/pattern matching and (per the ElevenLabs
+    # regression, 4ed8f5dd-f936-4357-8a58-7e47b9f3af8f) letting tier-3
+    # mis-guess income and inflate B&O gross.
+    "id": "4ed8f5dd1936",
+    "filename": "2026-08-18_object_object_4ed8f5dd1936",
+    "date": "2026-08-18T00:00:00.000Z",
+    "from": "[object Object] <billing@mail.elevenlabs.io>",
+    "subject": "Your receipt",
+    "body_text": "Receipt Amount paid $24.27\n",
+    "body_html": "<html></html>",
+}
+
+NON_STRING_FROM_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 3: some upstream n8n payloads send `from`
+    # as an actual JSON object rather than a string. Ingest must not crash.
+    "id": "nonstringfrom0001",
+    "filename": "2026-08-19_nonstring_from_0001",
+    "date": "2026-08-19T00:00:00.000Z",
+    "from": {"name": "Acme", "address": "billing@acme.example"},
+    "subject": "Your receipt",
+    "body_text": "Receipt Amount paid $10.00\n",
+    "body_html": "<html></html>",
+}
+
+NON_STRING_BODY_SUBJECT_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 4: `body_text`/`subject` as JSON objects
+    # (not strings) must not raise TypeError from re.search calls downstream.
+    "id": "nonstringbodysubj0001",
+    "filename": "2026-08-20_nonstring_body_subject_0001",
+    "date": "2026-08-20T00:00:00.000Z",
+    "from": "Acme <billing@acme.example>",
+    "subject": {"text": "Your receipt"},
+    "body_text": {"text": "Receipt Amount paid $10.00"},
+    "body_html": "<html></html>",
+}
+
+OBJECT_OBJECT_SUBJECT_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 4: the corrupted-payload literal can land in
+    # `subject` with a well-formed `from`, and must still route to review.
+    "id": "objectobjectsubject0001",
+    "filename": "2026-08-20_object_object_subject_0001",
+    "date": "2026-08-20T00:00:00.000Z",
+    "from": "Acme <billing@acme.example>",
+    "subject": "[object Object]",
+    "body_text": "Receipt Amount paid $10.00\n",
+    "body_html": "<html></html>",
+}
+
+NON_STRING_BODY_HTML_RECEIPT: dict[str, object] = {
+    # accounting#85 review round 5: `body_html` as a JSON object (not a
+    # string) must not raise TypeError from extract_amount/detect_currency.
+    "id": "nonstringbodyhtml0001",
+    "filename": "2026-08-21_nonstring_body_html_0001",
+    "date": "2026-08-21T00:00:00.000Z",
+    "from": "Acme <billing@acme.example>",
+    "subject": "Your receipt",
+    "body_text": "",
+    "body_html": {"text": "Receipt Amount paid $10.00"},
 }
 
 FORWARDED_APPLE_RECEIPT: dict[str, object] = {
@@ -743,6 +808,214 @@ class TestGmailN8nAdapterRun:
 
 
 # ---------------------------------------------------------------------------
+# REQ-GMOBJ-01: reject `[object Object]` description at ingest
+# ---------------------------------------------------------------------------
+
+
+class TestObjectObjectPayload:
+    def _make_adapter(self, *dirs: Path) -> GmailN8nAdapter:
+        return GmailN8nAdapter(source_dirs=[str(d) for d in dirs])
+
+    def test_object_object_payload_routes_to_needs_review(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85: a `[object Object]`-literal vendor must route the
+        record to NEEDS_REVIEW with a review reason, not pass through
+        silently."""
+        write_fixture(tmp_path, OBJECT_OBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.review_reason is not None
+        assert "object object" in tx.review_reason.lower()
+
+    def test_object_object_literal_never_stored_as_description(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """The literal string "[object Object]" must never be stored as the
+        plain description — it can never match a VendorRule and can never be
+        learned."""
+        write_fixture(tmp_path, OBJECT_OBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description != "[object Object]"
+
+    def test_well_formed_record_unaffected_by_object_object_guard(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """The guard must be narrowly scoped: a normal, well-formed vendor
+        description is stored and ingested exactly as before."""
+        write_fixture(tmp_path, ANTHROPIC_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description == "Anthropic, PBC"
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value  # classification pending, as today
+
+
+    def test_non_string_from_field_does_not_crash(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 3: a `from` value that is a JSON
+        object (not a string) must not raise AttributeError from
+        extract_vendor's .strip() call — ingest should still complete."""
+        write_fixture(tmp_path, NON_STRING_FROM_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description is not None
+
+    def test_non_string_body_and_subject_does_not_crash(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 4: `body_text`/`subject` as JSON
+        objects (not strings) must not raise TypeError from the re.search
+        calls that scan them — ingest should still complete."""
+        write_fixture(tmp_path, NON_STRING_BODY_SUBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description is not None
+
+    def test_non_string_body_html_does_not_crash(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 5: a `body_html` value that is a JSON
+        object (not a string) must not raise TypeError from
+        extract_amount/detect_currency — ingest should still complete."""
+        write_fixture(tmp_path, NON_STRING_BODY_HTML_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description is not None
+
+    def test_object_object_subject_routes_to_needs_review(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """accounting#85 review round 4: a corrupted `subject` (well-formed
+        `from`) must also route to NEEDS_REVIEW with the corrupted-payload
+        marker, not pass through silently."""
+        write_fixture(tmp_path, OBJECT_OBJECT_SUBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert tx.review_reason is not None
+        assert "object object" in tx.review_reason.lower()
+
+
+class TestObjectObjectVendorShapes:
+    """REQ-GMOBJ-01: no gmail row ever stores the literal, whatever the shape."""
+
+    def test_bare_literal_from_field(self) -> None:
+        assert "[object Object]" not in extract_vendor("[object Object]")
+
+    def test_literal_inside_angle_brackets(self) -> None:
+        assert "[object Object]" not in extract_vendor("Acme <[object Object]>")
+
+    def test_literal_in_forwarded_from_line(self) -> None:
+        body = (
+            "---------- Forwarded message ---------\n"
+            "From: [object Object] <billing@mail.elevenlabs.io>\n"
+        )
+        vendor = extract_vendor("Travis Sparks <sparkst@gmail.com>", body)
+        assert "[object Object]" not in vendor
+        # review round 2: the fallback must use the *forwarded* sender's
+        # domain, not the outer self-forward envelope (sparkst@gmail.com).
+        assert vendor == "elevenlabs.io"
+
+    def test_display_name_literal_falls_back_to_domain(self) -> None:
+        assert extract_vendor(
+            "[object Object] <billing@mail.elevenlabs.io>"
+        ) == "elevenlabs.io"
+
+
+class TestObjectObjectOCRPreservesMarker:
+    def test_ocr_branch_appends_not_overwrites_corrupted_marker(
+        self, tmp_path: Path, session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """review round 2 (P2): a corrupted-payload row whose body is empty but
+        whose attachment OCR succeeds must keep the CORRUPTED_PAYLOAD_MARKER in
+        review_reason, not have it clobbered by the OCR note."""
+        import src.adapters.gmail_n8n as gmail_n8n_mod
+        from src.utils.receipt_ocr import OCRResult
+
+        record = dict(OBJECT_OBJECT_RECEIPT)
+        record["body_text"] = ""  # forces the body_is_empty OCR branch
+        write_fixture(tmp_path, record)
+        # Co-locate a fake receipt image so find_extractable_attachments finds one.
+        (tmp_path / f"{record['id']}_receipt.png").write_bytes(b"fake")
+
+        monkeypatch.setattr(
+            gmail_n8n_mod,
+            "extract_receipt",
+            lambda _path: OCRResult(
+                vendor="Elevenlabs", amount=decimal.Decimal("24.27"), success=True
+            ),
+        )
+
+        GmailN8nAdapter(source_dirs=[str(tmp_path)]).run(session)
+
+        tx = session.query(Transaction).one()
+        assert gmail_n8n_mod.CORRUPTED_PAYLOAD_MARKER in (tx.review_reason or "")
+        assert "Auto-extracted from attachment" in (tx.review_reason or "")
+
+    def test_ocr_vendor_object_object_literal_not_stored_as_description(
+        self, tmp_path: Path, session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """accounting#85 review round 4 (P3): if OCR itself returns the
+        `[object Object]` literal as the vendor, it must not be stored as
+        tx.description — the pre-OCR fallback description is kept instead."""
+        import src.adapters.gmail_n8n as gmail_n8n_mod
+        from src.utils.receipt_ocr import OCRResult
+
+        record = dict(ANTHROPIC_RECEIPT)
+        record["id"] = "ocrobjectobject0001"
+        record["filename"] = "2026-08-20_ocr_object_object_0001"
+        record["from"] = "Travis Sparks <sparkst@gmail.com>"
+        record["body_text"] = ""
+        write_fixture(tmp_path, record)
+        (tmp_path / f"{record['id']}_receipt.png").write_bytes(b"fake")
+
+        monkeypatch.setattr(
+            gmail_n8n_mod,
+            "extract_receipt",
+            lambda _path: OCRResult(
+                vendor="[object Object]", amount=decimal.Decimal("24.27"), success=True
+            ),
+        )
+
+        GmailN8nAdapter(source_dirs=[str(tmp_path)]).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.description != "[object Object]"
+
+
+class TestObjectObjectSelfForwardIngest:
+    def test_self_forwarded_literal_flags_needs_review(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        """A self-forward whose body From: carries the literal must still be
+        flagged, and must not store the literal as the description."""
+        record = dict(OBJECT_OBJECT_RECEIPT)
+        record["from"] = "Travis Sparks <sparkst@gmail.com>"
+        record["body_text"] = (
+            "---------- Forwarded message ---------\n"
+            "From: [object Object] <billing@mail.elevenlabs.io>\n"
+            "Total: $24.27\n"
+        )
+        write_fixture(tmp_path, record)
+        GmailN8nAdapter(source_dirs=[str(tmp_path)]).run(session)
+
+        tx = session.query(Transaction).one()
+        assert "[object Object]" not in (tx.description or "")
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert "object object" in (tx.review_reason or "").lower()
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: forwarded vendor extraction helpers
 # ---------------------------------------------------------------------------
 
@@ -935,7 +1208,14 @@ class TestPerFileRollback:
             adapter = GmailN8nAdapter(source_dirs=[str(tmp_path)])
             result = adapter.run(session)
         finally:
-            gmail_mod.GmailN8nAdapter._record_ingested_file = monkey_target  # type: ignore[method-assign]
+            # Restore as a staticmethod: attribute access unwraps the
+            # descriptor to a plain function, so assigning `monkey_target`
+            # back bare would rebind it as an *instance* method and every
+            # later call in this module would raise "takes 5 positional
+            # arguments but 6 were given".
+            gmail_mod.GmailN8nAdapter._record_ingested_file = staticmethod(  # type: ignore[method-assign]
+                monkey_target
+            )
 
         assert result.records_created == 2
         assert result.records_failed == 1
@@ -952,3 +1232,61 @@ class TestPerFileRollback:
         # No partial IngestedFile row for the failed file either.
         ingested_files = session.query(IngestedFile).all()
         assert len(ingested_files) == 2
+
+
+# ---------------------------------------------------------------------------
+# accounting#85 review round v2: object-SHAPED payloads (dict/list values)
+# ---------------------------------------------------------------------------
+
+
+class TestObjectShapedPayloadIsCorrupted:
+    """A dict-valued ``from``/``subject``/``body_text`` is the SAME upstream
+    corruption as the ``[object Object]`` literal — it just stringifies to a
+    Python repr instead of the JS one, so every ``[object Object]`` guard
+    misses it. It must carry the corrupted-payload marker (so the engine's
+    sticky re-assert and the narrow gmail-income veto both fire) and must
+    never store the dict repr as the description.
+    """
+
+    def _make_adapter(self, tmp_path: Path) -> GmailN8nAdapter:
+        return GmailN8nAdapter(source_dirs=[str(tmp_path)])
+
+    def test_dict_from_is_flagged_with_corrupted_marker(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, NON_STRING_FROM_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert (tx.review_reason or "").startswith(CORRUPTED_PAYLOAD_MARKER)
+
+    def test_dict_from_repr_is_never_the_description(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, NON_STRING_FROM_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        description = tx.description or ""
+        assert "{" not in description and "'" not in description
+        assert description != str(NON_STRING_FROM_RECEIPT["from"])
+
+    def test_dict_subject_and_body_are_flagged_with_corrupted_marker(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, NON_STRING_BODY_SUBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert CORRUPTED_PAYLOAD_MARKER in (tx.review_reason or "")
+
+    def test_well_formed_record_carries_no_corrupted_marker(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, ANTHROPIC_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert CORRUPTED_PAYLOAD_MARKER not in (tx.review_reason or "")

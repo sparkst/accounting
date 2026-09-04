@@ -370,7 +370,41 @@ def _extract_forwarded_subject(body_text: str) -> str | None:
     return None
 
 
-def extract_vendor(from_field: str, body_text: str = "") -> str:
+_OBJECT_OBJECT_RE = re.compile(r"\[object\s+object\]", re.IGNORECASE)
+
+
+def _has_object_object(text: str) -> bool:
+    """True when *text* carries the JS ``[object Object]`` stringification.
+
+    accounting#85: an upstream n8n node serialises an object into the ``from``
+    header, so the display name arrives as the literal ``[object Object]``.
+    That literal can never match a VendorRule and can never be learned, so it
+    must never be stored as a description nor auto-classified.
+    """
+    return bool(_OBJECT_OBJECT_RE.search(text or ""))
+
+
+def _is_object_shaped(value: object) -> bool:
+    """True when an n8n field arrived as a JSON object/array, not a string.
+
+    accounting#85 review round 2: this is the SAME upstream corruption as the
+    ``[object Object]`` literal — the payload's node serialised an object into
+    a string field — but Python's ``str()`` renders it as a dict/list repr
+    (``"{'name': 'x'}"``), which no ``[object Object]`` guard can match. Left
+    undetected, the repr is stored as the description and the row passes with
+    only the generic "classification pending" reason, so neither the engine's
+    sticky corrupted-marker re-assert nor the narrow gmail-income veto fires.
+    """
+    return value is not None and not isinstance(value, str | int | float | bool)
+
+
+#: Public alias — the classification engine's narrow gmail-income veto
+#: (accounting#85 REQ-GMOBJ-02 v2) needs this predicate, and must use the
+#: adapter's single regex rather than re-declaring one that can drift.
+has_object_object = _has_object_object
+
+
+def _extract_vendor_raw(from_field: str, body_text: str = "") -> str:
     """Extract the human-readable vendor name from a RFC 5322 ``From`` header.
 
     For self-forwarded emails (from Travis Sparks's own addresses) the real
@@ -409,9 +443,53 @@ def extract_vendor(from_field: str, body_text: str = "") -> str:
     m = re.match(r"^(.*?)\s*<[^>]+>\s*$", from_field)
     if m:
         name = m.group(1).strip()
-        if name:
+        if name and not _has_object_object(name):
             return name
+        if name:
+            # accounting#85: never surface the "[object Object]" literal as a
+            # description — fall back to the sender's domain, which at least
+            # names the real vendor ("mail.elevenlabs.io" -> "elevenlabs.io").
+            return _vendor_from_domain(from_field)
     return from_field
+
+
+# accounting#85: marker phrase the classifier looks for so a corrupted-payload
+# row can never be silently auto-classified later (see engine._CORRUPTED_MARKER).
+CORRUPTED_PAYLOAD_MARKER = "Corrupted upstream payload"
+
+# Description stored when no usable vendor can be recovered from a corrupted
+# payload. Never the "[object Object]" literal (REQ-GMOBJ-01).
+UNKNOWN_VENDOR = "Unknown vendor"
+
+
+def extract_vendor(from_field: str, body_text: str = "") -> str:
+    """Vendor name for a ``From`` header, never the ``[object Object]`` literal.
+
+    REQ-GMOBJ-01: whatever shape the corrupted payload takes (bare literal,
+    display name, angle-bracket address, or a literal inside a forwarded
+    ``From:`` line), the returned vendor is sanitised — the sender domain when
+    one can be recovered, else ``"Unknown vendor"``.
+    """
+    vendor = _extract_vendor_raw(from_field, body_text)
+    if not _has_object_object(vendor):
+        return vendor
+    # review round 2: for a self-forward whose forwarded From: display name is
+    # the corrupted literal, fall back to the *forwarded* sender's own domain
+    # (from the body) rather than the outer self-forward envelope's domain —
+    # otherwise every self-forwarded corrupted payload mis-attributes to
+    # "gmail.com" instead of the real vendor.
+    if _is_self_forwarded(from_field):
+        m = re.search(
+            r"^From:\s+.*?<([^>]+)>", body_text, re.IGNORECASE | re.MULTILINE
+        )
+        if m:
+            forwarded_fallback = _vendor_from_domain(m.group(1).strip())
+            if forwarded_fallback and not _has_object_object(forwarded_fallback):
+                return forwarded_fallback
+    fallback = _vendor_from_domain(from_field)
+    if fallback and not _has_object_object(fallback):
+        return fallback
+    return UNKNOWN_VENDOR
 
 
 # ---------------------------------------------------------------------------
@@ -624,9 +702,18 @@ class GmailN8nAdapter(BaseAdapter):
                 f"{json_path.name}: invalid date {raw_date!r}: {exc}"
             ) from exc
 
-        from_field: str = record.get("from", "")
-        body_text: str = record.get("body_text", "")
-        subject: str = record.get("subject", "")
+        # str() guard: some upstream n8n payloads send `from`/`body_text`/
+        # `subject`/`body_html` as a JSON object rather than a string;
+        # without this, downstream .strip()/re.search calls raise
+        # TypeError/AttributeError on a dict (accounting#85 review round 2/3).
+        object_shaped_fields = [
+            name
+            for name in ("from", "subject", "body_text", "body_html")
+            if _is_object_shaped(record.get(name))
+        ]
+        from_field: str = str(record.get("from", "") or "")
+        body_text: str = str(record.get("body_text", "") or "")
+        subject: str = str(record.get("subject", "") or "")
 
         # Skip Shopify order notification emails — sales data comes from
         # the Shopify API integration, not email notifications.
@@ -645,10 +732,21 @@ class GmailN8nAdapter(BaseAdapter):
             return
 
         vendor = extract_vendor(from_field, body_text)
+        if _is_object_shaped(record.get("from")):
+            # The `from` repr must never become the description (REQ-GMOBJ-01):
+            # it can never match a VendorRule and can never be learned. Recover
+            # the vendor from the forwarded header in the body if there is one,
+            # else store the explicit UNKNOWN_VENDOR constant.
+            recovered = extract_vendor("", body_text)
+            vendor = (
+                recovered
+                if recovered and not _has_object_object(recovered)
+                else UNKNOWN_VENDOR
+            )
 
         amount = extract_amount(body_text, subject)
         # Fallback: try HTML body for amounts if body_text had nothing
-        body_html: str = record.get("body_html", "")
+        body_html: str = str(record.get("body_html", "") or "")
         if amount is None and body_html:
             amount = extract_amount(body_html, subject)
         payment_method = extract_payment_method(body_text) or extract_payment_method(body_html)
@@ -714,6 +812,33 @@ class GmailN8nAdapter(BaseAdapter):
             # charged); store it as negative per the sign convention.
             signed_amount = -abs(amount)
 
+        # accounting#85: a `[object Object]`-literal sender means the upstream
+        # payload was corrupted; force review with an explicit reason rather
+        # than letting the record pass through silently.
+        if (
+            _has_object_object(from_field)
+            or _has_object_object(subject)
+            or _has_object_object(_extract_vendor_raw(from_field, body_text))
+            or object_shaped_fields
+        ):
+            status = TransactionStatus.NEEDS_REVIEW.value
+            if object_shaped_fields:
+                detail = (
+                    "arrived as a JSON object rather than a string in "
+                    f"{', '.join(object_shaped_fields)}"
+                )
+            else:
+                detail = (
+                    "contained the literal '[object Object]' in the sender "
+                    "header or subject"
+                )
+            reason = (
+                f"{CORRUPTED_PAYLOAD_MARKER}: the upstream payload {detail}; "
+                "vendor was derived from the sender domain and must be "
+                "confirmed manually."
+            )
+            review_reason = f"{review_reason} {reason}" if review_reason else reason
+
         # Discover co-located attachments.
         attachments = find_attachments(json_path.parent, source_id)
         # Also include the JSON file itself.
@@ -756,7 +881,11 @@ class GmailN8nAdapter(BaseAdapter):
                 try:
                     ocr: OCRResult = extract_receipt(image_attachments[0])
                     if ocr.success:
-                        if ocr.vendor and vendor in ("Travis Sparks", ""):
+                        if (
+                            ocr.vendor
+                            and not _has_object_object(ocr.vendor)
+                            and vendor in ("Travis Sparks", "")
+                        ):
                             tx.description = ocr.vendor
                         if ocr.amount is not None and tx.amount is None:
                             tx.amount = -abs(ocr.amount)
@@ -764,10 +893,17 @@ class GmailN8nAdapter(BaseAdapter):
                             tx.date = ocr.date
                         if ocr.entity_hint:
                             tx.entity = ocr.entity_hint
-                        # Mark as OCR-extracted, still needs human review
-                        tx.review_reason = (
+                        # Mark as OCR-extracted, still needs human review. Append
+                        # rather than overwrite so an existing corrupted-payload
+                        # marker (accounting#85) survives (P2 review round 2).
+                        ocr_note = (
                             "Auto-extracted from attachment via Claude CLI. "
                             "Please verify vendor, amount, and entity."
+                        )
+                        tx.review_reason = (
+                            f"{tx.review_reason} {ocr_note}"
+                            if tx.review_reason
+                            else ocr_note
                         )
                         import json as _json
                         tx.notes = (

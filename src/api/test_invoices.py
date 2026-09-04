@@ -892,7 +892,9 @@ class TestBulkConfirm:
         assert data["rules_created"] == 0
 
         db_session.expire_all()
-        assert db_session.get(Transaction, tx.id).status == "confirmed"
+        reloaded = db_session.get(Transaction, tx.id)
+        assert reloaded is not None
+        assert reloaded.status == "confirmed"
         assert (
             db_session.query(VendorRule)
             .filter(VendorRule.vendor_pattern == "NoCategoryVendor")

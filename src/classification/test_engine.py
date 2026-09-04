@@ -907,6 +907,213 @@ class TestClassificationEngine:
 
 
 # ---------------------------------------------------------------------------
+# REQ-GMOBJ-02: gmail rows never auto-book as income
+# ---------------------------------------------------------------------------
+
+
+class TestGmailIncomeVeto:
+    """Issue #85: gmail_n8n's adapter contract is signed_amount = -abs()
+    (always an expense). A tier that mis-guesses an income tax_category for a
+    gmail-sourced row (e.g. a broken `[object Object]` description defeating
+    vendor/pattern rules) must be downgraded to NEEDS_REVIEW rather than
+    silently AUTO_CLASSIFIED, mirroring the existing _reconcile_sign() outflow
+    veto but keyed on source == GMAIL_N8N rather than on amount sign (gmail is
+    deliberately excluded from _AUTHORITATIVE_SIGN_SOURCES)."""
+
+    def test_gmail_income_veto_downgrades_subscription_income_to_needs_review(
+        self, seeded_session: Session
+    ) -> None:
+        """Regression for accounting#85: the ElevenLabs charge
+        (4ed8f5dd-f936-4357-8a58-7e47b9f3af8f, 2026-08-18, +$24.27) was
+        mis-booked SUBSCRIPTION_INCOME, inflating Sparkry B&O gross."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+        assert "gmail" in (result.review_reason or "").lower()
+
+    def test_gmail_income_veto_ignores_non_gmail_sources(
+        self, seeded_session: Session
+    ) -> None:
+        """The gmail-keyed veto must not fire for a non-gmail source."""
+        txn = _make_transaction(
+            description="Some subscription income vendor",
+            source=Source.STRIPE.value,
+            amount=Decimal("24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+        assert result.tax_category == TaxCategory.SUBSCRIPTION_INCOME
+
+    def test_gmail_income_veto_leaves_expense_classification_alone(
+        self, seeded_session: Session
+    ) -> None:
+        """A correctly-classified gmail expense row (e.g.
+        517ecbb1-a4cd-45b2-9f66-87c875f6884a, OFFICE_EXPENSE -$27.58) must
+        not be touched by the income veto."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-27.58"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.OFFICE_EXPENSE,
+                direction=Direction.EXPENSE,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="office supplies keyword matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+        assert result.tax_category == TaxCategory.OFFICE_EXPENSE
+
+
+class TestGmailIncomeVetoEdges:
+    """Round-1 review fixes for accounting#85."""
+
+    def test_reimbursable_direction_is_not_exempt(
+        self, seeded_session: Session
+    ) -> None:
+        """An income tax_category must be vetoed even when direction is
+        REIMBURSABLE — gross receipts aggregate on tax_category alone."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.CONSULTING_INCOME,
+                direction=Direction.REIMBURSABLE,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="reimbursable guess",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+
+    def test_low_confidence_reason_is_preserved(
+        self, seeded_session: Session
+    ) -> None:
+        """The veto appends to, never replaces, the tier's own explanation."""
+        txn = _make_transaction(
+            description="[object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.10,
+                tier_used=3,
+                reasoning="unsure",
+            )
+            result = classify(txn, seeded_session)
+
+        reason = result.review_reason or ""
+        assert "Low confidence" in reason
+        assert "gmail" in reason.lower()
+
+    def test_corrupted_payload_marker_survives_classification(
+        self, seeded_session: Session
+    ) -> None:
+        """A corrupted-payload flag set at ingest must not be erased by a
+        confident expense classification."""
+        txn = _make_transaction(
+            description="elevenlabs.io",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        txn.review_reason = (
+            "Corrupted upstream payload: the sender header contained the "
+            "literal '[object Object]'."
+        )
+        result = ClassificationResult(
+            entity=Entity.SPARKRY,
+            tax_category=TaxCategory.OFFICE_EXPENSE,
+            direction=Direction.EXPENSE,
+            confidence=0.95,
+            tier_used=3,
+            status=TransactionStatus.AUTO_CLASSIFIED,
+            reasoning="office expense",
+        )
+        apply_result(txn, result)
+
+        assert txn.status == TransactionStatus.NEEDS_REVIEW.value
+        assert "Corrupted upstream payload" in (txn.review_reason or "")
+
+    def test_corrupted_marker_imported_from_adapter_not_duplicated(self) -> None:
+        """review round 2: engine's marker must be the adapter's constant, not
+        an independent literal that can silently drift out of sync."""
+        import src.classification.engine as engine_mod
+        from src.adapters.gmail_n8n import CORRUPTED_PAYLOAD_MARKER
+
+        assert getattr(engine_mod, "_CORRUPTED_MARKER") is CORRUPTED_PAYLOAD_MARKER  # noqa: B009
+
+    def test_corrupted_payload_marker_not_duplicated_on_reclassify(
+        self, seeded_session: Session
+    ) -> None:
+        """review round 2 (P3): re-running apply_result on an already-flagged
+        row must not keep re-appending prior_reason, growing the text."""
+        txn = _make_transaction(
+            description="elevenlabs.io",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        txn.review_reason = (
+            "Corrupted upstream payload: the sender header contained the "
+            "literal '[object Object]'."
+        )
+        result = ClassificationResult(
+            entity=Entity.SPARKRY,
+            tax_category=TaxCategory.OFFICE_EXPENSE,
+            direction=Direction.EXPENSE,
+            confidence=0.95,
+            tier_used=3,
+            status=TransactionStatus.AUTO_CLASSIFIED,
+            reasoning="office expense",
+        )
+        apply_result(txn, result)
+        first_reason = txn.review_reason
+
+        # Simulate a second classification run against the now-persisted row.
+        apply_result(txn, result)
+
+        assert txn.review_reason == first_reason
+        assert (txn.review_reason or "").count("Corrupted upstream payload") == 1
+
+
+# ---------------------------------------------------------------------------
 # Seed rules
 # ---------------------------------------------------------------------------
 
@@ -934,3 +1141,123 @@ class TestSeedRules:
             assert rule.confidence >= 0.8, (
                 f"Rule {rule.vendor_pattern!r} has low confidence {rule.confidence}"
             )
+
+
+# ---------------------------------------------------------------------------
+# REQ-GMOBJ-02 v2: the gmail income veto is NARROW
+# ---------------------------------------------------------------------------
+
+
+class TestGmailIncomeVetoIsNarrow:
+    """Issue #85 review round v2: the round-1 veto fired on ANY gmail income
+    result, which disabled two deliberate income rules for gmail rows (the
+    Tier-2 SAP/Ariba pattern and the Tier-1 ``cardinal.*health`` seed) and
+    flipped the golden fixture 'CARDINAL HEALTH reimbursable expense' from
+    auto_classified to needs_review.
+
+    v2 rule: downgrade a gmail income result ONLY when (a) the row carries the
+    corrupted ``[object Object]`` marker, or (b) the income classification came
+    from the Tier-3 fallback/LLM path.
+    """
+
+    def test_tier1_gmail_income_rule_keeps_its_classification(
+        self, seeded_session: Session
+    ) -> None:
+        """The Tier-1 ``cardinal.*health`` seed explicitly yields consulting
+        income; a clean gmail row matching it stays auto_classified."""
+        txn = _make_transaction(
+            description="CARDINAL HEALTH reimbursable expense",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-500.00"),
+        )
+        result = classify(txn, seeded_session)
+
+        assert result.tier_used == 1
+        assert result.tax_category == TaxCategory.CONSULTING_INCOME
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+
+    def test_tier2_gmail_income_pattern_keeps_its_classification(
+        self, seeded_session: Session
+    ) -> None:
+        """The Tier-2 SAP/Ariba rule is a deliberate gmail income rule."""
+        txn = _make_transaction(
+            description="Ariba payment notification PO 4500",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-1200.00"),
+        )
+        result = classify(txn, seeded_session)
+
+        assert result.tier_used == 2
+        assert result.tax_category == TaxCategory.CONSULTING_INCOME
+        assert result.status == TransactionStatus.AUTO_CLASSIFIED
+
+    def test_tier1_gmail_income_with_corrupted_marker_is_still_vetoed(
+        self, seeded_session: Session
+    ) -> None:
+        """Branch (a): a corrupted-payload row is untrustworthy input, so even
+        a deterministic tier-1 income match is routed to review."""
+        txn = _make_transaction(
+            description="CARDINAL HEALTH [object Object]",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-500.00"),
+        )
+        result = classify(txn, seeded_session)
+
+        assert result.tier_used == 1
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+        assert "gmail" in (result.review_reason or "").lower()
+
+    def test_corrupted_marker_in_review_reason_vetoes_tier1_income(
+        self, seeded_session: Session
+    ) -> None:
+        """The adapter scrubs the literal out of the description and records
+        it in review_reason instead — that marker must veto too."""
+        from src.adapters.gmail_n8n import CORRUPTED_PAYLOAD_MARKER
+
+        txn = _make_transaction(
+            description="CARDINAL HEALTH reimbursable expense",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-500.00"),
+        )
+        txn.review_reason = f"{CORRUPTED_PAYLOAD_MARKER}: sender header was corrupt."
+        result = classify(txn, seeded_session)
+
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+
+    def test_tier3_gmail_income_without_marker_is_vetoed(
+        self, seeded_session: Session
+    ) -> None:
+        """Branch (b): a clean description whose income label came only from
+        the Tier-3 LLM guess is still routed to review."""
+        txn = _make_transaction(
+            description="Some Unremarkable Vendor LLC",
+            source=Source.GMAIL_N8N.value,
+            amount=Decimal("-24.27"),
+        )
+        with patch("src.classification.llm_classifier.llm_classify") as mock_llm:
+            mock_llm.return_value = ClassificationResult(
+                entity=Entity.SPARKRY,
+                tax_category=TaxCategory.SUBSCRIPTION_INCOME,
+                direction=Direction.INCOME,
+                confidence=0.95,
+                tier_used=3,
+                reasoning="keyword 'subscription' matched",
+            )
+            result = classify(txn, seeded_session)
+
+        assert result.tier_used == 3
+        assert result.status == TransactionStatus.NEEDS_REVIEW
+
+
+class TestPriorStatusGuardDeleted:
+    """REQ-GMOBJ-05: the ``prior_status != CONFIRMED`` guard at engine.py:329
+    was inert machinery (reclassify.py only ever queries NEEDS_REVIEW rows and
+    ingest.py applies to freshly created needs_review rows). It must be gone."""
+
+    def test_engine_source_has_no_prior_status_confirmed_guard(self) -> None:
+        import inspect
+
+        import src.classification.engine as engine_mod
+
+        source = inspect.getsource(engine_mod.apply_result)
+        assert "prior_status" not in source

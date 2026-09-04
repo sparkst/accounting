@@ -16,18 +16,18 @@ from src.classification.engine import ClassificationResult
 from src.models.enums import Direction, Entity, TaxCategory
 from src.models.vendor_rule import VendorRule
 
+from .learned_patterns import make_learned_vendor_rule as make_learned_vendor_rule
 from .learned_patterns import (  # noqa: F401 -- compatibility re-exports
-    make_learned_vendor_rule,
-    normalize_learned_pattern,
+    normalize_learned_pattern as normalize_learned_pattern,
 )
+from .pattern_integrity import ENTITY_TYPE_VENDOR_RULE as ENTITY_TYPE_VENDOR_RULE
+from .pattern_integrity import PatternFlagError as PatternFlagError
+from .pattern_integrity import PatternRepairResult as PatternRepairResult
+from .pattern_integrity import looks_like_regex as looks_like_regex
 from .pattern_integrity import (  # noqa: F401 -- compatibility re-exports
-    ENTITY_TYPE_VENDOR_RULE,
-    PatternFlagError,
-    PatternRepairResult,
-    looks_like_regex,
-    repair_literal_regex_rules,
-    validate_pattern_flag,
+    repair_literal_regex_rules as repair_literal_regex_rules,
 )
+from .pattern_integrity import validate_pattern_flag as validate_pattern_flag
 
 logger = logging.getLogger(__name__)
 

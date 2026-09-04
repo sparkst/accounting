@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from src.classification.rules import PatternFlagError, validate_pattern_flag
+from src.classification.pattern_integrity import PatternFlagError, validate_pattern_flag
 from src.db.connection import SessionLocal
 from src.models.enums import Direction, Entity, TaxCategory, TaxSubcategory, VendorRuleSource
 from src.models.transaction import Transaction

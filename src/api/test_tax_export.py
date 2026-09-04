@@ -823,3 +823,47 @@ class TestBnoSurfacesExcludeConfirmedOutOfStateSales:
                 csv_retailing_total += Decimal(r[3])
 
         assert Decimal(str(jan["income"])) == csv_retailing_total == Decimal("90.70")
+
+
+# ---------------------------------------------------------------------------
+# REQ-GMOBJ-04: GET /api/export/bno drops needs_review income rows
+# ---------------------------------------------------------------------------
+
+
+class TestBnoExportExcludesNeedsReviewIncome:
+    """Issue #85 review round v2: a gmail row vetoed to needs_review keeps its
+    income tax_category, so the B&O export's feeding query must exclude it or
+    the phantom receipts are still filed (and taxed)."""
+
+    def test_needs_review_income_row_absent_from_bno_export(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2025-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        resp = client.get(
+            "/api/export/bno", params={"entity": "sparkry", "year": 2025}
+        )
+        assert resp.status_code == 200
+
+        rows = list(csv.reader(io.StringIO(resp.text)))
+        total_row = next(r for r in rows if r and "TOTAL" in str(r))
+        assert Decimal(total_row[3]) == Decimal("10000.00")
+
+    def test_unconfirmed_warning_still_fires(self, client: TestClient) -> None:
+        """The >20% unconfirmed warning must survive the exclusion — it is
+        computed over the unfiltered fetch."""
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2025-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        resp = client.get(
+            "/api/export/bno", params={"entity": "sparkry", "year": 2025}
+        )
+        assert resp.text.startswith("# WARNING:")
+        assert "are unconfirmed" in resp.text.splitlines()[0]

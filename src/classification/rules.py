@@ -311,15 +311,24 @@ def looks_like_regex(pattern: str) -> bool:
     return bool(_REGEX_CONSTRUCTS.search(pattern))
 
 
-def validate_pattern_flag(pattern: str, *, is_regex: bool) -> None:
+def validate_pattern_flag(
+    pattern: str, *, is_regex: bool, force_literal: bool = False
+) -> None:
     """Guard a (pattern, is_regex) pair before it reaches the database.
 
     REQ-FIX-ING-022. Call at every rule-creation and rule-edit site.
 
+    REQ-VRESC-01: ``force_literal=True`` is the escape hatch for a legitimate
+    descriptor that happens to carry ``|`` or ``[...]`` (e.g. ``"FOO|BAR LLC"``).
+    It skips the ``looks_like_regex`` guard on the ``is_regex=False`` path so
+    the string is stored verbatim and matched via ``re.escape``. Ignored when
+    ``is_regex=True`` (a real regex still must compile).
+
     Raises:
         PatternFlagError: pattern is empty; or it carries regex constructs
-            while ``is_regex`` is False (it would be escaped and never match);
-            or ``is_regex`` is True and the pattern does not compile.
+            while ``is_regex`` is False and ``force_literal`` is False (it would
+            be escaped and never match); or ``is_regex`` is True and the pattern
+            does not compile.
     """
     if not pattern or not pattern.strip():
         raise PatternFlagError("vendor_pattern must not be empty")
@@ -334,7 +343,7 @@ def validate_pattern_flag(pattern: str, *, is_regex: bool) -> None:
             ) from exc
         return
 
-    if looks_like_regex(pattern):
+    if not force_literal and looks_like_regex(pattern):
         raise PatternFlagError(
             f"vendor_pattern {pattern!r} carries regex constructs but "
             f"is_regex=False, so it would be escaped and could never match a "

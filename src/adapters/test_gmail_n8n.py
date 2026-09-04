@@ -23,6 +23,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.adapters.gmail_n8n import (
+    CORRUPTED_PAYLOAD_MARKER,
     GmailN8nAdapter,
     _extract_forwarded_vendor,
     _is_self_forwarded,
@@ -1224,3 +1225,61 @@ class TestPerFileRollback:
         # No partial IngestedFile row for the failed file either.
         ingested_files = session.query(IngestedFile).all()
         assert len(ingested_files) == 2
+
+
+# ---------------------------------------------------------------------------
+# accounting#85 review round v2: object-SHAPED payloads (dict/list values)
+# ---------------------------------------------------------------------------
+
+
+class TestObjectShapedPayloadIsCorrupted:
+    """A dict-valued ``from``/``subject``/``body_text`` is the SAME upstream
+    corruption as the ``[object Object]`` literal — it just stringifies to a
+    Python repr instead of the JS one, so every ``[object Object]`` guard
+    misses it. It must carry the corrupted-payload marker (so the engine's
+    sticky re-assert and the narrow gmail-income veto both fire) and must
+    never store the dict repr as the description.
+    """
+
+    def _make_adapter(self, tmp_path: Path) -> GmailN8nAdapter:
+        return GmailN8nAdapter(source_dirs=[str(tmp_path)])
+
+    def test_dict_from_is_flagged_with_corrupted_marker(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, NON_STRING_FROM_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert (tx.review_reason or "").startswith(CORRUPTED_PAYLOAD_MARKER)
+
+    def test_dict_from_repr_is_never_the_description(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, NON_STRING_FROM_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        description = tx.description or ""
+        assert "{" not in description and "'" not in description
+        assert description != str(NON_STRING_FROM_RECEIPT["from"])
+
+    def test_dict_subject_and_body_are_flagged_with_corrupted_marker(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, NON_STRING_BODY_SUBJECT_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert tx.status == TransactionStatus.NEEDS_REVIEW.value
+        assert CORRUPTED_PAYLOAD_MARKER in (tx.review_reason or "")
+
+    def test_well_formed_record_carries_no_corrupted_marker(
+        self, tmp_path: Path, session: Session
+    ) -> None:
+        write_fixture(tmp_path, ANTHROPIC_RECEIPT)
+        self._make_adapter(tmp_path).run(session)
+
+        tx = session.query(Transaction).one()
+        assert CORRUPTED_PAYLOAD_MARKER not in (tx.review_reason or "")

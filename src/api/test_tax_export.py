@@ -867,3 +867,152 @@ class TestBnoExportExcludesNeedsReviewIncome:
         )
         assert resp.text.startswith("# WARNING:")
         assert "are unconfirmed" in resp.text.splitlines()[0]
+
+
+# ---------------------------------------------------------------------------
+# REQ-GMOBJ-04 (review round v2): EVERY B&O surface drops needs_review income
+# ---------------------------------------------------------------------------
+
+
+class TestAllBnoSurfacesExcludeNeedsReviewIncome:
+    """The B&O CSV/DOR export, the dashboard's bno_monthly/bno_quarterly, the
+    YoY comparison's B&O figures and /api/bno/retail-detail all file the same
+    WA gross receipts. Excluding needs_review income from only the CSV made
+    the dashboard silently disagree with the filed figure."""
+
+    def _make_wa_sale(self, session: Session, *, status: str) -> Transaction:
+        tx = Transaction(
+            id=str(uuid.uuid4()),
+            source=Source.SHOPIFY.value,
+            source_id=str(uuid.uuid4()),
+            source_hash=str(uuid.uuid4()),
+            date="2026-01-10",
+            description="Shopify Order — WA retail",
+            amount=Decimal("100.00"),
+            currency="USD",
+            entity=Entity.BLACKLINE.value,
+            direction=Direction.INCOME.value,
+            tax_category=TaxCategory.SALES_INCOME.value,
+            status=status,
+            confidence=0.95,
+            raw_data={
+                "total_price": "100.00",
+                "total_tax": "9.30",
+                "shipping_address": {"province_code": "WA"},
+                "tax_lines": [{"title": "Washington State Tax"}],
+            },
+            confirmed_by=ConfirmedBy.HUMAN.value,
+        )
+        session.add(tx)
+        session.commit()
+        return tx
+
+    def test_tax_summary_bno_monthly_excludes_needs_review_income(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2025-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        resp = client.get(
+            "/api/tax-summary", params={"entity": "sparkry", "year": 2025}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        jan = next(m for m in body["bno_monthly"] if m["month"] == "2025-01")
+        assert jan["income"] == 10000.00
+        q1 = next(q for q in body["bno_quarterly"] if q["quarter"] == "Q1")
+        assert q1["income"] == 10000.00
+
+    def test_dashboard_bno_monthly_matches_bno_csv_total(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2025-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        summary = client.get(
+            "/api/tax-summary", params={"entity": "sparkry", "year": 2025}
+        ).json()
+        csv_resp = client.get(
+            "/api/export/bno", params={"entity": "sparkry", "year": 2025}
+        )
+        jan = next(m for m in summary["bno_monthly"] if m["month"] == "2025-01")
+
+        rows = list(csv.reader(io.StringIO(csv_resp.text)))
+        total_row = next(r for r in rows if r and "TOTAL" in str(r))
+        assert Decimal(str(jan["income"])) == Decimal(total_row[3])
+
+    def test_yoy_comparison_bno_monthly_excludes_needs_review_income(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2024-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2024-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            s.commit()
+
+        resp = client.get(
+            "/api/tax-summary",
+            params={"entity": "sparkry", "year": 2025, "compare_year": 2024},
+        )
+        assert resp.status_code == 200
+        prior = resp.json()["comparison"]["prior"]
+        jan = next(m for m in prior["bno_monthly"] if m["month"] == "2024-01")
+        assert jan["income"] == 10000.00
+
+    def test_retail_detail_excludes_needs_review_sales(
+        self, client: TestClient
+    ) -> None:
+        with _TestSession() as s:
+            self._make_wa_sale(s, status=TransactionStatus.CONFIRMED.value)
+            self._make_wa_sale(s, status=TransactionStatus.NEEDS_REVIEW.value)
+
+        resp = client.get(
+            "/api/bno/retail-detail",
+            params={"entity": "blackline", "year": 2026, "month": 1},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["gross_retailing"] == 90.70
+        assert body["wa_taxable"] == 90.70
+
+    def test_income_tax_line_items_still_include_needs_review(
+        self, client: TestClient
+    ) -> None:
+        """The exclusion is B&O-only: Schedule C / 1065 gross receipts and the
+        Financials drill-down must still see unconfirmed income."""
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2025-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        body = client.get(
+            "/api/tax-summary", params={"entity": "sparkry", "year": 2025}
+        ).json()
+        assert body["gross_income"] == 20000.00
+
+    def test_monthly_income_unconfirmed_counter_still_sees_the_row(
+        self, client: TestClient
+    ) -> None:
+        """The B&O wizard's readiness counter must keep counting the row it
+        is warning about."""
+        with _TestSession() as s:
+            _make_tx(s, amount=Decimal("10000.00"), date="2025-01-15")
+            vetoed = _make_tx(s, amount=Decimal("10000.00"), date="2025-01-20")
+            vetoed.status = TransactionStatus.NEEDS_REVIEW.value
+            s.commit()
+
+        body = client.get(
+            "/api/tax-summary/monthly",
+            params={"entity": "sparkry", "year": 2025},
+        ).json()
+        jan = next(m for m in body["months"] if m["month"] == "2025-01")
+        assert jan["income_unconfirmed"] == 1

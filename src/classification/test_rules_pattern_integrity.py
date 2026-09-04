@@ -580,7 +580,7 @@ class TestForceLiteralEscapeHatch:
         rule = _rule(session, "FOO|BAR LLC", is_regex=False)
         hit = lookup_vendor_rule("FOO|BAR LLC", session)
         assert hit is not None, "force_literal rule must match its own description"
-        assert hit.id == rule.id
+        assert hit.rule_id == rule.id
 
     def test_default_still_rejects_pipe_and_bracket_literal(self) -> None:
         """REQ-VRESC-03: the default (force_literal=False, today's call

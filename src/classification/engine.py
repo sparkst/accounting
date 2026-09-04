@@ -49,16 +49,6 @@ class ClassificationResult:
     # policy keys on this + the rule's confidence.
     rule_id: str | None = field(default=None)
 
-    @property
-    def id(self) -> str | None:
-        """Alias for ``rule_id`` — the id of the winning Tier-1 VendorRule.
-
-        REQ-VRESC-02: callers that hold a vendor-rule hit read ``.id`` to key
-        back onto the matched rule; a Tier-1 ``ClassificationResult`` is that
-        hit, so ``.id`` mirrors ``rule_id``.
-        """
-        return self.rule_id
-
 
 # ---------------------------------------------------------------------------
 # Engine
